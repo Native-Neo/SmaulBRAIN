@@ -467,8 +467,12 @@ def load_expert_file(path: str) -> ExpertRecord:
     try:
         with open(sidecar) as f:
             meta = json.load(f)
-    except ValueError:
-        raise
+    except ValueError as e:
+        if "validation failed" in str(e):
+            raise
+        raise ValueError(
+            f"checkpoint validation failed: unreadable sidecar {sidecar}: {e}"
+        ) from e
     except Exception as e:
         raise ValueError(
             f"checkpoint validation failed: unreadable sidecar {sidecar}: {e}"
