@@ -111,6 +111,8 @@ def sample_next(logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0,
         _check_logits(logits, int(vocab_size))
     # Clone: masking must never mutate the caller's logits tensor.
     l = logits.detach().float().clone()
+    if not torch.isfinite(l).any().item():
+        raise ValueError("logits contain no finite values; nothing to sample")
     if forbidden_ids:
         try:
             banned = list(forbidden_ids)  # type: ignore[arg-type]
