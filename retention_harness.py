@@ -228,7 +228,6 @@ def run_once(seed: int = DEF_SEED, steps_a: int = DEF_STEPS_A,
     train_kw = dict(batch_size=batch, grow_every=0, grow_loss_below=-1.0,
                     seed=seed, log_fn=lambda s: None)
 
-    # ---- Phase A: train on A (mode entire) ----
     cfg = make_cfg(seed, context=ctx)
     model, opt = fresh_model_opt(cfg)
     run_training(model, opt, cfg, train_A, steps=steps_a,
@@ -243,7 +242,6 @@ def run_once(seed: int = DEF_SEED, steps_a: int = DEF_STEPS_A,
         afterA_A = eval_heldout(model, held_A, ctx)
         afterA_B = eval_heldout(model, held_B, ctx)
 
-        # ---- Branch NEW: load ckpt_A, staged grow, train B mode=new ----
         torch.manual_seed(seed)
         cfg_n = make_cfg(seed, context=ctx)
         m_new, o_new = fresh_model_opt(cfg_n)
@@ -267,7 +265,6 @@ def run_once(seed: int = DEF_SEED, steps_a: int = DEF_STEPS_A,
         n_experts_new = len(m_new.pool)
         m_new.pager.close()
 
-        # ---- Branch ENTIRE (control): load ckpt_A again, train B mode=entire ----
         torch.manual_seed(seed)
         cfg_e = make_cfg(seed, context=ctx)
         m_ent, o_ent = fresh_model_opt(cfg_e)
