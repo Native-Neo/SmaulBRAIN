@@ -81,6 +81,8 @@ def quantize_fp8_blockwise(w: torch.Tensor, tile: int = 64) -> FP8BlockTensor:
     FP32 scale (amax/448). Values pass through real E4M3 casting so the
     stored bytes are true FP8 code points, not relabeled higher precision.
     """
+    if not isinstance(tile, int) or isinstance(tile, bool) or tile < 1:
+        raise ValueError(f"fp8 tile must be a positive int, got {tile!r}")
     w32 = w.detach().to(torch.float32)
     orig = tuple(w32.shape)
     flat = w32.reshape(-1, orig[-1])
