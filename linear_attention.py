@@ -132,6 +132,13 @@ def linear_attn_forward(
         raise ValueError("q, k, and v must all have shape [B, H, T, Dh]")
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
+    if chunk_size < 32:
+        import warnings as _warnings
+        _warnings.warn(
+            f"chunk_size={chunk_size} is below the efficient floor 32 "
+            "(~25x loop-overhead cliff; correctness holds, throughput does not)",
+            RuntimeWarning, stacklevel=2,
+        )
     B, H, T, Dh = q.shape
     if state is None:
         state = LinearAttnState.zeros(B, H, Dh, device=q.device)
