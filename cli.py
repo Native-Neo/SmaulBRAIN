@@ -223,9 +223,9 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--prompt", type=str, default="hello", help="Prompt text.")
     i.add_argument("--max-new", type=int, default=32, help="Bytes to generate.")
     i.add_argument("--temperature", type=float, default=0.0, help="Sampling temp (0=greedy).")
-    i.add_argument("--top-k", type=int, default=0, dest="top_k",
+    i.add_argument("--top-k", type=int, default=None, dest="sampler_top_k",
                    help="Top-k sampling cutoff (0=off).")
-    i.add_argument("--top-p", type=float, default=1.0, dest="top_p",
+    i.add_argument("--top-p", type=float, default=None, dest="sampler_top_p",
                    help="Nucleus sampling cutoff (1.0=off).")
     i.add_argument("--infer-context", type=int, default=None, dest="infer_context",
                    help="Prompt window override (default: model context_length).")
@@ -541,8 +541,10 @@ def main(argv: list[str] | None = None) -> int:
         model.pager.load_from_disk = make_disk_loader(args.ckpt)
         res = generate(model, encode_text(args.prompt), max_new=args.max_new,
                        temperature=args.temperature,
-                       top_k=getattr(args, "top_k", 0) or 0,
-                       top_p=getattr(args, "top_p", 1.0),
+                       top_k=0 if getattr(args, "sampler_top_k", None) is None
+                       else int(args.sampler_top_k),
+                       top_p=1.0 if getattr(args, "sampler_top_p", None) is None
+                       else float(args.sampler_top_p),
                        context=getattr(args, "infer_context", None)
                        if getattr(args, "infer_context", None) is not None
                        else cfg.context_length,
