@@ -618,7 +618,6 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
         if "cuda" in snap:
             for i, t in enumerate(snap["cuda"]):
                 rng_tensors[f"cuda.{i}"] = t
-        # ---- stage: all slow writes happen off to the side ----
         staging = tempfile.mkdtemp(dir=ckpt_dir, prefix=_TMP_GEN_PREFIX)
         try:
             st_exp = os.path.join(staging, "experts")
@@ -649,7 +648,6 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
             _atomic_write_json(manifest, os.path.join(staging, "manifest.json"))
             _fsync_dir(st_exp)
             _fsync_dir(staging)
-            # ---- publish: fast renames only, manifest last (commit point) ----
             for name in ("config.json", "trunk.safetensors", "router.safetensors",
                          "optim.safetensors", "rng.safetensors", "meta.json",
                          "resume_config.json"):
@@ -915,7 +913,6 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
             raise ValueError(f"checkpoint validation failed: unreadable file {p}: {e}") from e
         return p
 
-    # ---- phase 1a: config + manifest (no live mutation) ----
     try:
         with open(_path("config.json")) as f:
             raw_cfg = json.load(f)
@@ -968,7 +965,6 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     _verify_manifest_hashes(ckpt_dir, manifest)
     saved_cfg.num_experts = len(eids)
 
-    # ---- phase 1b: tensors (read + validate, no live mutation) ----
     trunk = _checked_sf_load(_path("trunk.safetensors"))
     model_sd = model.state_dict()
     expected_trunk = {k for k in model_sd
@@ -1050,7 +1046,6 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     _require(on_disk == {f"{eid}.safetensors" for eid in eids},
              f"experts dir mismatch: disk {sorted(on_disk)} vs manifest {eids}")
 
-    # ---- phase 1c: build replacement objects (still no live mutation) ----
     import torch.nn as nn
     new_experts: dict = {}
     new_order: list[str] = []
@@ -1068,7 +1063,6 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     new_admit = torch.tensor(manifest.get("router_admit", [0.0] * len(eids)),
                              dtype=torch.float64, device=dev)
 
-    # ---- phase 2: commit (plain swaps; infallible after validation) ----
     model.load_state_dict(trunk, strict=False)
     model.pool.experts = new_experts
     model.pool.order = new_order
