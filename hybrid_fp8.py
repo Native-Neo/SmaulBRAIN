@@ -1,5 +1,11 @@
 """Hybrid FP8 mixed-precision execution (E4M3 forward, E5M2 backward).
 
+Study-only module (like kernels.SparseTopKHead): not wired into the
+default model path, which uses precision.py FP8 storage + FP32 compute.
+Kept for the E4M3/E5M2 simulation study and its dedicated test
+(tests/test_hybrid_fp8.py); do not import from training/inference code
+unless opting into the experiment explicitly.
+
 Design: forward activations/weights quantize to ``torch.float8_e4m3fn``
 (highest forward precision); incoming gradients quantize to
 ``torch.float8_e5m2`` in backward (wide exponent range kills
