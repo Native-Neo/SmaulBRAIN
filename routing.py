@@ -67,6 +67,13 @@ class SparseRouter(nn.Module):
         top_k: int,
         capacity_factor: float = 1.5,
     ) -> None:
+        if num_experts < 0:
+            raise ValueError(f"num_experts must be >= 0, got {num_experts!r}")
+        if num_experts > 0 and not 1 <= top_k <= num_experts:
+            raise ValueError(
+                f"need 1 <= top_k <= num_experts, got top_k={top_k!r} "
+                f"num_experts={num_experts!r}"
+            )
         super().__init__()
         self.d_model = d_model
         self.num_experts = num_experts
@@ -115,6 +122,8 @@ class SparseRouter(nn.Module):
         different slots than a full pass over the same tokens.
         """
         n_tokens = x.shape[0]
+        if self.num_experts <= 0 and n_tokens > 0:
+            raise ValueError("cannot route non-empty batch with 0 experts")
         if n_tokens == 0:
             dev = x.device
             empty_ids = torch.zeros((0, self.top_k), dtype=torch.long, device=dev)
