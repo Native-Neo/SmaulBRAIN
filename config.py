@@ -230,12 +230,24 @@ class SmaulBrainConfig:
                 f"config fields must not be null (omit for defaults): {sorted(nulls)}"
             )
         if "active_experts" in values and "top_k" in values:
-            if int(values["active_experts"]) != int(values["top_k"]):
+            try:
+                if int(values["active_experts"]) != int(values["top_k"]):
+                    raise ValueError(
+                        f"incompatible active_experts={values['active_experts']!r} "
+                        f"!= top_k={values['top_k']!r}; refusing to guess"
+                    )
+            except (TypeError, ValueError) as e:
+                # Preserve explicit mismatch errors; normalize bad-type
+                # coercion failures to ValueError per the from_dict contract.
+                if isinstance(e, ValueError) and "incompatible active_experts" in str(e):
+                    raise
                 raise ValueError(
-                    f"incompatible active_experts={values['active_experts']!r} "
-                    f"!= top_k={values['top_k']!r}; refusing to guess"
-                )
-        return cls(**values)
+                    f"config fields active_experts/top_k must be integers: {e}"
+                ) from e
+        try:
+            return cls(**values)
+        except (TypeError, AssertionError) as e:
+            raise ValueError(f"config has bad field types: {e}") from e
 
     def describe_counts(self) -> dict:
         """Architecture param breakdown with unambiguous count categories.
