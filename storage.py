@@ -944,8 +944,12 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
              f"schema major {saved_schema!r} != runtime {_schema!r}")
     try:
         saved_cfg = SmaulBrainConfig.from_dict(raw_cfg)
-    except ValueError:
-        raise
+    except ValueError as e:
+        if "validation failed" in str(e):
+            raise
+        raise ValueError(
+            f"checkpoint validation failed: bad config {e}"
+        ) from e
     except Exception as e:
         raise ValueError(
             f"checkpoint validation failed: bad config {e}"
