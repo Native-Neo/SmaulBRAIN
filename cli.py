@@ -223,6 +223,19 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--prompt", type=str, default="hello", help="Prompt text.")
     i.add_argument("--max-new", type=int, default=32, help="Bytes to generate.")
     i.add_argument("--temperature", type=float, default=0.0, help="Sampling temp (0=greedy).")
+    i.add_argument("--top-k", type=int, default=0, dest="top_k",
+                   help="Top-k sampling cutoff (0=off).")
+    i.add_argument("--top-p", type=float, default=1.0, dest="top_p",
+                   help="Nucleus sampling cutoff (1.0=off).")
+    i.add_argument("--infer-context", type=int, default=None, dest="infer_context",
+                   help="Prompt window override (default: model context_length).")
+    i.add_argument("--infer-seed", type=int, default=None, dest="infer_seed",
+                   help="Sampling seed (default: config seed).")
+    i.add_argument("--stop-on-eos", action="store_true", default=None,
+                   help="Stop at EOS (default: on).")
+    i.add_argument("--no-stop-on-eos", action="store_false", dest="stop_on_eos",
+                   default=None,
+                   help="Generate the full --max-new steps even past EOS.")
     # report
     r = sub.add_parser("report", help="Print dynamic parameter counts + paging stats.")
     # quantize
@@ -514,8 +527,17 @@ def main(argv: list[str] | None = None) -> int:
         from storage import make_disk_loader
         model.pager.load_from_disk = make_disk_loader(args.ckpt)
         res = generate(model, encode_text(args.prompt), max_new=args.max_new,
-                       temperature=args.temperature, context=cfg.context_length,
-                       seed=cfg.seed)
+                       temperature=args.temperature,
+                       top_k=getattr(args, "top_k", 0) or 0,
+                       top_p=getattr(args, "top_p", 1.0),
+                       context=getattr(args, "infer_context", None)
+                       if getattr(args, "infer_context", None) is not None
+                       else cfg.context_length,
+                       seed=getattr(args, "infer_seed", None)
+                       if getattr(args, "infer_seed", None) is not None
+                       else cfg.seed,
+                       stop_on_eos=True if getattr(args, "stop_on_eos", None) is None
+                       else bool(args.stop_on_eos))
         print(decode_text(res["ids"]))
     elif args.cmd == "report":
         counts = model.param_counts()
