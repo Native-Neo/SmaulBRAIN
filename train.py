@@ -280,6 +280,8 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
                 _router.new_routing_bias = 0.0
                 _router.new_expert_idx = ()
         loss = out["loss"]
+        if not torch.isfinite(loss.detach()).all().item():
+            raise ValueError("non-finite training loss; refusing to step on NaN/inf")
         loss.backward()
         stepped: list[str] = []
         train_trunk = mode in ("entire", "trunk")
