@@ -459,12 +459,15 @@ class SmaulBrainModel(nn.Module):
         self._check_ids(ids, "ids")
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, _T = ids.shape
+        # Fresh stream: reset conv carryover BEFORE convolving, so the prompt
+        # never mixes with a previous stream's tail (and the prompt tail is
+        # retained for subsequent single-step calls instead of being dropped).
+        if attn_states is None:
+            attn_states = self.new_infer_state(B)
         emb = self.embed(ids)
         if self.byte_conv is not None:
             emb = self._conv_embed(emb)
         h = self.n_init(emb.to(compute))
-        if attn_states is None:
-            attn_states = self.new_infer_state(B)
         if len(attn_states) != self.cfg.max_depth:
             raise ValueError("attention state depth does not match model max_depth")
         for st in attn_states:
