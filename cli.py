@@ -103,12 +103,10 @@ def _cfg_default(name: str):
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="smaulbrain",
                                 description="SmaulBRAIN recurrent byte-level MoE LM")
-    # --- vocabulary / specials (shape; validated before construction) ---
     p.add_argument("--vocab-size", type=int, default=None, dest="vocab_size",
                    help="Total ids (bytes + specials). Default 260 (256 bytes + "
                         "bos/eos/pad/sep). Padding is always PAD_ID (never byte 0). "
                         "On resume an explicit mismatch aborts; else checkpoint wins.")
-    # --- architecture (tiny defaults; see --full) ---
     p.add_argument("--d-model", type=int, default=None, help="Shared trunk width (default: tiny=64, full=512).")
     p.add_argument("--n-heads", type=int, default=None, help="Linear-attention heads (default: tiny=4).")
     p.add_argument("--experts", type=int, default=None, dest="num_experts",
@@ -129,7 +127,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Per-expert routing capacity multiple (default: 1.5).")
     p.add_argument("--moe-balance-weight", type=float, default=None, dest="moe_balance_weight",
                    help="Aux routing-balance loss weight (default: 0.01).")
-    # --- adaptive depth / pondering ---
     p.add_argument("--max-depth", type=int, default=None, help="Max recurrent applications (default: tiny=3).")
     p.add_argument("--min-depth", type=int, default=None, help="Min recurrent applications (default: tiny=1).")
     p.add_argument("--halting-threshold", type=float, default=None,
@@ -138,7 +135,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Geometric prior p for ponder KL (default: 0.1).")
     p.add_argument("--ponder-beta", type=float, default=None, dest="ponder_beta",
                    help="Weight of ponder KL regularizer (default: 0.01).")
-    # --- paging ---
     p.add_argument("--paging-method", "--pagingmthd", type=str, default=None,
                    dest="paging_method",
                    choices=["D2R", "R2VR", "D2VR", "d2r", "r2vr", "d2vr"],
@@ -146,7 +142,6 @@ def build_parser() -> argparse.ArgumentParser:
                         "(case-insensitive; default: D2R). Checkpoint wins on resume.")
     p.add_argument("--ram-cache", type=int, default=None, help="Max experts in RAM cache (default: tiny=8, full=32).")
     p.add_argument("--vram-cache", type=int, default=None, help="Max experts in VRAM cache (default: tiny=4, full=16).")
-    # --- optimization (checkpoint optimizer hparams win on resume) ---
     p.add_argument("--expert-lr", type=float, default=None, help="Expert learning rate (default: 2e-4).")
     p.add_argument("--trunk-lr-mult", type=float, default=None, dest="trunk_lr_mult",
                    help="Shared-trunk LR multiplier (slow trunk vs fast experts; default: 0.1).")
@@ -167,14 +162,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="SmaulOpt second-moment decay (default: 0.999).")
     p.add_argument("--epsilon", type=float, default=None, dest="epsilon",
                    help="SmaulOpt denominator epsilon (default: 1e-8).")
-    # --- precision policy ---
     p.add_argument("--fp8-tile", type=int, default=None, dest="fp8_tile",
                    help="Block size for FP8 per-block scaling (default: 64). "
                         "Adopted from checkpoint on resume (not a shape gate).")
     p.add_argument("--state-dtype", type=str, default=None, dest="state_dtype",
                    choices=["bf16", "fp32"],
                    help="Optimizer state storage dtype (default: bf16). Checkpoint wins on resume.")
-    # --- runtime ---
     p.add_argument("--context-length", type=int, default=None, help="Training context (default: tiny=128, full=1024). Checkpoint wins on resume.")
     p.add_argument("--attention-chunk-size", type=int, default=None, dest="attention_chunk_size",
                    help="Causal linear-attention training chunk size (default: 256). "
@@ -185,14 +178,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=None, help="RNG seed (default: 0). Explicit wins on resume.")
     p.add_argument("--rmsnorm-eps", type=float, default=None, dest="rmsnorm_eps",
                    help="RMSNorm epsilon (default: 1e-6).")
-    # --- growth (config; schedule flag lives on train) ---
     p.add_argument("--grow-every-default", type=int, default=None, dest="config_grow_every",
                    help="Config growth interval (default: 20000). Train --grow-every "
                         "overrides per-run; omitted train flag falls back to this config value.")
     p.add_argument("--max-new-experts", type=int, default=None, dest="max_new_experts",
                    help="Cap per growth event (default: 8).")
-    # --- BPB ports (conv default-on; lookahead/boundary/cosine default-off;
-    # enabling any of them changes training math) ---
     p.add_argument("--use-byte-conv", action="store_true", default=None,
                    help="Causal byte-n-gram conv in the trunk (default: on).")
     p.add_argument("--no-byte-conv", action="store_false", dest="use_byte_conv",
