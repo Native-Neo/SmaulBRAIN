@@ -11,12 +11,18 @@ parameters.
 
 from __future__ import annotations
 
+import os
 import warnings
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Routing plan validation is a host-syncing Python loop (.tolist() + per-row
+# set check) on the hot path (every MoE application, every depth). Gate it
+# behind SMAUL_DEBUG=1 or Python -O off: production runs skip it.
+_DEBUG_ROUTE = os.environ.get("SMAUL_DEBUG", "0") == "1"
 
 
 @dataclass
@@ -116,7 +122,8 @@ class SparseRouter(nn.Module):
             plan = RoutePlan(top_ids=empty_ids, top_weights=empty_w,
                              dropped=torch.zeros(0, dtype=torch.bool, device=dev),
                              probs=torch.zeros((0, self.num_experts), device=dev))
-            plan.validate(self.num_experts, self.top_k)
+            if _DEBUG_ROUTE and __debug__:
+                plan.validate(self.num_experts, self.top_k)
             return plan
         logits = self.proj(x.to(self.proj.weight.dtype)).float()  # [N, E]
         bad = ~torch.isfinite(logits).all(dim=-1)
@@ -153,7 +160,8 @@ class SparseRouter(nn.Module):
                 self.usage_counts += counts.to(torch.float64)
                 self.admit_counts += counts.to(torch.float64)
         plan = RoutePlan(top_ids=top_ids, top_weights=top_w, dropped=dropped, probs=probs)
-        plan.validate(self.num_experts, self.top_k)
+        if _DEBUG_ROUTE and __debug__:
+            plan.validate(self.num_experts, self.top_k)
         return plan
 
     def _admit_slots(self, top_ids: torch.Tensor, top_w: torch.Tensor,
