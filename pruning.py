@@ -31,29 +31,9 @@ import torch
 import torch.nn.functional as F
 
 from precision import dequantize_fp8_blockwise
+from growth import _check_optim_width  # single source (growth.py owns the check)
 
 FLOOR_DEFAULT = 64
-
-
-def _check_optim_width(optim_state: dict | None, expect: int) -> None:
-    """Validate-first: every momentum buffer must already match pool width.
-
-    Raises before mutating when a buffer's dim-0 disagrees with the pool,
-    so row drops cannot silently misalign survivors. Missing entries are
-    left alone (step_dense initializes them on next use).
-    """
-    if optim_state is None:
-        return
-    for st in optim_state.values():
-        if not isinstance(st, dict):
-            continue
-        for key in ("m", "v_row", "v"):
-            t = st.get(key)
-            if torch.is_tensor(t) and t.shape[0] > 0 and t.shape[0] != expect:
-                raise ValueError(
-                    f"optim_state out of sync: buffer {key} has "
-                    f"{t.shape[0]} rows vs {expect} experts (refusing to mutate)"
-                )
 
 
 def _drop_state_row(state: dict, index: int) -> None:
