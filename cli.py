@@ -135,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Geometric prior p for ponder KL (default: 0.1).")
     p.add_argument("--ponder-beta", type=float, default=None, dest="ponder_beta",
                    help="Weight of ponder KL regularizer (default: 0.01).")
-    p.add_argument("--paging-method", "--pagingmthd", type=str, default=None,
+    p.add_argument("--paging-method", type=str, default=None,
                    dest="paging_method",
                    choices=["D2R", "R2VR", "D2VR", "d2r", "r2vr", "d2vr"],
                    help="D2R=disk->RAM, R2VR=RAM->VRAM (staged), D2VR=disk->VRAM direct "
