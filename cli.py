@@ -323,8 +323,21 @@ def explicit_config_fields(args: argparse.Namespace) -> dict:
     return out
 
 
+def _safe_ckpt_dir(ckpt_dir: str) -> str:
+    """Canonicalize a user-supplied checkpoint dir (no shell, no traversal surprise).
+
+    Rejects empty/NUL paths and returns the normalized absolute path so
+    sibling joins (config.json, manifest.json, experts/...) always resolve
+    inside the intended directory. Callers pass the result to storage APIs.
+    """
+    if not isinstance(ckpt_dir, str) or not ckpt_dir or "\x00" in ckpt_dir:
+        raise ValueError(f"invalid checkpoint dir {ckpt_dir!r}")
+    return os.path.normpath(os.path.abspath(ckpt_dir))
+
+
 def load_saved_config(ckpt_dir: str) -> SmaulBrainConfig | None:
     """Checkpoint config without building a model (None when no checkpoint)."""
+    ckpt_dir = _safe_ckpt_dir(ckpt_dir)
     cfg_path = os.path.join(ckpt_dir, "config.json")
     man_path = os.path.join(ckpt_dir, "manifest.json")
     if not (os.path.exists(cfg_path) and os.path.exists(man_path)):
