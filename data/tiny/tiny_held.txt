@@ -1,0 +1,8 @@
+the baker scored the loaf before sliding it into the oven
+replica lag grew while the primary compacted its tables
+garden tomatoes ripened late after the cool spring
+scheduler evicted the pod when memory pressure rose
+honey glazed carrots roast in twenty minutes flat
+the ferry horn echoed across the still morning bay
+connection pool exhausted under the load test spike
+fresh basil torn over pasta beats dried every time

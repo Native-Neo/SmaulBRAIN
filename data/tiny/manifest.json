@@ -1,0 +1,16 @@
+{
+  "dataset": "tiny",
+  "preset": "hand",
+  "splits": {
+    "train": {
+      "path": "data/tiny/tiny_train.txt",
+      "lines": 32,
+      "sha256": "59324e0d370c425a0c261c7c9e63eb6537e42ccb65447660120daff12e131496"
+    },
+    "held": {
+      "path": "data/tiny/tiny_held.txt",
+      "lines": 8,
+      "sha256": "be02d22bf1e5300fdf6e42472b4f7bedbbc6cc3400297626476d88d055167965"
+    }
+  }
+}
