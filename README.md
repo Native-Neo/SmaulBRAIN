@@ -30,7 +30,7 @@ python cli.py --ckpt ckpt/demo train --steps 20 --batch 2   # tiny 246K config
 python cli.py --ckpt ckpt/demo infer --prompt "hello" --max-new 32
 python cli.py --ckpt ckpt/demo report                        # param counts
 python pruning.py --ckpt ckpt/demo --rm-worst 0 --dry-run    # pool + floor preview
-python -m pytest tests/ -q                                   # 379 tests
+python -m pytest tests/ -q                                   # 421 tests
 ```
 
 ## What does SmaulBRAIN do?
