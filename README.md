@@ -235,7 +235,7 @@ It is an experimental architecture.
 
 ### Measured
 
-379 tests pass (`python -m pytest tests/ -q`). Measured on CPU (torch 2.14,
+421 tests pass (`python -m pytest tests/ -q`). Measured on CPU (torch 2.14,
 4-core, 7.6 GB RAM) with tiny configs unless noted:
 
 * 16K context forward: +61 MB delta RSS, ~6 s (d=32, 4 experts, top-1,
