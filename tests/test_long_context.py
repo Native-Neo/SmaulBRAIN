@@ -6,7 +6,11 @@ recurrent state). Numbers are printed and asserted — 16K support is claimed
 only for the lengths actually measured (see VALIDATION.md for 16K).
 """
 
-import sys, os, resource
+import sys, os
+try:
+    import resource as _resource
+except ImportError:  # Windows has no resource module
+    _resource = None  # type: ignore
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
@@ -17,7 +21,9 @@ from model import SmaulBrainModel
 
 
 def _rss_mb():
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    if _resource is None:
+        return 0.0
+    return _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss / 1024.0
 
 
 def _model():
