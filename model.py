@@ -255,6 +255,14 @@ class SmaulBrainModel(nn.Module):
         self._check_ids(ids, "ids")
         if targets is not None:
             self._check_ids(targets, "targets")
+        if ids.ndim != 2:
+            raise ValueError(f"ids must be [B, T], got shape {tuple(ids.shape)}")
+        if ids.shape[0] * ids.shape[1] > 1_048_576:
+            raise ValueError(
+                f"batch token count B*T={ids.shape[0] * ids.shape[1]} exceeds "
+                "1M-token guard (D x head + CE transients scale with T; "
+                "chunk the input or reduce batch)"
+            )
         if self._leaves:
             raise RuntimeError(
                 f"unconsumed expert leaves from prior forward ({len(self._leaves)} experts); "
