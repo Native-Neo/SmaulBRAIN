@@ -178,7 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=None, help="RNG seed (default: 0). Explicit wins on resume.")
     p.add_argument("--rmsnorm-eps", type=float, default=None, dest="rmsnorm_eps",
                    help="RMSNorm epsilon (default: 1e-6).")
-    p.add_argument("--grow-every-default", type=int, default=None, dest="config_grow_every",
+    p.add_argument("--grow-every-default", "--config-grow-every", type=int, default=None, dest="config_grow_every",
                    help="Config growth interval (default: 20000). Train --grow-every "
                         "overrides per-run; omitted train flag falls back to this config value.")
     p.add_argument("--max-new-experts", type=int, default=None, dest="max_new_experts",
