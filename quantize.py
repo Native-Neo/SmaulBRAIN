@@ -22,97 +22,18 @@ import tempfile
 import torch
 
 from storage import EXPERT_NAMES, load_expert_file, save_expert_file
-
-
-def _fsync_file(path: str) -> None:
-    try:
-        with open(path, "rb") as f:
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                pass
-    except OSError:
-        pass
-
-
-def _fsync_dir(dirpath: str) -> None:
-    try:
-        fd = os.open(dirpath or ".", os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        try:
-            os.fsync(fd)
-        except OSError:
-            pass
-    finally:
-        os.close(fd)
-
-
-def _sweep_stale_tmp(directory: str) -> None:
-    """Remove leftover converter sidecars from a prior crash (best-effort).
-
-    Unified with storage: matches ``tmp_quant_``, ``tmp_ckpt_``,
-    ``tmp_json_``, staged generation dirs (``tmp_ckpt_gen_*``), and
-    ``.convert_tmp`` sidecars. Directories are removed recursively.
-    """
-    try:
-        names = os.listdir(directory)
-    except OSError:
-        return
-    for name in names:
-        if name.startswith(("tmp_quant_", "tmp_ckpt_", "tmp_json_")) or name.endswith(".convert_tmp"):
-            p = os.path.join(directory, name)
-            try:
-                if os.path.isdir(p) and not os.path.islink(p):
-                    shutil.rmtree(p, ignore_errors=True)
-                else:
-                    os.remove(p)
-            except OSError:
-                pass
+from storage import (  # single source for crash-safe IO helpers
+    _atomic_write_json,
+    _checked_sf_load,
+    _fsync_dir,
+    _fsync_file,
+    _sweep_stale_tmp,
+)
 
 
 def _checked_torch_load(path: str):
-    try:
-        if os.stat(path).st_size == 0:
-            raise ValueError(
-                f"checkpoint validation failed: empty file {path}"
-            )
-    except FileNotFoundError:
-        raise
-    except ValueError:
-        raise
-    except OSError as e:
-        raise ValueError(
-            f"checkpoint validation failed: unreadable file {path}: {e}"
-        ) from e
-    try:
-        import storage as _st
-        return _st._checked_sf_load(path)
-    except ValueError:
-        raise
-    except Exception as e:
-        raise ValueError(
-            f"checkpoint validation failed: unreadable/truncated file {path}: {e}"
-        ) from e
-
-
-def _atomic_write_json(payload: dict, path: str) -> None:
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix="tmp_quant_")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(payload, f, indent=2)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                pass
-        _fsync_file(tmp)
-        os.replace(tmp, path)
-        _fsync_dir(os.path.dirname(path) or ".")
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+    # Thin alias over the storage single source (kept for back-compat).
+    return _checked_sf_load(path)
 
 
 def _sidecar(path: str) -> str:
