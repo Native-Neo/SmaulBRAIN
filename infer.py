@@ -111,6 +111,10 @@ def sample_next(logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0,
         _check_logits(logits, int(vocab_size))
     # Clone: masking must never mutate the caller's logits tensor.
     l = logits.detach().float().clone()
+    # Legitimate -inf (masked slots) is fine; NaN/+inf are never samplable
+    # and must fail loudly instead of leaking RuntimeError or silent argmax.
+    if bool(torch.isnan(l).any().item()) or bool(torch.isposinf(l).any().item()):
+        raise ValueError("logits contain NaN/+inf; nothing to sample")
     if not torch.isfinite(l).any().item():
         raise ValueError("logits contain no finite values; nothing to sample")
     if forbidden_ids:
