@@ -104,6 +104,9 @@ class SmaulBrainConfig:
 
     def __post_init__(self) -> None:
         assert self.d_model % self.n_heads == 0, "d_model must split over heads"
+        assert isinstance(self.vocab_size, int) and not isinstance(self.vocab_size, bool) \
+            and self.vocab_size >= total_vocab(), \
+            f"vocab_size must be an int >= {total_vocab()} (bytes + specials)"
         assert 1 <= self.min_depth <= self.max_depth, "need 1 <= min <= max depth"
         assert 0.0 < self.halting_threshold < 1.0, "halting threshold in (0,1)"
         assert 0.0 < self.halt_prior < 1.0, "halt prior in (0,1)"
@@ -131,7 +134,8 @@ class SmaulBrainConfig:
         assert self.weight_decay >= 0, "weight decay must be non-negative"
         # Clipping semantics: grad_clip > 0 caps the global grad norm;
         # 0 (or negative) disables clipping entirely.
-        assert self.grad_clip >= 0, "grad clip must be non-negative (0 disables)"
+        assert self.grad_clip >= 0 and math.isfinite(self.grad_clip), \
+            "grad clip must be finite and non-negative (0 disables)"
         assert 0.0 <= self.beta_m < 1.0, "beta_m in [0, 1)"
         assert 0.0 <= self.beta_v < 1.0, "beta_v in [0, 1)"
         assert self.epsilon > 0, "epsilon must be positive"
