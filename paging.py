@@ -32,6 +32,7 @@ import torch
 @dataclass
 class PagingStats:
     disk_reads: int = 0
+    disk_errors: int = 0
     ram_hits: int = 0
     ram_evictions: int = 0
     ram_loads: int = 0
@@ -43,7 +44,7 @@ class PagingStats:
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in (
-            "disk_reads", "ram_hits", "ram_evictions", "ram_loads",
+            "disk_reads", "disk_errors", "ram_hits", "ram_evictions", "ram_loads",
             "vram_hits", "vram_evictions", "vram_loads",
             "prefetch_submitted", "prefetch_hits")}
 
@@ -137,17 +138,28 @@ class ExpertPager:
 
     # -- disk --
     def _read_disk(self, expert_id: str):
-        """Authoritative disk read. Counts once per physical read. Runs without global lock."""
+        """Authoritative disk read. Counts once per successful physical read.
+
+        Failed reads count as disk_errors, not disk_reads, so the metric
+        stays a measure of real IO rather than attempt pollution.
+        Runs without global lock.
+        """
         with self._lock:
             if self._closed:
                 raise RuntimeError("pager is closed")
             if expert_id in self._forgotten:
                 raise KeyError(f"expert {expert_id!r} was pruned")
+        try:
+            if self.load_from_disk is not None:
+                rec = self.load_from_disk(expert_id)
+            else:
+                rec = self.pool.experts[expert_id]
+        except Exception:
+            with self._lock:
+                self.stats.disk_errors += 1
+            raise
+        with self._lock:
             self.stats.disk_reads += 1
-        if self.load_from_disk is not None:
-            rec = self.load_from_disk(expert_id)
-        else:
-            rec = self.pool.experts[expert_id]
         return rec
 
     # -- public API --
