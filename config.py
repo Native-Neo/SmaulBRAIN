@@ -37,21 +37,17 @@ def expert_hidden_for_target(d_model: int, target: int = EXPERT_TARGET_PARAMS) -
 class SmaulBrainConfig:
     """Full SmaulBRAIN configuration. All CLI flags map onto these fields."""
 
-    # --- core topology (tiny/CPU-friendly defaults; see --full in cli.py) ---
     # Vocabulary covers raw bytes PLUS structural specials (bos/eos/pad/sep):
     # the model must accept special ids without index errors, and padding
     # uses PAD_ID (masked from the loss), never byte 0 (a real NUL byte).
     vocab_size: int = total_vocab()
     d_model: int = 64
     n_heads: int = 4
-    # --- recurrent block (shared, applied min_depth..max_depth times) ---
     min_depth: int = 1
     max_depth: int = 3
-    # --- adaptive halting (PonderNet-style) ---
     halting_threshold: float = 0.9
     halt_prior: float = 0.1  # geometric prior p for ponder KL
     ponder_beta: float = 0.01  # weight of ponder KL regularizer
-    # --- dynamic MoE ---
     num_experts: int = 8
     top_k: int = 2
     active_experts: int = 2  # alias enforced == top_k at runtime
@@ -60,14 +56,11 @@ class SmaulBrainConfig:
     expert_hidden: int = 128  # explicit knob; full preset uses 3328 for ~5.12M
     moe_balance_weight: float = 0.01
     capacity_factor: float = 1.5
-    # --- context / sequence ---
     context_length: int = 128
     attention_chunk_size: int = 256  # causal linear-attention training chunk
-    # --- paging ---
     paging_method: str = "D2R"  # D2R | R2VR | D2VR
     ram_cache: int = 8  # max experts resident in RAM cache
     vram_cache: int = 4  # max experts resident in VRAM cache
-    # --- optimization ---
     expert_lr: float = 2e-4
     trunk_lr_mult: float = 0.1  # shared trunk LR = expert_lr * trunk_lr_mult
     router_lr_mult: float = 1.0  # router LR = expert_lr * router_lr_mult
@@ -86,15 +79,12 @@ class SmaulBrainConfig:
     beta_m: float = 0.9
     beta_v: float = 0.999
     epsilon: float = 1e-8
-    # --- precision policy ---
     dtype: str = "bf16"  # compute dtype for activations: bf16 | fp32
     fp8_tile: int = 64  # block size for FP8 per-block scaling
     state_dtype: str = "bf16"  # optimizer state storage: bf16 | fp32
-    # --- misc ---
     threads: int = 2
     seed: int = 0
     rmsnorm_eps: float = 1e-6
-    # --- growth (training) / pruning (manual offline tool) ---
     # Defaults encode the standing policy: grow every 20K steps or on
     # sub-1.0 loss. Training never prunes; `python pruning.py --rm-worst N`
     # removes the worst experts down to min_experts (honored from the
@@ -104,8 +94,6 @@ class SmaulBrainConfig:
     prune_survival_steps: int = 500  # grace period before an expert may die
     prune_min_usage: float = 1e-4  # usage share below which expert is dying
     max_new_experts: int = 8  # cap per growth event (clone-top-8 strategy)
-    # --- BPB ports (conv default-on; lookahead/boundary/cosine default-off;
-    # enabling any of them changes training math) ---
     # use_byte_conv: causal depthwise conv over byte embeddings in the trunk.
     # lookahead_weight/boundary_weight: auxiliary t+2 CE + UTF-8-boundary BCE.
     # cosine_decay_steps: cosine LR decay horizon (0 = constant LR).
@@ -161,7 +149,6 @@ class SmaulBrainConfig:
         # active_experts is a user-facing alias for top_k; keep them in sync.
         object.__setattr__(self, "active_experts", self.top_k)
 
-    # --- derived counts ---
     @property
     def trunk_lr(self) -> float:
         return self.expert_lr * self.trunk_lr_mult
