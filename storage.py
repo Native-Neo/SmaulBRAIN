@@ -970,6 +970,13 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     expected_trunk = {k for k in model_sd
                       if not (k.startswith("router.") or "usage_" in k or "admit_" in k)}
     for k in expected_trunk:
+        # Pre-conv checkpoints lack byte_conv keys: skip the missing-key
+        # check when the checkpoint itself declares conv off. The live
+        # module is dropped after load (see below). The reverse direction
+        # (conv checkpoint into conv-less model) still refuses via the
+        # extra-key branch below.
+        if k.startswith("byte_conv.") and not saved_cfg.use_byte_conv:
+            continue
         _require(k in trunk, f"trunk.safetensors missing entry {k}")
     for k, v in trunk.items():
         _require(torch.is_tensor(v), f"trunk entry {k} is not a tensor")
