@@ -1051,8 +1051,12 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         try:
             with open(sidecar) as f:
                 m = json.load(f)
-        except ValueError:
-            raise
+        except ValueError as e:
+            if "validation failed" in str(e):
+                raise
+            raise ValueError(
+                f"checkpoint validation failed: unreadable sidecar {sidecar}: {e}"
+            ) from e
         except Exception as e:
             raise ValueError(
                 f"checkpoint validation failed: unreadable sidecar {sidecar}: {e}"
