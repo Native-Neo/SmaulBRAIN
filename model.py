@@ -434,6 +434,10 @@ class SmaulBrainModel(nn.Module):
         assert self.byte_conv is not None
         k = self.byte_conv.kernel_size
         B = emb.shape[0]
+        if emb.shape[1] == 0:
+            # Empty chunk: no output, no history mutation (matches the
+            # conv-off stateful path which returns [B, 0, H]).
+            return emb
         hist = self._conv_hist
         if hist is None or tuple(hist.shape) != (B, max(0, k - 1), emb.shape[2]):
             hist = emb.new_zeros((B, max(0, k - 1), emb.shape[2]))
