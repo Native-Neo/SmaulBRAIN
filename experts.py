@@ -21,10 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from precision import FP8BlockTensor, dequantize_fp8_blockwise, quantize_fp8_blockwise
-
-
-def expert_param_count(d_model: int, expert_hidden: int) -> int:
-    return 3 * d_model * expert_hidden
+from config import expert_param_count  # single source (config.py owns the formula)
 
 
 def init_expert_weights(
