@@ -153,7 +153,9 @@ def find_victims(
     victims.sort(key=_badness)  # worst first; eid tiebreak keeps it deterministic
     keep = max(0, len(pool) - min_experts)
     victims = victims[:keep]
-    if max_victims is not None and max_victims >= 0:
+    if max_victims is not None:
+        if max_victims < 0:
+            raise ValueError(f"max_victims must be >= 0, got {max_victims!r}")
         victims = victims[:max_victims]
     return victims
 
