@@ -108,7 +108,9 @@ def test_config_rejects_active_topk_mismatch():
 
 def test_config_rejects_impossible_min_experts():
     # min_experts < top_k must raise instead of being silently clamped.
-    with pytest.raises(AssertionError):
+    # from_dict normalizes all config errors to ValueError (direct
+    # construction still raises AssertionError via __post_init__).
+    with pytest.raises(ValueError):
         SmaulBrainConfig.from_dict(
             {"num_experts": 8, "top_k": 4, "min_experts": 2})
 
