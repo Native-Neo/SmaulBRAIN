@@ -285,7 +285,6 @@ def update_fp8_tile_block(
 
 
 
-# --- dtype policy table -----------------------------------------------------
 
 #: component -> (storage dtype, compute dtype)
 PRECISION_POLICY: dict[str, tuple[str, str]] = {
