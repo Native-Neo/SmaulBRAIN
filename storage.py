@@ -693,8 +693,12 @@ def load_manifest(ckpt_dir: str) -> dict:
             )
         with open(path) as f:
             return json.load(f)
-    except ValueError:
-        raise
+    except ValueError as e:
+        if "validation failed" in str(e):
+            raise
+        raise ValueError(
+            f"checkpoint validation failed: unreadable/truncated file {path}: {e}"
+        ) from e
     except Exception as e:
         raise ValueError(
             f"checkpoint validation failed: unreadable/truncated file {path}: {e}"
