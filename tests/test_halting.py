@@ -153,7 +153,11 @@ def test_mean_depth_is_valid_only_and_readout_is_ponder_mixed():
     with torch.no_grad():
         out = m(x, y, step=0)
     # Manual valid-only ponder expectation matches the diagnostic.
-    h = m.n_init(m.embed(x).to(torch.float32))
+    _emb = m.embed(x).to(torch.float32)
+    if getattr(m, "byte_conv", None) is not None:
+        with torch.no_grad():
+            _emb = m.byte_conv(_emb)
+    h = m.n_init(_emb)
     from linear_attention import LinearAttnState
     states = [LinearAttnState.zeros(1, 4, 8) for _ in range(3)]
     with torch.no_grad():
