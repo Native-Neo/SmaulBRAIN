@@ -1009,8 +1009,12 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     try:
         with open(_path("meta.json")) as f:
             meta = json.load(f)
-    except ValueError:
-        raise
+    except ValueError as e:
+        if "validation failed" in str(e):
+            raise
+        raise ValueError(
+            f"checkpoint validation failed: unreadable/truncated meta.json: {e}"
+        ) from e
     except Exception as e:
         raise ValueError(
             f"checkpoint validation failed: unreadable/truncated meta.json: {e}"
