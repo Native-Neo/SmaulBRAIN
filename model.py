@@ -407,12 +407,17 @@ class SmaulBrainModel(nn.Module):
     def _select_depth_hidden(
         hs: list[torch.Tensor], depths: torch.Tensor
     ) -> torch.Tensor:
-        """Select each token's halting-depth representation."""
-        stack = torch.stack(hs, dim=0)  # [D, B, T, H]
-        idx = (depths - 1).clamp(0, len(hs) - 1)
-        width = stack.shape[-1]
-        gather_idx = idx.unsqueeze(0).unsqueeze(-1).expand(1, *idx.shape, width)
-        return stack.gather(0, gather_idx).squeeze(0)
+        """Select each token's halting-depth representation.
+
+        Masked blend without materializing the [D, B, T, H] stack: peak
+        memory stays at one [B, T, H] output plus one depth slice at a
+        time instead of holding the full duplicated stack.
+        """
+        out = torch.zeros_like(hs[0])
+        for n, h_n in enumerate(hs):
+            mask = (depths == (n + 1)).unsqueeze(-1)
+            out = torch.where(mask, h_n, out)
+        return out
 
     def new_infer_state(self, batch: int = 1) -> list[LinearAttnState]:
         """Create the fixed-size per-depth attention state for streaming."""
