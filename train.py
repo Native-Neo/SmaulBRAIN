@@ -137,10 +137,15 @@ def run_training(
         stats["step"] = step
         hist.append(stats)
         if grow_every and (step + 1) % grow_every == 0 and len(model.pool) < cfg.max_experts:
-            eid = growth_mod.grow_expert(model.pool, model.router, cfg.d_model,
-                                         cfg.expert_hidden, step, seed=seed + step,
-                                         fp8_tile=cfg.fp8_tile)
-            log_fn(f"[grow] step={step} new={eid} pool={len(model.pool)}")
+            room = cfg.max_experts - len(model.pool)
+            count = min(cfg.max_new_experts, room)
+            for growth_index in range(count):
+                eid = growth_mod.grow_expert(
+                    model.pool, model.router, cfg.d_model, cfg.expert_hidden, step,
+                    seed=seed + step * max(1, cfg.max_new_experts) + growth_index,
+                    fp8_tile=cfg.fp8_tile,
+                )
+                log_fn(f"[grow] step={step} new={eid} pool={len(model.pool)}")
         if prune_every and (step + 1) % prune_every == 0:
             victims = pruning_mod.find_victims(model.pool, step,
                                                survival_steps=cfg.prune_survival_steps,
