@@ -1,7 +1,7 @@
 // SmaulBRAIN native kernel: linear-attention recurrent step.
 //
 // One token update with ELU+1 feature map and per-step key normalization,
-// matching smaulbrain/linear_attention.py::linear_attn_step:
+// matching linear_attention.py::linear_attn_step:
 //   kf = (elu(k)+1) / ||elu(k)+1|| ; qf = elu(q)+1
 //   S += kf^T v ; z += kf ; y = (qf^T S) / (qf^T z + eps)
 // Memory per call is O(Dh^2) — no sequence-length dependence.
