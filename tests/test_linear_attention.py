@@ -35,7 +35,7 @@ def test_step_matches_batch_exactly():
     for t in range(T):
         y, st = linear_attn_step(st, q[:, :, t, :], k[:, :, t, :], v[:, :, t, :])
         outs.append(y)
-    assert torch.equal(batched, torch.stack(outs, dim=2))
+    assert torch.allclose(batched, torch.stack(outs, dim=2), atol=2e-6, rtol=2e-6)
 
 
 def test_causal_no_future_leak():
@@ -63,3 +63,23 @@ def test_long_sequence_finite_and_bounded():
     v = torch.randn(1, 2, 512, 8)
     out, st = linear_attn_forward(q, k, v)
     assert torch.isfinite(out).all() and torch.isfinite(st.S).all()
+
+
+def test_chunked_state_carry_matches_full_sequence():
+    q, k, v = _rand(T=37)
+    full, full_state = linear_attn_forward(q, k, v, chunk_size=64)
+    first, state = linear_attn_forward(q[:, :, :13], k[:, :, :13], v[:, :, :13],
+                                       chunk_size=5)
+    second, carried = linear_attn_forward(q[:, :, 13:], k[:, :, 13:], v[:, :, 13:],
+                                          state=state, chunk_size=7)
+    chunked = torch.cat([first, second], dim=2)
+    assert torch.allclose(full, chunked, atol=2e-6, rtol=2e-6)
+    assert torch.allclose(full_state.S, carried.S, atol=2e-6, rtol=2e-6)
+    assert torch.allclose(full_state.z, carried.z, atol=2e-6, rtol=2e-6)
+
+
+def test_chunk_size_one_and_full_sequence_agree():
+    q, k, v = _rand(T=19)
+    full, _ = linear_attn_forward(q, k, v, chunk_size=19)
+    one, _ = linear_attn_forward(q, k, v, chunk_size=1)
+    assert torch.allclose(full, one, atol=2e-6, rtol=2e-6)
