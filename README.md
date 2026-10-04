@@ -493,6 +493,21 @@ Train/infer providers separate gradient-carrying expert leaves from plain
 cached weights, and `param_counts` reports shared/router/expert/active plus
 RAM/VRAM-resident splits as the topology changes.
 
+### How to use `model.py`
+
+```python
+from config import SmaulBrainConfig
+from model import SmaulBrainModel
+
+model = SmaulBrainModel(SmaulBrainConfig(d_model=128, num_experts=8, top_k=2))
+out = model(ids, targets, step=0)   # training: loss/nll/ponder_kl/acc/depths
+print(out["loss"], out["mean_depth"])
+out["loss"].backward()              # then step SmaulOpt groups (see train.py)
+
+inf = model.forward_infer(ids)      # no grad, early halting
+print(model.param_counts())         # dynamic counts incl. resident splits
+```
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
