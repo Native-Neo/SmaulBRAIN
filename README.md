@@ -308,6 +308,21 @@ helpers (`trunk_lr`, `per_expert_params`, `total/active_params`,
 `to_dict`/`from_dict`, `describe_counts`) keep checkpoints and reports
 consistent. `expert_hidden_for_target` sizes one expert to ~5.12M params.
 
+### How to use `config.py`
+
+```python
+from config import SmaulBrainConfig, expert_hidden_for_target
+
+cfg = SmaulBrainConfig(d_model=128, n_heads=4, num_experts=8, top_k=2,
+                       max_depth=4, paging_method="D2R")
+print(cfg.trunk_lr, cfg.per_expert_params)  # slow-trunk LR, params/expert
+print(expert_hidden_for_target(512))        # 3328 -> ~5.12M params
+
+d = cfg.to_dict()                 # what checkpoints persist in config.json
+cfg2 = SmaulBrainConfig.from_dict(d)
+print(cfg2.describe_counts())     # shared/router/expert/total/active splits
+```
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
