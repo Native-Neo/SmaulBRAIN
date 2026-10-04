@@ -348,6 +348,16 @@ after = evaluate_loss(model, b, context=128)
 print(retention_report(before, after))  # numeric deltas, no "solved" claims
 ```
 
+### What is `experts.py`
+
+The dynamic expert pool. An `ExpertRecord` bundles FP8 block weights, its own
+BF16 factored optimizer state, and metadata (stable `expert_NNNNN` id, birth
+step, parents, source, usage/gradient/contribution statistics) — identity is
+independent of router index and cache slot. `make_expert` builds records,
+`ExpertPool` maps router index <-> expert id, and its `forward` dispatches
+tokens batched per expert (one SwiGLU matmul per active expert) with routing
+weights, tracking per-expert usage as it goes.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
