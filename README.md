@@ -642,6 +642,15 @@ y = n(x)               # x: BF16 in -> BF16 out, FP32 statistics inside
 y = rmsnorm_fn(x, n.weight)
 ```
 
+### What is `routing.py`
+
+The sparse top-k router. Each token scores every expert, keeps the top-k
+(renormalized to sum to 1), and per-expert capacity drops overflow tokens to
+the residual path. A Switch-style balance loss keeps traffic spread, FP64
+usage/admission counters feed growth and pruning, and `add/remove_expert_row`
+keep router rows aligned with pool ids (preserving dtype) as the topology
+changes.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
