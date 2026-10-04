@@ -66,6 +66,7 @@ class SharedRecurrentBlock(nn.Module):
         h: torch.Tensor,
         attn: LinearAttnState,
         moe_fn: MoeFn,
+        chunk_size: int = 256,
     ) -> tuple[torch.Tensor, LinearAttnState, torch.Tensor, torch.Tensor]:
         """One recurrent application.
 
@@ -85,7 +86,7 @@ class SharedRecurrentBlock(nn.Module):
         from linear_attention import linear_attn_forward
 
         y, attn_next = linear_attn_forward(
-            q, k, v, eps=1e-6, state=attn, chunk_size=256
+            q, k, v, eps=1e-6, state=attn, chunk_size=chunk_size
         )
         y = y.reshape(B, T, D).to(h.dtype)
         h = h + self.o_proj(self.n_attn(y))
