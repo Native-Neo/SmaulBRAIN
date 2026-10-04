@@ -88,7 +88,7 @@ def test_cli_train_then_infer_then_quantize(tmp_path):
 
 
 def test_streaming_inference_matches_full_causal_pass():
-    m, _, _ = _model(max_depth=1)
+    m, _, _ = _model()
     ids = torch.tensor([[10, 20, 30, 40, 50, 60]])
     full, _ = m.forward_infer_stateful(ids)
     states = m.new_infer_state(1)
