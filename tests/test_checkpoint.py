@@ -83,3 +83,17 @@ def test_inference_identical_after_reload(tmp_path):
     b = m2.forward_infer(ids)["logits"]
     assert torch.equal(a, b)
     m.pager.close(); m2.pager.close()
+
+
+def test_resume_step_and_saved_config_are_restored(tmp_path):
+    d = str(tmp_path / "c")
+    m, opt = _trained(d)
+    cfg = SmaulBrainConfig(d_model=32, n_heads=4, num_experts=4, top_k=2,
+                           expert_hidden=64, max_depth=4, context_length=99)
+    m2 = SmaulBrainModel(cfg)
+    loaded = load_model(d, m2, SmaulOpt(SmaulOptHParams()))
+    assert loaded["step"] == 3
+    assert m2._resume_step == 3
+    assert m2.cfg.max_depth == 2
+    assert m2.cfg.context_length == 12
+    m.pager.close(); m2.pager.close()
