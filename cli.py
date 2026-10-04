@@ -12,27 +12,46 @@ import os
 import sys
 
 from bytes import decode_text, encode_text
-from config import SmaulBrainConfig, expert_hidden_for_target
+from config import SmaulBrainConfig
+
+
+# Tiny defaults are the parser defaults (fast CPU smoke runs: 246K params).
+TINY_DEFAULTS = {
+    "d_model": 64, "n_heads": 4, "num_experts": 8, "top_k": 2,
+    "expert_hidden": 128, "max_experts": 64, "min_experts": 2,
+    "max_depth": 3, "min_depth": 1, "context_length": 128,
+    "halting_threshold": 0.9, "ram_cache": 8, "vram_cache": 4,
+}
+# --full preset: ~5.12M params/expert, 64 experts, top-8 routing.
+FULL_DEFAULTS = {
+    **TINY_DEFAULTS,
+    "d_model": 512, "num_experts": 64, "top_k": 8, "expert_hidden": 3328,
+    "max_experts": 128, "min_experts": 8, "context_length": 1024,
+    "ram_cache": 32, "vram_cache": 16,
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="smaulbrain",
                                 description="SmaulBRAIN recurrent byte-level MoE LM")
-    # --- architecture ---
-    p.add_argument("--d-model", type=int, default=128, help="Shared trunk width.")
+    # --- architecture (tiny defaults; see --full) ---
+    p.add_argument("--d-model", type=int, default=64, help="Shared trunk width.")
     p.add_argument("--n-heads", type=int, default=4, help="Linear-attention heads.")
-    p.add_argument("--experts", type=int, default=4, dest="num_experts",
+    p.add_argument("--experts", type=int, default=8, dest="num_experts",
                    help="Initial dynamic expert count.")
     p.add_argument("--expert-size", type=int, default=None, dest="expert_size",
-                   help="Expert hidden dim. Omitted: 3328 at d-model 512 "
-                        "(~=5.12M params/expert); 256 at the d-model 128 default "
-                        "(test-scale, keeps CPU runs fast).")
+                   help="Expert hidden dim. Omitted: 128, or 3328 with --full "
+                        "(~=5.12M params/expert at d-model 512).")
+    p.add_argument("--full", action="store_true",
+                   help="Full-size preset: 64 experts, top-8 routing, ~5.12M "
+                        "params/expert. Any architecture flag passed explicitly "
+                        "overrides the preset.")
     p.add_argument("--active-experts", type=int, default=2, dest="top_k",
                    help="Top-k routed experts per token (active working set).")
     p.add_argument("--max-experts", type=int, default=64, help="Expert pool ceiling.")
     p.add_argument("--min-experts", type=int, default=2, help="Expert pool floor.")
     # --- adaptive depth ---
-    p.add_argument("--max-depth", type=int, default=4, help="Max recurrent applications.")
+    p.add_argument("--max-depth", type=int, default=3, help="Max recurrent applications.")
     p.add_argument("--min-depth", type=int, default=1, help="Min recurrent applications.")
     p.add_argument("--halting-threshold", type=float, default=0.9,
                    help="Cumulative halt prob that stops inference depth.")
@@ -47,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--trunk-lr-mult", type=float, default=0.1,
                    help="Shared-trunk LR multiplier (slow trunk vs fast experts).")
     # --- runtime ---
-    p.add_argument("--context-length", type=int, default=1024, help="Training context.")
+    p.add_argument("--context-length", type=int, default=128, help="Training context.")
     p.add_argument("--attention-chunk-size", type=int, default=256,
                    help="Causal linear-attention training chunk size.")
     p.add_argument("--threads", type=int, default=2, help="Torch CPU threads.")
@@ -88,17 +107,32 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def config_from_args(args: argparse.Namespace) -> SmaulBrainConfig:
+    preset = FULL_DEFAULTS if args.full else TINY_DEFAULTS
+
+    def pick(cli_value, key: str):
+        # An explicitly passed architecture flag (differs from the tiny
+        # default) always wins; otherwise the active preset applies.
+        return cli_value if cli_value != TINY_DEFAULTS[key] else preset[key]
+
     expert_hidden = args.expert_size
     if expert_hidden is None:
-        expert_hidden = expert_hidden_for_target(args.d_model) if args.d_model != 128 else 256
+        expert_hidden = preset["expert_hidden"]
     return SmaulBrainConfig(
-        d_model=args.d_model, n_heads=args.n_heads, num_experts=args.num_experts,
-        top_k=args.top_k, max_experts=args.max_experts, min_experts=args.min_experts,
-        expert_hidden=expert_hidden, max_depth=args.max_depth, min_depth=args.min_depth,
-        halting_threshold=args.halting_threshold, paging_method=args.pagingmthd,
-        ram_cache=args.ram_cache, vram_cache=args.vram_cache, expert_lr=args.expert_lr,
-        trunk_lr_mult=args.trunk_lr_mult, context_length=args.context_length,
-        attention_chunk_size=args.attention_chunk_size,
+        d_model=pick(args.d_model, "d_model"),
+        n_heads=pick(args.n_heads, "n_heads"),
+        num_experts=pick(args.num_experts, "num_experts"),
+        top_k=pick(args.top_k, "top_k"),
+        max_experts=pick(args.max_experts, "max_experts"),
+        min_experts=pick(args.min_experts, "min_experts"),
+        expert_hidden=expert_hidden,
+        max_depth=pick(args.max_depth, "max_depth"),
+        min_depth=pick(args.min_depth, "min_depth"),
+        halting_threshold=pick(args.halting_threshold, "halting_threshold"),
+        paging_method=args.pagingmthd,
+        ram_cache=pick(args.ram_cache, "ram_cache"),
+        vram_cache=pick(args.vram_cache, "vram_cache"),
+        expert_lr=args.expert_lr,
+        trunk_lr_mult=args.trunk_lr_mult, context_length=pick(args.context_length, "context_length"),
         threads=args.threads, dtype=args.dtype, seed=args.seed,
     )
 
