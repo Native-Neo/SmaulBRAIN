@@ -182,7 +182,6 @@ class ExpertPool:
         never a Python loop over individual tokens.
         """
         out = torch.zeros_like(x)
-        n, k = top_ids.shape
         live = ~dropped
         for rid in range(len(self.order)):
             mask_slot = (top_ids == rid) & live.unsqueeze(-1)  # [N, K]
