@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .precision import dequantize_fp8_blockwise, quantize_fp8_blockwise
+from precision import dequantize_fp8_blockwise, quantize_fp8_blockwise
 
 
 @dataclass
