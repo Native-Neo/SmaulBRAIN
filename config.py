@@ -7,7 +7,7 @@ a serialized copy of this config so topology changes stay checkpoint-safe.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 
 
 # Expert sizing: a SwiGLU expert with d_model=d and hidden=h owns
@@ -111,11 +111,10 @@ class SmaulBrainConfig:
 
     def shared_params(self) -> int:
         """Shared trunk params: embeddings + attention + norms + halt + router + head."""
-        d, v, h = self.d_model, self.vocab_size, self.n_heads
-        head_dim = d // h
-        # embed(v,d) + qkv+o (4*d*d) + 4 norms (4*d) + halt (d+1)
-        # + router (n_exp*d + n_exp) + out head (v*d)
-        return v * d + 4 * d * d + 4 * d + (d + 1) + (self.num_experts * d + self.num_experts) + v * d
+        d, v = self.d_model, self.vocab_size
+        # embed(v,d) + qkv+o (4*d*d) + 6 norms (n_init,n1,n_attn,n2,n3,n_final)
+        # + halt (d+1) + router (n_exp*d + n_exp) + out head (v*d)
+        return v * d + 4 * d * d + 6 * d + (d + 1) + (self.num_experts * d + self.num_experts) + v * d
 
     def total_params(self) -> int:
         return self.shared_params() + self.num_experts * self.per_expert_params
