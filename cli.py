@@ -48,6 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Shared-trunk LR multiplier (slow trunk vs fast experts).")
     # --- runtime ---
     p.add_argument("--context-length", type=int, default=1024, help="Training context.")
+    p.add_argument("--attention-chunk-size", type=int, default=256,
+                   help="Causal linear-attention training chunk size.")
     p.add_argument("--threads", type=int, default=2, help="Torch CPU threads.")
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp32"],
                    help="Activation compute dtype.")
@@ -96,6 +98,7 @@ def config_from_args(args: argparse.Namespace) -> SmaulBrainConfig:
         halting_threshold=args.halting_threshold, paging_method=args.pagingmthd,
         ram_cache=args.ram_cache, vram_cache=args.vram_cache, expert_lr=args.expert_lr,
         trunk_lr_mult=args.trunk_lr_mult, context_length=args.context_length,
+        attention_chunk_size=args.attention_chunk_size,
         threads=args.threads, dtype=args.dtype, seed=args.seed,
     )
 
