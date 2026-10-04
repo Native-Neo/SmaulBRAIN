@@ -111,10 +111,23 @@ class ExpertPager:
         The RAM stage keeps pointing at the pool's live record (updated in
         place by the optimizer) instead of re-reading a stale disk file.
         """
-        self.ram.pop(expert_id, None)
-        self.vram.pop(expert_id, None)
-        if expert_id in self.ram_records:
-            self.ram_records[expert_id] = self.pool.experts[expert_id]
+        with self._lock:
+            self.ram.pop(expert_id, None)
+            self.vram.pop(expert_id, None)
+            if expert_id in self.ram_records:
+                self.ram_records[expert_id] = self.pool.experts[expert_id]
+
+    def forget(self, expert_id: str) -> None:
+        """Drop every cached/staged trace of a pruned expert.
+
+        Weights, optimizer state, and router rows are already gone; without
+        this the caches would keep serving a ghost expert that no longer
+        exists in the pool.
+        """
+        with self._lock:
+            self.ram.pop(expert_id, None)
+            self.vram.pop(expert_id, None)
+            self.ram_records.pop(expert_id, None)
 
     # -- D2R: disk -> RAM --
     def _get_d2r(self, expert_id: str) -> dict[str, torch.Tensor]:
