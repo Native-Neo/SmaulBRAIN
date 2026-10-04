@@ -669,6 +669,15 @@ The project marker module: package docstring, `__version__`, and the
 `SmaulBrainConfig` re-export, so `import smaulbrain` gives the version and
 the central configuration from one place.
 
+### How to use `smaulbrain.py`
+
+```python
+import smaulbrain
+
+print(smaulbrain.__version__)
+cfg = smaulbrain.SmaulBrainConfig(d_model=128)
+```
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
