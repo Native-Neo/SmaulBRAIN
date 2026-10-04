@@ -663,6 +663,12 @@ print(router.usage_share())               # FP64-backed traffic distribution
 router.add_expert_row()                   # after growth (dtype preserved)
 ```
 
+### What is `smaulbrain.py`
+
+The project marker module: package docstring, `__version__`, and the
+`SmaulBrainConfig` re-export, so `import smaulbrain` gives the version and
+the central configuration from one place.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
