@@ -374,6 +374,16 @@ out = pool.forward(x, plan.top_ids, plan.top_weights, plan.dropped,
 print(pool.usage_snapshot())            # per-expert tokens/activity/parents
 ```
 
+### What is `growth.py`
+
+Controlled expert growth — never pure noise without a documented reason.
+`select_parents` ranks experts deterministically by contribution (then usage,
+then id); `recombine_weights` builds a convex parent-mean plus small seeded
+perturbation; `grow_expert` assigns the next stable id, derives the new
+router row from the parent-mean row, initializes optimizer state, records
+parents/birth step, and stays reproducible from the caller seed. An empty
+pool falls back to a fresh random expert.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
