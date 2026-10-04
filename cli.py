@@ -158,7 +158,11 @@ def main(argv: list[str] | None = None) -> int:
                            prune_every=args.prune_every)
         print(json.dumps({"final_loss": res["final_loss"],
                           "retention": res["retention"],
-                          "experts": len(model.pool)}, indent=2))
+                          "experts": len(model.pool),
+                          "steps_completed": res["steps_completed"],
+                          "elapsed_seconds": round(res["elapsed_seconds"], 3),
+                          "bytes_processed": res["bytes_processed"],
+                          "bytes_per_second": round(res["bytes_per_second"], 2)}, indent=2))
         if args.save_every == 0:
             save_model(args.ckpt, model, opt, int(getattr(model, "_resume_step", -1)))
     elif args.cmd == "infer":
