@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from linear_attention import LinearAttnState
+from linear_attention import LinearAttnState, linear_attn_forward
 from rmsnorm import RMSNorm
 
 
@@ -83,8 +83,6 @@ class SharedRecurrentBlock(nn.Module):
         v = v.transpose(1, 2).contiguous()
         # Chunkwise causal linear attention. The incoming state is visible
         # to every token; within each chunk only earlier-token prefixes are used.
-        from linear_attention import linear_attn_forward
-
         y, attn_next = linear_attn_forward(
             q, k, v, eps=1e-6, state=attn, chunk_size=chunk_size
         )
