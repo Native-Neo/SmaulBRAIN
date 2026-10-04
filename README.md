@@ -577,6 +577,15 @@ if victims:
 In training, schedule it with `run_training(..., prune_every=500)` or the
 CLI `--prune-every 500` (never below `min_experts`).
 
+### What is `quantize.py`
+
+Checkpoint conversion without full-model residency. `convert_expert_file`
+requantizes/retiles one expert file independently and reports byte counts
+plus the measured `max_abs_err`; `convert_checkpoint` applies that across a
+checkpoint, or casts trunk/router to BF16. FP8 trunk storage is refused on
+purpose (norms and accumulators stay precise per the precision policy);
+experts stay FP8 on disk by the same policy.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
