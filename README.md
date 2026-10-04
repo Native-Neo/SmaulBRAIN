@@ -295,6 +295,19 @@ Fine-tuning selectors: `--mode trunk|experts|selected|new`, with
 `--selected expert_00001,expert_00002` or `--new-since <step>`, plus
 `--grow-every N` / `--prune-every N` schedules.
 
+### What is `config.py`
+
+The single source of truth: `SmaulBrainConfig` holds topology (`d_model`,
+`n_heads`, `vocab_size`), recurrent depth (`min/max_depth`), halting
+(`halting_threshold`, `halt_prior`, `ponder_beta`), the dynamic MoE
+(`num/top_k/max/min_experts`, explicit `expert_hidden`), paging
+(`paging_method`, `ram/vram_cache`), learning rates (`expert_lr`,
+`trunk/router_lr_mult`), precision (`dtype`, `fp8_tile`, `state_dtype`), and
+growth/pruning knobs. `__post_init__` validates every field, and derived
+helpers (`trunk_lr`, `per_expert_params`, `total/active_params`,
+`to_dict`/`from_dict`, `describe_counts`) keep checkpoints and reports
+consistent. `expert_hidden_for_target` sizes one expert to ~5.12M params.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
