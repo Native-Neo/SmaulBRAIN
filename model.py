@@ -112,9 +112,14 @@ class SmaulBrainModel(nn.Module):
         attn_states: list[LinearAttnState],
         train: bool,
         step: int,
-        early_exit: bool = True,
     ):
-        """Run the shared block; return per-step (h, halt_prob, aux) + depths."""
+        """Run the shared block; return per-step (h, halt_prob, aux) + depths.
+
+        All max_depth applications always execute: per-depth attention states
+        must each observe every token, or streaming inference would resume
+        from incomplete states. Adaptivity lives in the per-token halting
+        depths (which representation is read out), not in skipped compute.
+        """
         B, T, _D = h.shape
         hs: list[torch.Tensor] = []
         lams: list[torch.Tensor] = []
@@ -140,8 +145,6 @@ class SmaulBrainModel(nn.Module):
                 newly = (~halted) & (cum >= self.cfg.halting_threshold)
                 depths[newly] = n_executed
                 halted = halted | (cum >= self.cfg.halting_threshold)
-                if early_exit and bool(halted.all()):
-                    break
         return hs, lams, aux_total, depths, n_executed
 
     def _ponder(self, lams: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -226,7 +229,7 @@ class SmaulBrainModel(nn.Module):
             for _ in range(self.cfg.max_depth)
         ]
         hs, lams, _aux, depths, n_executed = self._depth_loop(
-            h, attn_states, train=False, step=step, early_exit=False
+            h, attn_states, train=False, step=step
         )
         selected_h = self._select_depth_hidden(hs, depths)
         logits = self.head(self.n_final(selected_h)).float()
@@ -271,7 +274,7 @@ class SmaulBrainModel(nn.Module):
         if len(attn_states) != self.cfg.max_depth:
             raise ValueError("attention state depth does not match model max_depth")
         hs, lams, _aux, depths, n_executed = self._depth_loop(
-            h, attn_states, train=False, step=step, early_exit=False
+            h, attn_states, train=False, step=step
         )
         selected_h = self._select_depth_hidden(hs, depths)
         logits = self.head(self.n_final(selected_h)).float()
