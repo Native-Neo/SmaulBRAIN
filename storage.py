@@ -6,8 +6,7 @@ Layout (``ckpt_dir/``)::
     manifest.json        step, expert ids, usage/growth metadata, RNG cursor
     trunk.pt             embeddings, block, norms, head (dense BF16/FP32)
     router.pt            router projection (dense)
-    trunk_opt.pt         SmaulOpt trunk state (name-keyed, BF16 storage)
-    router_opt.pt        SmaulOpt router state
+    optim.pt             SmaulOpt trunk + router state (name-keyed, BF16 storage)
     rng.pt               torch RNG state
     experts/<id>.pt      one file per expert: FP8 codes + FP32 scales,
                          expert-local optimizer state, metadata
@@ -139,6 +138,7 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
         "paging_method": model.cfg.paging_method,
         "usage": model.pool.usage_snapshot(),
         "router_usage": model.router.usage_counts.tolist(),
+        "router_admit": model.router.admit_counts.tolist(),
         "param_counts": model.param_counts(),
         "extra": extra_meta or {},
     }
@@ -169,10 +169,14 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     model.load_state_dict(trunk, strict=False)
     router = torch.load(os.path.join(ckpt_dir, "router.pt"), map_location="cpu", weights_only=False)
     with torch.no_grad():
-        # Resize router if expert count changed (growth/pruning is checkpoint-safe).
+        # Resize router to the saved width in both directions: growth adds
+        # rows, pruning removes them. Trailing rows are the ones that move,
+        # so shrinking from the end keeps surviving indices aligned.
         n_saved = router["weight"].shape[0]
         while model.router.num_experts < n_saved:
             model.router.add_expert_row()
+        while model.router.num_experts > n_saved:
+            model.router.remove_expert_row(model.router.num_experts - 1)
         model.router.proj.weight.copy_(router["weight"].to(model.router.proj.weight.dtype))
         model.router.proj.bias.copy_(router["bias"].to(model.router.proj.bias.dtype))
     optim = torch.load(os.path.join(ckpt_dir, "optim.pt"), map_location="cpu", weights_only=False)
@@ -195,11 +199,19 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         saved_usage = manifest.get("router_usage", [])
         if len(saved_usage) == model.router.num_experts:
             model.router.usage_counts.copy_(torch.tensor(saved_usage, dtype=torch.float64))
+        saved_admit = manifest.get("router_admit", [])
+        if len(saved_admit) == model.router.num_experts:
+            model.router.admit_counts.copy_(torch.tensor(saved_admit, dtype=torch.float64))
     except Exception:
         pass
     rng_path = os.path.join(ckpt_dir, "rng.pt")
     if os.path.exists(rng_path):
         torch.set_rng_state(torch.load(rng_path, map_location="cpu", weights_only=False))
+    # The pool objects were replaced: cached compute weights and staged
+    # records still point at the pre-load experts and must go.
+    model.pager.ram.clear()
+    model.pager.vram.clear()
+    model.pager.ram_records.clear()
     if model.cfg.paging_method == "R2VR":
         model.pager.warm_ram()
     return manifest
