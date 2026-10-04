@@ -1,6 +1,6 @@
 // SmaulBRAIN native kernel: RMSNorm forward (FP32 statistics).
 //
-// Numerics match smaulbrain/rmsnorm.py exactly:
+// Numerics match rmsnorm.py exactly:
 //   y[i] = (x[i] / sqrt(mean(x^2) + eps)) * w[i]   (accumulators in float)
 // Compiles standalone (g++ -O2) or via torch.utils.cpp_extension.
 // The Python path is already vectorized; this kernel exists for the
