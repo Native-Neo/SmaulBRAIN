@@ -64,7 +64,7 @@ def main():
     infer_tps = 32 / infer_dt
 
     # --- FP8 vs BF16 expert compute ---
-    from smaulbrain.experts import swiglu_forward
+    from experts import swiglu_forward
     eid = model.pool.order[0]
     wfp32 = {k: v.float() for k, v in model.pool.experts[eid].dequantize(torch.float32).items()}
     wbf16 = {k: v.to(torch.bfloat16) for k, v in wfp32.items()}
