@@ -31,28 +31,28 @@ def expert_hidden_for_target(d_model: int, target: int = EXPERT_TARGET_PARAMS) -
 class SmaulBrainConfig:
     """Full SmaulBRAIN configuration. All CLI flags map onto these fields."""
 
-    # --- core topology ---
+    # --- core topology (tiny/CPU-friendly defaults; see --full in cli.py) ---
     vocab_size: int = 256  # raw bytes; specials extend this (see bytes.py)
-    d_model: int = 128
+    d_model: int = 64
     n_heads: int = 4
     # --- recurrent block (shared, applied min_depth..max_depth times) ---
     min_depth: int = 1
-    max_depth: int = 4
+    max_depth: int = 3
     # --- adaptive halting (PonderNet-style) ---
     halting_threshold: float = 0.9
     halt_prior: float = 0.1  # geometric prior p for ponder KL
     ponder_beta: float = 0.01  # weight of ponder KL regularizer
     # --- dynamic MoE ---
-    num_experts: int = 4
+    num_experts: int = 8
     top_k: int = 2
     active_experts: int = 2  # alias enforced == top_k at runtime
     max_experts: int = 64
     min_experts: int = 2
-    expert_hidden: int = 256  # explicit knob; ~=5.12M params at d=512/h=3328
+    expert_hidden: int = 128  # explicit knob; full preset uses 3328 for ~5.12M
     moe_balance_weight: float = 0.01
     capacity_factor: float = 1.5
     # --- context / sequence ---
-    context_length: int = 1024
+    context_length: int = 128
     attention_chunk_size: int = 256  # causal linear-attention training chunk
     # --- paging ---
     paging_method: str = "D2R"  # D2R | R2VR | D2VR
