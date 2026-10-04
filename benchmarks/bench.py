@@ -12,12 +12,12 @@ import sys, os, time, json, argparse, resource
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from smaulbrain.config import SmaulBrainConfig
-from smaulbrain.infer import generate
-from smaulbrain.kernels import time_fn
-from smaulbrain.model import SmaulBrainModel
-from smaulbrain.smaulopt import SmaulOpt, SmaulOptHParams
-from smaulbrain.train import train_step
+from config import SmaulBrainConfig
+from infer import generate
+from kernels import time_fn
+from model import SmaulBrainModel
+from smaulopt import SmaulOpt, SmaulOptHParams
+from train import train_step
 
 
 def rss_mb():
