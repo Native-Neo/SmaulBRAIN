@@ -136,11 +136,11 @@ class ExpertPager:
             self.vram.move_to_end(expert_id)
             return self.vram[expert_id]
         if expert_id not in self.ram_records:
-            raise RuntimeError(
-                f"R2VR mode: {expert_id} not staged in RAM (call warm_ram first); "
-                "direct disk reads are forbidden on this path."
-            )
-        rec = self.ram_records[expert_id]  # RAM-staged record, no disk IO here
+            # On-demand staging disk -> RAM (supports post-growth experts).
+            # The RAM stage is never skipped: VRAM is only ever fed from RAM.
+            self.ram_records[expert_id] = self._read_disk(expert_id)
+            self.stats.ram_loads += 1
+        rec = self.ram_records[expert_id]  # RAM-staged record, no disk IO below
         w = self._to_vram({k: v.to(self.compute_dtype)
                            for k, v in rec.dequantize(torch.float32).items()})
         self.vram[expert_id] = w
