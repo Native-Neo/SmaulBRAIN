@@ -214,7 +214,7 @@ class SmaulBrainModel(nn.Module):
 
     @torch.no_grad()
     def forward_infer(self, ids: torch.Tensor, step: int = 0) -> dict:
-        """Inference forward: early halting, no gradients."""
+        """Inference forward: fixed-state recurrent pass with token-depth selection."""
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
         h = self.n_init(self.embed(ids).to(compute))
@@ -262,7 +262,7 @@ class SmaulBrainModel(nn.Module):
         attn_states: list[LinearAttnState] | None = None,
         step: int = 0,
     ) -> tuple[dict, list[LinearAttnState]]:
-        """Process a prompt/chunk and return its updated recurrent states."""
+        """Process a prompt/chunk and return its updated fixed-size recurrent states."""
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, _T = ids.shape
         h = self.n_init(self.embed(ids).to(compute))
