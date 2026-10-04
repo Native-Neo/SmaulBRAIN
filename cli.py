@@ -162,6 +162,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.save_every == 0:
             save_model(args.ckpt, model, opt, int(getattr(model, "_resume_step", -1)))
     elif args.cmd == "infer":
+        if os.path.exists(os.path.join(args.ckpt, "manifest.json")):
+            from storage import make_disk_loader
+            model.pager.load_from_disk = make_disk_loader(args.ckpt)
+            model.pager.ram.clear()
+            model.pager.vram.clear()
+            model.pager.ram_records.clear()
+            if model.cfg.paging_method == "R2VR":
+                model.pager.warm_ram()
         res = generate(model, encode_text(args.prompt), max_new=args.max_new,
                        temperature=args.temperature, context=cfg.context_length,
                        seed=args.seed)
