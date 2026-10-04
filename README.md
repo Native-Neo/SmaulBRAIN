@@ -689,6 +689,20 @@ with a non-finite skip. `SmaulOpt` splits LR groups (`step_trunk`,
 `step_router`, `step_expert`), and expert states live on the records so they
 follow experts across paging and die on pruning.
 
+### How to use `smaulopt.py`
+
+```python
+from smaulopt import SmaulOpt, SmaulOptHParams
+
+opt = SmaulOpt(SmaulOptHParams(lr=2e-4, wd=0.01, clip=1.0, state_dtype="bf16"))
+opt.step_trunk(model._trunk_params(), cfg.trunk_lr)    # slow shared trunk
+opt.step_router(model._router_params(), cfg.router_lr)
+opt.step_expert(record, grad_carriers, 1.0, cfg.expert_lr)  # rewrites FP8
+```
+
+Dense groups update in place; `step_expert` decodes, updates, and
+requantizes only that expert's blocks.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
