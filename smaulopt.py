@@ -121,6 +121,8 @@ class SmaulOpt:
 
     def __init__(self, hparams: SmaulOptHParams | None = None) -> None:
         self.hp = hparams or SmaulOptHParams()
+        if self.hp.state_dtype not in ("bf16", "fp32"):
+            raise ValueError(f"state_dtype must be bf16|fp32, got {self.hp.state_dtype!r}")
         self.trunk_state: dict[str, dict] = {}
         self.router_state: dict[str, dict] = {}
         self.step_count = 0
