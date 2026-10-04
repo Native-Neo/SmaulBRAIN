@@ -282,9 +282,14 @@ path and one checkpoint format. Training flags cover architecture (`--d-model`,
 
 ### How to use `cli.py`
 
+Bare defaults are the tiny 246K config (fast CPU smoke runs). `--full`
+switches to the full preset: 64 experts, top-8 routing, ~5.12M params/expert
+(328.5M total, 42.2M active). Any architecture flag passed explicitly
+overrides the preset.
+
 ```bash
-python main.py --d-model 32 --experts 2 --expert-size 64 --active-experts 1 \
-  --max-depth 1 --context-length 64 --ckpt ckpt/demo train --steps 20 --batch 2
+python main.py --ckpt ckpt/demo train --steps 20 --batch 2
+python main.py --full --ckpt ckpt/big train --steps 20 --batch 2
 
 python main.py --ckpt ckpt/demo infer --prompt "hello" --max-new 32 --temperature 0.0
 python main.py --ckpt ckpt/demo report            # dynamic parameter counts
