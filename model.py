@@ -112,9 +112,9 @@ class SmaulBrainModel(nn.Module):
         hs: list[torch.Tensor] = []
         lams: list[torch.Tensor] = []
         aux_total = torch.zeros((), device=h.device)
-        depths = torch.full((B, T), self.cfg.max_depth, dtype=torch.long)
-        cum = torch.zeros(B, T)
-        halted = torch.zeros(B, T, dtype=torch.bool)
+        depths = torch.full((B, T), self.cfg.max_depth, dtype=torch.long, device=h.device)
+        cum = torch.zeros(B, T, device=h.device)
+        halted = torch.zeros(B, T, dtype=torch.bool, device=h.device)
         n_executed = 0
         for depth in range(self.cfg.max_depth):
             h, attn, halt_logit, aux = self.block(h, attn, self._moe_fn(train, step))
@@ -137,11 +137,11 @@ class SmaulBrainModel(nn.Module):
     def _ponder(self, lams: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Halting distribution p_n and geometric-prior KL (FP32 stats)."""
         B, T = lams[0].shape
-        device = lams[0].device
+        dev = lams[0].device
         p_pr = self.cfg.halt_prior
         probs: list[torch.Tensor] = []
-        remaining = torch.ones(B, T)
-        kl = torch.zeros(())
+        remaining = torch.ones(B, T, device=dev)
+        kl = torch.zeros((), device=dev)
         for n, lam in enumerate(lams):
             if n == len(lams) - 1:
                 p = remaining  # force-stop: all remaining mass halts here
@@ -149,9 +149,8 @@ class SmaulBrainModel(nn.Module):
                 p = lam * remaining
                 remaining = remaining * (1.0 - lam)
             probs.append(p)
-            if n < len(lams) - 1 or True:
-                geom = p_pr * ((1.0 - p_pr) ** n)
-                kl = kl + (p * (torch.log(p.clamp_min(1e-9)) - math.log(max(geom, 1e-12)))).sum()
+            geom = p_pr * ((1.0 - p_pr) ** n)
+            kl = kl + (p * (torch.log(p.clamp_min(1e-9)) - math.log(max(geom, 1e-12)))).sum()
         P = torch.stack(probs, dim=0)  # [D, B, T]
         return P, kl / (B * T)
 
@@ -204,6 +203,8 @@ class SmaulBrainModel(nn.Module):
         B, T = ids.shape
         h = self.n_init(self.embed(ids).to(compute))
         attn = LinearAttnState.zeros(B, self.cfg.n_heads, self.cfg.d_model // self.cfg.n_heads)
+        attn.S = attn.S.to(h.device)
+        attn.z = attn.z.to(h.device)
         hs, lams, _aux, depths, n_executed = self._depth_loop(h, attn, train=False, step=step)
         logits = self.head(self.n_final(hs[-1])).float()
         return {"logits": logits, "depths": depths, "n_executed": n_executed,
@@ -211,7 +212,6 @@ class SmaulBrainModel(nn.Module):
 
     # -- parameter accounting (dynamic topology) --
     def param_counts(self) -> dict:
-        d = self.cfg.d_model
         per_expert = self.pool.experts[self.pool.order[0]].param_count if len(self.pool) else 0
         shared = sum(p.nelement() for _, p in self._trunk_params()) + sum(
             p.nelement() for _, p in self._router_params())
