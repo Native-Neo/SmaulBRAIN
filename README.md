@@ -482,6 +482,17 @@ python main.py report            # parameter counts without training
 
 All flags are documented under "How to use `cli.py`" above.
 
+### What is `model.py`
+
+`SmaulBrainModel`: the shared trunk (byte embedding, init norm, one
+`SharedRecurrentBlock`, final norm, byte head) plus the `SparseRouter`,
+`ExpertPool`, and `ExpertPager`. The depth loop re-applies the shared block
+(`min_depth..max_depth`) with PonderNet halting; training minimizes
+halting-weighted cross-entropy plus ponder KL plus MoE balance loss.
+Train/infer providers separate gradient-carrying expert leaves from plain
+cached weights, and `param_counts` reports shared/router/expert/active plus
+RAM/VRAM-resident splits as the topology changes.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
