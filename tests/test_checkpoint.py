@@ -4,10 +4,10 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from smaulbrain.config import SmaulBrainConfig
-from smaulbrain.model import SmaulBrainModel
-from smaulbrain.smaulopt import SmaulOpt, SmaulOptHParams
-from smaulbrain.storage import load_expert_file, load_model, save_model
+from config import SmaulBrainConfig
+from model import SmaulBrainModel
+from smaulopt import SmaulOpt, SmaulOptHParams
+from storage import load_expert_file, load_model, save_model
 
 
 def _trained(tmp, seed=0):
