@@ -1,15 +1,25 @@
 """Benchmark harness: throughput, memory, paging, routing, depth, precision.
 
 Measures (never claims without measuring):
-  bytes/s + tokens/s for training and inference, peak RSS, disk usage,
-  expert loads/evictions per paging mode, routing distribution, active
-  experts, recurrent depth histogram, FP8 vs BF16 expert-compute timing.
+  tokens/s (= bytes/s: the vocabulary is bytes) for training and inference,
+  peak RSS, checkpoint disk usage, expert loads/evictions per paging mode,
+  routing distribution, active experts, recurrent depth, FP8 vs BF16
+  expert-compute timing.
 
-Usage: python benchmarks/bench.py [--mode D2R|R2VR|D2VR] [--seconds N]
+Usage: python benchmarks/bench.py [--mode D2R|R2VR|D2VR] [--steps N]
 """
 
-import sys, os, time, json, argparse, resource
+import sys, os, time, json, argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+try:
+    import resource
+
+    def rss_mb():
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+except ImportError:  # Windows: resource is Unix-only
+    def rss_mb():
+        return 0.0
 
 import torch
 from config import SmaulBrainConfig
@@ -18,10 +28,6 @@ from kernels import time_fn
 from model import SmaulBrainModel
 from smaulopt import SmaulOpt, SmaulOptHParams
 from train import train_step
-
-
-def rss_mb():
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 
 
 def disk_mb(path):
@@ -74,11 +80,19 @@ def main():
 
     # --- routing distribution ---
     share = model.router.usage_share().tolist()
+    # --- checkpoint disk usage (actually written + measured) ---
+    import tempfile
+    from storage import save_model
+    ckpt_dir = tempfile.mkdtemp(prefix="bench_ckpt_")
+    save_model(ckpt_dir, model, opt, args.steps)
     report = {
         "paging_mode": args.mode,
         "train_tokens_per_s": round(train_tps, 1),
+        "train_bytes_per_s": round(train_tps, 1),  # byte vocab: 1 token = 1 byte
         "infer_tokens_per_s": round(infer_tps, 1),
+        "infer_bytes_per_s": round(infer_tps, 1),
         "peak_rss_mb": round(rss_mb(), 1),
+        "checkpoint_disk_mb": round(disk_mb(ckpt_dir), 3),
         "param_counts": model.param_counts(),
         "paging": model.pager.stats.to_dict(),
         "routing_share": [round(v, 4) for v in share],
