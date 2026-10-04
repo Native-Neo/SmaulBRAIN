@@ -432,6 +432,18 @@ CPU and reports the measured winner — dense wins ~30x at 256-byte vocab, so
 sparsity lives in expert routing, not token connections.
 `linear_attn_memory_bound` states the T-independent attention memory formula.
 
+### How to use `kernels.py`
+
+```python
+from kernels import compare_heads, time_fn, linear_attn_memory_bound
+
+print(compare_heads()["winner"])   # 'dense' on CPU at 256-byte vocab
+print(time_fn(lambda: model.forward_infer(x))["median_ms"])
+print(linear_attn_memory_bound(heads=4, head_dim=8))  # bytes, T-independent
+```
+
+Native C++ equivalents live in `kernels_cpp/` (`g++ -O2 -std=c++17 -c`).
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
