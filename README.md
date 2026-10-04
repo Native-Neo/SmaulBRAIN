@@ -398,6 +398,15 @@ eid = grow_expert(pool, router, d_model=128, expert_hidden=256,
 In training, schedule it with `run_training(..., grow_every=200)` or the
 CLI `--grow-every 200` (capped by `max_experts`).
 
+### What is `infer.py`
+
+Inference on the same core model and checkpoint format — no separate
+architecture. `generate` runs autoregressive byte generation through
+`forward_infer` (early halting, no gradients), sampling with temperature /
+top-k / top-p, streaming UTF-8 decode, and returns paging counters alongside
+ids/text/depths. It preserves the caller's train/eval mode and runs on the
+model's device.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
