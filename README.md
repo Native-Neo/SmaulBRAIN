@@ -532,6 +532,15 @@ pager.invalidate("expert_00003")     # after its optimizer step
 print(pager.stats.to_dict())         # disk_reads/hits/evictions per path
 ```
 
+### What is `precision.py`
+
+The precision policy plus real FP8 storage. `FP8BlockTensor` holds uint8
+E4M3 codes with per-row-block FP32 scales — genuine FP8 bytes, not relabeled
+FP32 — dequantized one expert (or row slice) at a time, never as a full-model
+transient. `PRECISION_POLICY` maps each component to its storage/compute
+dtype (FP8 weights, BF16 activations/state, FP32 stats/math), and
+`compute_dtype` resolves it in code.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
