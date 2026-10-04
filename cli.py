@@ -11,8 +11,8 @@ import json
 import os
 import sys
 
-from .bytes import decode_text, encode_text
-from .config import SmaulBrainConfig, expert_hidden_for_target
+from bytes import decode_text, encode_text
+from config import SmaulBrainConfig, expert_hidden_for_target
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -102,10 +102,10 @@ def _demo_seqs(n: int = 64, length: int = 40) -> list[list[int]]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    from .infer import generate
-    from .model import SmaulBrainModel
-    from .smaulopt import SmaulOpt, SmaulOptHParams
-    from .storage import load_model, save_model
+    from infer import generate
+    from model import SmaulBrainModel
+    from smaulopt import SmaulOpt, SmaulOptHParams
+    from storage import load_model, save_model
 
     args = build_parser().parse_args(argv)
     import torch
@@ -114,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = config_from_args(args)
 
     if args.cmd == "quantize":
-        from .quantize import convert_checkpoint
+        from quantize import convert_checkpoint
         reports = convert_checkpoint(args.ckpt, to=args.to)
         print(json.dumps({"converted_experts": len(reports),
                           "bytes_after": sum(r["bytes_after"] for r in reports)}, indent=2))
@@ -129,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
         load_model(args.ckpt, model, opt)
 
     if args.cmd == "train":
-        from .train import run_training
+        from train import run_training
         if args.data and os.path.exists(args.data):
             with open(args.data, "rb") as f:
                 raw = f.read()
