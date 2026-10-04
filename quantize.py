@@ -22,7 +22,9 @@ from storage import EXPERT_NAMES, expert_from_payload, expert_to_payload, load_m
 
 def convert_expert_file(src: str, dst: str, to: str = "fp8", tile: int = 64) -> dict:
     """Convert one expert file independently. Returns a small conversion report."""
-    from precision import dequantize_fp8_blockwise, quantize_fp8_blockwise
+    from precision import (
+        FP8BlockTensor, dequantize_fp8_row_block, quantize_fp8_blockwise
+    )
 
     rec = expert_from_payload(torch.load(src, map_location="cpu", weights_only=False))
     before = {n: rec.weights_fp8[n].nbytes() for n in EXPERT_NAMES}
@@ -30,11 +32,30 @@ def convert_expert_file(src: str, dst: str, to: str = "fp8", tile: int = 64) -> 
         # Any source precision -> canonical FP8 block storage (also re-tiles).
         max_err = 0.0
         for n in EXPERT_NAMES:
-            full = dequantize_fp8_blockwise(rec.weights_fp8[n], dtype=torch.float32)
-            new_t = quantize_fp8_blockwise(full, tile=tile)
-            max_err = max(max_err, float(
-                (dequantize_fp8_blockwise(new_t, dtype=torch.float32) - full).abs().max().item()))
-            rec.weights_fp8[n] = new_t
+            src = rec.weights_fp8[n]
+            # Requantize in bounded row windows; never materialize the whole
+            # expert as FP32 at once.
+            row_block = 256
+            code_parts = []
+            scale_parts = []
+            for row_start in range(0, src.shape[0], row_block):
+                row_end = min(row_start + row_block, src.shape[0])
+                full = dequantize_fp8_row_block(
+                    src, row_start, row_end, dtype=torch.float32
+                )
+                part = quantize_fp8_blockwise(full, tile=tile)
+                recon = dequantize_fp8_row_block(
+                    part, 0, row_end - row_start, dtype=torch.float32
+                )
+                max_err = max(max_err, float((recon - full).abs().max().item()))
+                code_parts.append(part.codes)
+                scale_parts.append(part.scales)
+            rec.weights_fp8[n] = FP8BlockTensor(
+                codes=torch.cat(code_parts, dim=0),
+                scales=torch.cat(scale_parts, dim=0),
+                shape=src.shape,
+                tile=tile,
+            )
     elif to == "bf16":
         # Experts stay FP8 on disk per the precision policy (large
         # storage-heavy tensors); BF16 conversion applies to the trunk.
