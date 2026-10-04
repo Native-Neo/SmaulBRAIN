@@ -70,7 +70,7 @@ def test_checkpoint_correct_after_pruning(tmp_path):
     from storage import save_model, load_model
     torch.manual_seed(0)
     cfg = SmaulBrainConfig(d_model=16, n_heads=2, num_experts=3, top_k=1,
-                           expert_hidden=32, max_depth=1)
+                           expert_hidden=32, max_depth=1, min_experts=1)
     m = SmaulBrainModel(cfg); opt = SmaulOpt()
     keep = m.pool.order[0]
     m.pool.experts[keep].tokens_routed = 100
