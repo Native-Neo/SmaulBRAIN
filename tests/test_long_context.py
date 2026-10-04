@@ -10,10 +10,10 @@ import sys, os, resource
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from smaulbrain.config import SmaulBrainConfig
-from smaulbrain.kernels import linear_attn_memory_bound
-from smaulbrain.linear_attention import LinearAttnState
-from smaulbrain.model import SmaulBrainModel
+from config import SmaulBrainConfig
+from kernels import linear_attn_memory_bound
+from linear_attention import LinearAttnState
+from model import SmaulBrainModel
 
 
 def _rss_mb():
