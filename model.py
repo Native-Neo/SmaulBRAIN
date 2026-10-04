@@ -20,13 +20,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import SmaulBrainConfig
-from .experts import ExpertPool, make_expert
-from .linear_attention import LinearAttnState
-from .paging import ExpertPager
-from .recurrent import SharedRecurrentBlock
-from .rmsnorm import RMSNorm
-from .routing import SparseRouter
+from config import SmaulBrainConfig
+from experts import ExpertPool, make_expert
+from linear_attention import LinearAttnState
+from paging import ExpertPager
+from recurrent import SharedRecurrentBlock
+from rmsnorm import RMSNorm
+from routing import SparseRouter
 
 
 class SmaulBrainModel(nn.Module):
