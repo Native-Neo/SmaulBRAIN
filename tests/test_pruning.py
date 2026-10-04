@@ -82,7 +82,7 @@ def test_checkpoint_correct_after_pruning(tmp_path):
     d = str(tmp_path / "ckpt")
     save_model(d, m, opt, step=600)
     m2 = SmaulBrainModel(SmaulBrainConfig(d_model=16, n_heads=2, num_experts=1,
-                                         top_k=1, expert_hidden=32, max_depth=1))
+                                         top_k=1, expert_hidden=32, max_depth=1, min_experts=1))
     man = load_model(d, m2, SmaulOpt())
     assert man["expert_ids"] == [keep] and len(m2.pool) == 1
     ids = torch.randint(0, 256, (1, 8))
