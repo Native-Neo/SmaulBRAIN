@@ -70,7 +70,7 @@ def test_smaulopt_factored_state_and_bf16_storage():
 
 
 def test_no_hidden_fp32_master_copy_of_pool():
-    from smaulbrain.experts import ExpertPool, make_expert
+    from experts import ExpertPool, make_expert
     torch.manual_seed(0)
     pool = ExpertPool()
     for _ in range(2):
