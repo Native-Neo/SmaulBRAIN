@@ -384,6 +384,20 @@ router row from the parent-mean row, initializes optimizer state, records
 parents/birth step, and stays reproducible from the caller seed. An empty
 pool falls back to a fresh random expert.
 
+### How to use `growth.py`
+
+```python
+from growth import grow_expert, select_parents
+
+print(select_parents(pool, k=2))   # deterministic parent ranking
+eid = grow_expert(pool, router, d_model=128, expert_hidden=256,
+                  step=100, seed=123, n_parents=2)
+# Same seed + same pool -> byte-identical child (verified in tests).
+```
+
+In training, schedule it with `run_training(..., grow_every=200)` or the
+CLI `--grow-every 200` (capped by `max_experts`).
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
