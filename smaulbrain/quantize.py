@@ -19,20 +19,6 @@ import torch
 from .storage import EXPERT_NAMES, expert_from_payload, expert_to_payload, load_manifest
 
 
-def _map_storage(payload: dict, fn) -> dict:
-    for n in EXPERT_NAMES:
-        payload["weights"][n] = fn(payload["weights"][n])
-    return payload
-
-
-def fp32_to_bf16_block(codes_dict: dict) -> dict:
-    """FP8/FP32-stored weight block -> BF16 compute tensor (for inspection)."""
-    from .precision import dequantize_fp8_blockwise, FP8BlockTensor
-    t = FP8BlockTensor(codes=codes_dict["codes"], scales=codes_dict["scales"],
-                       shape=tuple(codes_dict["shape"]), tile=codes_dict["tile"])
-    return {"tensor": dequantize_fp8_blockwise(t, dtype=torch.bfloat16)}
-
-
 def convert_expert_file(src: str, dst: str, to: str = "fp8", tile: int = 64) -> dict:
     """Convert one expert file independently. Returns a small conversion report."""
     from .precision import FP8BlockTensor, dequantize_fp8_blockwise, quantize_fp8_blockwise
