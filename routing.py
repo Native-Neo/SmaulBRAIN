@@ -99,7 +99,7 @@ class SparseRouter(nn.Module):
     def add_expert_row(self, init: torch.Tensor | None = None) -> int:
         """Append one router row; returns the new expert index."""
         new_index = self.num_experts
-        new = nn.Linear(self.d_model, self.num_experts + 1)
+        new = nn.Linear(self.d_model, self.num_experts + 1).to(self.proj.weight.dtype)
         with torch.no_grad():
             new.weight[: self.num_experts] = self.proj.weight
             new.bias[: self.num_experts] = self.proj.bias
@@ -121,7 +121,7 @@ class SparseRouter(nn.Module):
         """Delete router row ``index`` (called after expert pruning)."""
         assert 0 <= index < self.num_experts and self.num_experts > 1
         keep = [i for i in range(self.num_experts) if i != index]
-        new = nn.Linear(self.d_model, self.num_experts - 1)
+        new = nn.Linear(self.d_model, self.num_experts - 1).to(self.proj.weight.dtype)
         with torch.no_grad():
             new.weight[:] = self.proj.weight[keep]
             new.bias[:] = self.proj.bias[keep]
