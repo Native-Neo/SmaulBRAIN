@@ -64,6 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--data", type=str, default=None,
                    help="Text file for training bytes (default: synthetic demo).")
     t.add_argument("--save-every", type=int, default=0, help="Checkpoint every N steps (0=off).")
+    t.add_argument("--grow-every", type=int, default=0, help="Growth eval every N steps (0=off).")
+    t.add_argument("--prune-every", type=int, default=0, help="Prune eval every N steps (0=off).")
     # infer
     i = sub.add_parser("infer", help="Generate bytes from a prompt.")
     i.add_argument("--prompt", type=str, default="hello", help="Prompt text.")
@@ -138,7 +140,9 @@ def main(argv: list[str] | None = None) -> int:
         res = run_training(model, opt, cfg, seqs, steps=args.steps,
                            batch_size=args.batch, mode=args.mode,
                            ckpt_dir=args.ckpt if args.save_every else None,
-                           save_every=args.save_every)
+                           save_every=args.save_every,
+                           grow_every=args.grow_every,
+                           prune_every=args.prune_every)
         print(json.dumps({"final_loss": res["final_loss"],
                           "retention": res["retention"],
                           "experts": len(model.pool)}, indent=2))
