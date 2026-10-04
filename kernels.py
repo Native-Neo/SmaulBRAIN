@@ -16,7 +16,6 @@ import time
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class SparseTopKHead(nn.Module):
@@ -69,8 +68,6 @@ def compare_heads(vocab: int = 256, d_model: int = 128, batch_tokens: int = 1024
     dense = nn.Linear(d_model, vocab, bias=False)
     sparse = SparseTopKHead(vocab, d_model, fan_in)
     x = torch.randn(batch_tokens, d_model)
-    with torch.no_grad():
-        yd, ys = dense(x), sparse(x)
     dense_t = time_fn(lambda: dense(x), repeat=repeat)
     sparse_t = time_fn(lambda: sparse(x), repeat=repeat)
     winner = "dense" if dense_t["median_ms"] <= sparse_t["median_ms"] else "sparse"
