@@ -4,10 +4,10 @@ import sys, os, json, subprocess
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from smaulbrain.config import SmaulBrainConfig
-from smaulbrain.growth import grow_expert
-from smaulbrain.model import SmaulBrainModel
-from smaulbrain.pruning import find_victims, prune_experts
+from config import SmaulBrainConfig
+from growth import grow_expert
+from model import SmaulBrainModel
+from pruning import find_victims, prune_experts
 
 
 def _model(n_exp=4):
@@ -56,7 +56,7 @@ def test_one_billion_params_need_not_be_resident():
 def test_cli_report_json(tmp_path):
     ckpt = str(tmp_path / "ckpt")
     r = subprocess.run(
-        [sys.executable, "-m", "smaulbrain", "--d-model", "32", "--n-heads", "4",
+        [sys.executable, "main.py", "--d-model", "32", "--n-heads", "4",
          "--experts", "2", "--expert-size", "64", "--active-experts", "1",
          "--max-depth", "1", "--ckpt", ckpt, "report"],
         capture_output=True, text=True, cwd=os.path.join(os.path.dirname(__file__), ".."),
