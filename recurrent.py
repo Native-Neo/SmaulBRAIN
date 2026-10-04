@@ -80,23 +80,15 @@ class SharedRecurrentBlock(nn.Module):
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
-        # Continue from the incoming accumulator: genuine state influence.
-        S, z = attn.S, attn.z
-        qf = F.elu(q.float()) + 1.0
-        kf = F.elu(k.float()) + 1.0
-        kf = kf / kf.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        vf = v.float()
-        outs: list[torch.Tensor] = []
-        for t in range(T):
-            kt, vt, qt = kf[:, :, t, :], vf[:, :, t, :], qf[:, :, t, :]
-            S = S + kt.unsqueeze(-1) * vt.unsqueeze(-2)
-            z = z + kt
-            num = torch.einsum("bhd,bhde->bhe", qt, S)
-            den = (qt * z).sum(dim=-1, keepdim=True).clamp_min(1e-6)
-            outs.append(num / den)
-        y = torch.stack(outs, dim=2).transpose(1, 2).reshape(B, T, D).to(h.dtype)
-        h = h + self.o_proj(self.n_attn(y))  # Norm -> residual (per architecture)
-        attn_next = LinearAttnState(S=S, z=z)
+        # Chunkwise causal linear attention. The incoming state is visible
+        # to every token; within each chunk only earlier-token prefixes are used.
+        from linear_attention import linear_attn_forward
+
+        y, attn_next = linear_attn_forward(
+            q, k, v, eps=1e-6, state=attn, chunk_size=256
+        )
+        y = y.reshape(B, T, D).to(h.dtype)
+        h = h + self.o_proj(self.n_attn(y))
         # -- sparse MoE branch (Norm -> residual, injected routing+experts) --
         m = self.n2(h)
         flat = m.reshape(B * T, D)
