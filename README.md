@@ -241,6 +241,11 @@ Breaking changes are still expected.
 
 Tests, measurements, memory usage, and actual training results are more important than keeping the current design unchanged.
 
+## Module guide
+
+What each root-level module is and how to use it. Start with `config.py`:
+every other module is configured through `SmaulBrainConfig`.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
