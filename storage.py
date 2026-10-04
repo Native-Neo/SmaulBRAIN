@@ -26,8 +26,8 @@ import tempfile
 
 import torch
 
-from .experts import ExpertRecord, init_expert_optim_state
-from .precision import FP8BlockTensor
+from experts import ExpertRecord, init_expert_optim_state
+from precision import FP8BlockTensor
 
 EXPERT_NAMES = ("w_gate", "w_up", "w_down")
 
@@ -159,7 +159,7 @@ def make_disk_loader(ckpt_dir: str):
 
 def load_model(ckpt_dir: str, model, opt) -> dict:
     """Load weights/opt/router/experts into an existing model+opt. Returns manifest."""
-    from .config import SmaulBrainConfig
+    from config import SmaulBrainConfig
 
     with open(os.path.join(ckpt_dir, "config.json")) as f:
         saved_cfg = SmaulBrainConfig.from_dict(json.load(f))
