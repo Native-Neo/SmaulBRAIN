@@ -4,13 +4,13 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from smaulbrain.config import SmaulBrainConfig
-from smaulbrain.continual import (
+from config import SmaulBrainConfig
+from continual import (
     ReplayBuffer, batch_from_seqs, evaluate_loss, retention_report,
 )
-from smaulbrain.model import SmaulBrainModel
-from smaulbrain.smaulopt import SmaulOpt, SmaulOptHParams
-from smaulbrain.train import run_training
+from model import SmaulBrainModel
+from smaulopt import SmaulOpt, SmaulOptHParams
+from train import run_training
 
 
 def _model(seed=0):
