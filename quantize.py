@@ -16,12 +16,12 @@ import os
 
 import torch
 
-from .storage import EXPERT_NAMES, expert_from_payload, expert_to_payload, load_manifest
+from storage import EXPERT_NAMES, expert_from_payload, expert_to_payload, load_manifest
 
 
 def convert_expert_file(src: str, dst: str, to: str = "fp8", tile: int = 64) -> dict:
     """Convert one expert file independently. Returns a small conversion report."""
-    from .precision import FP8BlockTensor, dequantize_fp8_blockwise, quantize_fp8_blockwise
+    from precision import FP8BlockTensor, dequantize_fp8_blockwise, quantize_fp8_blockwise
 
     rec = expert_from_payload(torch.load(src, map_location="cpu", weights_only=False))
     before = {n: rec.weights_fp8[n].nbytes() for n in EXPERT_NAMES}
