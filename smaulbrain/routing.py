@@ -50,7 +50,7 @@ class SparseRouter(nn.Module):
 
     def route(self, x: torch.Tensor) -> RoutePlan:
         """Route N tokens to top-k experts. x: [N, D] (any float dtype)."""
-        logits = self.proj(x.float())  # [N, E]
+        logits = self.proj(x.to(self.proj.weight.dtype)).float()  # [N, E]
         probs = F.softmax(logits, dim=-1)
         top_w, top_ids = torch.topk(probs, k=self.top_k, dim=-1)
         top_w = top_w / top_w.sum(dim=-1, keepdim=True).clamp_min(1e-9)
