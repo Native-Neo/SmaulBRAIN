@@ -4,8 +4,8 @@ import sys, os, subprocess
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from smaulbrain.kernels import compare_heads, linear_attn_memory_bound, time_fn
-from smaulbrain.rmsnorm import RMSNorm, rmsnorm_fn
+from kernels import compare_heads, linear_attn_memory_bound, time_fn
+from rmsnorm import RMSNorm, rmsnorm_fn
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 
