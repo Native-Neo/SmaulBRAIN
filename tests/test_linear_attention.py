@@ -9,7 +9,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from smaulbrain.linear_attention import (
+from linear_attention import (
     LinearAttnState, feature_map, linear_attn_forward, linear_attn_step,
 )
 
