@@ -323,6 +323,15 @@ cfg2 = SmaulBrainConfig.from_dict(d)
 print(cfg2.describe_counts())     # shared/router/expert/total/active splits
 ```
 
+### What is `continual.py`
+
+The continual-learning toolkit: a reservoir `ReplayBuffer` that interleaves
+old byte sequences into training, `batch_from_seqs` for packing variable
+length sequences into padded batches, `evaluate_loss` for gradient-free
+old/new-data scoring, and `retention_report`, which reports forgetting as
+numbers (loss/accuracy deltas plus a `retained` heuristic) instead of
+claiming it is solved.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
