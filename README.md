@@ -734,6 +734,22 @@ trunk, `selected` steps listed ids, `new` steps experts born after a cutoff.
 `run_training` adds replay interleaving, growth/pruning schedules,
 periodic checkpointing, and before/after retention measurement.
 
+### How to use `train.py`
+
+```python
+from train import train_step, run_training
+
+stats = train_step(model, opt, cfg, x, y, step=0, mode="entire")
+print(stats["loss"], stats["mean_depth"], stats["stepped_experts"])
+
+res = run_training(model, opt, cfg, train_seqs, steps=20, batch_size=2,
+                   mode="selected", selected=["expert_00001"],
+                   replay=ReplayBuffer(512), replay_n=2,
+                   old_seqs=old_data, grow_every=200, prune_every=500,
+                   ckpt_dir="ckpt/run1", save_every=50)
+print(res["final_loss"], res["retention"])  # retention measured, not claimed
+```
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
