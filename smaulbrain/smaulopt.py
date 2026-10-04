@@ -177,7 +177,6 @@ class SmaulOpt:
         full model (avoids the old SmaulNative RQT full-matrix pathology).
         Returns mean |update| as a gradient-activity signal (FP32 math).
         """
-        from .experts import ExpertRecord as _ER  # noqa: F401  (type anchor only)
 
         names = [n for n in ("w_gate", "w_up", "w_down") if compute[n].grad is not None]
         if not names:
