@@ -4,11 +4,11 @@ import sys, os, json, subprocess
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from smaulbrain.config import SmaulBrainConfig
-from smaulbrain.infer import generate
-from smaulbrain.model import SmaulBrainModel
-from smaulbrain.smaulopt import SmaulOpt, SmaulOptHParams
-from smaulbrain.train import run_training, train_step
+from config import SmaulBrainConfig
+from infer import generate
+from model import SmaulBrainModel
+from smaulopt import SmaulOpt, SmaulOptHParams
+from train import run_training, train_step
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 
@@ -67,7 +67,7 @@ def test_finetune_modes_move_right_groups():
 def test_cli_train_then_infer_then_quantize(tmp_path):
     ckpt = str(tmp_path / "ckpt")
     r = subprocess.run(
-        [sys.executable, "-m", "smaulbrain", "--d-model", "32", "--n-heads", "4",
+        [sys.executable, "main.py", "--d-model", "32", "--n-heads", "4",
          "--experts", "2", "--expert-size", "64", "--active-experts", "1",
          "--max-depth", "1", "--context-length", "24", "--ckpt", ckpt,
          "train", "--steps", "3", "--batch", "2"], capture_output=True,
@@ -75,13 +75,13 @@ def test_cli_train_then_infer_then_quantize(tmp_path):
     assert r.returncode == 0, r.stderr
     assert json.loads(r.stdout)["final_loss"] > 0
     r = subprocess.run(
-        [sys.executable, "-m", "smaulbrain", "--d-model", "32", "--n-heads", "4",
+        [sys.executable, "main.py", "--d-model", "32", "--n-heads", "4",
          "--experts", "2", "--expert-size", "64", "--active-experts", "1",
          "--max-depth", "1", "--context-length", "24", "--ckpt", ckpt,
          "infer", "--prompt", "hi", "--max-new", "4", "--temperature", "0"],
         capture_output=True, text=True, cwd=ROOT)
     assert r.returncode == 0, r.stderr
     r = subprocess.run(
-        [sys.executable, "-m", "smaulbrain", "--ckpt", ckpt, "quantize", "--to", "fp8"],
+        [sys.executable, "main.py", "--ckpt", ckpt, "quantize", "--to", "fp8"],
         capture_output=True, text=True, cwd=ROOT)
     assert r.returncode == 0, r.stderr
