@@ -632,6 +632,16 @@ inverse square root) always run in FP32 even for BF16 inputs, then cast back.
 both are pure vectorized tensor ops, numerically matched by
 `kernels_cpp/rmsnorm.cpp`.
 
+### How to use `rmsnorm.py`
+
+```python
+from rmsnorm import RMSNorm, rmsnorm_fn
+
+n = RMSNorm(dim=128)   # weight stays FP32 by design
+y = n(x)               # x: BF16 in -> BF16 out, FP32 statistics inside
+y = rmsnorm_fn(x, n.weight)
+```
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
