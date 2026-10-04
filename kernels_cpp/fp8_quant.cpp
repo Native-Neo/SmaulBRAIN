@@ -36,7 +36,13 @@ static inline uint8_t f32_to_e4m3(float v) {
   float base = std::ldexp(1.0f, exp2);
   int m = (int)std::floor((a / base - 1.0f) * 8.0f + 0.5f);
   if (m < 0) m = 0;
-  if (m > 7) m = 7;
+  if (m > 7) {
+    // Rounded past the top of this binade: carry into e+1,m=0 (the true
+    // nearest), instead of clamping to m=7 (a whole step too low).
+    m = 0;
+    e += 1;
+  }
+  if (e > 15) return (uint8_t)(sign | 0x7E);  // saturate, stay finite
   if (e == 15 && m > 6) m = 6;  // 0x7F would be NaN; clamp to max finite
   return (uint8_t)(sign | (unsigned)((e << 3) | m));
 }
