@@ -623,6 +623,15 @@ h, attn, halt_logit, aux = blk(h, attn, moe_fn)  # one shared application
 
 `moe_fn` is injected: `(x_flat) -> (y_flat, aux_loss, usage_ids)`.
 
+### What is `rmsnorm.py`
+
+RMSNorm at every major recurrent/residual boundary, with the precision
+contract the rest of the system relies on: statistics (mean of squares,
+inverse square root) always run in FP32 even for BF16 inputs, then cast back.
+`RMSNorm` is the module (FP32 weight), `rmsnorm_fn` the functional form;
+both are pure vectorized tensor ops, numerically matched by
+`kernels_cpp/rmsnorm.cpp`.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
