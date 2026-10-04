@@ -118,7 +118,9 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
     os.makedirs(ckpt_dir, exist_ok=True)
     exp_dir = os.path.join(ckpt_dir, "experts")
     os.makedirs(exp_dir, exist_ok=True)
-    _atomic_write_json(model.cfg.to_dict(), os.path.join(ckpt_dir, "config.json"))
+    cfg_dict = model.cfg.to_dict()
+    cfg_dict["num_experts"] = len(model.pool)
+    _atomic_write_json(cfg_dict, os.path.join(ckpt_dir, "config.json"))
     _atomic_save({k: v.detach().cpu() for k, v in model.state_dict().items()
                   if not k.startswith("router.") and "usage_" not in k and "admit_" not in k
                   and k not in ("router.proj.weight", "router.proj.bias")},
@@ -163,8 +165,16 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
 
     with open(os.path.join(ckpt_dir, "config.json")) as f:
         saved_cfg = SmaulBrainConfig.from_dict(json.load(f))
-    assert saved_cfg.d_model == model.cfg.d_model, "d_model mismatch"
-    assert saved_cfg.vocab_size == model.cfg.vocab_size, "vocab mismatch"
+    shape_fields = (
+        "d_model", "vocab_size", "n_heads", "expert_hidden",
+        "top_k", "fp8_tile", "dtype",
+    )
+    for field in shape_fields:
+        if getattr(saved_cfg, field) != getattr(model.cfg, field):
+            raise ValueError(
+                f"checkpoint {field}={getattr(saved_cfg, field)!r} "
+                f"does not match model {getattr(model.cfg, field)!r}"
+            )
     trunk = torch.load(os.path.join(ckpt_dir, "trunk.pt"), map_location="cpu", weights_only=False)
     model.load_state_dict(trunk, strict=False)
     router = torch.load(os.path.join(ckpt_dir, "router.pt"), map_location="cpu", weights_only=False)
@@ -184,6 +194,15 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     opt.router_state = optim["router"]
     opt.step_count = int(optim.get("step_count", 0))
     manifest = load_manifest(ckpt_dir)
+    saved_count = len(manifest["expert_ids"])
+    saved_cfg.num_experts = saved_count
+    model.cfg = saved_cfg
+    model.pager.mode = saved_cfg.paging_method
+    model.pager.ram_cache = saved_cfg.ram_cache
+    model.pager.vram_cache = saved_cfg.vram_cache
+    model.pager.compute_dtype = (
+        torch.bfloat16 if saved_cfg.dtype == "bf16" else torch.float32
+    )
     # Rebuild pool exactly in manifest order (index-consistent after pruning).
     model.pool.experts.clear()
     model.pool.order.clear()
@@ -214,4 +233,5 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     model.pager.ram_records.clear()
     if model.cfg.paging_method == "R2VR":
         model.pager.warm_ram()
+    model._resume_step = int(manifest.get("step", -1))
     return manifest
