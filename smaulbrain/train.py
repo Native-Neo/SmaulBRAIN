@@ -98,6 +98,7 @@ def run_training(
     replay_n: int = 0,
     old_seqs: list[list[int]] | None = None,
     grow_every: int = 0,
+    prune_every: int = 0,
     seed: int = 0,
     log_fn=print,
 ) -> dict:
@@ -130,6 +131,14 @@ def run_training(
                                          cfg.expert_hidden, step, seed=seed + step,
                                          fp8_tile=cfg.fp8_tile)
             log_fn(f"[grow] step={step} new={eid} pool={len(model.pool)}")
+        if prune_every and (step + 1) % prune_every == 0:
+            victims = pruning_mod.find_victims(model.pool, step,
+                                               survival_steps=cfg.prune_survival_steps,
+                                               min_experts=cfg.min_experts,
+                                               usage_threshold=cfg.prune_min_usage)
+            if victims:
+                pruned = pruning_mod.prune_experts(model.pool, model.router, victims)
+                log_fn(f"[prune] step={step} removed={pruned} pool={len(model.pool)}")
         if ckpt_dir and save_every and (step + 1) % save_every == 0:
             save_model(ckpt_dir, model, opt, step)
     report = None
