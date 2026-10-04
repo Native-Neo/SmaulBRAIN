@@ -32,10 +32,15 @@ class _GradOnly:
         self.shape = tuple(grad.shape)
 
 
+_MODES = ("entire", "trunk", "experts", "selected", "new")
+
+
 def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
                mode: str = "entire", selected: list[str] | None = None,
                new_since_step: int = 0) -> dict:
     """One optimizer step. Returns loss stats + stepped expert ids."""
+    if mode not in _MODES:
+        raise ValueError(f"unknown training mode {mode!r}; expected one of {_MODES}")
     model.train()
     model.zero_grad(set_to_none=True)
     out = model(x, y, step=step)
@@ -92,6 +97,8 @@ def run_training(
     steps: int = 20,
     batch_size: int = 2,
     mode: str = "entire",
+    selected: list[str] | None = None,
+    new_since_step: int = 0,
     ckpt_dir: str | None = None,
     save_every: int = 0,
     replay: ReplayBuffer | None = None,
@@ -123,7 +130,8 @@ def run_training(
             batch_seqs = batch_seqs + replay.sample(replay_n)
         b = batch_from_seqs(batch_seqs, cfg.context_length)
         stats = train_step(model, opt, cfg, b[:, : cfg.context_length],
-                           b[:, 1 : cfg.context_length + 1], step, mode=mode)
+                           b[:, 1 : cfg.context_length + 1], step, mode=mode,
+                           selected=selected, new_since_step=new_since_step)
         stats["step"] = step
         hist.append(stats)
         if grow_every and (step + 1) % grow_every == 0 and len(model.pool) < cfg.max_experts:
