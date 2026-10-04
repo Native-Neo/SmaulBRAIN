@@ -145,6 +145,15 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
         "extra": extra_meta or {},
     }
     _atomic_write_json(manifest, os.path.join(ckpt_dir, "manifest.json"))
+    # The manifest is the commit point. Once it is safely published, remove
+    # expert files no longer referenced by the new topology.
+    live = {f"{eid}.pt" for eid in model.pool.order}
+    for name in os.listdir(exp_dir):
+        if name.endswith(".pt") and name not in live:
+            try:
+                os.remove(os.path.join(exp_dir, name))
+            except FileNotFoundError:
+                pass
 
 
 def load_manifest(ckpt_dir: str) -> dict:
