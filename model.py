@@ -117,7 +117,10 @@ class SmaulBrainModel(nn.Module):
         halted = torch.zeros(B, T, dtype=torch.bool, device=h.device)
         n_executed = 0
         for depth in range(self.cfg.max_depth):
-            h, attn, halt_logit, aux = self.block(h, attn, self._moe_fn(train, step))
+            h, attn, halt_logit, aux = self.block(
+                h, attn, self._moe_fn(train, step),
+                chunk_size=self.cfg.attention_chunk_size,
+            )
             aux_total = aux_total + aux  # keep router grad graph (training)
             lam = torch.sigmoid(halt_logit.float())  # [B, T]
             hs.append(h)
