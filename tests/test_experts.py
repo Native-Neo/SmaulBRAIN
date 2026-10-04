@@ -4,10 +4,10 @@ import sys, os, copy
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from smaulbrain.experts import ExpertPool, make_expert
-from smaulbrain.growth import grow_expert, recombine_weights, select_parents
-from smaulbrain.precision import dequantize_fp8_blockwise
-from smaulbrain.routing import SparseRouter
+from experts import ExpertPool, make_expert
+from growth import grow_expert, recombine_weights, select_parents
+from precision import dequantize_fp8_blockwise
+from routing import SparseRouter
 
 
 def _pool(n=3, d=16, h=32, seed=0):
@@ -19,7 +19,7 @@ def _pool(n=3, d=16, h=32, seed=0):
 
 
 def test_expert_size_explicit_and_512_target():
-    from smaulbrain.config import SmaulBrainConfig, expert_hidden_for_target
+    from config import SmaulBrainConfig, expert_hidden_for_target
     cfg = SmaulBrainConfig(d_model=512, expert_hidden=expert_hidden_for_target(512))
     assert abs(cfg.per_expert_params - 5_120_000) / 5_120_000 < 0.02
 
@@ -78,7 +78,7 @@ def test_recombine_is_parent_mean_plus_noise():
     pool = _pool()
     w = recombine_weights(pool, ["expert_00000", "expert_00001"],
                           weights=[0.5, 0.5], noise_std=0.0)
-    from smaulbrain.precision import dequantize_fp8_blockwise as dq
+    from precision import dequantize_fp8_blockwise as dq
     pa = dq(pool.experts["expert_00000"].weights_fp8["w_gate"]).float()
     pb = dq(pool.experts["expert_00001"].weights_fp8["w_gate"]).float()
     assert torch.allclose(w["w_gate"], (pa + pb) / 2, atol=1e-5)
