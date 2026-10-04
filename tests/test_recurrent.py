@@ -4,8 +4,8 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from smaulbrain.linear_attention import LinearAttnState
-from smaulbrain.recurrent import RecurrentState, SharedRecurrentBlock
+from linear_attention import LinearAttnState
+from recurrent import RecurrentState, SharedRecurrentBlock
 
 
 def _block(d=32, h=4):
