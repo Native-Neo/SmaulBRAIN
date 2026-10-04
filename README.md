@@ -678,6 +678,17 @@ print(smaulbrain.__version__)
 cfg = smaulbrain.SmaulBrainConfig(d_model=128)
 ```
 
+### What is `smaulopt.py`
+
+SmaulOpt, ported equation-for-equation from the verified SmaulNative
+implementation: momentum over `g`, second moment over `|g|` (not g²), bias
+correction, normalized update `u = m̂/(v̂+eps)`, decoupled weight decay.
+Two-D weights use factored row/col second moments (full matrix never
+materialized); state stores BF16 with FP32 math; global FP64 grad clipping
+with a non-finite skip. `SmaulOpt` splits LR groups (`step_trunk`,
+`step_router`, `step_expert`), and expert states live on the records so they
+follow experts across paging and die on pruning.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
