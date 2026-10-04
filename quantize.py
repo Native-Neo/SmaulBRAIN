@@ -13,6 +13,7 @@ within the checkpoint directory.
 from __future__ import annotations
 
 import os
+import tempfile
 
 import torch
 
@@ -21,15 +22,19 @@ from storage import EXPERT_NAMES, expert_from_payload, expert_to_payload, load_m
 
 def convert_expert_file(src: str, dst: str, to: str = "fp8", tile: int = 64) -> dict:
     """Convert one expert file independently. Returns a small conversion report."""
-    from precision import FP8BlockTensor, dequantize_fp8_blockwise, quantize_fp8_blockwise
+    from precision import dequantize_fp8_blockwise, quantize_fp8_blockwise
 
     rec = expert_from_payload(torch.load(src, map_location="cpu", weights_only=False))
     before = {n: rec.weights_fp8[n].nbytes() for n in EXPERT_NAMES}
     if to == "fp8":
         # Any source precision -> canonical FP8 block storage (also re-tiles).
+        max_err = 0.0
         for n in EXPERT_NAMES:
             full = dequantize_fp8_blockwise(rec.weights_fp8[n], dtype=torch.float32)
-            rec.weights_fp8[n] = quantize_fp8_blockwise(full, tile=tile)
+            new_t = quantize_fp8_blockwise(full, tile=tile)
+            max_err = max(max_err, float(
+                (dequantize_fp8_blockwise(new_t, dtype=torch.float32) - full).abs().max().item()))
+            rec.weights_fp8[n] = new_t
     elif to == "bf16":
         # Experts stay FP8 on disk per the precision policy (large
         # storage-heavy tensors); BF16 conversion applies to the trunk.
@@ -38,7 +43,6 @@ def convert_expert_file(src: str, dst: str, to: str = "fp8", tile: int = 64) -> 
     else:
         raise ValueError(f"unknown target {to}")
     os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-    import tempfile
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dst) or ".", prefix="tmp_quant_")
     os.close(fd)
     try:
@@ -48,16 +52,19 @@ def convert_expert_file(src: str, dst: str, to: str = "fp8", tile: int = 64) -> 
         if os.path.exists(tmp):
             os.remove(tmp)
     after = {n: rec.weights_fp8[n].nbytes() for n in EXPERT_NAMES}
-    return {"expert_id": rec.expert_id, "to": to,
-            "bytes_before": sum(before.values()), "bytes_after": sum(after.values())}
+    report = {"expert_id": rec.expert_id, "to": to,
+              "bytes_before": sum(before.values()), "bytes_after": sum(after.values())}
+    if to == "fp8":
+        report["max_abs_err"] = max_err
+    return report
 
 
 def convert_checkpoint(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[dict]:
-    """Convert every expert file in a checkpoint independently + trunk.
+    """Convert checkpoint precision without full-model residency.
 
-    Trunk FP32 -> BF16 casts dense weights; FP32 -> FP8 is refused for the
-    trunk (norms/accumulators must stay precise per the precision policy —
-    this refusal is intentional, not a missing feature).
+    ``to="fp8"`` requantizes/retile every expert file independently (the trunk
+    is untouched — FP8 trunk storage is refused per the precision policy).
+    ``to="bf16"`` casts trunk.pt/router.pt to BF16 (experts stay FP8).
     """
     manifest = load_manifest(ckpt_dir)
     reports = []
@@ -77,7 +84,6 @@ def convert_checkpoint(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[d
             if isinstance(obj, dict):
                 obj = {k: (v.to(torch.bfloat16) if torch.is_tensor(v) and v.is_floating_point() else v)
                        for k, v in obj.items()}
-                import tempfile
                 fd, tmp = tempfile.mkstemp(dir=ckpt_dir, prefix="tmp_quant_")
                 os.close(fd)
                 try:
