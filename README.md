@@ -423,6 +423,15 @@ print(res["paging"])   # disk reads / cache hits / evictions
 
 `temperature=0.0` is greedy; `top_k`/`top_p` shape sampling otherwise.
 
+### What is `kernels.py`
+
+The vectorized CPU hot paths plus the sparse-vs-dense study. `time_fn`
+benchmarks any callable (median/mean ms). `SparseTopKHead` is a fixed fan-in
+sparse alternative to the dense byte head, and `compare_heads` times both on
+CPU and reports the measured winner — dense wins ~30x at 256-byte vocab, so
+sparsity lives in expert routing, not token connections.
+`linear_attn_memory_bound` states the T-independent attention memory formula.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
