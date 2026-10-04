@@ -153,6 +153,7 @@ def run_training(
                     fp8_tile=cfg.fp8_tile,
                 )
                 log_fn(f"[grow] step={step} new={eid} pool={len(model.pool)}")
+            model.cfg.num_experts = len(model.pool)
         if prune_every and (step + 1) % prune_every == 0:
             victims = pruning_mod.find_victims(model.pool, step,
                                                survival_steps=cfg.prune_survival_steps,
@@ -160,6 +161,9 @@ def run_training(
                                                usage_threshold=cfg.prune_min_usage)
             if victims:
                 pruned = pruning_mod.prune_experts(model.pool, model.router, victims)
+                for eid in pruned:
+                    model.pager.forget(eid)
+                model.cfg.num_experts = len(model.pool)
                 log_fn(f"[prune] step={step} removed={pruned} pool={len(model.pool)}")
         if ckpt_dir and save_every and (step + 1) % save_every == 0:
             save_model(ckpt_dir, model, opt, step)
