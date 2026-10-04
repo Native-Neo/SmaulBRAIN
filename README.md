@@ -246,6 +246,14 @@ Tests, measurements, memory usage, and actual training results are more importan
 What each root-level module is and how to use it. Start with `config.py`:
 every other module is configured through `SmaulBrainConfig`.
 
+### What is `bytes.py`
+
+The core input representation: raw bytes are the tokens (ids 0–255), so any
+byte data works with no BPE/WordPiece vocabulary. Four structural specials
+(`<bos>`, `<eos>`, `<pad>`, `<sep>`, ids 256+) may bracket sequences but are
+skipped by byte decoding. Also owns `IncrementalByteDecoder`, which buffers
+split UTF-8 tails during streaming generation.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
