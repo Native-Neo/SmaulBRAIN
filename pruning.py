@@ -18,7 +18,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .precision import dequantize_fp8_blockwise
+from precision import dequantize_fp8_blockwise
 
 
 def dying_score(
