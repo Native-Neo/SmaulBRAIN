@@ -444,6 +444,15 @@ print(linear_attn_memory_bound(heads=4, head_dim=8))  # bytes, T-independent
 
 Native C++ equivalents live in `kernels_cpp/` (`g++ -O2 -std=c++17 -c`).
 
+### What is `linear_attention.py`
+
+Genuine linear attention — no QKᵀ matrix, ever. With the ELU+1 feature map,
+each step does a rank-1 outer-product update into the recurrent state
+(`S += φ(k)ᵀv`, `z += φ(k)`) and reads `y = φ(q)ᵀS / (φ(q)ᵀz + eps)`: O(T·Dh²)
+time and O(Dh²) memory, causal by construction. `LinearAttnState` is the
+streamable (S, z) pair; `linear_attn_forward` folds a chunk, `linear_attn_step`
+advances one token, and both agree exactly (tested).
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
