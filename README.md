@@ -254,6 +254,21 @@ byte data works with no BPE/WordPiece vocabulary. Four structural specials
 skipped by byte decoding. Also owns `IncrementalByteDecoder`, which buffers
 split UTF-8 tails during streaming generation.
 
+### How to use `bytes.py`
+
+```python
+from bytes import encode_text, decode_text, decode_bytes, IncrementalByteDecoder
+
+ids = encode_text("hi ✓")      # UTF-8 bytes -> ids, e.g. [104, 105, 32, 226, 156, 147]
+text = decode_text(ids)        # ids -> str (invalid UTF-8 -> replacement char)
+raw = decode_bytes(ids)        # ids -> bytes, specials (>=256) skipped
+
+dec = IncrementalByteDecoder()
+for chunk in [[104], [105]]:
+    print(dec.feed(chunk), end="")  # emits decodable prefix, buffers split tails
+print(dec.flush())
+```
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
