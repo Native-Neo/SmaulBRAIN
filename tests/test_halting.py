@@ -31,14 +31,16 @@ def test_low_threshold_halts_earlier_than_high():
     ids = torch.randint(0, 256, (2, 16))
     m1 = _model(min_depth=1, max_depth=4, halting_threshold=0.05)
     m2 = _model(min_depth=1, max_depth=4, halting_threshold=0.999)
-    # Same weights, different thresholds: compare executed steps.
+    # Same weights, different thresholds: per-token selected depths must
+    # reflect the threshold (inference runs full depth for state completeness
+    # but selects each token's halting-depth representation).
     m2.load_state_dict({k: v.clone() for k, v in m1.state_dict().items()
                         if not k.startswith("router.")} |
                        {k: v for k, v in m2.state_dict().items()
                         if k.startswith("router.")}, strict=False)
-    e1 = m1.forward_infer(ids)["n_executed"]
-    e2 = m2.forward_infer(ids)["n_executed"]
-    assert e1 <= e2
+    d1 = m1.forward_infer(ids)["depths"].float().mean().item()
+    d2 = m2.forward_infer(ids)["depths"].float().mean().item()
+    assert d1 < d2, f"threshold had no effect on selected depth: {d1} vs {d2}"
     m1.pager.close(); m2.pager.close()
 
 
