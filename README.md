@@ -563,6 +563,20 @@ looser usage bar, so load-bearing twins survive. `prune_experts` removes
 weights, optimizer state, router row, and metadata together, highest index
 first, keeping checkpoints index-consistent.
 
+### How to use `pruning.py`
+
+```python
+from pruning import find_victims, prune_experts
+
+victims = find_victims(pool, step=1000, survival_steps=500,
+                       min_experts=2, usage_threshold=1e-4)
+if victims:
+    print(prune_experts(pool, router, victims))  # weights+state+row+meta gone
+```
+
+In training, schedule it with `run_training(..., prune_every=500)` or the
+CLI `--prune-every 500` (never below `min_experts`).
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
