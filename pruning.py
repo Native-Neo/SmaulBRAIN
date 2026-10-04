@@ -46,8 +46,14 @@ def find_victims(
     min_experts: int = 1,
     usage_threshold: float = 1e-4,
     redundancy_cos: float = 0.995,
+    redundancy_usage_mult: float = 10.0,
 ) -> list[str]:
-    """Rank prune candidates (stable id order). Never returns > len-min_experts."""
+    """Rank prune candidates (stable id order). Never returns > len-min_experts.
+
+    The redundancy pass uses a looser usage bar (``usage_threshold * mult``):
+    near-duplicates that still carry real traffic are capacity, not waste,
+    and must survive.
+    """
     total = sum(r.tokens_routed for r in pool.experts.values())
     victims: list[str] = []
     for eid in sorted(pool.experts):
@@ -63,16 +69,21 @@ def find_victims(
     if redundancy_cos < 1.0:
         ids = sorted(pool.experts)
         seen = set(victims)
+        loose = usage_threshold * redundancy_usage_mult
         for i, a in enumerate(ids):
             if a in seen:
                 continue
-            ga = dequantize_fp8_blockwise(pool.experts[a].weights_fp8["w_gate"]).float().flatten()
+            rec_a = pool.experts[a]
+            share_a = rec_a.tokens_routed / max(1, total)
+            if share_a >= loose or (step - rec_a.birth_step) < survival_steps:
+                continue  # load-bearing or young: twins are capacity, not waste
+            ga = dequantize_fp8_blockwise(rec_a.weights_fp8["w_gate"]).float().flatten()
             for b in ids[:i]:
                 if b in seen:
                     continue
                 gb = dequantize_fp8_blockwise(pool.experts[b].weights_fp8["w_gate"]).float().flatten()
                 cos = F.cosine_similarity(ga, gb, dim=0).item()
-                if cos > redundancy_cos and (step - pool.experts[a].birth_step) >= survival_steps:
+                if cos > redundancy_cos:
                     victims.append(a)
                     seen.add(a)
                     break
