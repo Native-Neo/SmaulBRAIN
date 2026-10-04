@@ -88,7 +88,7 @@ class SmaulBrainConfig:
         assert 0.0 < self.halt_prior < 1.0, "halt prior in (0,1)"
         assert 1 <= self.top_k <= self.num_experts, "need 1 <= top_k <= experts"
         assert self.num_experts >= 1 and self.max_experts >= self.num_experts
-        assert self.min_experts >= 1 and self.min_experts <= self.num_experts
+        assert self.min_experts >= self.top_k and self.min_experts <= self.num_experts
         assert self.paging_method in ("D2R", "R2VR", "D2VR"), "bad paging method"
         assert self.ram_cache >= 1 and self.vram_cache >= 1, "caches need >= 1 slot"
         assert self.dtype in ("bf16", "fp32"), "compute dtype bf16|fp32"
