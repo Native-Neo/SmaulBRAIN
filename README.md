@@ -541,6 +541,18 @@ transient. `PRECISION_POLICY` maps each component to its storage/compute
 dtype (FP8 weights, BF16 activations/state, FP32 stats/math), and
 `compute_dtype` resolves it in code.
 
+### How to use `precision.py`
+
+```python
+from precision import quantize_fp8_blockwise, dequantize_fp8_blockwise, compute_dtype
+import torch
+
+t = quantize_fp8_blockwise(weight_fp32, tile=64)
+print(t.codes.dtype, t.scales.shape)  # uint8 bytes + one FP32 scale per block
+w = dequantize_fp8_blockwise(t, dtype=torch.bfloat16)
+print(compute_dtype("activations"))   # torch.bfloat16 per PRECISION_POLICY
+```
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
