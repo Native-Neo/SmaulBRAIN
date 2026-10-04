@@ -508,6 +508,15 @@ inf = model.forward_infer(ids)      # no grad, early halting
 print(model.param_counts())         # dynamic counts incl. resident splits
 ```
 
+### What is `paging.py`
+
+`ExpertPager`: three genuinely different execution paths — D2R (disk→RAM
+compute cache), R2VR (disk→RAM staging, then RAM→VRAM per use), D2VR
+(disk→VRAM direct, RAM bypassed) — with LRU cache caps, per-path counters
+that prove which route executed, thread-safe fetches, background `prefetch`
+of predicted experts, and `invalidate` after optimizer rewrites. Optimizer
+state lives on the record, so it follows the expert, never a cache slot.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
