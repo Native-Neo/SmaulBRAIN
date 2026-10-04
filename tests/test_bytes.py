@@ -3,7 +3,7 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from smaulbrain.bytes import (
+from bytes import (
     IncrementalByteDecoder, decode_bytes, decode_text, encode_bytes,
     encode_text, with_bos, with_eos, BOS_ID, EOS_ID, PAD_ID, BYTE_VOCAB,
 )
