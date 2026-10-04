@@ -4,11 +4,11 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from smaulbrain.precision import (
+from precision import (
     PRECISION_POLICY, compute_dtype, dequantize_fp8_blockwise,
     dequantize_fp8_row_block, quantize_fp8_blockwise,
 )
-from smaulbrain.smaulopt import SmaulOpt, SmaulOptHParams, init_state, smaul_update
+from smaulopt import SmaulOpt, SmaulOptHParams, init_state, smaul_update
 
 
 def test_fp8_storage_not_relabeled_fp32():
