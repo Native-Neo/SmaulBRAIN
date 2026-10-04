@@ -358,6 +358,22 @@ independent of router index and cache slot. `make_expert` builds records,
 tokens batched per expert (one SwiGLU matmul per active expert) with routing
 weights, tracking per-expert usage as it goes.
 
+### How to use `experts.py`
+
+```python
+from experts import ExpertPool, make_expert
+
+pool = ExpertPool()
+pool.add(make_expert(pool.fresh_id(), d_model=128, expert_hidden=256))
+print(pool.order)                       # ['expert_00000', ...] (stable ids)
+print(pool.experts['expert_00000'].param_count)
+
+# Weighted combination over a routing plan (provider = paging layer):
+out = pool.forward(x, plan.top_ids, plan.top_weights, plan.dropped,
+                   provider=pager.provider, step=step)
+print(pool.usage_snapshot())            # per-expert tokens/activity/parents
+```
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
