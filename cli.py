@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--active-experts", type=int, default=2, dest="top_k",
                    help="Top-k routed experts per token (active working set).")
     p.add_argument("--max-experts", type=int, default=64, help="Expert pool ceiling.")
-    p.add_argument("--min-experts", type=int, default=1, help="Expert pool floor.")
+    p.add_argument("--min-experts", type=int, default=2, help="Expert pool floor.")
     # --- adaptive depth ---
     p.add_argument("--max-depth", type=int, default=4, help="Max recurrent applications.")
     p.add_argument("--min-depth", type=int, default=1, help="Min recurrent applications.")
