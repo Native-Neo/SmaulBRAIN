@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import torch
 
-from .bytes import IncrementalByteDecoder, decode_text, encode_text
+from bytes import IncrementalByteDecoder, decode_text, encode_text
 
 
 def sample_next(logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0,
