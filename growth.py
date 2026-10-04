@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import torch
 
-from .experts import ExpertPool, init_expert_optim_state, make_expert
-from .precision import dequantize_fp8_blockwise
+from experts import ExpertPool, init_expert_optim_state, make_expert
+from precision import dequantize_fp8_blockwise
 
 
 def select_parents(pool: ExpertPool, k: int = 2) -> list[str]:
