@@ -453,6 +453,19 @@ time and O(Dh²) memory, causal by construction. `LinearAttnState` is the
 streamable (S, z) pair; `linear_attn_forward` folds a chunk, `linear_attn_step`
 advances one token, and both agree exactly (tested).
 
+### How to use `linear_attention.py`
+
+```python
+from linear_attention import LinearAttnState, linear_attn_forward, linear_attn_step
+
+out, state = linear_attn_forward(q, k, v)  # [B, H, T, Dh] + terminal state
+print(state.nbytes())                      # constant in T (no quadratic growth)
+
+st = LinearAttnState.zeros(B, H, Dh, device=q.device)
+for t in range(T):                         # incremental inference, O(1)/step
+    y, st = linear_attn_step(st, q[:, :, t], k[:, :, t], v[:, :, t])
+```
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
