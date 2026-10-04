@@ -586,6 +586,19 @@ checkpoint, or casts trunk/router to BF16. FP8 trunk storage is refused on
 purpose (norms and accumulators stay precise per the precision policy);
 experts stay FP8 on disk by the same policy.
 
+### How to use `quantize.py`
+
+```python
+from quantize import convert_expert_file, convert_checkpoint
+
+print(convert_expert_file("ckpt/experts/expert_00000.pt",
+                          "ckpt/experts/expert_00000.pt",
+                          to="fp8", tile=32))  # retile + error report
+convert_checkpoint("ckpt", to="bf16")          # trunk/router -> BF16
+```
+
+Or via CLI: `python main.py --ckpt ckpt quantize --to fp8`.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
