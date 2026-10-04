@@ -517,6 +517,21 @@ that prove which route executed, thread-safe fetches, background `prefetch`
 of predicted experts, and `invalidate` after optimizer rewrites. Optimizer
 state lives on the record, so it follows the expert, never a cache slot.
 
+### How to use `paging.py`
+
+```python
+from paging import ExpertPager
+
+pager = ExpertPager(pool, mode="D2R", ram_cache=8, vram_cache=4)
+if pager.mode == "R2VR":
+    pager.warm_ram()                 # bulk disk->RAM staging at startup
+w = pager.provider("expert_00003")   # mode-specific fetch of compute weights
+pager.prefetch(["expert_00004"])     # async load while current expert computes
+pager.await_prefetch()
+pager.invalidate("expert_00003")     # after its optimizer step
+print(pager.stats.to_dict())         # disk_reads/hits/evictions per path
+```
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
