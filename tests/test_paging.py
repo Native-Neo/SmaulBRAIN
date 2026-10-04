@@ -3,7 +3,6 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import pytest
 import torch
 from smaulbrain.experts import ExpertPool, make_expert
 from smaulbrain.paging import ExpertPager
@@ -34,17 +33,21 @@ def test_d2r_disk_to_ram_never_vram():
     pg.close()
 
 
-def test_r2vr_requires_ram_staging_and_avoids_disk():
+def test_r2vr_stages_through_ram_never_direct_to_vram():
     pool = _pool()
     pg = ExpertPager(pool, mode="R2VR", vram_cache=2, load_from_disk=_counting(pool))
-    with pytest.raises(RuntimeError):
-        pg.provider(pool.order[0])
-    reads_before = pg.stats.disk_reads
-    pg.warm_ram()  # the only disk path in R2VR
-    assert pg.stats.disk_reads == reads_before + 4
+    pg.warm_ram()  # bulk staging: the only prefetch-free disk path at startup
+    assert pg.stats.disk_reads == 4 and pg.stats.ram_loads == 4
     pg.provider(pool.order[0]); pg.provider(pool.order[0])
-    assert pg.stats.disk_reads == reads_before + 4  # get() adds zero disk reads
     assert pg.stats.vram_loads == 1 and pg.stats.vram_hits == 1
+    # Post-growth expert (never warmed): staged disk -> RAM -> VRAM on demand.
+    from smaulbrain.experts import make_expert
+    rec = make_expert("expert_00099", 16, 32)
+    pool.add(rec)
+    d0, r0 = pg.stats.disk_reads, pg.stats.ram_loads
+    pg.provider("expert_00099")
+    assert pg.stats.disk_reads == d0 + 1 and pg.stats.ram_loads == r0 + 1
+    assert pg.stats.vram_loads == 2 and len(pg.ram) == 0  # RAM compute cache bypassed
     pg.close()
 
 
