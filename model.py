@@ -231,6 +231,57 @@ class SmaulBrainModel(nn.Module):
         return {"logits": logits, "depths": depths, "n_executed": n_executed,
                 "halt_probs": [l.detach() for l in lams]}
 
+    def new_infer_state(self, batch: int = 1) -> list[LinearAttnState]:
+        """Create the fixed-size per-depth attention state for streaming."""
+        dev = self.embed.weight.device
+        return [
+            LinearAttnState.zeros(
+                batch, self.cfg.n_heads, self.cfg.d_model // self.cfg.n_heads,
+                device=dev
+            )
+            for _ in range(self.cfg.max_depth)
+        ]
+
+    @torch.no_grad()
+    def forward_infer_stateful(
+        self,
+        ids: torch.Tensor,
+        attn_states: list[LinearAttnState] | None = None,
+        step: int = 0,
+    ) -> tuple[dict, list[LinearAttnState]]:
+        """Process a prompt/chunk and return its updated recurrent states."""
+        compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
+        B, _T = ids.shape
+        h = self.n_init(self.embed(ids).to(compute))
+        if attn_states is None:
+            attn_states = self.new_infer_state(B)
+        if len(attn_states) != self.cfg.max_depth:
+            raise ValueError("attention state depth does not match model max_depth")
+        hs, lams, _aux, depths, n_executed = self._depth_loop(
+            h, attn_states, train=False, step=step
+        )
+        logits = self.head(self.n_final(hs[-1])).float()
+        return {
+            "logits": logits,
+            "depths": depths,
+            "n_executed": n_executed,
+            "halt_probs": [l.detach() for l in lams],
+        }, attn_states
+
+    @torch.no_grad()
+    def forward_infer_step(
+        self,
+        ids: torch.Tensor,
+        attn_states: list[LinearAttnState],
+        step: int = 0,
+    ) -> tuple[dict, list[LinearAttnState]]:
+        """Process one or more new tokens using persistent per-depth state."""
+        if ids.ndim == 1:
+            ids = ids.unsqueeze(1)
+        if ids.ndim != 2 or ids.shape[1] != 1:
+            raise ValueError("forward_infer_step expects [B] or [B, 1]")
+        return self.forward_infer_stateful(ids, attn_states=attn_states, step=step)
+
     # -- parameter accounting (dynamic topology) --
     def param_counts(self) -> dict:
         per_expert = self.pool.experts[self.pool.order[0]].param_count if len(self.pool) else 0
