@@ -24,8 +24,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--experts", type=int, default=4, dest="num_experts",
                    help="Initial dynamic expert count.")
     p.add_argument("--expert-size", type=int, default=None, dest="expert_size",
-                   help="Expert hidden dim. Default targets ~5.12M params/expert "
-                        "at d-model 512 (3328); scales with d-model otherwise.")
+                   help="Expert hidden dim. Omitted: 3328 at d-model 512 "
+                        "(~=5.12M params/expert); 256 at the d-model 128 default "
+                        "(test-scale, keeps CPU runs fast).")
     p.add_argument("--active-experts", type=int, default=2, dest="top_k",
                    help="Top-k routed experts per token (active working set).")
     p.add_argument("--max-experts", type=int, default=64, help="Expert pool ceiling.")
@@ -61,6 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--mode", type=str, default="entire",
                    choices=["entire", "trunk", "experts", "selected", "new"],
                    help="Fine-tuning selector: which groups move.")
+    t.add_argument("--selected", type=str, default=None,
+                   help="Comma-separated expert ids for --mode selected.")
+    t.add_argument("--new-since", type=int, default=0,
+                   help="Birth-step cutoff for --mode new.")
     t.add_argument("--data", type=str, default=None,
                    help="Text file for training bytes (default: synthetic demo).")
     t.add_argument("--save-every", type=int, default=0, help="Checkpoint every N steps (0=off).")
@@ -139,6 +144,8 @@ def main(argv: list[str] | None = None) -> int:
             seqs = _demo_seqs()
         res = run_training(model, opt, cfg, seqs, steps=args.steps,
                            batch_size=args.batch, mode=args.mode,
+                           selected=args.selected.split(",") if args.selected else None,
+                           new_since_step=args.new_since,
                            ckpt_dir=args.ckpt if args.save_every else None,
                            save_every=args.save_every,
                            grow_every=args.grow_every,
