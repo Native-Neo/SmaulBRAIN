@@ -2,7 +2,8 @@
 
 Policy (best precision per component, no giant hidden FP32 master copy):
   FP8  - expert weights, large projection weights (storage; blockwise scaled)
-  BF16 - activations, recurrent state, optimizer-state storage
+  BF16 - activations, optimizer-state storage
+  FP32 - recurrent attention state
   FP32 - norm statistics, accumulators, loss, optimizer math, scales,
          routing/halting statistics
 
@@ -95,7 +96,7 @@ PRECISION_POLICY: dict[str, tuple[str, str]] = {
     "expert_weights": ("fp8", "bf16"),
     "large_projections": ("fp8", "bf16"),
     "activations": ("bf16", "bf16"),
-    "recurrent_state": ("bf16", "bf16"),
+    "recurrent_state": ("fp32", "fp32"),
     "optimizer_state": ("bf16", "fp32"),
     "norm_stats": ("fp32", "fp32"),
     "loss": ("fp32", "fp32"),
