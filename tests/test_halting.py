@@ -52,8 +52,8 @@ def test_ponder_distribution_sums_to_one():
 
 
 def test_halting_stable_during_training_step():
-    from smaulbrain.smaulopt import SmaulOpt, SmaulOptHParams
-    from smaulbrain.train import train_step
+    from smaulopt import SmaulOpt, SmaulOptHParams
+    from train import train_step
     torch.manual_seed(0)
     m = _model(min_depth=1, max_depth=3)
     opt = SmaulOpt(SmaulOptHParams())
