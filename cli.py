@@ -132,6 +132,9 @@ def main(argv: list[str] | None = None) -> int:
                                    state_dtype=cfg.state_dtype))
     if os.path.exists(os.path.join(args.ckpt, "manifest.json")):
         load_model(args.ckpt, model, opt)
+        # The checkpoint is authoritative for all runtime configuration that
+        # does not change tensor shapes; use it for the resumed run.
+        cfg = model.cfg
 
     if args.cmd == "train":
         from train import run_training
@@ -154,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
                           "retention": res["retention"],
                           "experts": len(model.pool)}, indent=2))
         if args.save_every == 0:
-            save_model(args.ckpt, model, opt, args.steps)
+            save_model(args.ckpt, model, opt, int(getattr(model, "_resume_step", -1)))
     elif args.cmd == "infer":
         res = generate(model, encode_text(args.prompt), max_new=args.max_new,
                        temperature=args.temperature, context=cfg.context_length,
