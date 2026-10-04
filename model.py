@@ -226,7 +226,7 @@ class SmaulBrainModel(nn.Module):
             for _ in range(self.cfg.max_depth)
         ]
         hs, lams, _aux, depths, n_executed = self._depth_loop(
-            h, attn_states, train=False, step=step, early_exit=False
+            h, attn_states, train=False, step=step
         )
         logits = self.head(self.n_final(hs[-1])).float()
         return {"logits": logits, "depths": depths, "n_executed": n_executed,
@@ -259,7 +259,7 @@ class SmaulBrainModel(nn.Module):
         if len(attn_states) != self.cfg.max_depth:
             raise ValueError("attention state depth does not match model max_depth")
         hs, lams, _aux, depths, n_executed = self._depth_loop(
-            h, attn_states, train=False, step=step
+            h, attn_states, train=False, step=step, early_exit=False
         )
         logits = self.head(self.n_final(hs[-1])).float()
         return {
