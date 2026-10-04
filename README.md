@@ -651,6 +651,18 @@ usage/admission counters feed growth and pruning, and `add/remove_expert_row`
 keep router rows aligned with pool ids (preserving dtype) as the topology
 changes.
 
+### How to use `routing.py`
+
+```python
+from routing import SparseRouter
+
+router = SparseRouter(d_model=128, num_experts=8, top_k=2, capacity_factor=1.5)
+plan = router.route(x)                    # [N, D] -> top_ids/weights/dropped/probs
+aux = router.balance_loss(plan.probs)     # add moe_balance_weight * aux to loss
+print(router.usage_share())               # FP64-backed traffic distribution
+router.add_expert_row()                   # after growth (dtype preserved)
+```
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
