@@ -18,8 +18,8 @@ from typing import Callable
 import torch
 import torch.nn as nn
 
-from .linear_attention import LinearAttnState
-from .rmsnorm import RMSNorm
+from linear_attention import LinearAttnState
+from rmsnorm import RMSNorm
 
 
 @dataclass
