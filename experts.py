@@ -20,7 +20,7 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from .precision import FP8BlockTensor, dequantize_fp8_blockwise, quantize_fp8_blockwise
+from precision import FP8BlockTensor, dequantize_fp8_blockwise, quantize_fp8_blockwise
 
 
 def expert_param_count(d_model: int, expert_hidden: int) -> int:
