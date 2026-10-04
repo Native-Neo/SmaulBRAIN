@@ -122,7 +122,9 @@ def run_training(
         old_before = evaluate_loss(model, batch_from_seqs(old_seqs, cfg.context_length), cfg.context_length)
     hist: list[dict] = []
     n = max(1, len(train_seqs))
-    for step in range(steps):
+    start_step = int(getattr(model, "_resume_step", -1)) + 1
+    for local_step in range(steps):
+        step = start_step + local_step
         batch_seqs = [train_seqs[(step * batch_size + i) % n] for i in range(batch_size)]
         if replay is not None and replay_n > 0:
             for s in train_seqs[(step * batch_size) % n : (step * batch_size) % n + 1]:
@@ -149,6 +151,7 @@ def run_training(
                 log_fn(f"[prune] step={step} removed={pruned} pool={len(model.pool)}")
         if ckpt_dir and save_every and (step + 1) % save_every == 0:
             save_model(ckpt_dir, model, opt, step)
+            model._resume_step = step
     report = None
     if old_seqs and old_before is not None:
         old_after = evaluate_loss(model, batch_from_seqs(old_seqs, cfg.context_length), cfg.context_length)
