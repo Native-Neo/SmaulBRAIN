@@ -157,6 +157,8 @@ def run_training(
         if ckpt_dir and save_every and (step + 1) % save_every == 0:
             save_model(ckpt_dir, model, opt, step)
             model._resume_step = step
+    if hist:
+        model._resume_step = int(hist[-1]["step"])
     report = None
     if old_seqs and old_before is not None:
         old_after = evaluate_loss(model, batch_from_seqs(old_seqs, cfg.context_length), cfg.context_length)
