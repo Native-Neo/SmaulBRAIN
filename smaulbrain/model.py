@@ -61,8 +61,9 @@ class SmaulBrainModel(nn.Module):
             for mod in (self.embed, self.block.qkv, self.block.o_proj,
                         self.block.halt, self.head, self.router.proj):
                 mod.to(torch.bfloat16)
-        # Active expert leaves (training): eid -> dequantized leaf weights w/ grad.
-        self._leaves: dict[str, dict[str, torch.Tensor]] = {}
+        # Active expert leaves (training): eid -> list of leaf weight dicts
+        # (one entry per depth-step activation; grads are summed at opt time).
+        self._leaves: dict[str, list[dict[str, torch.Tensor]]] = {}
         self._last_step: int = 0
 
     # -- MoE wiring --
@@ -70,7 +71,7 @@ class SmaulBrainModel(nn.Module):
         base = self.pager.provider(expert_id)
         leaves = {k: v.detach().to(base[k].dtype).requires_grad_(True)
                   for k, v in base.items()}
-        self._leaves[expert_id] = leaves
+        self._leaves.setdefault(expert_id, []).append(leaves)
         return leaves
 
     def _eval_provider(self, expert_id: str) -> dict[str, torch.Tensor]:
@@ -85,6 +86,24 @@ class SmaulBrainModel(nn.Module):
             aux = self.router.balance_loss(plan.probs)
             return y, aux, plan.top_ids
         return fn
+
+    def take_expert_grads(self) -> dict[str, dict[str, torch.Tensor]]:
+        """Sum leaf grads per expert across depth-step copies; clear the buffer.
+
+        Returns eid -> {wname: summed grad or None}. Call after loss.backward().
+        """
+        agg: dict[str, dict[str, torch.Tensor]] = {}
+        for eid, copies in self._leaves.items():
+            summed: dict[str, torch.Tensor] = {}
+            for leaves in copies:
+                for n, leaf in leaves.items():
+                    if leaf.grad is None:
+                        continue
+                    g = leaf.grad.detach().float()
+                    summed[n] = g if n not in summed else summed[n] + g
+            agg[eid] = summed
+        self._leaves = {}
+        return agg
 
     # -- adaptive depth loop --
     def _depth_loop(self, h: torch.Tensor, attn: LinearAttnState, train: bool, step: int):
