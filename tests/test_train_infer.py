@@ -85,3 +85,17 @@ def test_cli_train_then_infer_then_quantize(tmp_path):
         [sys.executable, "main.py", "--ckpt", ckpt, "quantize", "--to", "fp8"],
         capture_output=True, text=True, cwd=ROOT)
     assert r.returncode == 0, r.stderr
+
+
+def test_streaming_inference_matches_full_causal_pass():
+    m, _, _ = _model()
+    ids = torch.tensor([[10, 20, 30, 40, 50, 60]])
+    full, _ = m.forward_infer_stateful(ids)
+    states = m.new_infer_state(1)
+    parts = []
+    for token in ids[0]:
+        out, states = m.forward_infer_step(token.view(1), states)
+        parts.append(out["logits"])
+    streamed = torch.cat(parts, dim=1)
+    assert torch.allclose(full["logits"], streamed, atol=2e-5, rtol=2e-5)
+    m.pager.close()
