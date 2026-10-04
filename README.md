@@ -280,6 +280,21 @@ path and one checkpoint format. Training flags cover architecture (`--d-model`,
 `--trunk-lr-mult`), and runtime (`--context-length`, `--threads`, `--dtype`,
 `--seed`, `--ckpt`).
 
+### How to use `cli.py`
+
+```bash
+python main.py --d-model 32 --experts 2 --expert-size 64 --active-experts 1 \
+  --max-depth 1 --context-length 64 --ckpt ckpt/demo train --steps 20 --batch 2
+
+python main.py --ckpt ckpt/demo infer --prompt "hello" --max-new 32 --temperature 0.0
+python main.py --ckpt ckpt/demo report            # dynamic parameter counts
+python main.py --ckpt ckpt/demo quantize --to fp8 # requantize experts
+```
+
+Fine-tuning selectors: `--mode trunk|experts|selected|new`, with
+`--selected expert_00001,expert_00002` or `--new-since <step>`, plus
+`--grow-every N` / `--prune-every N` schedules.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
