@@ -106,7 +106,13 @@ class SmaulBrainModel(nn.Module):
         return agg
 
     # -- adaptive depth loop --
-    def _depth_loop(self, h: torch.Tensor, attn: LinearAttnState, train: bool, step: int):
+    def _depth_loop(
+        self,
+        h: torch.Tensor,
+        attn_states: list[LinearAttnState],
+        train: bool,
+        step: int,
+    ):
         """Run the shared block; return per-step (h, halt_prob, aux) + depths."""
         B, T, _D = h.shape
         hs: list[torch.Tensor] = []
@@ -117,8 +123,8 @@ class SmaulBrainModel(nn.Module):
         halted = torch.zeros(B, T, dtype=torch.bool, device=h.device)
         n_executed = 0
         for depth in range(self.cfg.max_depth):
-            h, attn, halt_logit, aux = self.block(
-                h, attn, self._moe_fn(train, step),
+            h, attn_states[depth], halt_logit, aux = self.block(
+                h, attn_states[depth], self._moe_fn(train, step),
                 chunk_size=self.cfg.attention_chunk_size,
             )
             aux_total = aux_total + aux  # keep router grad graph (training)
@@ -167,10 +173,16 @@ class SmaulBrainModel(nn.Module):
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
         h = self.n_init(self.embed(ids).to(compute))
-        attn = LinearAttnState.zeros(B, self.cfg.n_heads, self.cfg.d_model // self.cfg.n_heads)
-        attn.S = attn.S.to(h.device)
-        attn.z = attn.z.to(h.device)
-        hs, lams, aux, depths, n_executed = self._depth_loop(h, attn, train=True, step=step)
+        attn_states = [
+            LinearAttnState.zeros(
+                B, self.cfg.n_heads, self.cfg.d_model // self.cfg.n_heads,
+                device=h.device
+            )
+            for _ in range(self.cfg.max_depth)
+        ]
+        hs, lams, aux, depths, n_executed = self._depth_loop(
+            h, attn_states, train=True, step=step
+        )
         P, kl = self._ponder([l.float() for l in lams])
         if targets is None:
             logits = self.head(self.n_final(hs[-1])).float()
@@ -205,10 +217,16 @@ class SmaulBrainModel(nn.Module):
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
         h = self.n_init(self.embed(ids).to(compute))
-        attn = LinearAttnState.zeros(B, self.cfg.n_heads, self.cfg.d_model // self.cfg.n_heads)
-        attn.S = attn.S.to(h.device)
-        attn.z = attn.z.to(h.device)
-        hs, lams, _aux, depths, n_executed = self._depth_loop(h, attn, train=False, step=step)
+        attn_states = [
+            LinearAttnState.zeros(
+                B, self.cfg.n_heads, self.cfg.d_model // self.cfg.n_heads,
+                device=h.device
+            )
+            for _ in range(self.cfg.max_depth)
+        ]
+        hs, lams, _aux, depths, n_executed = self._depth_loop(
+            h, attn_states, train=False, step=step
+        )
         logits = self.head(self.n_final(hs[-1])).float()
         return {"logits": logits, "depths": depths, "n_executed": n_executed,
                 "halt_probs": [l.detach() for l in lams]}
