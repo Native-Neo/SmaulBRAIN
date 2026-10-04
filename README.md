@@ -725,6 +725,15 @@ rec = load_expert_file("ckpt/run1/experts/expert_00002.pt")  # no full load
 loader = make_disk_loader("ckpt/run1")                       # pager wiring
 ```
 
+### What is `train.py`
+
+One training loop for training and fine-tuning (a mode, not a separate
+model). `train_step` runs forward → backward → mode-gated SmaulOpt updates:
+`entire` moves everything, `trunk` freezes experts, `experts` freezes the
+trunk, `selected` steps listed ids, `new` steps experts born after a cutoff.
+`run_training` adds replay interleaving, growth/pruning schedules,
+periodic checkpointing, and before/after retention measurement.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
