@@ -6,8 +6,8 @@
         otherwise explicitly tagged CPU-side VRAM simulation)
 
   D2R:  disk -> RAM; compute reads the RAM cache. VRAM is never touched.
-  R2VR: disk -> RAM (bulk ``warm_ram`` first), then RAM -> VRAM per use;
-        ``get`` refuses disk reads — everything must flow through RAM.
+  R2VR: disk -> RAM (bulk ``warm_ram`` at startup, on-demand staging after),
+        then RAM -> VRAM per use; VRAM is only ever fed from staged RAM.
   D2VR: disk -> VRAM directly, bypassing RAM; the RAM cache stays empty.
 
 Mode-specific counters prove which path executed (tests assert this).
@@ -22,7 +22,9 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+import threading
 
 import torch
 
@@ -69,6 +71,7 @@ class ExpertPager:
         self.vram: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
         self.ram_records: dict = {}  # R2VR staging area: disk-loaded records
         self.stats = PagingStats()
+        self._lock = threading.Lock()  # prefetch thread vs mutating main thread
         self._exec = ThreadPoolExecutor(max_workers=1)
         self._pending: dict[str, Future] = {}
         self._prefetched: set[str] = set()
@@ -95,17 +98,23 @@ class ExpertPager:
     # -- public API --
     def provider(self, expert_id: str) -> dict[str, torch.Tensor]:
         """WeightProvider for ExpertPool.forward: mode-specific fetch."""
-        if self.mode == "D2R":
-            return self._get_d2r(expert_id)
-        if self.mode == "R2VR":
-            return self._get_r2vr(expert_id)
-        return self._get_d2vr(expert_id)
+        with self._lock:
+            if self.mode == "D2R":
+                return self._get_d2r(expert_id)
+            if self.mode == "R2VR":
+                return self._get_r2vr(expert_id)
+            return self._get_d2vr(expert_id)
 
     def invalidate(self, expert_id: str) -> None:
-        """Drop cached compute weights after an optimizer rewrite."""
+        """Drop cached compute weights after an optimizer rewrite.
+
+        The RAM stage keeps pointing at the pool's live record (updated in
+        place by the optimizer) instead of re-reading a stale disk file.
+        """
         self.ram.pop(expert_id, None)
         self.vram.pop(expert_id, None)
-        self.ram_records.pop(expert_id, None)
+        if expert_id in self.ram_records:
+            self.ram_records[expert_id] = self.pool.experts[expert_id]
 
     # -- D2R: disk -> RAM --
     def _get_d2r(self, expert_id: str) -> dict[str, torch.Tensor]:
@@ -124,7 +133,11 @@ class ExpertPager:
 
     # -- R2VR: RAM -> VRAM (disk only via warm_ram) --
     def warm_ram(self) -> None:
-        """Stage expert records from disk into RAM. The only disk path in R2VR."""
+        """Bulk-stage expert records from disk into RAM at startup.
+
+        Later misses stage on demand through the same disk -> RAM path;
+        VRAM is only ever fed from staged RAM records, never from disk.
+        """
         for eid in self.pool.order:
             rec = self._read_disk(eid)
             self.stats.ram_loads += 1
