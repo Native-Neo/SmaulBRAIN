@@ -226,11 +226,23 @@ class SmaulBrainModel(nn.Module):
             for _ in range(self.cfg.max_depth)
         ]
         hs, lams, _aux, depths, n_executed = self._depth_loop(
-            h, attn_states, train=False, step=step
+            h, attn_states, train=False, step=step, early_exit=False
         )
-        logits = self.head(self.n_final(hs[-1])).float()
+        selected_h = self._select_depth_hidden(hs, depths)
+        logits = self.head(self.n_final(selected_h)).float()
         return {"logits": logits, "depths": depths, "n_executed": n_executed,
                 "halt_probs": [l.detach() for l in lams]}
+
+    @staticmethod
+    def _select_depth_hidden(
+        hs: list[torch.Tensor], depths: torch.Tensor
+    ) -> torch.Tensor:
+        """Select each token's halting-depth representation."""
+        stack = torch.stack(hs, dim=0)  # [D, B, T, H]
+        idx = (depths - 1).clamp(0, len(hs) - 1)
+        width = stack.shape[-1]
+        gather_idx = idx.unsqueeze(0).unsqueeze(-1).expand(1, *idx.shape, width)
+        return stack.gather(0, gather_idx).squeeze(0)
 
     def new_infer_state(self, batch: int = 1) -> list[LinearAttnState]:
         """Create the fixed-size per-depth attention state for streaming."""
@@ -261,7 +273,8 @@ class SmaulBrainModel(nn.Module):
         hs, lams, _aux, depths, n_executed = self._depth_loop(
             h, attn_states, train=False, step=step, early_exit=False
         )
-        logits = self.head(self.n_final(hs[-1])).float()
+        selected_h = self._select_depth_hidden(hs, depths)
+        logits = self.head(self.n_final(selected_h)).float()
         return {
             "logits": logits,
             "depths": depths,
