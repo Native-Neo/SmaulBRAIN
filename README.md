@@ -553,6 +553,16 @@ w = dequantize_fp8_blockwise(t, dtype=torch.bfloat16)
 print(compute_dtype("activations"))   # torch.bfloat16 per PRECISION_POLICY
 ```
 
+### What is `pruning.py`
+
+Hysteresis pruning with grace periods. An expert dies only when old enough,
+long idle, AND below threshold on every vitality signal (usage share,
+gradient activity, contribution) — one strong signal saves it. A redundancy
+pass additionally retires near-duplicate gate weights, but only below a
+looser usage bar, so load-bearing twins survive. `prune_experts` removes
+weights, optimizer state, router row, and metadata together, highest index
+first, keeping checkpoints index-consistent.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
