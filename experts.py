@@ -198,7 +198,8 @@ class ExpertPool:
             rec = self.experts[eid]
             rec.tokens_routed += int(rows.sum().item())
             rec.last_used_step = step
-            rec.contribution = 0.9 * rec.contribution + 0.1 * float(weight.sum().item())
+            mean_weight = float(weight.sum().item()) / max(1, int(rows.sum().item()))
+            rec.contribution = 0.9 * rec.contribution + 0.1 * mean_weight
         return out
 
     # -- stats --
