@@ -472,6 +472,16 @@ The six-line program entry point. It imports `main()` from `cli.py` and runs
 it, so `python main.py ...` is the way to reach every subcommand without
 installing the project as a package.
 
+### How to use `main.py`
+
+```bash
+python main.py --help            # every flag, with help text
+python main.py train --steps 5   # tiny defaults for a first smoke run
+python main.py report            # parameter counts without training
+```
+
+All flags are documented under "How to use `cli.py`" above.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
