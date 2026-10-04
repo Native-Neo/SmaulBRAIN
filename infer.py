@@ -49,7 +49,9 @@ def generate(
     seed: int = 0,
 ) -> dict:
     """Autoregressive byte generation. Returns ids, text, depths, paging stats."""
+    was_training = model.training
     model.eval()
+    dev = model.embed.weight.device
     ctx = context or model.cfg.context_length
     gen = torch.Generator().manual_seed(seed)
     ids = list(prompt_ids) or [10]
@@ -58,13 +60,15 @@ def generate(
     text_parts: list[str] = []
     for _ in range(max_new):
         window = ids[-ctx:]
-        x = torch.tensor([window], dtype=torch.long)
+        x = torch.tensor([window], dtype=torch.long, device=dev)
         out = model.forward_infer(x)
         nxt = sample_next(out["logits"][0, -1], temperature, top_k, top_p, gen)
         ids.append(nxt)
         depths.append([int(out["depths"][0, -1].item())])
         text_parts.append(decoder.feed([nxt]))
     text_parts.append(decoder.flush())
+    if was_training:
+        model.train()
     return {"ids": ids, "text": "".join(text_parts), "depths": depths,
             "paging": model.pager.stats.to_dict()}
 
