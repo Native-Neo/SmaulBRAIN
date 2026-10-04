@@ -1,0 +1,93 @@
+"""Paging: D2R / R2VR / D2VR execute genuinely different paths."""
+
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import pytest
+import torch
+from smaulbrain.experts import ExpertPool, make_expert
+from smaulbrain.paging import ExpertPager
+
+
+def _pool(n=4, seed=0):
+    torch.manual_seed(seed)
+    pool = ExpertPool()
+    for _ in range(n):
+        pool.add(make_expert(pool.fresh_id(), 16, 32))
+    return pool
+
+
+def _counting(pool):
+    def load(eid):
+        return pool.experts[eid]
+    return load
+
+
+def test_d2r_disk_to_ram_never_vram():
+    pool = _pool()
+    pg = ExpertPager(pool, mode="D2R", ram_cache=2, load_from_disk=_counting(pool))
+    e = pool.order
+    pg.provider(e[0]); pg.provider(e[1]); pg.provider(e[0]); pg.provider(e[2])
+    s = pg.stats
+    assert (s.disk_reads, s.ram_hits, s.ram_evictions) == (3, 1, 1)
+    assert s.vram_loads == 0 and len(pg.vram) == 0 and len(pg.ram) == 2
+    pg.close()
+
+
+def test_r2vr_requires_ram_staging_and_avoids_disk():
+    pool = _pool()
+    pg = ExpertPager(pool, mode="R2VR", vram_cache=2, load_from_disk=_counting(pool))
+    with pytest.raises(RuntimeError):
+        pg.provider(pool.order[0])
+    reads_before = pg.stats.disk_reads
+    pg.warm_ram()  # the only disk path in R2VR
+    assert pg.stats.disk_reads == reads_before + 4
+    pg.provider(pool.order[0]); pg.provider(pool.order[0])
+    assert pg.stats.disk_reads == reads_before + 4  # get() adds zero disk reads
+    assert pg.stats.vram_loads == 1 and pg.stats.vram_hits == 1
+    pg.close()
+
+
+def test_d2vr_bypasses_ram():
+    pool = _pool()
+    pg = ExpertPager(pool, mode="D2VR", vram_cache=2, load_from_disk=_counting(pool))
+    pg.provider(pool.order[0]); pg.provider(pool.order[0]); pg.provider(pool.order[1])
+    assert len(pg.ram) == 0 and pg.stats.ram_loads == 0
+    assert pg.stats.disk_reads == 2 and pg.stats.vram_hits == 1
+    pg.close()
+
+
+def test_modes_produce_identical_math():
+    pools = [_pool() for _ in range(3)]
+    for a, b in zip(pools[0].order, pools[1].order):
+        pools[1].experts[b].weights_fp8 = pools[0].experts[a].weights_fp8
+    for a, b in zip(pools[0].order, pools[2].order):
+        pools[2].experts[b].weights_fp8 = pools[0].experts[a].weights_fp8
+    pgs = [ExpertPager(pools[0], mode="D2R", load_from_disk=_counting(pools[0])),
+           ExpertPager(pools[2], mode="D2VR", load_from_disk=_counting(pools[2]))]
+    w0 = pgs[0].provider(pools[0].order[0])["w_gate"].float()
+    w1 = pgs[1].provider(pools[2].order[0])["w_gate"].float()
+    assert torch.allclose(w0.cpu(), w1.cpu(), atol=1e-3)
+    for pg in pgs:
+        pg.close()
+
+
+def test_prefetch_loads_ahead_async():
+    pool = _pool()
+    pg = ExpertPager(pool, mode="D2VR", vram_cache=8, load_from_disk=_counting(pool))
+    pg.prefetch([pool.order[2], pool.order[3]])
+    pg.await_prefetch()
+    assert pg.stats.prefetch_submitted == 2 and pg.stats.prefetch_hits == 2
+    assert pool.order[2] in pg.vram and pool.order[3] in pg.vram
+    pg.close()
+
+
+def test_identity_independent_of_cache_slot_and_opt_state_follows():
+    pool = _pool()
+    pg = ExpertPager(pool, mode="D2R", ram_cache=1, load_from_disk=_counting(pool))
+    e0, e1 = pool.order[0], pool.order[1]
+    pool.experts[e0].optim_state["w_gate"]["m"].fill_(1.0)
+    pg.provider(e0); pg.provider(e1); pg.provider(e0)  # evict + reload
+    assert pool.experts[e0].optim_state["w_gate"]["m"].sum().item() > 0
+    assert pool.order[0] == e0  # identity untouched by slot churn
+    pg.close()
