@@ -4,8 +4,8 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from smaulbrain.experts import ExpertPool, make_expert
-from smaulbrain.paging import ExpertPager
+from experts import ExpertPool, make_expert
+from paging import ExpertPager
 
 
 def _pool(n=4, seed=0):
@@ -41,7 +41,7 @@ def test_r2vr_stages_through_ram_never_direct_to_vram():
     pg.provider(pool.order[0]); pg.provider(pool.order[0])
     assert pg.stats.vram_loads == 1 and pg.stats.vram_hits == 1
     # Post-growth expert (never warmed): staged disk -> RAM -> VRAM on demand.
-    from smaulbrain.experts import make_expert
+    from experts import make_expert
     rec = make_expert("expert_00099", 16, 32)
     pool.add(rec)
     d0, r0 = pg.stats.disk_reads, pg.stats.ram_loads
