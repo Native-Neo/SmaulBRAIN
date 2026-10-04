@@ -120,6 +120,9 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
     os.makedirs(exp_dir, exist_ok=True)
     cfg_dict = model.cfg.to_dict()
     cfg_dict["num_experts"] = len(model.pool)
+    # Pruning may reduce the pool below the configured floor; checkpoints
+    # must remain constructible while still respecting top_k.
+    cfg_dict["min_experts"] = min(model.cfg.min_experts, len(model.pool))
     _atomic_write_json(cfg_dict, os.path.join(ckpt_dir, "config.json"))
     _atomic_save({k: v.detach().cpu() for k, v in model.state_dict().items()
                   if not k.startswith("router.") and "usage_" not in k and "admit_" not in k
