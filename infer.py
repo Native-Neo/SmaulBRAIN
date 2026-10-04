@@ -55,17 +55,26 @@ def generate(
     ctx = context or model.cfg.context_length
     gen = torch.Generator().manual_seed(seed)
     ids = list(prompt_ids) or [10]
+    if context is not None:
+        ids = ids[-context:]
+    x = torch.tensor([ids], dtype=torch.long, device=dev)
+    out, attn_states = model.forward_infer_stateful(x)
     depths: list[list[int]] = []
     decoder = IncrementalByteDecoder()
     text_parts: list[str] = []
+    if max_new <= 0:
+        if was_training:
+            model.train()
+        return {"ids": ids, "text": "", "depths": depths,
+                "paging": model.pager.stats.to_dict()}
     for _ in range(max_new):
-        window = ids[-ctx:]
-        x = torch.tensor([window], dtype=torch.long, device=dev)
-        out = model.forward_infer(x)
         nxt = sample_next(out["logits"][0, -1], temperature, top_k, top_p, gen)
         ids.append(nxt)
         depths.append([int(out["depths"][0, -1].item())])
         text_parts.append(decoder.feed([nxt]))
+        x = torch.tensor([[nxt]], dtype=torch.long, device=dev)
+        out, attn_states = model.forward_infer_step(x, attn_states)
+
     text_parts.append(decoder.flush())
     if was_training:
         model.train()
