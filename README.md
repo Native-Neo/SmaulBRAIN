@@ -269,6 +269,17 @@ for chunk in [[104], [105]]:
 print(dec.flush())
 ```
 
+### What is `cli.py`
+
+The command-line interface. Every flag maps onto `SmaulBrainConfig`, and the
+`train` / `infer` / `report` / `quantize` subcommands share one model build
+path and one checkpoint format. Training flags cover architecture (`--d-model`,
+`--experts`, `--expert-size`, `--active-experts`, `--max/min-experts`,
+`--max/min-depth`, `--halting-threshold`), paging (`--pagingmthd`,
+`--ram-cache`, `--vram-cache`), optimization (`--expert-lr`,
+`--trunk-lr-mult`), and runtime (`--context-length`, `--threads`, `--dtype`,
+`--seed`, `--ckpt`).
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
