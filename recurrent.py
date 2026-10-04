@@ -3,7 +3,8 @@
 One ``SharedRecurrentBlock`` instance is applied min_depth..max_depth times per
 forward pass (depth recurrence, as in mini-AGI's RecurCoder). The block owns:
 RMSNorm -> linear-attention projections -> RMSNorm -> residual ->
-MoE (injected) -> RMSNorm -> residual, plus a halt head for adaptive depth.
+sparse MoE (RMSNorm -> routing -> experts) -> RMSNorm -> residual,
+plus a halt head for adaptive depth.
 
 The recurrence is genuine: step n+1 reads both the hidden vector ``h`` and
 the linear-attention accumulator ``(S, z)`` written by step n. Throwing the
@@ -17,6 +18,7 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from linear_attention import LinearAttnState
 from rmsnorm import RMSNorm
@@ -48,6 +50,7 @@ class SharedRecurrentBlock(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.n1 = RMSNorm(d_model, eps)
+        self.n_attn = RMSNorm(d_model, eps)
         self.n2 = RMSNorm(d_model, eps)
         self.n3 = RMSNorm(d_model, eps)
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
@@ -79,8 +82,8 @@ class SharedRecurrentBlock(nn.Module):
         v = v.transpose(1, 2).contiguous()
         # Continue from the incoming accumulator: genuine state influence.
         S, z = attn.S, attn.z
-        qf = torch.nn.functional.elu(q.float()) + 1.0
-        kf = torch.nn.functional.elu(k.float()) + 1.0
+        qf = F.elu(q.float()) + 1.0
+        kf = F.elu(k.float()) + 1.0
         kf = kf / kf.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         vf = v.float()
         outs: list[torch.Tensor] = []
@@ -92,13 +95,12 @@ class SharedRecurrentBlock(nn.Module):
             den = (qt * z).sum(dim=-1, keepdim=True).clamp_min(1e-6)
             outs.append(num / den)
         y = torch.stack(outs, dim=2).transpose(1, 2).reshape(B, T, D).to(h.dtype)
-        h = h + self.o_proj(y)
+        h = h + self.o_proj(self.n_attn(y))  # Norm -> residual (per architecture)
         attn_next = LinearAttnState(S=S, z=z)
-        # -- sparse MoE branch (residual, injected) --
+        # -- sparse MoE branch (Norm -> residual, injected routing+experts) --
         m = self.n2(h)
         flat = m.reshape(B * T, D)
         moe_out, aux_loss, _usage = moe_fn(flat)
-        h = h + moe_out.reshape(B, T, D)
-        h = self.n3(h)  # norm boundary: stabilizes the next recurrent application
+        h = h + self.n3(moe_out.reshape(B, T, D).to(h.dtype))
         halt_logit = self.halt(h.detach()).squeeze(-1)  # [B, T], no halt-grad into trunk
         return h, attn_next, halt_logit, aux_loss
