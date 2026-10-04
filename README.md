@@ -332,6 +332,22 @@ old/new-data scoring, and `retention_report`, which reports forgetting as
 numbers (loss/accuracy deltas plus a `retained` heuristic) instead of
 claiming it is solved.
 
+### How to use `continual.py`
+
+```python
+from continual import ReplayBuffer, batch_from_seqs, evaluate_loss, retention_report
+
+buf = ReplayBuffer(capacity=512, seed=0)
+buf.add([104, 105])          # reservoir-kept past sequence
+old = buf.sample(4)          # interleave into the next batch
+
+b = batch_from_seqs(old_seqs, context=128)   # [B, T+1], padded/truncated
+before = evaluate_loss(model, b, context=128)
+# ... train on new data ...
+after = evaluate_loss(model, b, context=128)
+print(retention_report(before, after))  # numeric deltas, no "solved" claims
+```
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
