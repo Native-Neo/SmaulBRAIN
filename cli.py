@@ -167,13 +167,11 @@ def main(argv: list[str] | None = None) -> int:
             save_model(args.ckpt, model, opt, int(getattr(model, "_resume_step", -1)))
     elif args.cmd == "infer":
         if os.path.exists(os.path.join(args.ckpt, "manifest.json")):
+            # Serve future misses from the checkpoint files. load_model above
+            # already cleared stale caches and staged R2VR RAM; wiring the
+            # loader here must not repeat that work (double disk reads).
             from storage import make_disk_loader
             model.pager.load_from_disk = make_disk_loader(args.ckpt)
-            model.pager.ram.clear()
-            model.pager.vram.clear()
-            model.pager.ram_records.clear()
-            if model.cfg.paging_method == "R2VR":
-                model.pager.warm_ram()
         res = generate(model, encode_text(args.prompt), max_new=args.max_new,
                        temperature=args.temperature, context=cfg.context_length,
                        seed=args.seed)
