@@ -52,36 +52,50 @@ class LinearAttnState:
 
 
 def linear_attn_forward(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, eps: float = 1e-6
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    eps: float = 1e-6,
+    state: LinearAttnState | None = None,
+    chunk_size: int = 256,
 ) -> tuple[torch.Tensor, LinearAttnState]:
-    """Batched causal linear attention over [B, H, T, Dh] inputs.
+    """Causal linear attention with vectorized work inside each chunk.
 
-    Returns outputs [B, H, T, Dh] plus the terminal recurrent state.
-    The loop over T uses only rank-1 outer-product updates (no QK^T).
-    Vectorized across B and H; the T loop is a genuine recurrence where
-    step t reads state written by step t-1.
+    The additive state makes causal prefixes associative. Each chunk computes
+    all of its token prefixes with cumsum; only the terminal state crosses the
+    chunk boundary. There is no Python loop over individual tokens and no QK^T.
     """
+    if q.ndim != 4 or k.shape != q.shape or v.shape != q.shape:
+        raise ValueError("q, k, and v must all have shape [B, H, T, Dh]")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
     B, H, T, Dh = q.shape
+    if state is None:
+        state = LinearAttnState.zeros(B, H, Dh, device=q.device)
+    S = state.S.float()
+    z = state.z.float()
     qf = feature_map(q.float())
     kf = feature_map(k.float())
     vf = v.float()
-    # Per-step key normalization keeps the accumulator bounded (SmaulNative).
     kf = kf / kf.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    S = torch.zeros(B, H, Dh, Dh, device=q.device)
-    z = torch.zeros(B, H, Dh, device=q.device)
-    outs: list[torch.Tensor] = []
-    for t in range(T):
-        kt = kf[:, :, t, :]  # [B, H, Dh]
-        vt = vf[:, :, t, :]
-        qt = qf[:, :, t, :]
-        S = S + kt.unsqueeze(-1) * vt.unsqueeze(-2)  # rank-1 outer update
-        z = z + kt
-        num = torch.einsum("bhd,bhde->bhe", qt, S)
-        den = (qt * z).sum(dim=-1, keepdim=True).clamp_min(eps)
-        outs.append((num / den).to(v.dtype))
-    out = torch.stack(outs, dim=2)
-    return out, LinearAttnState(S=S, z=z)
 
+    chunks: list[torch.Tensor] = []
+    for start in range(0, T, chunk_size):
+        end = min(start + chunk_size, T)
+        kc = kf[:, :, start:end, :]
+        vc = vf[:, :, start:end, :]
+        qc = qf[:, :, start:end, :]
+        updates = kc.unsqueeze(-1) * vc.unsqueeze(-2)
+        prefix_S = updates.cumsum(dim=2) + S.unsqueeze(2)
+        prefix_z = kc.cumsum(dim=2) + z.unsqueeze(2)
+        num = torch.einsum("bhcd,bhcde->bhce", qc, prefix_S)
+        den = (qc * prefix_z).sum(dim=-1, keepdim=True).clamp_min(eps)
+        chunks.append((num / den).to(v.dtype).transpose(1, 2))
+        S = prefix_S[:, :, -1]
+        z = prefix_z[:, :, -1]
+
+    out = torch.cat(chunks, dim=1)
+    return out, LinearAttnState(S=S, z=z)
 
 def linear_attn_step(
     state: LinearAttnState,
