@@ -112,6 +112,7 @@ class SmaulBrainModel(nn.Module):
         attn_states: list[LinearAttnState],
         train: bool,
         step: int,
+        early_exit: bool = True,
     ):
         """Run the shared block; return per-step (h, halt_prob, aux) + depths."""
         B, T, _D = h.shape
@@ -139,7 +140,7 @@ class SmaulBrainModel(nn.Module):
                 newly = (~halted) & (cum >= self.cfg.halting_threshold)
                 depths[newly] = n_executed
                 halted = halted | (cum >= self.cfg.halting_threshold)
-                if bool(halted.all()):
+                if early_exit and bool(halted.all()):
                     break
         return hs, lams, aux_total, depths, n_executed
 
@@ -225,7 +226,7 @@ class SmaulBrainModel(nn.Module):
             for _ in range(self.cfg.max_depth)
         ]
         hs, lams, _aux, depths, n_executed = self._depth_loop(
-            h, attn_states, train=False, step=step
+            h, attn_states, train=False, step=step, early_exit=False
         )
         logits = self.head(self.n_final(hs[-1])).float()
         return {"logits": logits, "depths": depths, "n_executed": n_executed,
