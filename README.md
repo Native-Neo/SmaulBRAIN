@@ -466,6 +466,12 @@ for t in range(T):                         # incremental inference, O(1)/step
     y, st = linear_attn_step(st, q[:, :, t], k[:, :, t], v[:, :, t])
 ```
 
+### What is `main.py`
+
+The six-line program entry point. It imports `main()` from `cli.py` and runs
+it, so `python main.py ...` is the way to reach every subcommand without
+installing the project as a package.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
