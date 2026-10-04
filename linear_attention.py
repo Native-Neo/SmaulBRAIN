@@ -9,8 +9,8 @@ the SmaulNative reference), the causal output is
 
 Complexity is O(T * Dh^2) time and O(Dh^2) memory — linear in sequence length
 T. There is no QK^T matrix anywhere: scores are never formed pairwise. The
-(S, z) pair is the streamable state: ``step()`` advances one token with
-bounded memory, and ``prefill()`` folds a chunk left-to-right.
+(S, z) pair is the streamable state: ``linear_attn_step`` advances one token
+with bounded memory, and ``linear_attn_forward`` folds a chunk left-to-right.
 
 Multi-head projections (qkv/o) intentionally live in the recurrent block
 (``recurrent.py``); this module owns only the head-wise recurrence math so
@@ -40,8 +40,8 @@ class LinearAttnState:
     @classmethod
     def zeros(cls, batch: int, heads: int, head_dim: int, device=None) -> "LinearAttnState":
         return cls(
-            S=torch.zeros(batch, heads, head_dim, head_dim),
-            z=torch.zeros(batch, heads, head_dim),
+            S=torch.zeros(batch, heads, head_dim, head_dim, device=device),
+            z=torch.zeros(batch, heads, head_dim, device=device),
         )
 
     def clone(self) -> "LinearAttnState":
@@ -67,8 +67,8 @@ def linear_attn_forward(
     vf = v.float()
     # Per-step key normalization keeps the accumulator bounded (SmaulNative).
     kf = kf / kf.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    S = torch.zeros(B, H, Dh, Dh)
-    z = torch.zeros(B, H, Dh)
+    S = torch.zeros(B, H, Dh, Dh, device=q.device)
+    z = torch.zeros(B, H, Dh, device=q.device)
     outs: list[torch.Tensor] = []
     for t in range(T):
         kt = kf[:, :, t, :]  # [B, H, Dh]
