@@ -17,6 +17,8 @@ schedule, retention eval, and checkpointing are all driven here.
 
 from __future__ import annotations
 
+import time
+
 import torch
 
 import growth as growth_mod
@@ -123,7 +125,10 @@ def run_training(
     hist: list[dict] = []
     n = max(1, len(train_seqs))
     start_step = int(getattr(model, "_resume_step", -1)) + 1
+    run_started = time.perf_counter()
+    bytes_processed = 0
     for local_step in range(steps):
+        step_started = time.perf_counter()
         step = start_step + local_step
         batch_seqs = [train_seqs[(step * batch_size + i) % n] for i in range(batch_size)]
         if replay is not None and replay_n > 0:
@@ -135,6 +140,8 @@ def run_training(
                            b[:, 1 : cfg.context_length + 1], step, mode=mode,
                            selected=selected, new_since_step=new_since_step)
         stats["step"] = step
+        step_bytes = int(b[:, : cfg.context_length].numel())
+        bytes_processed += step_bytes
         hist.append(stats)
         if grow_every and (step + 1) % grow_every == 0 and len(model.pool) < cfg.max_experts:
             room = cfg.max_experts - len(model.pool)
@@ -157,11 +164,38 @@ def run_training(
         if ckpt_dir and save_every and (step + 1) % save_every == 0:
             save_model(ckpt_dir, model, opt, step)
             model._resume_step = step
+
+        elapsed = time.perf_counter() - step_started
+        total_elapsed = time.perf_counter() - run_started
+        completed = local_step + 1
+        avg_step = total_elapsed / completed
+        eta = max(0.0, (steps - completed) * avg_step)
+        step_bps = step_bytes / max(elapsed, 1e-12)
+        avg_bps = bytes_processed / max(total_elapsed, 1e-12)
+        stepped = ",".join(stats["stepped_experts"]) or "-"
+        log_fn(
+            f"[train] step {completed}/{steps} (global={step}) "
+            f"loss={stats['loss']:.4f} nll={stats['nll']:.4f} "
+            f"acc={stats['acc']:.2%} depth={stats['mean_depth']:.2f} "
+            f"time={elapsed:.2f}s bytes/s={step_bps:.1f} "
+            f"avg_bytes/s={avg_bps:.1f} ETA={eta:.1f}s "
+            f"experts={len(model.pool)} updated={stepped} "
+            f"lr(trunk/router/expert)={cfg.trunk_lr:.2g}/"
+            f"{cfg.router_lr:.2g}/{cfg.expert_lr:.2g}"
+        )
+    total_elapsed = time.perf_counter() - run_started
     if hist:
         model._resume_step = int(hist[-1]["step"])
     report = None
     if old_seqs and old_before is not None:
         old_after = evaluate_loss(model, batch_from_seqs(old_seqs, cfg.context_length), cfg.context_length)
         report = retention_report(old_before, old_after)
-    return {"history": hist, "retention": report,
-            "final_loss": hist[-1]["loss"] if hist else None}
+    return {
+        "history": hist,
+        "retention": report,
+        "final_loss": hist[-1]["loss"] if hist else None,
+        "steps_completed": len(hist),
+        "elapsed_seconds": total_elapsed,
+        "bytes_processed": bytes_processed,
+        "bytes_per_second": bytes_processed / max(total_elapsed, 1e-12),
+    }
