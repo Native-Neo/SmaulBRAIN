@@ -407,6 +407,22 @@ top-k / top-p, streaming UTF-8 decode, and returns paging counters alongside
 ids/text/depths. It preserves the caller's train/eval mode and runs on the
 model's device.
 
+### How to use `infer.py`
+
+```python
+from infer import generate
+from bytes import encode_text, decode_text
+
+res = generate(model, encode_text("hello"), max_new=32,
+               temperature=0.0, top_k=0, top_p=1.0,
+               context=1024, seed=0)
+print(res["text"])     # streamed byte decode
+print(res["depths"])   # per-token executed depth (adaptive halting)
+print(res["paging"])   # disk reads / cache hits / evictions
+```
+
+`temperature=0.0` is greedy; `top_k`/`top_p` shape sampling otherwise.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
