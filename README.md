@@ -703,6 +703,17 @@ opt.step_expert(record, grad_carriers, 1.0, cfg.expert_lr)  # rewrites FP8
 Dense groups update in place; `step_expert` decodes, updates, and
 requantizes only that expert's blocks.
 
+### What is `storage.py`
+
+Atomic, per-expert checkpointing. Layout: `config.json`, `trunk.pt`,
+`router.pt`, single `optim.pt`, `rng.pt`, one `experts/<id>.pt` per expert
+(FP8 codes + scales, expert-local optimizer state, metadata), and
+`manifest.json` written last as the commit point — a crash mid-save leaves
+the previous checkpoint intact. Loading resizes the router both ways,
+restores usage stats and RNG, clears stale pager caches, and rebuilds the
+pool in manifest order. `make_disk_loader` reads single experts without
+loading the model.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
