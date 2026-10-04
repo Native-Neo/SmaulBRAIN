@@ -22,8 +22,6 @@ static inline uint8_t f32_to_e4m3(float v) {
   // E4M3 normal range: 2^-8 .. 448; subnormals flush toward zero bins.
   int e = exp2 + 8;  // biased exponent
   if (e < 1) {
-    float frac = a / (float)(1 << (exp2 + 8)) ;  // subnormal-ish path
-    (void)frac;
     // Flush tiny values to the smallest representable mantissa steps.
     float step = std::ldexp(1.0f, -11);  // 2^-11 ~ min subnormal scale
     int m = (int)std::floor(a / step + 0.5f);
