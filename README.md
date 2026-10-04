@@ -609,6 +609,20 @@ residual → routed MoE → RMSNorm → residual, plus a halt head (bias −2.0,
 the model ponders before halting). `RecurrentState` bundles the hidden vector
 with the attention state carried between applications.
 
+### How to use `recurrent.py`
+
+```python
+from recurrent import SharedRecurrentBlock, RecurrentState
+from linear_attention import LinearAttnState
+
+blk = SharedRecurrentBlock(d_model=128, n_heads=4)
+attn = LinearAttnState.zeros(B, 4, 32)
+h, attn, halt_logit, aux = blk(h, attn, moe_fn)  # one shared application
+# Repeat with the returned (h, attn): step n+1 reads step n's state.
+```
+
+`moe_fn` is injected: `(x_flat) -> (y_flat, aux_loss, usage_ids)`.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
