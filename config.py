@@ -53,6 +53,7 @@ class SmaulBrainConfig:
     capacity_factor: float = 1.5
     # --- context / sequence ---
     context_length: int = 1024
+    attention_chunk_size: int = 256  # causal linear-attention training chunk
     # --- paging ---
     paging_method: str = "D2R"  # D2R | R2VR | D2VR
     ram_cache: int = 8  # max experts resident in RAM cache
@@ -93,6 +94,7 @@ class SmaulBrainConfig:
         assert self.dtype in ("bf16", "fp32"), "compute dtype bf16|fp32"
         assert self.state_dtype in ("bf16", "fp32"), "state dtype bf16|fp32"
         assert self.expert_hidden >= 8, "expert hidden dim too small"
+        assert self.attention_chunk_size >= 1, "attention chunk size must be positive"
         # active_experts is a user-facing alias for top_k; keep them in sync.
         object.__setattr__(self, "active_experts", self.top_k)
 
