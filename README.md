@@ -208,11 +208,36 @@ It is an experimental architecture.
 
 ## Status
 
-**Experimental / Research**
+**Experimental / Research — implemented and measured (2026-10-04)**
 
-The architecture is still being developed.
+79 tests pass (`python -m pytest tests/ -q`). Measured on CPU (torch 2.14,
+4-core, 7.6 GB RAM) with tiny configs unless noted:
 
-Breaking changes are expected.
+* 16K context forward: +61 MB delta RSS, ~6 s (d=32, 4 experts, top-1,
+  depth 1); 1K→8K RSS ratios stay <1.5x per doubling (quadratic would be 4x).
+* Training throughput (d=64, 8 experts, top-2, depth ≤3, ctx 128):
+  D2R 248 tok/s, R2VR 248 tok/s, D2VR 318 tok/s; inference 12–22 tok/s.
+* Continual-learning demo: new-data loss 5.60 → 2.88 over 12 steps with
+  replay; old-data delta +0.06 (reported numerically, not claimed solved).
+* Sparse-vs-dense byte head on CPU: dense 3.9 ms vs sparse 115 ms per
+  1024-token batch — dense wins at 256-byte vocab (measured); sparsity is
+  used for expert routing, not token connections.
+* Expert compute BF16 vs FP32 on this CPU: 8.9 ms vs 1.1 ms — FP8 storage
+  with FP32 compute is the faster default where BF16 lacks acceleration.
+* Expert size is explicit (`--expert-size`); at d=512/h=3328 one expert is
+  5,111,808 params (~5.12M).
+
+Reference audit: SmaulNative's SmaulOpt (update equations, factored `v`,
+BF16 state/FP32 math) and linear attention (ELU+1, S/z recurrence) were
+verified in source and ported; its static MoE has no growth/pruning/paging
+and its LR is constant. mini-AGI's depth recurrence, PonderNet halting,
+paged disk/RAM/VRAM pool, recombination growth, per-expert moments, and
+0.1x slow trunk were verified in source and adapted; its attention is
+quadratic SDPA (replaced here with linear attention) and it has no FP8 and
+no tests. Nothing was copied blindly; nothing was invented where the
+reference could not be verified.
+
+Breaking changes are still expected.
 
 Tests, measurements, memory usage, and actual training results are more important than keeping the current design unchanged.
 
