@@ -19,9 +19,9 @@ from __future__ import annotations
 
 import torch
 
-from . import growth as growth_mod
-from . import pruning as pruning_mod
-from .continual import ReplayBuffer, batch_from_seqs, evaluate_loss, retention_report
+import growth as growth_mod
+import pruning as pruning_mod
+from continual import ReplayBuffer, batch_from_seqs, evaluate_loss, retention_report
 
 
 class _GradOnly:
@@ -108,7 +108,7 @@ def run_training(
     Returns history + optional retention report (old_seqs evaluated before
     and after) so continual-learning retention is measured, not claimed.
     """
-    from .storage import save_model
+    from storage import save_model
 
     old_before = None
     if old_seqs:
