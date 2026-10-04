@@ -714,6 +714,17 @@ restores usage stats and RNG, clears stale pager caches, and rebuilds the
 pool in manifest order. `make_disk_loader` reads single experts without
 loading the model.
 
+### How to use `storage.py`
+
+```python
+from storage import save_model, load_model, load_expert_file, make_disk_loader
+
+save_model("ckpt/run1", model, opt, step=100)
+manifest = load_model("ckpt/run1", fresh_model, fresh_opt)  # returns manifest
+rec = load_expert_file("ckpt/run1/experts/expert_00002.pt")  # no full load
+loader = make_disk_loader("ckpt/run1")                       # pager wiring
+```
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
