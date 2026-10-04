@@ -4,9 +4,9 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from smaulbrain.experts import ExpertPool, make_expert
-from smaulbrain.pruning import find_victims, prune_experts
-from smaulbrain.routing import SparseRouter
+from experts import ExpertPool, make_expert
+from pruning import find_victims, prune_experts
+from routing import SparseRouter
 
 
 def _pool(n=4, seed=0):
@@ -64,10 +64,10 @@ def test_min_experts_floor_never_violated():
 
 
 def test_checkpoint_correct_after_pruning(tmp_path):
-    from smaulbrain.config import SmaulBrainConfig
-    from smaulbrain.model import SmaulBrainModel
-    from smaulbrain.smaulopt import SmaulOpt
-    from smaulbrain.storage import save_model, load_model
+    from config import SmaulBrainConfig
+    from model import SmaulBrainModel
+    from smaulopt import SmaulOpt
+    from storage import save_model, load_model
     torch.manual_seed(0)
     cfg = SmaulBrainConfig(d_model=16, n_heads=2, num_experts=3, top_k=1,
                            expert_hidden=32, max_depth=1)
