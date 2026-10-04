@@ -47,7 +47,7 @@ class SmaulBrainConfig:
     top_k: int = 2
     active_experts: int = 2  # alias enforced == top_k at runtime
     max_experts: int = 64
-    min_experts: int = 1
+    min_experts: int = 2
     expert_hidden: int = 256  # explicit knob; ~=5.12M params at d=512/h=3328
     moe_balance_weight: float = 0.01
     capacity_factor: float = 1.5
@@ -130,7 +130,14 @@ class SmaulBrainConfig:
     @classmethod
     def from_dict(cls, d: dict) -> "SmaulBrainConfig":
         known = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in d.items() if k in known})
+        values = {k: v for k, v in d.items() if k in known}
+        # Older checkpoints allowed an impossible pruning floor below top-k.
+        # Clamp it to the minimum viable active expert count when loading.
+        values["min_experts"] = max(
+            int(values.get("min_experts", cls.min_experts)),
+            int(values.get("top_k", cls.top_k)),
+        )
+        return cls(**values)
 
     def describe_counts(self) -> dict:
         return {
