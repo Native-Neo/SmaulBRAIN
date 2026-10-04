@@ -599,6 +599,16 @@ convert_checkpoint("ckpt", to="bf16")          # trunk/router -> BF16
 
 Or via CLI: `python main.py --ckpt ckpt quantize --to fp8`.
 
+### What is `recurrent.py`
+
+The shared recurrent block applied `min_depth..max_depth` times per forward
+pass — one parameter set, reused, never stacked. Each application runs
+RMSNorm → linear-attention projections (continuing the incoming S/z
+accumulator, so state genuinely influences the next step) → RMSNorm →
+residual → routed MoE → RMSNorm → residual, plus a halt head (bias −2.0, so
+the model ponders before halting). `RecurrentState` bundles the hidden vector
+with the attention state carried between applications.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
