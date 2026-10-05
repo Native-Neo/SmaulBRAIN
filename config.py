@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-from bytes import total_vocab, PAD_ID
-
 
 __version__ = "0.1.0"
 
@@ -37,7 +35,7 @@ class SmaulBrainConfig:
     """Full SmaulBRAIN configuration. All CLI flags map onto these fields."""
 
     # --- core topology (tiny/CPU-friendly defaults; see --full in cli.py) ---
-    vocab_size: int = total_vocab()  # 256 raw bytes + BOS/EOS/PAD/SEP
+    vocab_size: int = 256  # raw bytes; specials extend this (see bytes.py)
     d_model: int = 64
     n_heads: int = 4
     # --- recurrent block (shared, applied min_depth..max_depth times) ---
@@ -76,8 +74,6 @@ class SmaulBrainConfig:
     dtype: str = "bf16"  # compute dtype for activations: bf16 | fp32
     fp8_tile: int = 64  # block size for FP8 per-block scaling
     state_dtype: str = "bf16"  # optimizer state storage: bf16 | fp32
-    # --- token structure ---
-    pad_id: int = PAD_ID
     # --- misc ---
     threads: int = 2
     seed: int = 0
@@ -101,7 +97,6 @@ class SmaulBrainConfig:
         assert self.dtype in ("bf16", "fp32"), "compute dtype bf16|fp32"
         assert self.state_dtype in ("bf16", "fp32"), "state dtype bf16|fp32"
         assert self.expert_hidden >= 8, "expert hidden dim too small"
-        assert 0 <= self.pad_id < self.vocab_size, "pad_id must be inside the vocabulary"
         assert self.attention_chunk_size >= 1, "attention chunk size must be positive"
         # active_experts is a user-facing alias for top_k; keep them in sync.
         object.__setattr__(self, "active_experts", self.top_k)

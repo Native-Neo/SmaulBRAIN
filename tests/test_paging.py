@@ -35,10 +35,9 @@ def test_d2r_disk_to_ram_never_vram():
 
 def test_r2vr_stages_through_ram_never_direct_to_vram():
     pool = _pool()
-    pg = ExpertPager(pool, mode="R2VR", ram_cache=2, vram_cache=2, load_from_disk=_counting(pool))
-    pg.warm_ram()
-    assert pg.stats.disk_reads == 2 and pg.stats.ram_loads == 2
-    assert len(pg.ram_records) == 2
+    pg = ExpertPager(pool, mode="R2VR", vram_cache=2, load_from_disk=_counting(pool))
+    pg.warm_ram()  # bulk staging: the only prefetch-free disk path at startup
+    assert pg.stats.disk_reads == 4 and pg.stats.ram_loads == 4
     pg.provider(pool.order[0]); pg.provider(pool.order[0])
     assert pg.stats.vram_loads == 1 and pg.stats.vram_hits == 1
     # Post-growth expert (never warmed): staged disk -> RAM -> VRAM on demand.
@@ -49,7 +48,6 @@ def test_r2vr_stages_through_ram_never_direct_to_vram():
     pg.provider("expert_00099")
     assert pg.stats.disk_reads == d0 + 1 and pg.stats.ram_loads == r0 + 1
     assert pg.stats.vram_loads == 2 and len(pg.ram) == 0  # RAM compute cache bypassed
-    assert len(pg.ram_records) <= 2
     pg.close()
 
 

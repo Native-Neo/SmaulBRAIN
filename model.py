@@ -199,16 +199,14 @@ class SmaulBrainModel(nn.Module):
                                  targets.reshape(-1), reduction="none").reshape(B, T)
             ce_steps.append(ce)
         CE = torch.stack(ce_steps, dim=0)  # [D, B, T]
-        mask = targets.ne(self.cfg.pad_id).float()
-        denom = mask.sum().clamp_min(1.0)
-        nll = ((P * CE) * mask.unsqueeze(0)).sum() / denom
+        nll = (P * CE).sum(dim=0).mean()
         balance = aux / n_executed
         loss = nll + self.cfg.ponder_beta * kl + self.cfg.moe_balance_weight * balance
         with torch.no_grad():
             pred = self.head(self.n_final(hs[-1])).float().argmax(-1)
-            acc = (((pred == targets).float() * mask).sum() / denom).item()
+            acc = (pred == targets).float().mean().item()
             steps = torch.arange(1, len(hs) + 1, device=P.device).view(-1, 1, 1)
-            mean_depth = float(((P * steps) * mask.unsqueeze(0)).sum().item() / denom.item())
+            mean_depth = float((P * steps).sum().item() / (B * T))
         return {
             "logits": self.head(self.n_final(hs[-1])).float(),
             "loss": loss, "nll": nll.detach(), "ponder_kl": kl.detach(),
