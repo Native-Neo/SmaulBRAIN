@@ -7,8 +7,10 @@ An expert is pruned only when it is simultaneously:
     contribution all below thresholds — hysteresis, not a single counter),
   * not load-bearing for capacity (pool stays >= min_experts).
 
-Pruning removes weights, optimizer state, router row, and metadata together;
-the pool order compacts so checkpoint loading stays index-consistent.
+Only the worst ``max_victims`` go per evaluation (worst-first ranking), so
+one bad cycle can never wipe out the pool. Pruning removes weights,
+optimizer state, router row, and metadata together; the pool order compacts
+so checkpoint loading stays index-consistent.
 Redundancy (near-duplicate of a sibling) is an additional trigger, measured
 by cosine similarity of dequantized gate weights.
 """
@@ -47,12 +49,14 @@ def find_victims(
     usage_threshold: float = 1e-4,
     redundancy_cos: float = 0.995,
     redundancy_usage_mult: float = 10.0,
+    max_victims: int | None = 4,
 ) -> list[str]:
-    """Rank prune candidates (stable id order). Never returns > len-min_experts.
+    """Rank prune candidates worst-first. Never returns > len-min_experts.
 
-    The redundancy pass uses a looser usage bar (``usage_threshold * mult``):
-    near-duplicates that still carry real traffic are capacity, not waste,
-    and must survive.
+    At most ``max_victims`` (None = uncapped) go per call so a single
+    evaluation cannot collapse the pool. The redundancy pass uses a looser
+    usage bar (``usage_threshold * mult``): near-duplicates that still carry
+    real traffic are capacity, not waste, and must survive.
     """
     total = sum(r.tokens_routed for r in pool.experts.values())
     victims: list[str] = []
@@ -87,9 +91,17 @@ def find_victims(
                     victims.append(a)
                     seen.add(a)
                     break
-    victims.sort()
+    def _badness(eid: str) -> tuple:
+        rec = pool.experts[eid]
+        return (rec.tokens_routed / max(1, total), rec.grad_activity,
+                rec.contribution, eid)
+
+    victims.sort(key=_badness)  # worst first; eid tiebreak keeps it deterministic
     keep = max(0, len(pool) - min_experts)
-    return victims[:keep]
+    victims = victims[:keep]
+    if max_victims is not None and max_victims >= 0:
+        victims = victims[:max_victims]
+    return victims
 
 
 def prune_experts(
