@@ -288,12 +288,12 @@ switches to the full preset: 64 experts, top-8 routing, ~5.12M params/expert
 overrides the preset.
 
 ```bash
-python main.py --ckpt ckpt/demo train --steps 20 --batch 2
-python main.py --full --ckpt ckpt/big train --steps 20 --batch 2
+python cli.py --ckpt ckpt/demo train --steps 20 --batch 2
+python cli.py --full --ckpt ckpt/big train --steps 20 --batch 2
 
-python main.py --ckpt ckpt/demo infer --prompt "hello" --max-new 32 --temperature 0.0
-python main.py --ckpt ckpt/demo report            # dynamic parameter counts
-python main.py --ckpt ckpt/demo quantize --to fp8 # requantize experts
+python cli.py --ckpt ckpt/demo infer --prompt "hello" --max-new 32 --temperature 0.0
+python cli.py --ckpt ckpt/demo report            # dynamic parameter counts
+python cli.py --ckpt ckpt/demo quantize --to fp8 # requantize experts
 ```
 
 Fine-tuning selectors: `--mode trunk|experts|selected|new`, with
@@ -316,8 +316,9 @@ consistent. `expert_hidden_for_target` sizes one expert to ~5.12M params.
 ### How to use `config.py`
 
 ```python
-from config import SmaulBrainConfig, expert_hidden_for_target
+from config import SmaulBrainConfig, expert_hidden_for_target, __version__
 
+print(__version__)
 cfg = SmaulBrainConfig(d_model=128, n_heads=4, num_experts=8, top_k=2,
                        max_depth=4, paging_method="D2R")
 print(cfg.trunk_lr, cfg.per_expert_params)  # slow-trunk LR, params/expert
@@ -328,19 +329,19 @@ cfg2 = SmaulBrainConfig.from_dict(d)
 print(cfg2.describe_counts())     # shared/router/expert/total/active splits
 ```
 
-### What is `continual.py`
+### What is replay/retention (in `train.py`)
 
-The continual-learning toolkit: a reservoir `ReplayBuffer` that interleaves
-old byte sequences into training, `batch_from_seqs` for packing variable
-length sequences into padded batches, `evaluate_loss` for gradient-free
-old/new-data scoring, and `retention_report`, which reports forgetting as
-numbers (loss/accuracy deltas plus a `retained` heuristic) instead of
-claiming it is solved.
+The continual-learning toolkit, merged into the training loop: a reservoir
+`ReplayBuffer` that interleaves old byte sequences into training,
+`batch_from_seqs` for packing variable length sequences into padded batches,
+`evaluate_loss` for gradient-free old/new-data scoring, and
+`retention_report`, which reports forgetting as numbers (loss/accuracy
+deltas plus a `retained` heuristic) instead of claiming it is solved.
 
-### How to use `continual.py`
+### How to use replay/retention (in `train.py`)
 
 ```python
-from continual import ReplayBuffer, batch_from_seqs, evaluate_loss, retention_report
+from train import ReplayBuffer, batch_from_seqs, evaluate_loss, retention_report
 
 buf = ReplayBuffer(capacity=512, seed=0)
 buf.add([104, 105])          # reservoir-kept past sequence
@@ -471,22 +472,6 @@ for t in range(T):                         # incremental inference, O(1)/step
     y, st = linear_attn_step(st, q[:, :, t], k[:, :, t], v[:, :, t])
 ```
 
-### What is `main.py`
-
-The six-line program entry point. It imports `main()` from `cli.py` and runs
-it, so `python main.py ...` is the way to reach every subcommand without
-installing the project as a package.
-
-### How to use `main.py`
-
-```bash
-python main.py --help            # every flag, with help text
-python main.py train --steps 5   # tiny defaults for a first smoke run
-python main.py report            # parameter counts without training
-```
-
-All flags are documented under "How to use `cli.py`" above.
-
 ### What is `model.py`
 
 `SmaulBrainModel`: the shared trunk (byte embedding, init norm, one
@@ -602,7 +587,7 @@ print(convert_expert_file("ckpt/experts/expert_00000.pt",
 convert_checkpoint("ckpt", to="bf16")          # trunk/router -> BF16
 ```
 
-Or via CLI: `python main.py --ckpt ckpt quantize --to fp8`.
+Or via CLI: `python cli.py --ckpt ckpt quantize --to fp8`.
 
 ### What is `recurrent.py`
 
@@ -666,21 +651,6 @@ plan = router.route(x)                    # [N, D] -> top_ids/weights/dropped/pr
 aux = router.balance_loss(plan.probs)     # add moe_balance_weight * aux to loss
 print(router.usage_share())               # FP64-backed traffic distribution
 router.add_expert_row()                   # after growth (dtype preserved)
-```
-
-### What is `smaulbrain.py`
-
-The project marker module: package docstring, `__version__`, and the
-`SmaulBrainConfig` re-export, so `import smaulbrain` gives the version and
-the central configuration from one place.
-
-### How to use `smaulbrain.py`
-
-```python
-import smaulbrain
-
-print(smaulbrain.__version__)
-cfg = smaulbrain.SmaulBrainConfig(d_model=128)
 ```
 
 ### What is `smaulopt.py`
