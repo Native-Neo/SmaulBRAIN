@@ -19,6 +19,8 @@ from dataclasses import dataclass
 
 import torch
 
+import native
+
 FP8_MAX = 448.0  # max normal of E4M3
 FP8_DTYPE = torch.float8_e4m3fn
 
@@ -48,6 +50,15 @@ def quantize_fp8_blockwise(w: torch.Tensor, tile: int = 64) -> FP8BlockTensor:
     flat = w32.reshape(-1, orig[-1])
     n_cols = flat.shape[1]
     n_blocks = (n_cols + tile - 1) // tile
+    rows = flat.shape[0]
+    # Native path is bit-exact (proven by tests/test_cpp_parity.py), so it
+    # may auto-dispatch even with gradients enabled: stored bytes are
+    # identical either way. It needs no padding: the kernel loops exact cols.
+    scales = torch.empty(rows, n_blocks, dtype=torch.float32)
+    codes_flat = torch.empty(rows, n_cols, dtype=torch.uint8)
+    if native.call_fp8_quant(flat, codes_flat, scales, rows, n_cols, tile):
+        codes_u8 = codes_flat.reshape(orig).clone()
+        return FP8BlockTensor(codes=codes_u8, scales=scales, shape=orig, tile=tile)
     pad = n_blocks * tile - n_cols
     if pad:
         flat = torch.cat([flat, torch.zeros(flat.shape[0], pad)], dim=1)
@@ -65,7 +76,14 @@ def dequantize_fp8_blockwise(t: FP8BlockTensor, dtype: torch.dtype = torch.float
     """Reconstruct a float tensor from blockwise FP8 storage (per-expert use)."""
     n_cols = t.shape[-1]
     n_blocks = t.scales.shape[-1]
-    codes_f8 = t.codes.reshape(-1, n_cols).contiguous().view(FP8_DTYPE)
+    rows = t.codes.reshape(-1, n_cols).shape[0]
+    out = torch.empty(rows, n_cols, dtype=torch.float32)
+    codes_2d = t.codes.reshape(-1, n_cols)
+    scales_2d = t.scales.reshape(-1, n_blocks)
+    if native.call_fp8_dequant(codes_2d, scales_2d, out, rows, n_cols, t.tile):
+        return out.reshape(t.shape).to(dtype)
+    # Reference fallback (also used when native is disabled/unavailable).
+    codes_f8 = codes_2d.contiguous().view(FP8_DTYPE)
     flat = codes_f8.to(torch.float32)
     pad = n_blocks * t.tile - n_cols
     if pad:
