@@ -137,20 +137,19 @@ def run_training(
     prev_loss: float | None = None
 
     def grow_batch(step: int, salt: int) -> bool:
-        """Add up to max_new_experts (capped by max_experts). True if grew."""
-        if len(model.pool) >= cfg.max_experts:
-            return False
+        """Clone the top-8 experts (exact copies + 2 mutants), room-capped."""
         room = cfg.max_experts - len(model.pool)
-        count = min(cfg.max_new_experts, room)
-        for growth_index in range(count):
-            eid = growth_mod.grow_expert(
-                model.pool, model.router, cfg.d_model, cfg.expert_hidden, step,
-                seed=seed + salt + growth_index,
-                fp8_tile=cfg.fp8_tile,
-            )
+        if room <= 0:
+            return False
+        new_ids = growth_mod.grow_topk_clones(
+            model.pool, model.router, cfg.d_model, cfg.expert_hidden, step,
+            seed=seed + salt, k=min(8, room), n_mutated=2,
+            fp8_tile=cfg.fp8_tile,
+        )
+        for eid in new_ids:
             log_fn(f"[grow] step={step} new={eid} pool={len(model.pool)}")
         model.cfg.num_experts = len(model.pool)
-        return True
+        return bool(new_ids)
 
     def prune_eval(step: int) -> None:
         victims = pruning_mod.find_victims(model.pool, step,
