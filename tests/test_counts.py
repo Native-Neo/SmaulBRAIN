@@ -56,7 +56,7 @@ def test_one_billion_params_need_not_be_resident():
 def test_cli_report_json(tmp_path):
     ckpt = str(tmp_path / "ckpt")
     r = subprocess.run(
-        [sys.executable, "main.py", "--d-model", "32", "--n-heads", "4",
+        [sys.executable, "cli.py", "--d-model", "32", "--n-heads", "4",
          "--experts", "2", "--expert-size", "64", "--active-experts", "1",
          "--max-depth", "1", "--ckpt", ckpt, "report"],
         capture_output=True, text=True, cwd=os.path.join(os.path.dirname(__file__), ".."),
