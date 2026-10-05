@@ -82,7 +82,7 @@ class SmaulBrainConfig:
     grow_every: int = 200  # optimizer steps between growth evaluations
     prune_survival_steps: int = 500  # grace period before an expert may die
     prune_min_usage: float = 1e-4  # usage share below which expert is dying
-    max_new_experts: int = 2  # cap per growth event (reproducibility)
+    max_new_experts: int = 8  # cap per growth event (clone-top-8 strategy)
 
     def __post_init__(self) -> None:
         assert self.d_model % self.n_heads == 0, "d_model must split over heads"
