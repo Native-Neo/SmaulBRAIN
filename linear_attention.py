@@ -24,6 +24,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+import native
+
 
 def feature_map(x: torch.Tensor) -> torch.Tensor:
     """ELU+1: positive feature map enabling the kernel linearization."""
@@ -103,12 +105,21 @@ def linear_attn_step(
     k: torch.Tensor,
     v: torch.Tensor,
     eps: float = 1e-6,
+    use_native: bool = False,
 ) -> tuple[torch.Tensor, LinearAttnState]:
     """Advance the recurrent state by one token ([B, H, Dh] each).
 
     Returns the output for this token and the updated state (in place).
     This is the incremental-inference path with O(1) memory per step.
+
+    ``use_native`` (or ``SMAUL_NATIVE=1``) routes through the C++ kernel.
+    Native has no autograd rule, so it engages only with gradients disabled;
+    results agree with the reference path up to float summation order.
     """
+    if (use_native or native.native_mode() == "force") and not torch.is_grad_enabled():
+        y_nat = _native_step(state, q, k, v, eps)
+        if y_nat is not None:
+            return y_nat, state
     qf = feature_map(q.float())
     kf = feature_map(k.float())
     vf = v.float()
@@ -118,3 +129,42 @@ def linear_attn_step(
     num = torch.einsum("bhd,bhde->bhe", qf, state.S.float())
     den = (qf * state.z).sum(dim=-1, keepdim=True).clamp_min(eps)
     return (num / den).to(v.dtype), state
+
+
+def _native_step(
+    state: LinearAttnState,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    eps: float,
+) -> torch.Tensor | None:
+    """One native step over [B, H, Dh] inputs. None = caller must fall back.
+
+    State tensors update in place, so they must already be contiguous: a
+    defensive copy would silently discard the update.
+    """
+    if q.ndim != 3 or k.shape != q.shape or v.shape != q.shape:
+        return None
+    B, H, Dh = q.shape
+    S, z = state.S, state.z
+    if S.shape != (B, H, Dh, Dh) or z.shape != (B, H, Dh):
+        return None
+    outs = torch.empty(B, H, Dh, dtype=torch.float32)
+    ok = True
+    for b in range(B):
+        for h in range(H):
+            scratch = torch.empty(2 * Dh, dtype=torch.float32)
+            y = torch.empty(Dh, dtype=torch.float32)
+            if not native.call_attn_step(
+                S[b, h], z[b, h],
+                q[b, h].to(torch.float32), k[b, h].to(torch.float32),
+                v[b, h].to(torch.float32), y, scratch, Dh, eps,
+            ):
+                ok = False
+                break
+            outs[b, h] = y
+        if not ok:
+            break
+    if not ok:
+        return None
+    return outs.to(v.dtype)
