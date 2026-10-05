@@ -5,12 +5,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 from config import SmaulBrainConfig
-from continual import (
-    ReplayBuffer, batch_from_seqs, evaluate_loss, retention_report,
-)
 from model import SmaulBrainModel
 from smaulopt import SmaulOpt, SmaulOptHParams
-from train import run_training
+from train import (
+    ReplayBuffer, batch_from_seqs, evaluate_loss, retention_report,
+    run_training,
+)
 
 
 def _model(seed=0):
