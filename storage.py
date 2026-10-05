@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import tempfile
 
 import torch
@@ -29,6 +30,31 @@ from experts import ExpertRecord, init_expert_optim_state
 from precision import FP8BlockTensor
 
 EXPERT_NAMES = ("w_gate", "w_up", "w_down")
+
+
+def get_rng_snapshot() -> dict:
+    """Capture all RNG state that affects future training (CPU/CUDA/Python)."""
+    snap: dict = {
+        "torch_cpu": torch.get_rng_state(),
+        "python": random.getstate(),
+    }
+    if torch.cuda.is_available():
+        snap["cuda"] = torch.cuda.get_rng_state_all()
+    return snap
+
+
+def set_rng_snapshot(snap: dict) -> None:
+    """Restore RNG state captured by get_rng_snapshot (legacy tensor tolerated)."""
+    if isinstance(snap, torch.Tensor):
+        torch.set_rng_state(snap)  # legacy rng.pt: torch CPU state only
+        return
+    if "torch_cpu" in snap:
+        torch.set_rng_state(snap["torch_cpu"])
+    if "python" in snap:
+        version, inner, gauss = snap["python"]
+        random.setstate((int(version), tuple(int(v) for v in inner), gauss))
+    if "cuda" in snap and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(snap["cuda"])
 
 
 def _atomic_save(obj, path: str) -> None:
@@ -133,7 +159,7 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
                  os.path.join(ckpt_dir, "router.pt"))
     _atomic_save({"trunk": opt.trunk_state, "router": opt.router_state,
                   "step_count": opt.step_count}, os.path.join(ckpt_dir, "optim.pt"))
-    _atomic_save(torch.get_rng_state(), os.path.join(ckpt_dir, "rng.pt"))
+    _atomic_save(get_rng_snapshot(), os.path.join(ckpt_dir, "rng.pt"))
     for eid in model.pool.order:
         save_expert_file(model.pool.experts[eid], os.path.join(exp_dir, f"{eid}.pt"))
     manifest = {
@@ -237,7 +263,14 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         pass
     rng_path = os.path.join(ckpt_dir, "rng.pt")
     if os.path.exists(rng_path):
-        torch.set_rng_state(torch.load(rng_path, map_location="cpu", weights_only=False))
+        set_rng_snapshot(torch.load(rng_path, map_location="cpu", weights_only=False))
+    # Scheduler snapshot (loss edge, growth/prune counters, replay buffer)
+    # travels in manifest extras; run_training picks it up for exact resume.
+    try:
+        sched = manifest.get("extra", {}).get("scheduler", {}) or {}
+    except Exception:
+        sched = {}
+    model._scheduler_snapshot = dict(sched) if isinstance(sched, dict) else {}
     # The pool objects were replaced: cached compute weights and staged
     # records still point at the pre-load experts and must go.
     model.pager.ram.clear()
