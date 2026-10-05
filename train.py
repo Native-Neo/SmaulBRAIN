@@ -86,10 +86,14 @@ def evaluate_loss(model, batch: torch.Tensor, context: int) -> dict:
     y = batch[:, 1 : context + 1]
     out = model.forward_infer(x)
     logits = out["logits"].float()
-    loss = torch.nn.functional.cross_entropy(logits.reshape(-1, model.cfg.vocab_size),
-                                             y.reshape(-1), ignore_index=model.cfg.pad_id).item()
     mask = y.ne(model.cfg.pad_id)
+    per_token = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, model.cfg.vocab_size),
+        y.reshape(-1),
+        reduction="none",
+    ).reshape_as(y)
     denom = mask.sum().clamp_min(1)
+    loss = per_token.masked_fill(~mask, 0.0).sum().div(denom).item()
     acc = ((logits.argmax(-1) == y) & mask).float().sum().div(denom).item()
     if was_training:
         model.train()
