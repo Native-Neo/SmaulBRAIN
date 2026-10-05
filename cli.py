@@ -195,7 +195,10 @@ def main(argv: list[str] | None = None) -> int:
                            grow_every=args.grow_every,
                            grow_loss_below=args.grow_loss_below,
                            growths_per_prune=args.growths_per_prune,
-                           prune_every=args.prune_every)
+                           prune_every=args.prune_every,
+                           # Progress/grow/prune lines go to stderr: stdout
+                           # stays pure JSON for scripting.
+                           log_fn=lambda s: print(s, file=sys.stderr))
         print(json.dumps({"final_loss": res["final_loss"],
                           "retention": res["retention"],
                           "experts": len(model.pool),
