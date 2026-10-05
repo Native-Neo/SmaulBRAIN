@@ -25,6 +25,7 @@ import torch
 
 import growth as growth_mod
 import pruning as pruning_mod
+from bytes import PAD_ID
 
 
 class _GradOnly:
@@ -65,7 +66,7 @@ class ReplayBuffer:
         return len(self.buf)
 
 
-def batch_from_seqs(seqs: list[list[int]], context: int, pad_id: int = 0) -> torch.Tensor:
+def batch_from_seqs(seqs: list[list[int]], context: int, pad_id: int = PAD_ID) -> torch.Tensor:
     """Pack variable-length byte seqs into a [B, T] batch (truncate/pad)."""
     rows = []
     for s in seqs:
@@ -86,8 +87,10 @@ def evaluate_loss(model, batch: torch.Tensor, context: int) -> dict:
     out = model.forward_infer(x)
     logits = out["logits"].float()
     loss = torch.nn.functional.cross_entropy(logits.reshape(-1, model.cfg.vocab_size),
-                                             y.reshape(-1)).item()
-    acc = (logits.argmax(-1) == y).float().mean().item()
+                                             y.reshape(-1), ignore_index=model.cfg.pad_id).item()
+    mask = y.ne(model.cfg.pad_id)
+    denom = mask.sum().clamp_min(1)
+    acc = ((logits.argmax(-1) == y) & mask).float().sum().div(denom).item()
     if was_training:
         model.train()
     return {"loss": loss, "acc": acc, "mean_executed": float(out["n_executed"])}
@@ -198,7 +201,7 @@ def run_training(
 
     old_before = None
     if old_seqs:
-        old_before = evaluate_loss(model, batch_from_seqs(old_seqs, cfg.context_length), cfg.context_length)
+        old_before = evaluate_loss(model, batch_from_seqs(old_seqs, cfg.context_length, cfg.pad_id), cfg.context_length)
     hist: list[dict] = []
     n = max(1, len(train_seqs))
     start_step = int(getattr(model, "_resume_step", -1)) + 1
@@ -241,7 +244,7 @@ def run_training(
             for s in train_seqs[(step * batch_size) % n : (step * batch_size) % n + 1]:
                 replay.add(list(s))
             batch_seqs = batch_seqs + replay.sample(replay_n)
-        b = batch_from_seqs(batch_seqs, cfg.context_length)
+        b = batch_from_seqs(batch_seqs, cfg.context_length, cfg.pad_id)
         stats = train_step(model, opt, cfg, b[:, : cfg.context_length],
                            b[:, 1 : cfg.context_length + 1], step, mode=mode,
                            selected=selected, new_since_step=new_since_step)
@@ -292,7 +295,7 @@ def run_training(
         model._resume_step = int(hist[-1]["step"])
     report = None
     if old_seqs and old_before is not None:
-        old_after = evaluate_loss(model, batch_from_seqs(old_seqs, cfg.context_length), cfg.context_length)
+        old_after = evaluate_loss(model, batch_from_seqs(old_seqs, cfg.context_length, cfg.pad_id), cfg.context_length)
         report = retention_report(old_before, old_after)
     return {
         "history": hist,
