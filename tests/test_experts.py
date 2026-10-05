@@ -89,3 +89,25 @@ def test_parents_rank_by_contribution():
     pool.experts["expert_00002"].contribution = 3.0
     pool.experts["expert_00000"].contribution = 1.0
     assert select_parents(pool, k=1) == ["expert_00002"]
+
+
+def test_dispatch_matches_admitted_weighted_combination():
+    from experts import swiglu_forward
+    pool = _pool(n=3)
+    torch.manual_seed(1)
+    x = torch.randn(6, 16)
+    # Fixed plan: token t uses experts (t%3, (t+1)%3) with weights (.7,.3);
+    # token 5 is dropped and must contribute nothing.
+    top_ids = torch.tensor([[i % 3, (i + 1) % 3] for i in range(6)])
+    top_weights = torch.tensor([[0.7, 0.3]] * 6)
+    dropped = torch.tensor([False] * 5 + [True])
+    prov = {e: pool.experts[e].dequantize(torch.float32) for e in pool.order}
+    out = pool.forward(x, top_ids, top_weights, dropped, lambda e: prov[e])
+    for t in range(5):
+        expect = torch.zeros(16)
+        for slot, w in ((0, 0.7), (1, 0.3)):
+            eid = pool.order[int(top_ids[t, slot])]
+            expect += w * swiglu_forward(x[t : t + 1], prov[eid])[0]
+        assert torch.allclose(out[t], expect, atol=1e-5), t
+    assert torch.equal(out[5], torch.zeros(16))  # dropped token: pure residual
+    assert pool.experts["expert_00000"].tokens_routed == 3  # live tokens only
