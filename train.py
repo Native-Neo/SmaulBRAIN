@@ -108,15 +108,23 @@ def run_training(
     old_seqs: list[list[int]] | None = None,
     grow_every: int = 0,
     prune_every: int = 0,
+    grow_loss_below: float | None = 0.75,
+    growths_per_prune: int = 2,
     seed: int = 0,
     log_fn=print,
 ) -> dict:
     """Small-driver training over in-memory byte sequences.
 
     ``train_seqs`` are byte-id lists; batches cycle deterministically.
+    Growth fires on schedule (``grow_every``) and whenever the step loss
+    newly dips below ``grow_loss_below`` (falling edge; negative disables).
+    After every ``growths_per_prune`` growth events one prune evaluation
+    runs, on top of the ``prune_every`` schedule.
     Returns history + optional retention report (old_seqs evaluated before
     and after) so continual-learning retention is measured, not claimed.
     """
+    if growths_per_prune < 1:
+        raise ValueError(f"growths_per_prune must be >= 1, got {growths_per_prune!r}")
     from storage import save_model
 
     old_before = None
@@ -125,6 +133,36 @@ def run_training(
     hist: list[dict] = []
     n = max(1, len(train_seqs))
     start_step = int(getattr(model, "_resume_step", -1)) + 1
+    growth_events = 0
+    prev_loss: float | None = None
+
+    def grow_batch(step: int, salt: int) -> bool:
+        """Add up to max_new_experts (capped by max_experts). True if grew."""
+        if len(model.pool) >= cfg.max_experts:
+            return False
+        room = cfg.max_experts - len(model.pool)
+        count = min(cfg.max_new_experts, room)
+        for growth_index in range(count):
+            eid = growth_mod.grow_expert(
+                model.pool, model.router, cfg.d_model, cfg.expert_hidden, step,
+                seed=seed + salt + growth_index,
+                fp8_tile=cfg.fp8_tile,
+            )
+            log_fn(f"[grow] step={step} new={eid} pool={len(model.pool)}")
+        model.cfg.num_experts = len(model.pool)
+        return True
+
+    def prune_eval(step: int) -> None:
+        victims = pruning_mod.find_victims(model.pool, step,
+                                           survival_steps=cfg.prune_survival_steps,
+                                           min_experts=cfg.min_experts,
+                                           usage_threshold=cfg.prune_min_usage)
+        if victims:
+            pruned = pruning_mod.prune_experts(model.pool, model.router, victims)
+            for eid in pruned:
+                model.pager.forget(eid)
+            model.cfg.num_experts = len(model.pool)
+            log_fn(f"[prune] step={step} removed={pruned} pool={len(model.pool)}")
     run_started = time.perf_counter()
     bytes_processed = 0
     for local_step in range(steps):
@@ -143,28 +181,22 @@ def run_training(
         step_bytes = int(b[:, : cfg.context_length].numel())
         bytes_processed += step_bytes
         hist.append(stats)
-        if grow_every and (step + 1) % grow_every == 0 and len(model.pool) < cfg.max_experts:
-            room = cfg.max_experts - len(model.pool)
-            count = min(cfg.max_new_experts, room)
-            for growth_index in range(count):
-                eid = growth_mod.grow_expert(
-                    model.pool, model.router, cfg.d_model, cfg.expert_hidden, step,
-                    seed=seed + step * max(1, cfg.max_new_experts) + growth_index,
-                    fp8_tile=cfg.fp8_tile,
-                )
-                log_fn(f"[grow] step={step} new={eid} pool={len(model.pool)}")
-            model.cfg.num_experts = len(model.pool)
+        grew = False
+        if grow_every and (step + 1) % grow_every == 0:
+            grew = grow_batch(step, step * max(1, cfg.max_new_experts)) or grew
+        # Loss-triggered growth on the falling edge below the threshold; the
+        # salt offset keeps its seeds distinct from scheduled growth.
+        loss_now = float(stats["loss"])
+        if (grow_loss_below is not None and prev_loss is not None
+                and prev_loss >= grow_loss_below > loss_now):
+            grew = grow_batch(step, step * max(1, cfg.max_new_experts) + 7919) or grew
+        prev_loss = loss_now
+        if grew:
+            growth_events += 1
+            if growth_events % growths_per_prune == 0:
+                prune_eval(step)
         if prune_every and (step + 1) % prune_every == 0:
-            victims = pruning_mod.find_victims(model.pool, step,
-                                               survival_steps=cfg.prune_survival_steps,
-                                               min_experts=cfg.min_experts,
-                                               usage_threshold=cfg.prune_min_usage)
-            if victims:
-                pruned = pruning_mod.prune_experts(model.pool, model.router, victims)
-                for eid in pruned:
-                    model.pager.forget(eid)
-                model.cfg.num_experts = len(model.pool)
-                log_fn(f"[prune] step={step} removed={pruned} pool={len(model.pool)}")
+            prune_eval(step)
         if ckpt_dir and save_every and (step + 1) % save_every == 0:
             save_model(ckpt_dir, model, opt, step)
             model._resume_step = step
