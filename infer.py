@@ -22,12 +22,13 @@ def sample_next(logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0,
     if top_k > 0:
         k = min(top_k, l.numel())
         thresh = torch.topk(l, k).values[-1]
-        l = torch.where(l >= thresh, l, torch.tensor(float("-inf")))
+        l = torch.where(l >= thresh, l, torch.full_like(l, float("-inf")))
     if top_p < 1.0:
         order = torch.argsort(l, descending=True)
         probs = torch.softmax(l[order], dim=-1)
         cum = torch.cumsum(probs, dim=-1)
-        keep = torch.cat([torch.tensor([True]), cum[:-1] < top_p])
+        keep = torch.cat([torch.ones(1, dtype=torch.bool, device=l.device),
+                          cum[:-1] < top_p])
         mask = torch.full_like(l, float("-inf"))
         mask[order[keep]] = l[order[keep]]
         l = mask
