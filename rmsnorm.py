@@ -12,6 +12,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+import native
+
 
 class RMSNorm(nn.Module):
     """Root-mean-square layer norm without mean centering or bias."""
@@ -23,6 +25,17 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
+        # Native path is inference-only: it has no autograd rule, so training
+        # always takes the torch path and keeps exact gradients. It is also
+        # opt-in (SMAUL_NATIVE=1): float summation order differs in the last
+        # ulp, and bit-deterministic tests run on the reference path.
+        if (dtype == torch.float32 and x.device.type == "cpu"
+                and not torch.is_grad_enabled()
+                and native.native_mode() == "force"):
+            flat = x.reshape(-1, x.shape[-1])
+            y = native.call_rmsnorm(flat, self.weight.detach(), self.eps)
+            if y is not None:
+                return y.reshape(x.shape).to(dtype)
         xf = x.float()
         var = xf.pow(2).mean(dim=-1, keepdim=True)
         out = xf * torch.rsqrt(var + self.eps) * self.weight.to(torch.float32)
