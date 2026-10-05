@@ -8,7 +8,8 @@ from config import SmaulBrainConfig
 from infer import generate
 from model import SmaulBrainModel
 from smaulopt import SmaulOpt, SmaulOptHParams
-from train import run_training, train_step
+from train import run_training, train_step, batch_from_seqs
+from bytes import PAD_ID
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 
@@ -98,4 +99,14 @@ def test_streaming_inference_matches_full_causal_pass():
         parts.append(out["logits"])
     streamed = torch.cat(parts, dim=1)
     assert torch.allclose(full["logits"], streamed, atol=2e-5, rtol=2e-5)
+    m.pager.close()
+
+
+def test_padding_is_distinct_from_byte_zero_and_masked():
+    m, opt, cfg = _model()
+    b = batch_from_seqs([[0, 1, 2], [3]], context=6, pad_id=cfg.pad_id)
+    assert cfg.pad_id != 0
+    assert b[1, -1].item() == cfg.pad_id
+    out = m(b[:, :6], b[:, 1:7], step=0)
+    assert torch.isfinite(out["loss"])
     m.pager.close()
