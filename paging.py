@@ -69,7 +69,7 @@ class ExpertPager:
         self.load_from_disk = load_from_disk
         self.ram: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
         self.vram: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
-        self.ram_records: dict = {}  # R2VR staging area: disk-loaded records
+        self.ram_records: OrderedDict[str, object] = OrderedDict()  # bounded R2VR staging
         self.stats = PagingStats()
         self._lock = threading.Lock()  # prefetch thread vs mutating main thread
         self._exec = ThreadPoolExecutor(max_workers=1)
@@ -146,15 +146,21 @@ class ExpertPager:
 
     # -- R2VR: RAM -> VRAM (disk only via warm_ram) --
     def warm_ram(self) -> None:
-        """Bulk-stage expert records from disk into RAM at startup.
+        """Stage at most the configured RAM-cache records at startup.
 
-        Later misses stage on demand through the same disk -> RAM path;
-        VRAM is only ever fed from staged RAM records, never from disk.
+        R2VR must not preload the whole expert pool. Missing experts are
+        staged on demand, and the oldest staged records are evicted.
         """
-        for eid in self.pool.order:
+        for eid in self.pool.order[:max(0, self.ram_cache)]:
+            if eid in self.ram_records:
+                self.ram_records.move_to_end(eid)
+                continue
             rec = self._read_disk(eid)
             self.stats.ram_loads += 1
             self.ram_records[eid] = rec
+        while len(self.ram_records) > self.ram_cache:
+            self.ram_records.popitem(last=False)
+            self.stats.ram_evictions += 1
 
     def _get_r2vr(self, expert_id: str) -> dict[str, torch.Tensor]:
         if expert_id in self.vram:
@@ -166,6 +172,11 @@ class ExpertPager:
             # The RAM stage is never skipped: VRAM is only ever fed from RAM.
             self.ram_records[expert_id] = self._read_disk(expert_id)
             self.stats.ram_loads += 1
+            while len(self.ram_records) > self.ram_cache:
+                self.ram_records.popitem(last=False)
+                self.stats.ram_evictions += 1
+        else:
+            self.ram_records.move_to_end(expert_id)
         rec = self.ram_records[expert_id]  # RAM-staged record, no disk IO below
         w = self._to_vram({k: v.to(self.compute_dtype)
                            for k, v in rec.dequantize(torch.float32).items()})
