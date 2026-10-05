@@ -63,3 +63,49 @@ def test_router_grows_and_shrinks_with_pool():
     assert r.num_experts == 3
     plan = r.route(torch.randn(10, 16))
     assert plan.top_ids.max().item() < 3
+
+
+def test_empty_batch_returns_empty_plan():
+    torch.manual_seed(0)
+    r = SparseRouter(16, num_experts=4, top_k=2)
+    plan = r.route(torch.zeros(0, 16))
+    assert plan.top_ids.shape == (0, 2)
+    assert plan.top_weights.shape == (0, 2)
+    assert plan.dropped.shape == (0,)
+    assert plan.probs.shape == (0, 4)
+    assert float(r.balance_loss(plan.probs)) == 0.0
+
+
+def test_nonfinite_input_sanitized_and_counted():
+    torch.manual_seed(0)
+    r = SparseRouter(8, num_experts=3, top_k=2)
+    x = torch.randn(6, 8)
+    x[0, :] = float("nan")
+    x[1, 0] = float("inf")
+    plan = r.route(x)
+    assert torch.isfinite(plan.top_weights).all()
+    assert ((plan.top_ids >= 0) & (plan.top_ids < 3)).all()
+    assert torch.isfinite(plan.probs).all()
+    assert torch.isfinite(r.balance_loss(plan.probs))
+    assert float(r.sanitized_counts) == 2.0
+    r.reset_stats()
+    assert float(r.sanitized_counts) == 0.0
+
+
+def test_routing_deterministic_for_same_input():
+    torch.manual_seed(0)
+    r = SparseRouter(16, num_experts=5, top_k=2)
+    x = torch.randn(24, 16)
+    a = r.route(x)
+    b = r.route(x.clone())
+    assert torch.equal(a.top_ids, b.top_ids)
+    assert torch.equal(a.dropped, b.dropped)
+    assert torch.allclose(a.top_weights, b.top_weights)
+
+
+def test_all_dropped_keeps_balance_finite():
+    torch.manual_seed(0)
+    r = SparseRouter(8, num_experts=2, top_k=2, capacity_factor=0.05)
+    plan = r.route(torch.randn(64, 8))
+    assert plan.dropped.sum().item() > 0
+    assert torch.isfinite(r.balance_loss(plan.probs))
