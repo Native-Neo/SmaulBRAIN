@@ -145,7 +145,10 @@ class SmaulOpt:
         if self.hp.clip > 0 and norm > self.hp.clip:
             scale = self.hp.clip / (norm + 1e-12)
         eff_lr = lr * scale
-        self.step_count += 1
+        # NOTE: no step_count increment here. step_dense runs once per
+        # parameter group (trunk, router, ...), so counting here would
+        # double-count train steps. The single global increment lives in
+        # train_step, which owns the once-per-step semantics.
         with torch.no_grad():
             for name, p in named_params:
                 if p.grad is None:
