@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import torch
 
-from experts import ExpertPool, init_expert_optim_state, make_expert
-from precision import dequantize_fp8_blockwise
+from experts import ExpertPool, ExpertRecord, init_expert_optim_state, make_expert
+from precision import FP8BlockTensor, dequantize_fp8_blockwise
+
+_EXPERT_WEIGHTS = ("w_gate", "w_up", "w_down")
 
 
 def select_parents(pool: ExpertPool, k: int = 2) -> list[str]:
@@ -98,3 +100,68 @@ def grow_expert(
     pool.add(rec)
     router.add_expert_row(init=init_row)
     return rec.expert_id
+
+
+def grow_topk_clones(
+    pool: ExpertPool,
+    router,  # SparseRouter (duck-typed)
+    d_model: int,
+    expert_hidden: int,
+    step: int,
+    seed: int = 0,
+    k: int = 8,
+    n_mutated: int = 2,
+    noise_std: float = 0.0005,
+    fp8_tile: int = 64,
+) -> list[str]:
+    """Duplicate the top-k experts by contribution (exact copies + mutants).
+
+    Each clone inherits its parent's router row, so traffic splits between
+    twins — approximately output-preserving under top-k renormalization.
+    ``n_mutated`` clones (seeded choice) receive small Gaussian perturbation
+    for exploration; the rest are bit-identical consolidation with fresh
+    (zero) optimizer state. Returns new ids in parent-rank order.
+    Reproducible from ``seed``; birth steps grant prune grace periods.
+    """
+    ranked = sorted(
+        pool.experts.values(),
+        key=lambda r: (-r.contribution, -r.tokens_routed, r.expert_id),
+    )
+    parents = ranked[: max(1, min(k, len(ranked)))]
+    gen = torch.Generator().manual_seed(seed)
+    mutated = set(torch.randperm(len(parents), generator=gen)[: max(0, min(n_mutated, len(parents)))].tolist())
+    new_ids: list[str] = []
+    for i, par in enumerate(parents):
+        eid = pool.fresh_id()
+        if i in mutated and noise_std > 0:
+            w = {n: dequantize_fp8_blockwise(par.weights_fp8[n], torch.float32)
+                 for n in _EXPERT_WEIGHTS}
+            for n in w:
+                noise = torch.empty_like(w[n])
+                noise.normal_(0.0, noise_std, generator=gen)
+                w[n] += noise
+            rec = make_expert(eid, d_model, expert_hidden, weights=w, birth_step=step,
+                              parents=[par.expert_id], source="clone-mutated",
+                              fp8_tile=fp8_tile)
+        else:
+            rec = ExpertRecord(
+                expert_id=eid,
+                d_model=d_model,
+                expert_hidden=expert_hidden,
+                weights_fp8={n: FP8BlockTensor(
+                    codes=par.weights_fp8[n].codes.clone(),
+                    scales=par.weights_fp8[n].scales.clone(),
+                    shape=par.weights_fp8[n].shape,
+                    tile=par.weights_fp8[n].tile,
+                ) for n in _EXPERT_WEIGHTS},
+                birth_step=step,
+                parents=[par.expert_id],
+                source="clone",
+            )
+            rec.optim_state = init_expert_optim_state(rec)
+        pool.add(rec)
+        with torch.no_grad():
+            parent_row = router.proj.weight[pool.index_of(par.expert_id)].detach().clone()
+        router.add_expert_row(init=parent_row)
+        new_ids.append(eid)
+    return new_ids
