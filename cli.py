@@ -91,6 +91,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Text file for training bytes (default: synthetic demo).")
     t.add_argument("--save-every", type=int, default=0, help="Checkpoint every N steps (0=off).")
     t.add_argument("--grow-every", type=int, default=0, help="Growth eval every N steps (0=off).")
+    t.add_argument("--grow-loss-below", type=float, default=0.75,
+                   help="Grow whenever step loss newly dips below this (negative disables).")
+    t.add_argument("--growths-per-prune", type=int, default=2,
+                   help="One prune evaluation every N growth events.")
     t.add_argument("--prune-every", type=int, default=0, help="Prune eval every N steps (0=off).")
     # infer
     i = sub.add_parser("infer", help="Generate bytes from a prompt.")
@@ -189,6 +193,8 @@ def main(argv: list[str] | None = None) -> int:
                            ckpt_dir=args.ckpt if args.save_every else None,
                            save_every=args.save_every,
                            grow_every=args.grow_every,
+                           grow_loss_below=args.grow_loss_below,
+                           growths_per_prune=args.growths_per_prune,
                            prune_every=args.prune_every)
         print(json.dumps({"final_loss": res["final_loss"],
                           "retention": res["retention"],
