@@ -64,6 +64,28 @@ class ReplayBuffer:
     def __len__(self) -> int:
         return len(self.buf)
 
+    def to_dict(self) -> dict:
+        """JSON-safe snapshot: sequences, cursor, and sampler RNG state."""
+        version, inner, gauss = self.rng.getstate()
+        return {
+            "capacity": self.capacity,
+            "buf": [list(s) for s in self.buf],
+            "seen": self.seen,
+            "rng": [int(version), [int(v) for v in inner], gauss],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict, seed: int = 0) -> "ReplayBuffer":
+        """Rebuild a buffer from to_dict (exact RNG continuation)."""
+        buf = cls(capacity=int(d.get("capacity", 512)), seed=seed)
+        buf.buf = deque([list(s) for s in d.get("buf", [])])
+        buf.seen = int(d.get("seen", 0))
+        rng = d.get("rng")
+        if rng is not None:
+            version, inner, gauss = rng
+            buf.rng.setstate((int(version), tuple(int(v) for v in inner), gauss))
+        return buf
+
 
 def batch_from_seqs(seqs: list[list[int]], context: int, pad_id: int = 0) -> torch.Tensor:
     """Pack variable-length byte seqs into a [B, T] batch (truncate/pad)."""
@@ -206,8 +228,28 @@ def run_training(
     hist: list[dict] = []
     n = max(1, len(train_seqs))
     start_step = int(getattr(model, "_resume_step", -1)) + 1
-    growth_events = 0
-    prev_loss: float | None = None
+    # Resume scheduler state stashed by storage.load_model (loss edge,
+    # growth/prune counters, replay buffer). Fresh runs start clean.
+    _snap = getattr(model, "_scheduler_snapshot", {}) or {}
+    if not isinstance(_snap, dict):
+        _snap = {}
+    try:
+        growth_events = int(_snap.get("growth_events", 0))
+    except (TypeError, ValueError):
+        growth_events = 0
+    try:
+        prev_loss = None if _snap.get("prev_loss") is None else float(_snap["prev_loss"])
+    except (TypeError, ValueError):
+        prev_loss = None  # corrupt entry: lose edge memory, never crash here
+    if replay is None and isinstance(_snap.get("replay"), dict):
+        replay = ReplayBuffer.from_dict(_snap["replay"])
+
+    def scheduler_snapshot() -> dict:
+        return {
+            "prev_loss": prev_loss,
+            "growth_events": growth_events,
+            "replay": replay.to_dict() if replay is not None else None,
+        }
 
     def grow_batch(step: int, salt: int) -> bool:
         """Clone the top experts (room-capped by max_new_experts)."""
