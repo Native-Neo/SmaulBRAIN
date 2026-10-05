@@ -59,6 +59,7 @@ class ExpertPager:
         vram_cache: int = 4,
         compute_dtype: torch.dtype = torch.bfloat16,
         load_from_disk=None,  # (expert_id) -> ExpertRecord (real file IO)
+        max_staged: int = 128,  # R2VR RAM-staging ceiling (LRU; misses re-read)
     ) -> None:
         assert mode in ("D2R", "R2VR", "D2VR"), f"unknown paging mode {mode}"
         self.pool = pool
@@ -67,9 +68,10 @@ class ExpertPager:
         self.vram_cache = vram_cache
         self.compute_dtype = compute_dtype
         self.load_from_disk = load_from_disk
+        self.max_staged = max_staged
         self.ram: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
         self.vram: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
-        self.ram_records: dict = {}  # R2VR staging area: disk-loaded records
+        self.ram_records: OrderedDict = OrderedDict()  # R2VR staging area
         self.stats = PagingStats()
         self._lock = threading.Lock()  # prefetch thread vs mutating main thread
         self._exec = ThreadPoolExecutor(max_workers=1)
@@ -144,17 +146,26 @@ class ExpertPager:
         assert len(self.vram) == 0, "D2R path must never populate VRAM"
         return w
 
+    def _stage(self, expert_id: str):
+        """Disk -> RAM staging with LRU bound; evicted records re-read later."""
+        rec = self._read_disk(expert_id)
+        self.stats.ram_loads += 1
+        self.ram_records[expert_id] = rec
+        self.ram_records.move_to_end(expert_id)
+        while len(self.ram_records) > self.max_staged:
+            self.ram_records.popitem(last=False)
+
     # -- R2VR: RAM -> VRAM (disk only via warm_ram) --
     def warm_ram(self) -> None:
         """Bulk-stage expert records from disk into RAM at startup.
 
         Later misses stage on demand through the same disk -> RAM path;
         VRAM is only ever fed from staged RAM records, never from disk.
+        Staging never exceeds max_staged entries (LRU); evicted records
+        are re-read from disk on their next miss.
         """
         for eid in self.pool.order:
-            rec = self._read_disk(eid)
-            self.stats.ram_loads += 1
-            self.ram_records[eid] = rec
+            self._stage(eid)
 
     def _get_r2vr(self, expert_id: str) -> dict[str, torch.Tensor]:
         if expert_id in self.vram:
@@ -164,8 +175,9 @@ class ExpertPager:
         if expert_id not in self.ram_records:
             # On-demand staging disk -> RAM (supports post-growth experts).
             # The RAM stage is never skipped: VRAM is only ever fed from RAM.
-            self.ram_records[expert_id] = self._read_disk(expert_id)
-            self.stats.ram_loads += 1
+            self._stage(expert_id)
+        else:
+            self.ram_records.move_to_end(expert_id)
         rec = self.ram_records[expert_id]  # RAM-staged record, no disk IO below
         w = self._to_vram({k: v.to(self.compute_dtype)
                            for k, v in rec.dequantize(torch.float32).items()})
