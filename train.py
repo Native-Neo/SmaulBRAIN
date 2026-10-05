@@ -150,6 +150,10 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
         opt.step_expert(rec, compute, 1.0, cfg.expert_lr)
         model.pager.invalidate(eid)
         stepped.append(eid)
+    # Global optimizer steps: exactly one per train_step call, including
+    # steps whose updates were skipped (see skipped-step semantics). The
+    # per-tensor bias corrections use each tensor's own step counter.
+    opt.step_count += 1
     return {
         "loss": float(loss.item()),
         "nll": float(out["nll"].item()),
@@ -206,13 +210,14 @@ def run_training(
     prev_loss: float | None = None
 
     def grow_batch(step: int, salt: int) -> bool:
-        """Clone the top-8 experts (exact copies + 2 mutants), room-capped."""
+        """Clone the top experts (room-capped by max_new_experts)."""
         room = cfg.max_experts - len(model.pool)
-        if room <= 0:
+        count = min(cfg.max_new_experts, room)
+        if count <= 0:
             return False
         new_ids = growth_mod.grow_topk_clones(
             model.pool, model.router, cfg.d_model, cfg.expert_hidden, step,
-            seed=seed + salt, k=min(8, room), n_mutated=2,
+            seed=seed + salt, k=count, n_mutated=min(2, count),
             fp8_tile=cfg.fp8_tile,
         )
         for eid in new_ids:
