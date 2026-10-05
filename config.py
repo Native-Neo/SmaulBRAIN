@@ -10,6 +10,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 
 
+__version__ = "0.1.0"
+
+
 # Expert sizing: a SwiGLU expert with d_model=d and hidden=h owns
 # 3*d*h parameters (gate, up, down projections, no biases).
 # At d=512, h=3328 -> 3*512*3328 = 5,111,808 ~= 5.12M.
