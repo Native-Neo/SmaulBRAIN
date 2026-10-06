@@ -203,3 +203,13 @@ def test_train_step_leaves_unstepped_experts_bit_identical():
                 continue  # stepped experts may legitimately change
             assert same_codes and same_scales, (eid, n)  # untouched: bit identical
     m.pager.close()
+
+
+def test_growth_build_failure_commits_nothing():
+    """Two-phase rollback: a phase-1 build failure leaves pool/router exact."""
+    pool, r = _synced(n=3)
+    pool.experts["expert_00000"].weights_fp8["w_gate"] = None  # poison build
+    order = list(pool.order)
+    with pytest.raises(Exception):
+        grow_topk_clones(pool, r, 16, 32, step=1, seed=0, k=3)
+    assert pool.order == order and r.num_experts == 3
