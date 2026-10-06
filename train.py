@@ -150,6 +150,10 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
     """One optimizer step. Returns loss stats + stepped expert ids."""
     if mode not in _MODES:
         raise ValueError(f"unknown training mode {mode!r}; expected one of {_MODES}")
+    if x.shape != y.shape or x.ndim != 2:
+        raise ValueError(f"x and y must share one [B, T] shape, got {tuple(x.shape)} vs {tuple(y.shape)}")
+    if x.shape[0] < 1 or x.shape[1] < 1:
+        raise ValueError(f"empty batch {tuple(x.shape)} carries no gradient signal")
     model.train()
     model.zero_grad(set_to_none=True)
     out = model(x, y, step=step)
@@ -237,6 +241,14 @@ def run_training(
     Returns history + optional retention report (old_seqs evaluated before
     and after) so continual-learning retention is measured, not claimed.
     """
+    if not train_seqs:
+        raise ValueError("train_seqs is empty: nothing to train on")
+    if steps < 1:
+        raise ValueError(f"steps must be >= 1, got {steps!r}")
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size!r}")
+    if replay_n < 0:
+        raise ValueError(f"replay_n must be >= 0, got {replay_n!r}")
     if growths_per_prune < 1:
         raise ValueError(f"growths_per_prune must be >= 1, got {growths_per_prune!r}")
     from storage import save_model
