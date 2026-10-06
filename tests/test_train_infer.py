@@ -8,7 +8,7 @@ from config import SmaulBrainConfig
 from infer import generate
 from model import SmaulBrainModel
 from smaulopt import SmaulOpt, SmaulOptHParams
-from train import run_training, train_step
+from train import batch_from_seqs, evaluate_loss, run_training, train_step
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 
@@ -98,4 +98,40 @@ def test_streaming_inference_matches_full_causal_pass():
         parts.append(out["logits"])
     streamed = torch.cat(parts, dim=1)
     assert torch.allclose(full["logits"], streamed, atol=2e-5, rtol=2e-5)
+    m.pager.close()
+
+
+def test_special_token_ids_train_without_index_errors():
+    from bytes import with_bos, with_eos
+    m, opt, cfg = _model()
+    assert cfg.vocab_size >= 260  # specials inside model bounds
+    seq = with_eos(with_bos([10, 20, 30, 40]))
+    b = batch_from_seqs([seq], context=cfg.context_length)
+    s = train_step(m, opt, cfg, b[:, :cfg.context_length], b[:, 1:], step=0)
+    assert torch.isfinite(torch.tensor(s["loss"]))
+    m.pager.close()
+
+
+def test_eval_loss_invariant_to_pad_tail_length():
+    m, _, cfg = _model()
+    seq = [10, 20, 30, 40, 50, 60]
+    got = []
+    for ctx in (8, 12, 20):
+        b = batch_from_seqs([seq], context=ctx)
+        got.append(evaluate_loss(m, b, ctx)["loss"])
+    assert got[0] == got[1] == got[2]  # pads contribute nothing, norm is valid-only
+    m.pager.close()
+
+
+def test_train_loss_invariant_to_pad_tail_without_capacity_pressure():
+    # Capacity binds nothing here (factor 1000), so per-position outputs are
+    # prefix-determined and the valid-normalized loss must match exactly.
+    m, _, cfg = _model(capacity_factor=1000.0)
+    seq = [10, 20, 30, 40, 50, 60]
+    got = []
+    for ctx in (8, 12, 20):
+        b = batch_from_seqs([seq], context=ctx)
+        with torch.no_grad():
+            got.append(float(m(b[:, :ctx], b[:, 1:], step=0)["loss"]))
+    assert got[0] == got[1] == got[2]
     m.pager.close()
