@@ -65,3 +65,15 @@ def test_cli_report_json(tmp_path):
     payload = json.loads(r.stdout)
     assert payload["total_params"] > payload["active_params"]
     assert payload["expert_count"] == 2
+
+
+def test_stored_bytes_track_growth_and_undercut_logical():
+    m = _model()
+    before = m.param_counts()
+    assert before["stored_expert_bytes"] > 0
+    # FP8 storage is a fraction of the logical fp32-equivalent footprint.
+    assert before["stored_expert_bytes"] < before["expert_params_total"] * 4
+    grow_expert(m.pool, m.router, 32, 64, step=1, seed=0)
+    after = m.param_counts()
+    assert after["stored_expert_bytes"] > before["stored_expert_bytes"]
+    m.pager.close()
