@@ -219,12 +219,17 @@ def main(argv: list[str] | None = None) -> int:
             save_model(args.ckpt, model, opt, int(getattr(model, "_resume_step", -1)),
                        extra_meta={"scheduler": res["scheduler"]})
     elif args.cmd == "infer":
-        if os.path.exists(os.path.join(args.ckpt, "manifest.json")):
-            # Serve future misses from the checkpoint files. load_model above
-            # already cleared stale caches and staged R2VR RAM; wiring the
-            # loader here must not repeat that work (double disk reads).
-            from storage import make_disk_loader
-            model.pager.load_from_disk = make_disk_loader(args.ckpt)
+        # Inference is continuation-only: generating from a freshly
+        # initialized model would emit confidently meaningless bytes.
+        if not os.path.exists(os.path.join(args.ckpt, "manifest.json")):
+            print(f"error: no checkpoint at {args.ckpt}; train first",
+                  file=sys.stderr)
+            return 2
+        # Serve future misses from the checkpoint files. load_model above
+        # already cleared stale caches and staged R2VR RAM; wiring the
+        # loader here must not repeat that work (double disk reads).
+        from storage import make_disk_loader
+        model.pager.load_from_disk = make_disk_loader(args.ckpt)
         res = generate(model, encode_text(args.prompt), max_new=args.max_new,
                        temperature=args.temperature, context=cfg.context_length,
                        seed=args.seed)
