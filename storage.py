@@ -233,8 +233,11 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         saved_cfg = SmaulBrainConfig.from_dict(json.load(f))
     shape_fields = (
         "d_model", "vocab_size", "n_heads", "expert_hidden",
-        "top_k", "fp8_tile", "dtype",
+        "top_k", "dtype",
     )
+    # Note: fp8_tile is intentionally not a shape field. Tiles ride on each
+    # stored tensor and retile conversions update them; the model adopts the
+    # checkpoint tile for future growth instead of refusing to load.
     for field in shape_fields:
         if getattr(saved_cfg, field) != getattr(model.cfg, field):
             raise ValueError(
