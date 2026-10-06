@@ -103,6 +103,26 @@ class SmaulBrainConfig:
         assert self.state_dtype in ("bf16", "fp32"), "state dtype bf16|fp32"
         assert self.expert_hidden >= 8, "expert hidden dim too small"
         assert self.attention_chunk_size >= 1, "attention chunk size must be positive"
+        assert self.capacity_factor > 0, "capacity factor must be positive"
+        assert self.moe_balance_weight >= 0, "balance weight must be non-negative"
+        assert self.expert_lr > 0, "expert LR must be positive"
+        assert self.trunk_lr_mult > 0, "trunk LR multiplier must be positive"
+        assert self.router_lr_mult > 0, "router LR multiplier must be positive"
+        assert self.weight_decay >= 0, "weight decay must be non-negative"
+        # Clipping semantics: grad_clip > 0 caps the global grad norm;
+        # 0 (or negative) disables clipping entirely.
+        assert self.grad_clip >= 0, "grad clip must be non-negative (0 disables)"
+        assert 0.0 <= self.beta_m < 1.0, "beta_m in [0, 1)"
+        assert 0.0 <= self.beta_v < 1.0, "beta_v in [0, 1)"
+        assert self.epsilon > 0, "epsilon must be positive"
+        assert self.fp8_tile >= 8, "FP8 tile too small"
+        assert self.threads >= 1, "need at least 1 thread"
+        assert self.context_length >= 2, "context must fit input + target"
+        assert self.rmsnorm_eps > 0, "rmsnorm eps must be positive"
+        assert self.grow_every >= 0, "grow_every must be non-negative (0 disables)"
+        assert self.prune_survival_steps >= 1, "need a positive prune grace period"
+        assert self.prune_min_usage >= 0, "prune usage threshold must be non-negative"
+        assert self.max_new_experts >= 1, "need at least 1 new expert per growth"
         # active_experts is a user-facing alias for top_k; keep them in sync.
         object.__setattr__(self, "active_experts", self.top_k)
 
