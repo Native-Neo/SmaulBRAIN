@@ -30,6 +30,20 @@ def test_replay_buffer_reservoir_and_sample():
     assert len(buf.sample(3)) == 3
 
 
+def test_replay_buffer_ingress_copy_and_egress_copy():
+    buf = ReplayBuffer(capacity=8, seed=0)
+    seq = [1, 2, 3]
+    buf.add(seq)
+    seq.append(999)  # caller mutation after add must not corrupt replay
+    seq2 = [4, 5]
+    buf.add(seq2)
+    got = buf.to_dict()["buf"]
+    assert [1, 2, 3] in got and [4, 5] in got
+    out = buf.sample(2)
+    out[0].append(-1)
+    assert buf.to_dict()["buf"] == got  # sampling hands out copies too
+
+
 def test_retention_report_numeric_and_honest():
     before = {"loss": 2.0, "acc": 0.5}
     after = {"loss": 2.2, "acc": 0.45}
