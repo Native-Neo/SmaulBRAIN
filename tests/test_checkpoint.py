@@ -237,3 +237,76 @@ def test_config_rejects_nonsense_values():
     for k, v in bad.items():
         with pytest.raises(AssertionError):
             SmaulBrainConfig(**{k: v})
+
+
+def _tampered_load_fails_cleanly(tmp_path, tamper):
+    """Corrupt one checkpoint file; load must raise with m2 bit-untouched."""
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    tamper(d)
+    m2 = SmaulBrainModel(m.cfg)
+    order_before = list(m2.pool.order)
+    embed_before = m2.embed.weight.detach().clone()
+    with pytest.raises((ValueError, FileNotFoundError, RuntimeError)):
+        load_model(d, m2, SmaulOpt(SmaulOptHParams()))
+    assert list(m2.pool.order) == order_before  # pool never swapped
+    assert torch.equal(m2.embed.weight, embed_before)  # trunk never copied
+    assert m2.router.num_experts == len(order_before)  # router never resized
+    ids = torch.randint(0, 256, (1, 12))  # survivor still runs
+    assert m2.forward_infer(ids)["logits"].shape == (1, 12, m2.cfg.vocab_size)
+    m.pager.close(); m2.pager.close()
+
+
+def test_corrupt_expert_file_leaves_model_untouched(tmp_path):
+    def tamper(d):
+        import torch as _t
+        p = os.path.join(d, "experts", "expert_00000.pt")
+        payload = _t.load(p, map_location="cpu", weights_only=False)
+        payload["weights"]["w_gate"]["codes"] = payload["weights"]["w_gate"]["codes"][:-1]
+        _t.save(payload, p)
+    _tampered_load_fails_cleanly(tmp_path, tamper)
+
+
+def test_missing_expert_file_leaves_model_untouched(tmp_path):
+    def tamper(d):
+        os.remove(os.path.join(d, "experts", "expert_00001.pt"))
+    _tampered_load_fails_cleanly(tmp_path, tamper)
+
+
+def test_router_width_mismatch_leaves_model_untouched(tmp_path):
+    def tamper(d):
+        import torch as _t
+        p = os.path.join(d, "router.pt")
+        obj = _t.load(p, map_location="cpu", weights_only=False)
+        obj["weight"] = obj["weight"][:2]
+        obj["bias"] = obj["bias"][:2]
+        _t.save(obj, p)
+    _tampered_load_fails_cleanly(tmp_path, tamper)
+
+
+def test_trunk_shape_mismatch_leaves_model_untouched(tmp_path):
+    def tamper(d):
+        import torch as _t
+        p = os.path.join(d, "trunk.pt")
+        obj = _t.load(p, map_location="cpu", weights_only=False)
+        k = next(k for k in obj if isinstance(obj[k], _t.Tensor) and obj[k].ndim == 2)
+        obj[k] = obj[k][:, :-1]
+        _t.save(obj, p)
+    _tampered_load_fails_cleanly(tmp_path, tamper)
+
+
+def test_duplicate_manifest_ids_leaves_model_untouched(tmp_path):
+    def tamper(d):
+        import json as _j
+        p = os.path.join(d, "manifest.json")
+        man = _j.load(open(p))
+        man["expert_ids"] = [man["expert_ids"][0], man["expert_ids"][0]]
+        _j.dump(man, open(p, "w"))
+    _tampered_load_fails_cleanly(tmp_path, tamper)
+
+
+def test_garbage_rng_snapshot_leaves_model_untouched(tmp_path):
+    def tamper(d):
+        import torch as _t
+        _t.save({"bogus": 1}, os.path.join(d, "rng.pt"))
+    _tampered_load_fails_cleanly(tmp_path, tamper)
