@@ -51,13 +51,18 @@ class SparseRouter(nn.Module):
         # Tokens sanitized for nonfinite router input (observable, not silent).
         self.register_buffer("sanitized_counts", torch.zeros((), dtype=torch.float64))
 
-    def route(self, x: torch.Tensor) -> RoutePlan:
+    def route(self, x: torch.Tensor, enforce_capacity: bool = True) -> RoutePlan:
         """Route N tokens to top-k experts. x: [N, D] (any float dtype).
 
         Empty batches return a well-formed empty plan. Nonfinite logits are
         sanitized (NaN->0, +/-Inf->-/+1e4) and counted so dispatch artifacts
         (ids, weights, statistics, balance loss) stay finite; upstream NaNs
         still propagate through expert compute into the loss.
+
+        Capacity is a training throughput guard and is batch-size relative,
+        so inference must not enforce it (``enforce_capacity=False`` admits
+        every slot): otherwise chunked/streaming inference would admit
+        different slots than a full pass over the same tokens.
         """
         n_tokens = x.shape[0]
         if n_tokens == 0:
@@ -75,12 +80,33 @@ class SparseRouter(nn.Module):
         probs = F.softmax(logits, dim=-1)
         top_w, top_ids = torch.topk(probs, k=self.top_k, dim=-1)
         top_w = top_w / top_w.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-        # Capacity: max admitted slots per expert. Admission is per slot, not
-        # per token: a live token dispatches only to the subset of its top-k
-        # that fits, with weights renormalized over the admitted subset.
-        # Non-admitted slots read weight 0 so downstream dispatch (which
-        # multiplies mask x weight) cannot serve what capacity refused.
-        # A token with no admitted slot is dropped to the residual path.
+        n = top_ids.shape[0]
+        if not enforce_capacity:
+            admit = torch.ones_like(top_ids, dtype=torch.bool)
+            dropped = torch.zeros(n, dtype=torch.bool)
+        else:
+            admit, dropped = self._admit_slots(top_ids, top_w, n)
+            top_w = torch.where(admit, top_w, torch.zeros_like(top_w))
+            top_w = top_w / top_w.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        # Usage statistics count admitted slots only (no grad).
+        with torch.no_grad():
+            kept = top_ids[admit]
+            if kept.numel():
+                counts = torch.bincount(kept, minlength=self.num_experts)
+                self.usage_counts += counts.to(torch.float64)
+                self.admit_counts += counts.to(torch.float64)
+        return RoutePlan(top_ids=top_ids, top_weights=top_w, dropped=dropped, probs=probs)
+
+    def _admit_slots(self, top_ids: torch.Tensor, top_w: torch.Tensor,
+                     n_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-slot capacity admission. See route() for the contract.
+
+        A live token dispatches only to the subset of its top-k that fits,
+        with weights renormalized over the admitted subset. Non-admitted
+        slots read weight 0 so downstream dispatch (which multiplies
+        mask x weight) cannot serve what capacity refused. A token with no
+        admitted slot is dropped to the residual path.
+        """
         cap = max(1, int(self.capacity_factor * n_tokens * self.top_k / self.num_experts))
         order = torch.argsort(top_w.max(dim=-1).values, descending=True)
         assigned = torch.zeros(self.num_experts, dtype=torch.long)
@@ -94,16 +120,7 @@ class SparseRouter(nn.Module):
                     admit[idx, slot] = True
             if not admit[idx].any():
                 dropped[idx] = True
-        top_w = torch.where(admit, top_w, torch.zeros_like(top_w))
-        top_w = top_w / top_w.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-        # Usage statistics count admitted slots only (no grad).
-        with torch.no_grad():
-            kept = top_ids[admit]
-            if kept.numel():
-                counts = torch.bincount(kept, minlength=self.num_experts)
-                self.usage_counts += counts.to(torch.float64)
-                self.admit_counts += counts.to(torch.float64)
-        return RoutePlan(top_ids=top_ids, top_weights=top_w, dropped=dropped, probs=probs)
+        return admit, dropped
 
     def balance_loss(self, probs: torch.Tensor) -> torch.Tensor:
         """Switch-style auxiliary loss: E * sum_e (mean_prob_e * frac_e).
