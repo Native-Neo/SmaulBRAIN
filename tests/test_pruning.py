@@ -120,3 +120,20 @@ def test_prune_forgets_pager_caches_inline():
     with pytest.raises(KeyError):
         pg.provider(eid)  # no ghost served after removal
     pg.close()
+
+
+def test_prune_keeps_survivor_momentum_aligned():
+    from smaulopt import SmaulOpt, SmaulOptHParams
+    pool, r = _pool()
+    opt = SmaulOpt(SmaulOptHParams())
+    d = r.proj.weight.shape[1]
+    m = torch.stack([torch.full((d,), 100.0 + i) for i in range(4)])
+    opt.router_state["w"] = {"m": m, "step": 7,
+                             "v_row": torch.zeros(4, 1),
+                             "v_col": torch.zeros(1, d)}
+    assert prune_experts(pool, r, ["expert_00001"], optim_state=opt.router_state)
+    got = opt.router_state["w"]["m"]
+    assert got.shape == (3, d)
+    for i, want in enumerate((100.0, 102.0, 103.0)):  # victim row excised
+        assert torch.equal(got[i], torch.full((d,), want))
+    assert opt.router_state["w"]["step"] == 7
