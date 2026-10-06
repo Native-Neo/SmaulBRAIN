@@ -109,3 +109,34 @@ def test_all_dropped_keeps_balance_finite():
     plan = r.route(torch.randn(64, 8))
     assert plan.dropped.sum().item() > 0
     assert torch.isfinite(r.balance_loss(plan.probs))
+
+
+def test_per_slot_admission_respects_capacity():
+    torch.manual_seed(0)
+    n, experts, k = 16, 4, 2
+    r = SparseRouter(8, num_experts=experts, top_k=k, capacity_factor=0.5)
+    cap = max(1, int(0.5 * n * k / experts))
+    plan = r.route(torch.randn(n, 8))
+    live = ~plan.dropped
+    admitted_w = plan.top_weights[live]
+    assert torch.allclose(admitted_w.sum(-1), torch.ones(live.sum()),
+                          atol=1e-5)  # live rows renormalized over admitted subset
+    if plan.dropped.any():
+        assert (plan.top_weights[plan.dropped].sum(-1) == 0).all()
+    per_expert = torch.bincount(plan.top_ids[plan.top_weights > 0],
+                                minlength=experts)
+    assert int(per_expert.max().item()) <= cap  # real slot load within cap
+    assert int(r.usage_counts.sum().item()) == int(per_expert.sum().item())
+
+
+def test_inference_routing_ignores_batch_size():
+    torch.manual_seed(0)
+    r = SparseRouter(8, num_experts=4, top_k=2, capacity_factor=0.05)
+    x = torch.randn(8, 8)
+    whole = r.route(x, enforce_capacity=False)
+    assert not whole.dropped.any()
+    parts = [r.route(x[i : i + 1], enforce_capacity=False) for i in range(8)]
+    split_ids = torch.cat([p.top_ids for p in parts], dim=0)
+    split_w = torch.cat([p.top_weights for p in parts], dim=0)
+    assert torch.equal(whole.top_ids, split_ids)
+    assert torch.allclose(whole.top_weights, split_w)
