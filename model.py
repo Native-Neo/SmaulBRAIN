@@ -346,18 +346,25 @@ class SmaulBrainModel(nn.Module):
 
     # -- parameter accounting (dynamic topology) --
     def param_counts(self) -> dict:
+        """Logical params (architecture) plus stored expert bytes (FP8 reality).
+
+        Logical counts size the model; ``stored_expert_bytes`` sizes RAM and
+        checkpoints. Resident cache counts are dequantized compute elements
+        (transients), not parameters — hence reported separately.
+        """
         per_expert = self.pool.experts[self.pool.order[0]].param_count if len(self.pool) else 0
-        shared = sum(p.nelement() for _, p in self._trunk_params()) + sum(
-            p.nelement() for _, p in self._router_params())
+        trunk_n = sum(p.nelement() for _, p in self._trunk_params())
         router_n = sum(p.nelement() for _, p in self._router_params())
+        stored = sum(rec.storage_bytes() for rec in self.pool.experts.values())
         return {
-            "shared_params": shared - router_n,
+            "shared_params": trunk_n,
             "router_params": router_n,
             "per_expert_params": per_expert,
             "expert_count": len(self.pool),
             "expert_params_total": per_expert * len(self.pool),
-            "total_params": shared + per_expert * len(self.pool),
-            "active_params": shared + per_expert * self.cfg.top_k,
+            "stored_expert_bytes": stored,
+            "total_params": trunk_n + router_n + per_expert * len(self.pool),
+            "active_params": trunk_n + router_n + per_expert * self.cfg.top_k,
             "resident_ram_params": self._resident_params(self.pager.ram),
             "resident_vram_params": self._resident_params(self.pager.vram),
         }
