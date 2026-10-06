@@ -130,6 +130,15 @@ class ExpertPager:
             self.ram.pop(expert_id, None)
             self.vram.pop(expert_id, None)
             self.ram_records.pop(expert_id, None)
+            # In-flight background loads must not resurrect the pruned
+            # expert: drop (and cancel where still queued) its prefetch.
+            fut = self._pending.pop(expert_id, None)
+            if fut is not None:
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+            self._prefetched.discard(expert_id)
 
     # -- D2R: disk -> RAM --
     def _get_d2r(self, expert_id: str) -> dict[str, torch.Tensor]:
@@ -214,7 +223,15 @@ class ExpertPager:
             self._pending[eid] = self._exec.submit(self._prefetch_one, eid)
 
     def _prefetch_one(self, expert_id: str) -> None:
-        w = self.provider(expert_id)
+        try:
+            w = self.provider(expert_id)
+        except KeyError:
+            # Pruned mid-flight: the expert is gone from the pool, so there
+            # is nothing to stage. A KeyError for a live expert is a real
+            # bug and must still surface via the future.
+            if expert_id in self.pool.experts:
+                raise
+            return
         self._prefetched.add(expert_id)
         _ = w
 
