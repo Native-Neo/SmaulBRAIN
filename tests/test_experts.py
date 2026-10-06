@@ -106,6 +106,30 @@ def test_grow_refuses_diverged_topology_without_mutating():
     assert pool.order == order and len(pool) == 2 and r.num_experts == 3
 
 
+def _marked_router_state(nrows, d=16):
+    from smaulopt import SmaulOpt, SmaulOptHParams
+    opt = SmaulOpt(SmaulOptHParams())
+    m = torch.stack([torch.full((d,), 100.0 + i) for i in range(nrows)])
+    opt.router_state["w"] = {"m": m, "step": 5,
+                             "v_row": torch.zeros(nrows, 1),
+                             "v_col": torch.zeros(1, d)}
+    return opt
+
+
+def test_growth_preserves_survivor_momentum():
+    pool, r = _synced(n=3)
+    opt = _marked_router_state(3)
+    ids = grow_topk_clones(pool, r, 16, 32, step=1, seed=0, k=2,
+                           optim_state=opt.router_state)
+    assert len(ids) == 2 and r.num_experts == 5
+    m = opt.router_state["w"]["m"]
+    assert m.shape == (5, 16)
+    for i in range(3):  # survivors bit-identical
+        assert torch.equal(m[i], torch.full((16,), 100.0 + i))
+    assert (m[3:] == 0).all()  # newborns start at zero momentum
+    assert opt.router_state["w"]["step"] == 5
+
+
 def test_recombine_is_parent_mean_plus_noise():
     pool = _pool()
     w = recombine_weights(pool, ["expert_00000", "expert_00001"],
