@@ -215,8 +215,11 @@ class SmaulBrainModel(nn.Module):
         )
         P, _kl_mean, kl_pos = self._ponder([l.float() for l in lams])
         if targets is None:
-            logits = self.head(self.n_final(hs[-1])).float()
-            return {"logits": logits, "depths": depths, "n_executed": n_executed}
+            # Same ponder-mixed readout as the scored path (no targets to
+            # mask; P sums to 1 per position regardless).
+            mixed = sum(P[n].detach() * self.head(self.n_final(hs[n])).float()
+                        for n in range(len(hs)))
+            return {"logits": mixed, "depths": depths, "n_executed": n_executed}
         # Ponder-weighted CE: each step's logits score against halting mass.
         # Padding (PAD_ID) is not data: it is excluded from the loss via
         # ignore_index and every mean below normalizes over valid targets
@@ -224,8 +227,10 @@ class SmaulBrainModel(nn.Module):
         assert valid is not None
         n_valid = int(valid.sum().item())
         ce_steps = []
-        for h_n in hs:
+        mixed = 0.0  # ponder-mixed readout: the predictor the loss optimizes
+        for n, h_n in enumerate(hs):
             logits_n = self.head(self.n_final(h_n)).float()
+            mixed = mixed + P[n].unsqueeze(-1).detach() * logits_n.detach()
             ce = F.cross_entropy(logits_n.reshape(-1, self.cfg.vocab_size),
                                  targets.reshape(-1), reduction="none",
                                  ignore_index=PAD_ID).reshape(B, T)
@@ -239,12 +244,17 @@ class SmaulBrainModel(nn.Module):
         balance = aux / n_executed
         loss = nll + self.cfg.ponder_beta * kl_valid + self.cfg.moe_balance_weight * balance
         with torch.no_grad():
-            pred = self.head(self.n_final(hs[-1])).float().argmax(-1)
+            # Accuracy uses the ponder-mixed readout (same predictor the
+            # loss scores), not the max-depth representation inference
+            # would not necessarily read out.
+            pred = mixed.argmax(-1)
             acc = ((pred == targets) & valid).float().sum().item() / max(1, n_valid)
             steps = torch.arange(1, len(hs) + 1, device=P.device).view(-1, 1, 1)
             mean_depth = float((P * steps).sum().item() / (B * T))
         return {
-            "logits": self.head(self.n_final(hs[-1])).float(),
+            # The model's prediction is the ponder-mixed readout, matching
+            # the loss and the accuracy above (cached: no second head pass).
+            "logits": mixed,
             "loss": loss, "nll": nll.detach(), "ponder_kl": kl_valid.detach(),
             "balance": balance.detach() if torch.is_tensor(balance) else balance,
             "acc": acc, "depths": depths, "mean_depth": mean_depth,
