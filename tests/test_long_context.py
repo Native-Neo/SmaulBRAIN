@@ -41,7 +41,7 @@ def test_rss_growth_subquadratic():
     for T in (1024, 2048, 4096, 8192):
         ids = torch.randint(0, 256, (1, T))
         out = m.forward_infer(ids)
-        assert out["logits"].shape == (1, T, 256)
+        assert out["logits"].shape == (1, T, m.cfg.vocab_size)
         peak = _rss_mb() - base
         rows.append((T, peak))
         print(f"\n[T={T}] delta-peak-RSS={peak:.1f}MB executed={out['n_executed']}")
