@@ -83,3 +83,20 @@ def test_chunk_size_one_and_full_sequence_agree():
     full, _ = linear_attn_forward(q, k, v, chunk_size=19)
     one, _ = linear_attn_forward(q, k, v, chunk_size=1)
     assert torch.allclose(full, one, atol=2e-6, rtol=2e-6)
+
+
+def test_saturated_and_zero_inputs_stay_finite():
+    B, H, T, Dh = 2, 2, 16, 8
+    q = torch.full((B, H, T, Dh), -50.0)  # feature map ~0 (saturated ELU)
+    k = torch.full((B, H, T, Dh), 50.0)
+    v = torch.zeros(B, H, T, Dh)
+    out, st = linear_attn_forward(q, k, v)
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(st.S).all() and torch.isfinite(st.z).all()
+    st2 = LinearAttnState.zeros(B, H, Dh)
+    for t in range(T):
+        y, st2 = linear_attn_step(st2, q[:, :, t, :], k[:, :, t, :], v[:, :, t, :])
+        assert torch.isfinite(y).all()
+    out2, _ = linear_attn_forward(torch.full((B, H, T, Dh), 50.0), k,
+                                  torch.ones(B, H, T, Dh))
+    assert torch.isfinite(out2).all()  # large queries cannot explode the ratio
