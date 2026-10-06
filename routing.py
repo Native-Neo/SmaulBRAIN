@@ -122,18 +122,23 @@ class SparseRouter(nn.Module):
                 dropped[idx] = True
         return admit, dropped
 
-    def balance_loss(self, probs: torch.Tensor) -> torch.Tensor:
+    def balance_loss(self, probs: torch.Tensor, keep: torch.Tensor | None = None) -> torch.Tensor:
         """Switch-style auxiliary loss: E * sum_e (mean_prob_e * frac_e).
 
         Empty routing yields exactly 0 (never NaN): no token reached an
-        expert, so there is nothing to balance.
+        expert, so there is nothing to balance. ``keep`` (bool [N]) restricts
+        both means to scored positions so padding cannot dilute the balance
+        signal; all-excluded also yields 0.
         """
         if probs.shape[0] == 0:
             return torch.zeros((), dtype=probs.dtype)
-        top_ids = probs.argmax(dim=-1)
+        rows = probs if keep is None else probs[keep]
+        if rows.shape[0] == 0:
+            return torch.zeros((), dtype=probs.dtype)
+        top_ids = rows.argmax(dim=-1)
         onehot = F.one_hot(top_ids, num_classes=self.num_experts).float()
         frac = onehot.mean(dim=0)
-        mean_prob = probs.mean(dim=0)
+        mean_prob = rows.mean(dim=0)
         return (self.num_experts * (frac * mean_prob).sum()).to(probs.dtype)
 
     def usage_share(self) -> torch.Tensor:
