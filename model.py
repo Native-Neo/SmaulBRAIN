@@ -79,7 +79,10 @@ class SmaulBrainModel(nn.Module):
 
     def _moe_fn(self, train: bool, step: int):
         def fn(x: torch.Tensor):
-            plan = self.router.route(x)
+            # Capacity binds only in training: it is batch-size relative,
+            # so enforcing it at inference would make chunked/streaming
+            # results differ from a full pass over the same tokens.
+            plan = self.router.route(x, enforce_capacity=train)
             prov = self._train_provider if train else self._eval_provider
             y = self.pool.forward(x, plan.top_ids, plan.top_weights,
                                   plan.dropped, prov, step=step)
