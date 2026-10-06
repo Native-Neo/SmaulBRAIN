@@ -253,15 +253,14 @@ def run_training(
         }
 
     def grow_batch(step: int, salt: int) -> bool:
-        """Clone the top experts (room-capped by max_new_experts)."""
-        room = cfg.max_experts - len(model.pool)
-        count = min(cfg.max_new_experts, room)
+        """Clone the top experts (callee enforces the max_experts cap)."""
+        count = min(cfg.max_new_experts, cfg.max_experts - len(model.pool))
         if count <= 0:
             return False
         new_ids = growth_mod.grow_topk_clones(
             model.pool, model.router, cfg.d_model, cfg.expert_hidden, step,
             seed=seed + salt, k=count, n_mutated=min(2, count),
-            fp8_tile=cfg.fp8_tile,
+            fp8_tile=cfg.fp8_tile, max_experts=cfg.max_experts,
         )
         for eid in new_ids:
             log_fn(f"[grow] step={step} new={eid} pool={len(model.pool)}")
@@ -274,9 +273,10 @@ def run_training(
                                            min_experts=cfg.min_experts,
                                            usage_threshold=cfg.prune_min_usage)
         if victims:
-            pruned = pruning_mod.prune_experts(model.pool, model.router, victims)
-            for eid in pruned:
-                model.pager.forget(eid)
+            # Pager traces are forgotten inside prune_experts (atomic with
+            # removal); no separate caller loop to skip on partial failure.
+            pruned = pruning_mod.prune_experts(model.pool, model.router, victims,
+                                               pager=model.pager)
             model.cfg.num_experts = len(model.pool)
             log_fn(f"[prune] step={step} removed={pruned} pool={len(model.pool)}")
     run_started = time.perf_counter()
