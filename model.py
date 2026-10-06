@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import SmaulBrainConfig
+from bytes import PAD_ID
 from experts import ExpertPool, make_expert
 from linear_attention import LinearAttnState
 from paging import ExpertPager
@@ -195,24 +196,31 @@ class SmaulBrainModel(nn.Module):
             logits = self.head(self.n_final(hs[-1])).float()
             return {"logits": logits, "depths": depths, "n_executed": n_executed}
         # Ponder-weighted CE: each step's logits score against halting mass.
+        # Padding (PAD_ID) is not data: it is excluded from the loss via
+        # ignore_index and every mean below normalizes over valid targets
+        # only, so trailing-pad length cannot dilute (or NaN) the loss.
+        valid = (targets != PAD_ID)
+        n_valid = int(valid.sum().item())
         ce_steps = []
         for h_n in hs:
             logits_n = self.head(self.n_final(h_n)).float()
             ce = F.cross_entropy(logits_n.reshape(-1, self.cfg.vocab_size),
-                                 targets.reshape(-1), reduction="none").reshape(B, T)
+                                 targets.reshape(-1), reduction="none",
+                                 ignore_index=PAD_ID).reshape(B, T)
             ce_steps.append(ce)
         CE = torch.stack(ce_steps, dim=0)  # [D, B, T]
-        nll = (P * CE).sum(dim=0).mean()
+        nll = (P * CE).sum() / max(1, n_valid)
+        kl_valid = kl * (B * T) / max(1, n_valid)  # _ponder means over B*T
         balance = aux / n_executed
-        loss = nll + self.cfg.ponder_beta * kl + self.cfg.moe_balance_weight * balance
+        loss = nll + self.cfg.ponder_beta * kl_valid + self.cfg.moe_balance_weight * balance
         with torch.no_grad():
             pred = self.head(self.n_final(hs[-1])).float().argmax(-1)
-            acc = (pred == targets).float().mean().item()
+            acc = ((pred == targets) & valid).float().sum().item() / max(1, n_valid)
             steps = torch.arange(1, len(hs) + 1, device=P.device).view(-1, 1, 1)
             mean_depth = float((P * steps).sum().item() / (B * T))
         return {
             "logits": self.head(self.n_final(hs[-1])).float(),
-            "loss": loss, "nll": nll.detach(), "ponder_kl": kl.detach(),
+            "loss": loss, "nll": nll.detach(), "ponder_kl": kl_valid.detach(),
             "balance": balance.detach() if torch.is_tensor(balance) else balance,
             "acc": acc, "depths": depths, "mean_depth": mean_depth,
             "n_executed": n_executed,
