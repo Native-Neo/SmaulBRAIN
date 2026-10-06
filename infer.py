@@ -11,10 +11,31 @@ import torch
 
 from bytes import IncrementalByteDecoder, decode_text, encode_text
 
+#: Prompt used when the caller passes no ids (embedding row 10 == newline).
+DEFAULT_PROMPT_ID = 10
+
+
+def _check_ids(ids: list[int], vocab_size: int, what: str) -> None:
+    bad = [i for i in ids if not 0 <= i < vocab_size]
+    if bad:
+        raise ValueError(
+            f"{what} has {len(bad)} ids outside [0, {vocab_size}) "
+            f"(e.g. {bad[:5]}); vocabulary covers bytes + specials only"
+        )
+
+
+def _check_sampler(temperature: float, top_p: float) -> None:
+    import math
+    if not math.isfinite(temperature):
+        raise ValueError(f"temperature must be finite, got {temperature!r}")
+    if not (isinstance(top_p, (int, float)) and 0.0 < top_p <= 1.0):
+        raise ValueError(f"top_p must be in (0, 1], got {top_p!r}")
+
 
 def sample_next(logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0,
                 top_p: float = 1.0, generator: torch.Generator | None = None) -> int:
     """Sample one id from last-position logits [V]."""
+    _check_sampler(temperature, top_p)
     l = logits.float()
     if temperature <= 0:
         return int(l.argmax().item())
@@ -27,8 +48,11 @@ def sample_next(logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0,
         order = torch.argsort(l, descending=True)
         probs = torch.softmax(l[order], dim=-1)
         cum = torch.cumsum(probs, dim=-1)
+        # First position always kept: top_p can never mask every candidate.
         keep = torch.cat([torch.ones(1, dtype=torch.bool, device=l.device),
                           cum[:-1] < top_p])
+        if not bool(keep.any()):
+            keep[0] = True
         mask = torch.full_like(l, float("-inf"))
         mask[order[keep]] = l[order[keep]]
         l = mask
@@ -49,15 +73,23 @@ def generate(
     context: int | None = None,
     seed: int = 0,
 ) -> dict:
-    """Autoregressive byte generation. Returns ids, text, depths, paging stats."""
+    """Autoregressive byte generation. Returns ids, text, depths, paging stats.
+
+    ``context`` caps the prompt window (defaults to the model context
+    length); the prompt keeps its LAST ``context`` ids. An empty prompt
+    falls back to ``[DEFAULT_PROMPT_ID]``. Every id is range-checked
+    against the model vocabulary before the first matmul.
+    """
     was_training = model.training
     model.eval()
     dev = model.embed.weight.device
-    ctx = context or model.cfg.context_length
+    ctx = model.cfg.context_length if context is None else int(context)
+    if ctx <= 0:
+        raise ValueError(f"context must be positive, got {context!r}")
     gen = torch.Generator().manual_seed(seed)
-    ids = list(prompt_ids) or [10]
-    if context is not None:
-        ids = ids[-context:]
+    ids = list(prompt_ids) or [DEFAULT_PROMPT_ID]
+    _check_ids(ids, model.cfg.vocab_size, "prompt_ids")
+    ids = ids[-ctx:]
     x = torch.tensor([ids], dtype=torch.long, device=dev)
     out, attn_states = model.forward_infer_stateful(x)
     depths: list[list[int]] = []
