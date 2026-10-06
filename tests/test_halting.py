@@ -65,3 +65,38 @@ def test_halting_stable_during_training_step():
         assert 1.0 <= s["mean_depth"] <= 3.0
         assert s["loss"] == s["loss"]  # no NaN
     m.pager.close()
+
+
+def test_streamed_depths_match_full_pass():
+    m = _model(min_depth=1, max_depth=3)
+    ids = torch.tensor([[10, 20, 30, 40, 50, 60]])
+    full = m.forward_infer_stateful(ids)[0]["depths"]
+    states = m.new_infer_state(1)
+    parts = []
+    for token in ids[0]:
+        out, states = m.forward_infer_step(token.view(1), states)
+        parts.append(out["depths"])
+    assert torch.equal(torch.cat(parts, dim=1), full)  # halting is chunk-free
+    m.pager.close()
+
+
+def test_executed_work_is_always_full_depth():
+    # Streaming design: every depth executes (states must observe all
+    # tokens); adaptivity lives in readout. n_executed must say so.
+    m = _model(min_depth=1, max_depth=3, halting_threshold=0.01)
+    ids = torch.randint(0, 256, (2, 16))
+    out = m.forward_infer(ids)
+    assert out["n_executed"] == 3
+    assert out["depths"].min().item() >= 1 and out["depths"].max().item() <= 3
+    m.pager.close()
+
+
+def test_saturated_halt_logits_stay_finite():
+    m = _model(min_depth=1, max_depth=3)
+    with torch.no_grad():
+        m.block.halt.bias.fill_(50.0)  # force lam ~ 1 everywhere
+    ids = torch.randint(0, 256, (2, 16))
+    out = m(ids, ids, step=0)
+    for key in ("loss", "nll", "ponder_kl", "balance"):
+        assert torch.isfinite(out[key].detach()).all(), key
+    m.pager.close()
