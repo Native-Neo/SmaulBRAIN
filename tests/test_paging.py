@@ -119,3 +119,28 @@ def test_provider_joins_inflight_prefetch_without_reload():
     pg.await_prefetch()  # already joined: nothing left to await or count
     assert pg.stats.prefetch_hits == 0
     pg.close()
+
+
+def test_train_step_invalidates_only_stepped_experts():
+    from config import SmaulBrainConfig
+    from model import SmaulBrainModel
+    from smaulopt import SmaulOpt, SmaulOptHParams
+    from train import train_step
+    torch.manual_seed(0)
+    cfg = SmaulBrainConfig(d_model=32, n_heads=4, num_experts=4, top_k=2,
+                           expert_hidden=64, max_depth=2, context_length=24,
+                           expert_lr=3e-2)
+    m = SmaulBrainModel(cfg)
+    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
+    for eid in m.pool.order:
+        m.pager.provider(eid)  # warm every compute cache
+    assert len(m.pager.ram) == 4
+    b = torch.randint(0, 256, (2, cfg.context_length + 1))
+    s = train_step(m, opt, cfg, b[:, :cfg.context_length], b[:, 1:], step=0)
+    assert s["stepped_experts"], "update path must run for this test"
+    for eid in m.pool.order:
+        if eid in s["stepped_experts"]:
+            assert eid not in m.pager.ram  # rewritten: stale serve impossible
+        else:
+            assert eid in m.pager.ram  # untouched: cache hums along
+    m.pager.close()
