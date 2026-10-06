@@ -185,7 +185,8 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
                   "bias": model.router.proj.bias.detach().cpu()},
                  os.path.join(ckpt_dir, "router.pt"))
     _atomic_save({"trunk": opt.trunk_state, "router": opt.router_state,
-                  "step_count": opt.step_count}, os.path.join(ckpt_dir, "optim.pt"))
+                  "step_count": opt.step_count,
+                  "hparams": dict(opt.hp.__dict__)}, os.path.join(ckpt_dir, "optim.pt"))
     _atomic_save(get_rng_snapshot(), os.path.join(ckpt_dir, "rng.pt"))
     for eid in model.pool.order:
         save_expert_file(model.pool.experts[eid], os.path.join(exp_dir, f"{eid}.pt"))
@@ -258,6 +259,14 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     opt.trunk_state = optim["trunk"]
     opt.router_state = optim["router"]
     opt.step_count = int(optim.get("step_count", 0))
+    # Optimizer hyperparameters are checkpoint-authoritative: resuming with
+    # different betas/eps/clip/weight-decay would silently change the math.
+    # Checkpoints predating hparams persistence keep the caller's hparams.
+    saved_hp = optim.get("hparams")
+    if isinstance(saved_hp, dict) and saved_hp:
+        for k, v in saved_hp.items():
+            if hasattr(opt.hp, k):
+                setattr(opt.hp, k, v)
     manifest = load_manifest(ckpt_dir)
     saved_count = len(manifest["expert_ids"])
     saved_cfg.num_experts = saved_count
