@@ -56,9 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--halting-threshold", type=float, default=None,
                    help="Cumulative halt prob that stops inference depth (default: tiny=0.9).")
     # --- paging ---
-    p.add_argument("--pagingmthd", type=str, default="D2R",
-                   choices=["D2R", "R2VR", "D2VR"],
-                   help="D2R=disk->RAM, R2VR=RAM->VRAM (staged), D2VR=disk->VRAM direct.")
+    p.add_argument("--pagingmthd", "--paging-method", type=str, default="D2R",
+                   dest="pagingmthd",
+                   choices=["D2R", "R2VR", "D2VR", "d2r", "r2vr", "d2vr"],
+                   help="D2R=disk->RAM, R2VR=RAM->VRAM (staged), D2VR=disk->VRAM direct (case-insensitive).")
     p.add_argument("--ram-cache", type=int, default=None, help="Max experts in RAM cache (default: tiny=8).")
     p.add_argument("--vram-cache", type=int, default=None, help="Max experts in VRAM cache (default: tiny=4).")
     # --- optimization ---
@@ -132,7 +133,7 @@ def config_from_args(args: argparse.Namespace) -> SmaulBrainConfig:
         max_depth=pick(args.max_depth, "max_depth"),
         min_depth=pick(args.min_depth, "min_depth"),
         halting_threshold=pick(args.halting_threshold, "halting_threshold"),
-        paging_method=args.pagingmthd,
+        paging_method=args.pagingmthd.upper(),
         ram_cache=pick(args.ram_cache, "ram_cache"),
         vram_cache=pick(args.vram_cache, "vram_cache"),
         expert_lr=args.expert_lr,
