@@ -19,6 +19,23 @@ from precision import FP8BlockTensor, dequantize_fp8_blockwise
 _EXPERT_WEIGHTS = ("w_gate", "w_up", "w_down")
 
 
+def _pad_state_rows(state: dict, n_new: int) -> None:
+    """Append zero rows to dim 0 of every stored momentum buffer.
+
+    Newborn router rows start with zero momentum (same as fresh init_state);
+    surviving rows keep theirs bit-identically. Missing entries are left
+    alone: step_dense initializes them at the post-growth width on next use.
+    """
+    for st in state.values():
+        if not isinstance(st, dict):
+            continue
+        for key in ("m", "v_row", "v"):
+            t = st.get(key)
+            if torch.is_tensor(t) and t.shape[0] > 0:
+                st[key] = torch.cat([t, torch.zeros(
+                    (n_new, *t.shape[1:]), dtype=t.dtype, device=t.device)])
+
+
 def select_parents(pool: ExpertPool, k: int = 2) -> list[str]:
     """Pick up to k parents by contribution (ties -> usage, then id order).
 
@@ -85,6 +102,7 @@ def grow_expert(
     noise_std: float = 0.005,
     fp8_tile: int = 64,
     max_experts: int | None = None,
+    optim_state: dict | None = None,
 ) -> str:
     """Add one expert by recombination. Returns the new stable expert id.
 
@@ -94,6 +112,9 @@ def grow_expert(
     Two-phase: the record and router row are fully built before either the
     pool or the router is touched, so a build failure cannot leave them
     diverged.
+    ``optim_state`` (e.g. SmaulOpt.router_state) gains one zero row per new
+    router row so surviving rows keep their momentum instead of the whole
+    table resetting on shape mismatch.
     """
     _check_topology_in_sync(pool, router)
     if max_experts is not None and len(pool) >= max_experts:
@@ -115,6 +136,8 @@ def grow_expert(
         rec.optim_state = init_expert_optim_state(rec)
     pool.add(rec)
     router.add_expert_row(init=init_row)
+    if optim_state is not None:
+        _pad_state_rows(optim_state, 1)
     return rec.expert_id
 
 
@@ -130,6 +153,7 @@ def grow_topk_clones(
     noise_std: float = 0.0005,
     fp8_tile: int = 64,
     max_experts: int | None = None,
+    optim_state: dict | None = None,
 ) -> list[str]:
     """Duplicate the top-k experts by contribution (exact copies + mutants).
 
@@ -199,4 +223,6 @@ def grow_topk_clones(
         pool.add(rec)
         router.add_expert_row(init=parent_row)
         new_ids.append(rec.expert_id)
+    if optim_state is not None and new_ids:
+        _pad_state_rows(optim_state, len(new_ids))
     return new_ids
