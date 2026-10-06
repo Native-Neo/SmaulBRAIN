@@ -69,9 +69,10 @@ def test_growth_reproducible_and_empty_pool_fallback():
     assert a == b == "expert_00003"
     assert torch.equal(pool.experts[a].weights_fp8["w_gate"].codes,
                        pool_b.experts[b].weights_fp8["w_gate"].codes)
-    empty, re_ = ExpertPool(), SparseRouter(16, 1, 1)
+    empty, re_ = ExpertPool(), SparseRouter(16, 0, 1)
     eid = grow_expert(empty, re_, 16, 32, step=0, seed=0)
     assert empty.experts[eid].source == "init"  # documented fallback
+    assert len(empty) == re_.num_experts == 1  # restart stays pool/router synced
 
 
 def test_recombine_is_parent_mean_plus_noise():
