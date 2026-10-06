@@ -23,6 +23,21 @@ import torch.nn.functional as F
 from precision import dequantize_fp8_blockwise
 
 
+def _drop_state_row(state: dict, index: int) -> None:
+    """Delete dim-0 row ``index`` from every stored momentum buffer.
+
+    Mirrors remove_expert_row so surviving rows keep their momentum aligned.
+    ``v_col`` is per-column and untouched; the shared step counter is kept.
+    """
+    for st in state.values():
+        if not isinstance(st, dict):
+            continue
+        for key in ("m", "v_row", "v"):
+            t = st.get(key)
+            if torch.is_tensor(t) and 0 <= index < t.shape[0]:
+                st[key] = torch.cat([t[:index], t[index + 1:]])
+
+
 def dying_score(
     tokens_routed: int,
     total_tokens: int,
@@ -109,6 +124,7 @@ def prune_experts(
     router,  # SparseRouter
     victims: list[str],
     pager=None,  # ExpertPager (duck-typed): forgotten per victim, else caller must
+    optim_state: dict | None = None,  # e.g. SmaulOpt.router_state: rows migrate
 ) -> list[str]:
     """Remove victims: weights + optimizer state + router row + pager traces.
 
@@ -118,6 +134,8 @@ def prune_experts(
     highest-index-first so surviving indices stay valid during the sweep.
     Pager traces are forgotten inline (never served ghosts on direct calls);
     the call is idempotent, so callers may also forget defensively.
+    Optimizer momentum rows are deleted inline at the same indices, so
+    surviving rows keep their momentum instead of resetting on mismatch.
     Returns pruned ids in pool-order.
     """
     missing = [eid for eid in victims if eid not in pool.experts]
@@ -135,6 +153,8 @@ def prune_experts(
         rec = pool.remove(eid)  # drops weights + optim_state + metadata
         assert rec.expert_id == eid
         router.remove_expert_row(idx)
+        if optim_state is not None:
+            _drop_state_row(optim_state, idx)
         if pager is not None:
             pager.forget(eid)
         pruned.append(eid)
