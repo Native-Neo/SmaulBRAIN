@@ -23,7 +23,8 @@ class RoutePlan:
     """Per-token dispatch decisions for one MoE application."""
 
     top_ids: torch.Tensor  # [N, K] expert ids per token
-    top_weights: torch.Tensor  # [N, K] renormalized weights, rows sum to 1
+    top_weights: torch.Tensor  # [N, K] admitted weights (live rows sum to 1,
+                               # dropped rows sum to 0; non-admitted slots are 0)
     dropped: torch.Tensor  # [N] bool: token dropped by capacity
     probs: torch.Tensor  # [N, E] full softmax probs (for balance loss)
 
@@ -74,24 +75,30 @@ class SparseRouter(nn.Module):
         probs = F.softmax(logits, dim=-1)
         top_w, top_ids = torch.topk(probs, k=self.top_k, dim=-1)
         top_w = top_w / top_w.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-        # Capacity: max tokens per expert; overflow tokens are dropped.
+        # Capacity: max admitted slots per expert. Admission is per slot, not
+        # per token: a live token dispatches only to the subset of its top-k
+        # that fits, with weights renormalized over the admitted subset.
+        # Non-admitted slots read weight 0 so downstream dispatch (which
+        # multiplies mask x weight) cannot serve what capacity refused.
+        # A token with no admitted slot is dropped to the residual path.
         cap = max(1, int(self.capacity_factor * n_tokens * self.top_k / self.num_experts))
         order = torch.argsort(top_w.max(dim=-1).values, descending=True)
         assigned = torch.zeros(self.num_experts, dtype=torch.long)
+        admit = torch.zeros_like(top_ids, dtype=torch.bool)
         dropped = torch.zeros(n_tokens, dtype=torch.bool)
         for idx in order.tolist():
-            chosen = False
             for slot in range(self.top_k):
                 e = int(top_ids[idx, slot].item())
                 if assigned[e] < cap:
                     assigned[e] += 1
-                    chosen = True
-                    break
-            if not chosen:
+                    admit[idx, slot] = True
+            if not admit[idx].any():
                 dropped[idx] = True
-        # Usage statistics (no grad).
+        top_w = torch.where(admit, top_w, torch.zeros_like(top_w))
+        top_w = top_w / top_w.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        # Usage statistics count admitted slots only (no grad).
         with torch.no_grad():
-            kept = top_ids[~dropped].reshape(-1)
+            kept = top_ids[admit]
             if kept.numel():
                 counts = torch.bincount(kept, minlength=self.num_experts)
                 self.usage_counts += counts.to(torch.float64)
