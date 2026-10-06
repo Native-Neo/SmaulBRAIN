@@ -196,3 +196,22 @@ def test_optimizer_hparams_roundtrip_authoritatively(tmp_path):
     load_model(d, m2, opt2)
     assert opt2.hp.clip == 0.5 and opt2.hp.wd == 0.03  # checkpoint wins
     m.pager.close(); m2.pager.close()
+
+
+def test_retile_updates_precision_metadata_and_reloads(tmp_path):
+    import json
+    from quantize import convert_checkpoint
+    d = str(tmp_path / "c")
+    m, opt = _trained(d)
+    reports = convert_checkpoint(d, to="fp8", tile=32)
+    assert reports and all(r["to"] == "fp8" for r in reports)
+    man = json.load(open(os.path.join(d, "manifest.json")))
+    assert man["precision"] == {"format": "fp8", "fp8_tile": 32}
+    cfg = json.load(open(os.path.join(d, "config.json")))
+    assert cfg["fp8_tile"] == 32
+    assert not [f for f in os.listdir(os.path.join(d, "experts"))
+                if f.endswith(".convert_tmp")]  # no sidecars left behind
+    m2 = SmaulBrainModel(m.cfg)
+    load_model(d, m2, SmaulOpt(SmaulOptHParams()))
+    assert m2.cfg.fp8_tile == 32 and len(m2.pool) == len(m.pool)
+    m.pager.close(); m2.pager.close()
