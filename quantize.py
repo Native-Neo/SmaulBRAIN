@@ -12,12 +12,24 @@ within the checkpoint directory.
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 
 import torch
 
 from storage import EXPERT_NAMES, expert_from_payload, expert_to_payload, load_manifest
+
+
+def _atomic_write_json(payload: dict, path: str) -> None:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix="tmp_quant_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def convert_expert_file(src: str, dst: str, to: str = "fp8", tile: int = 64) -> dict:
@@ -86,15 +98,40 @@ def convert_checkpoint(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[d
     ``to="fp8"`` requantizes/retile every expert file independently (the trunk
     is untouched — FP8 trunk storage is refused per the precision policy).
     ``to="bf16"`` casts trunk.pt/router.pt to BF16 (experts stay FP8).
+
+    Transactional: every input is validated first, converted outputs land
+    in sidecar files, and the sidecars replace the originals only after all
+    conversions succeed — a failure never leaves a half-converted pool.
+    Precision metadata (manifest + config tile) updates last.
     """
+    if to not in ("fp8", "bf16"):
+        raise ValueError(f"unknown target {to}")
     manifest = load_manifest(ckpt_dir)
+    man_path = os.path.join(ckpt_dir, "manifest.json")
+    cfg_path = os.path.join(ckpt_dir, "config.json")
     reports = []
     if to == "fp8":
-        for eid in manifest["expert_ids"]:
-            p = os.path.join(ckpt_dir, "experts", f"{eid}.pt")
-            reports.append(convert_expert_file(p, p, to=to, tile=tile))
-    elif to != "bf16":
-        raise ValueError(f"unknown target {to}")
+        paths = [(eid, os.path.join(ckpt_dir, "experts", f"{eid}.pt"))
+                 for eid in manifest["expert_ids"]]
+        missing = [eid for eid, p in paths if not os.path.exists(p)]
+        if missing:
+            raise FileNotFoundError(f"missing expert files (refusing): {missing}")
+        staged: list[tuple[str, str]] = []
+        try:
+            for eid, p in paths:
+                tmp = p + ".convert_tmp"
+                reports.append(convert_expert_file(p, tmp, to=to, tile=tile))
+                staged.append((tmp, p))
+            for tmp, p in staged:
+                os.replace(tmp, p)
+        finally:
+            for tmp, _ in staged:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+        with open(cfg_path) as f:
+            cfg_dict = json.load(f)
+        cfg_dict["fp8_tile"] = tile
+        _atomic_write_json(cfg_dict, cfg_path)
     # to == "bf16": experts intentionally stay FP8; only the trunk converts.
     if to == "bf16":
         for name in ("trunk.pt", "router.pt"):
@@ -113,4 +150,6 @@ def convert_checkpoint(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[d
                 finally:
                     if os.path.exists(tmp):
                         os.remove(tmp)
+    manifest["precision"] = {"format": to, "fp8_tile": tile}
+    _atomic_write_json(manifest, man_path)
     return reports
