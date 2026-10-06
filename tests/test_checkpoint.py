@@ -3,6 +3,7 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import pytest
 import torch
 from config import SmaulBrainConfig
 from model import SmaulBrainModel
@@ -161,3 +162,22 @@ def test_save_resume_matches_uninterrupted_run(tmp_path):
     assert list(m2.pool.order) == ref_order
     assert torch.equal(m2.embed.weight, ref_embed)
     m2.pager.close(); m.pager.close()
+
+
+def test_save_refuses_diverged_topology_without_writing(tmp_path):
+    d = str(tmp_path / "c")
+    m, opt = _trained(d)
+    before = set(os.listdir(d))
+    m.router.add_expert_row()  # diverged: router wider than pool
+    with pytest.raises(ValueError):
+        save_model(d, m, opt, step=9)
+    assert set(os.listdir(d)) == before  # previous generation untouched
+    m.pager.close()
+
+
+def test_save_refuses_negative_step(tmp_path):
+    d = str(tmp_path / "c")
+    m, opt = _trained(d)
+    with pytest.raises(ValueError):
+        save_model(d, m, opt, step=-1)
+    m.pager.close()
