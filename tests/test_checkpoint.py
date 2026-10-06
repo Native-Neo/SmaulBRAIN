@@ -181,3 +181,18 @@ def test_save_refuses_negative_step(tmp_path):
     with pytest.raises(ValueError):
         save_model(d, m, opt, step=-1)
     m.pager.close()
+
+
+def test_optimizer_hparams_roundtrip_authoritatively(tmp_path):
+    from smaulopt import SmaulOptHParams
+    d = str(tmp_path / "c")
+    m, opt = _trained(d)
+    opt.hp.clip = 0.5
+    opt.hp.wd = 0.03
+    save_model(d, m, opt, step=5)
+    m2 = SmaulBrainModel(m.cfg)
+    opt2 = SmaulOpt(SmaulOptHParams())  # defaults differ from saved
+    assert opt2.hp.clip != 0.5
+    load_model(d, m2, opt2)
+    assert opt2.hp.clip == 0.5 and opt2.hp.wd == 0.03  # checkpoint wins
+    m.pager.close(); m2.pager.close()
