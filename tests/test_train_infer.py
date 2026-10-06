@@ -3,6 +3,7 @@
 import sys, os, json, subprocess
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import pytest
 import torch
 from config import SmaulBrainConfig
 from infer import generate
@@ -153,3 +154,28 @@ def test_cli_paging_aliases_and_chunk_size():
         ["--paging-method", "r2vr", "--attention-chunk-size", "64", "train"]))
     assert cfg.paging_method == "R2VR"
     assert cfg.attention_chunk_size == 64
+
+
+def test_generate_rejects_out_of_range_prompt_ids():
+    m, _, _ = _model()
+    with pytest.raises(ValueError):
+        generate(m, [10, 99999], max_new=2)
+    with pytest.raises(ValueError):
+        generate(m, [10, -1], max_new=2)
+    m.pager.close()
+
+
+def test_sampler_rejects_nonsense_hyperparams():
+    from infer import sample_next
+    l = torch.zeros(260)
+    for kw in (dict(temperature=float("nan")), dict(top_p=0.0), dict(top_p=1.5)):
+        with pytest.raises(ValueError):
+            sample_next(l, **kw)
+
+
+def test_top_p_keeps_true_nucleus():
+    from infer import sample_next
+    torch.manual_seed(0)
+    l = torch.tensor([10.0, 9.0, 0.0, -100.0])
+    seen = {sample_next(l, temperature=1.0, top_p=0.9) for _ in range(50)}
+    assert seen and seen <= {0, 1}  # ~all mass on the top two, tail excluded
