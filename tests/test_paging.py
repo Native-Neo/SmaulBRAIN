@@ -94,3 +94,15 @@ def test_identity_independent_of_cache_slot_and_opt_state_follows():
     assert pool.experts[e0].optim_state["w_gate"]["m"].sum().item() > 0
     assert pool.order[0] == e0  # identity untouched by slot churn
     pg.close()
+
+
+def test_prefetch_then_forget_leaves_no_ghost():
+    pool = _pool()
+    pg = ExpertPager(pool, mode="D2R", load_from_disk=_counting(pool))
+    eid = pool.order[0]
+    pg.prefetch([eid])
+    pg.forget(eid)  # prune won the race: cancel/drop the pending load
+    pg.await_prefetch()  # must not raise and must not count a ghost hit
+    assert pg.stats.prefetch_hits == 0
+    assert eid not in pg.ram and eid not in pg._pending
+    pg.close()
