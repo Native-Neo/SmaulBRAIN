@@ -77,6 +77,7 @@ class ExpertPager:
         self._exec = ThreadPoolExecutor(max_workers=1)
         self._pending: dict[str, Future] = {}
         self._prefetched: set[str] = set()
+        self._tls = threading.local()  # marks the prefetch worker thread
 
     # -- device handling --
     @property
@@ -99,7 +100,23 @@ class ExpertPager:
 
     # -- public API --
     def provider(self, expert_id: str) -> dict[str, torch.Tensor]:
-        """WeightProvider for ExpertPool.forward: mode-specific fetch."""
+        """WeightProvider for ExpertPool.forward: mode-specific fetch.
+
+        Joins an in-flight prefetch for the same expert instead of loading
+        it twice: the background fetch warms the caches as a side effect,
+        so after the join the normal path below is a cache hit. The
+        prefetch worker itself bypasses the join (thread-local flag) —
+        joining your own future would deadlock.
+        """
+        if not getattr(self._tls, "prefetching", False):
+            with self._lock:
+                fut = self._pending.pop(expert_id, None)
+            if fut is not None:
+                try:
+                    fut.result()
+                finally:
+                    with self._lock:
+                        self._prefetched.discard(expert_id)
         with self._lock:
             if self.mode == "D2R":
                 return self._get_d2r(expert_id)
@@ -223,15 +240,19 @@ class ExpertPager:
             self._pending[eid] = self._exec.submit(self._prefetch_one, eid)
 
     def _prefetch_one(self, expert_id: str) -> None:
+        self._tls.prefetching = True
         try:
-            w = self.provider(expert_id)
-        except KeyError:
-            # Pruned mid-flight: the expert is gone from the pool, so there
-            # is nothing to stage. A KeyError for a live expert is a real
-            # bug and must still surface via the future.
-            if expert_id in self.pool.experts:
-                raise
-            return
+            try:
+                w = self.provider(expert_id)
+            except KeyError:
+                # Pruned mid-flight: the expert is gone from the pool, so there
+                # is nothing to stage. A KeyError for a live expert is a real
+                # bug and must still surface via the future.
+                if expert_id in self.pool.experts:
+                    raise
+                return
+        finally:
+            self._tls.prefetching = False
         self._prefetched.add(expert_id)
         _ = w
 
