@@ -135,3 +135,21 @@ def test_train_loss_invariant_to_pad_tail_without_capacity_pressure():
             got.append(float(m(b[:, :ctx], b[:, 1:], step=0)["loss"]))
     assert got[0] == got[1] == got[2]
     m.pager.close()
+
+
+def test_cli_explicit_flag_beats_full_preset():
+    from cli import build_parser, config_from_args
+    args = build_parser().parse_args(["--full", "--max-depth", "3", "train"])
+    cfg = config_from_args(args)
+    assert cfg.max_depth == 3  # explicit tiny-equal value wins over preset
+    assert cfg.d_model == 512  # silent flags follow the preset
+    tiny = config_from_args(build_parser().parse_args(["train"]))
+    assert (tiny.d_model, tiny.max_depth) == (64, 3)
+
+
+def test_cli_paging_aliases_and_chunk_size():
+    from cli import build_parser, config_from_args
+    cfg = config_from_args(build_parser().parse_args(
+        ["--paging-method", "r2vr", "--attention-chunk-size", "64", "train"]))
+    assert cfg.paging_method == "R2VR"
+    assert cfg.attention_chunk_size == 64
