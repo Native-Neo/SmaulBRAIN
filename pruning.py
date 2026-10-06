@@ -108,12 +108,26 @@ def prune_experts(
     pool,  # ExpertPool
     router,  # SparseRouter
     victims: list[str],
+    pager=None,  # ExpertPager (duck-typed): forgotten per victim, else caller must
 ) -> list[str]:
-    """Remove victims: weights + optimizer state + router row + metadata.
+    """Remove victims: weights + optimizer state + router row + pager traces.
 
-    Router rows are removed highest-index-first so surviving indices stay
-    valid during the sweep. Returns pruned ids in pool-order.
+    Validate-first: every victim must exist and pool/router widths must
+    match before anything is removed, so a bad victim list cannot commit a
+    prefix and leave pool/router diverged. Router rows are removed
+    highest-index-first so surviving indices stay valid during the sweep.
+    Pager traces are forgotten inline (never served ghosts on direct calls);
+    the call is idempotent, so callers may also forget defensively.
+    Returns pruned ids in pool-order.
     """
+    missing = [eid for eid in victims if eid not in pool.experts]
+    if missing:
+        raise ValueError(f"unknown victims (refusing to prune): {missing}")
+    if router.num_experts != len(pool):
+        raise ValueError(
+            f"pool/router out of sync: {len(pool)} experts vs "
+            f"{router.num_experts} router rows (refusing to mutate)"
+        )
     ordered = sorted(victims, key=lambda eid: pool.index_of(eid), reverse=True)
     pruned: list[str] = []
     for eid in ordered:
@@ -121,5 +135,7 @@ def prune_experts(
         rec = pool.remove(eid)  # drops weights + optim_state + metadata
         assert rec.expert_id == eid
         router.remove_expert_row(idx)
+        if pager is not None:
+            pager.forget(eid)
         pruned.append(eid)
     return sorted(pruned, key=lambda eid: eid)
