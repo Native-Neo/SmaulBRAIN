@@ -106,3 +106,16 @@ def test_prefetch_then_forget_leaves_no_ghost():
     assert pg.stats.prefetch_hits == 0
     assert eid not in pg.ram and eid not in pg._pending
     pg.close()
+
+
+def test_provider_joins_inflight_prefetch_without_reload():
+    pool = _pool()
+    pg = ExpertPager(pool, mode="D2R", load_from_disk=_counting(pool))
+    eid = pool.order[0]
+    pg.prefetch([eid])
+    w = pg.provider(eid)  # joins the background fetch instead of loading twice
+    assert pg.stats.disk_reads == 1
+    assert eid in pg.ram and w is pg.ram[eid]
+    pg.await_prefetch()  # already joined: nothing left to await or count
+    assert pg.stats.prefetch_hits == 0
+    pg.close()
