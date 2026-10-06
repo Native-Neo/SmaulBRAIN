@@ -3,6 +3,7 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import pytest
 import torch
 from experts import ExpertPool, make_expert
 from pruning import find_victims, prune_experts
@@ -88,3 +89,34 @@ def test_checkpoint_correct_after_pruning(tmp_path):
     ids = torch.randint(0, 256, (1, 8))
     assert m2.forward_infer(ids)["logits"].shape == (1, 8, 256)
     m.pager.close(); m2.pager.close()
+
+
+def test_prune_unknown_victim_aborts_without_mutating():
+    pool, r = _pool()
+    order = list(pool.order)
+    with pytest.raises(ValueError):
+        prune_experts(pool, r, ["expert_00001", "expert_99999"])
+    assert pool.order == order and len(pool) == 4 and r.num_experts == 4
+
+
+def test_prune_diverged_topology_refuses():
+    pool, r = _pool()
+    r.add_expert_row()  # diverged: 4 experts vs 5 router rows
+    with pytest.raises(ValueError):
+        prune_experts(pool, r, ["expert_00001"])
+    assert len(pool) == 4 and "expert_00001" in pool.experts
+
+
+def test_prune_forgets_pager_caches_inline():
+    from paging import ExpertPager
+    pool, r = _pool()
+    pg = ExpertPager(pool, mode="D2R", ram_cache=4,
+                     load_from_disk=lambda eid: pool.experts[eid])
+    eid = pool.order[0]
+    pg.provider(eid)
+    assert eid in pg.ram
+    assert prune_experts(pool, r, [eid], pager=pg) == [eid]
+    assert eid not in pg.ram and r.num_experts == 3
+    with pytest.raises(KeyError):
+        pg.provider(eid)  # no ghost served after removal
+    pg.close()
