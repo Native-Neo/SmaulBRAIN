@@ -179,12 +179,15 @@ class ExpertPool:
         """Weighted expert combination. x: [N, D] -> [N, D].
 
         Dispatch is batched per expert (one SwiGLU matmul per active expert),
-        never a Python loop over individual tokens.
+        never a Python loop over individual tokens. Only admitted slots
+        (nonzero weight, live token) dispatch: capacity-refused slots carry
+        weight 0 and contribute nothing, not even to routing statistics.
         """
         out = torch.zeros_like(x)
         live = ~dropped
+        admitted = live.unsqueeze(-1) & (top_weights > 0)  # [N, K] actual dispatch
         for rid in range(len(self.order)):
-            mask_slot = (top_ids == rid) & live.unsqueeze(-1)  # [N, K]
+            mask_slot = (top_ids == rid) & admitted  # [N, K]
             if not mask_slot.any():
                 continue
             eid = self.order[rid]
