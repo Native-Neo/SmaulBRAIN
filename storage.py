@@ -140,7 +140,34 @@ def load_expert_file(path: str) -> ExpertRecord:
 
 
 def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = None) -> None:
-    """Save the full model + optimizer. Manifest is written last (commit point)."""
+    """Save the full model + optimizer. Manifest is written last (commit point).
+
+    Validates before writing anything: a topology that fails validation
+    raises without touching the checkpoint directory, so a previous
+    complete generation is never clobbered by a partial one.
+    """
+    if int(step) < 0:
+        raise ValueError(f"refusing to checkpoint negative step {step}")
+    if len(model.pool) == 0:
+        raise ValueError("refusing to checkpoint an empty expert pool")
+    if model.router.num_experts != len(model.pool):
+        raise ValueError(
+            f"refusing to checkpoint diverged topology: {len(model.pool)} "
+            f"experts vs {model.router.num_experts} router rows"
+        )
+    for eid in model.pool.order:
+        rec = model.pool.experts[eid]
+        want = {
+            "w_gate": (rec.expert_hidden, rec.d_model),
+            "w_up": (rec.expert_hidden, rec.d_model),
+            "w_down": (rec.d_model, rec.expert_hidden),
+        }
+        for n in EXPERT_NAMES:
+            t = rec.weights_fp8.get(n)
+            if t is None or tuple(t.shape) != want[n]:
+                raise ValueError(
+                    f"refusing to checkpoint {eid}: corrupt {n} storage"
+                )
     os.makedirs(ckpt_dir, exist_ok=True)
     exp_dir = os.path.join(ckpt_dir, "experts")
     os.makedirs(exp_dir, exist_ok=True)
