@@ -58,8 +58,15 @@ def recombine_weights(
 ) -> dict[str, torch.Tensor]:
     """Convex combination of dequantized parent weights + seeded noise."""
     assert parents, "need at least one parent (empty pool uses make_expert fallback)"
+    missing = [eid for eid in parents if eid not in pool.experts]
+    if missing:
+        raise ValueError(f"unknown parents (refusing to recombine): {missing}")
     if weights is None:
         weights = [1.0 / len(parents)] * len(parents)
+    if len(weights) != len(parents):
+        raise ValueError(
+            f"{len(weights)} weights for {len(parents)} parents (zip would truncate)"
+        )
     assert abs(sum(weights) - 1.0) < 1e-6 and all(w >= 0 for w in weights)
     out: dict[str, torch.Tensor] | None = None
     for eid, w in zip(parents, weights):
