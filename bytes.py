@@ -8,6 +8,8 @@ round-trips exactly, including invalid UTF-8 (decoded with replacement).
 
 from __future__ import annotations
 
+import codecs
+
 BYTE_VOCAB = 256
 
 # Structural markers only; the model works fine with zero specials.
@@ -53,25 +55,28 @@ def with_eos(ids: list[int]) -> list[int]:
 
 
 class IncrementalByteDecoder:
-    """Streaming decoder that buffers split UTF-8 tails across chunks."""
+    """Streaming decoder that buffers split UTF-8 tails across chunks.
+
+    Backed by a codecs incremental decoder: O(n) amortized instead of
+    re-scanning the whole buffer for the longest decodable prefix on every
+    feed. Special ids (>=256) are structural and never enter the byte stream.
+    """
 
     def __init__(self) -> None:
-        self._buf = bytearray()
+        # errors=replace: invalid bytes surface as U+FFFD at feed time instead
+        # of stalling the decoder (the old prefix-scan buffered them forever).
+        # Incomplete split tails are still buffered across feeds; only a
+        # trailing tail at flush falls back to replacement, matching
+        # decode_text semantics.
+        self._dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
     def feed(self, ids: list[int]) -> str:
-        self._buf.extend(i for i in ids if 0 <= i < BYTE_VOCAB)
-        raw = bytes(self._buf)
-        # Find longest decodable prefix; keep a possible split tail buffered.
-        for end in range(len(raw), -1, -1):
-            try:
-                text = raw[:end].decode("utf-8")
-                self._buf = bytearray(raw[end:])
-                return text
-            except UnicodeDecodeError:
-                continue
-        return ""
+        raw = bytes(i for i in ids if 0 <= i < BYTE_VOCAB)
+        return self._dec.decode(raw, final=False)
 
     def flush(self) -> str:
-        text = bytes(self._buf).decode("utf-8", errors="replace")
-        self._buf.clear()
-        return text
+        # A trailing split tail is incomplete input: decode with replacement,
+        # matching decode_text semantics.
+        buf, _ = self._dec.getstate()
+        self._dec.reset()
+        return bytes(buf).decode("utf-8", errors="replace")
