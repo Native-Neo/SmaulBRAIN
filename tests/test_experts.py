@@ -213,3 +213,171 @@ def test_growth_build_failure_commits_nothing():
     with pytest.raises(Exception):
         grow_topk_clones(pool, r, 16, 32, step=1, seed=0, k=3)
     assert pool.order == order and r.num_experts == 3
+
+
+def test_expert_leaf_grads_keyed_by_stable_ids_and_routing_weights():
+    from config import SmaulBrainConfig
+    from model import SmaulBrainModel
+
+    torch.manual_seed(0)
+    cfg = SmaulBrainConfig(d_model=32, n_heads=4, num_experts=4, top_k=2,
+                           expert_hidden=64, max_depth=2, context_length=16)
+    m = SmaulBrainModel(cfg)
+    ids = torch.randint(0, 256, (2, 16))
+    out = m(ids, ids, step=0)
+    out["loss"].backward()
+
+    grads = m.take_expert_grads()
+    assert len(grads) > 0
+    for eid, weight_grads in grads.items():
+        # Keyed by stable IDs (expert_<NNNNN>), not arbitrary router indices
+        assert eid in m.pool.experts
+        assert eid.startswith("expert_")
+        # Keyed by weight names with non-None gradients
+        for wname, g in weight_grads.items():
+            assert wname in ("w_gate", "w_up", "w_down")
+            assert g is not None
+            assert torch.isfinite(g).all()
+            # Gradient must be non-zero since expert was routed with non-zero weight
+            assert g.abs().sum().item() > 0.0
+    m.pager.close()
+
+
+def test_unconsumed_leaves_never_silently_discarded():
+    from config import SmaulBrainConfig
+    from model import SmaulBrainModel
+
+    torch.manual_seed(0)
+    cfg = SmaulBrainConfig(d_model=32, n_heads=4, num_experts=4, top_k=2,
+                           expert_hidden=64, max_depth=2, context_length=16)
+    m = SmaulBrainModel(cfg)
+    ids = torch.randint(0, 256, (2, 16))
+
+    # First forward allocates active expert leaves
+    m(ids, ids, step=0)
+    assert len(m._leaves) > 0
+
+    # Second forward without consuming or clearing must raise RuntimeError
+    with pytest.raises(RuntimeError, match="unconsumed expert leaves"):
+        m(ids, ids, step=1)
+
+    # Calling zero_grad or clear_expert_grads safely clears the guard
+    m.zero_grad(set_to_none=True)
+    assert len(m._leaves) == 0
+
+    # Now forward succeeds
+    out = m(ids, ids, step=1)
+    assert "loss" in out
+    m.pager.close()
+
+
+def test_leaf_cleanup_exception_safe():
+    from config import SmaulBrainConfig
+    from model import SmaulBrainModel
+
+    torch.manual_seed(0)
+    cfg = SmaulBrainConfig(d_model=32, n_heads=4, num_experts=4, top_k=2,
+                           expert_hidden=64, max_depth=2, context_length=16)
+    m = SmaulBrainModel(cfg)
+    ids = torch.randint(0, 256, (2, 16))
+
+    # Simulate an exception mid-forward
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated depth explosion")
+
+    orig_depth_loop = m._depth_loop
+    m._depth_loop = boom
+    with pytest.raises(RuntimeError, match="simulated depth explosion"):
+        m(ids, ids, step=0)
+
+    # Cleanup must be exception-safe: leaves cleared, no dangling state
+    assert len(m._leaves) == 0
+
+    # Restore and run properly
+    m._depth_loop = orig_depth_loop
+    out = m(ids, ids, step=0)
+    assert "loss" in out
+    m.take_expert_grads()
+    m.pager.close()
+
+
+def test_step_expert_avoids_optim_state_for_no_grad_leaves():
+    from experts import make_expert
+    from smaulopt import SmaulOpt, SmaulOptHParams
+    from train import _GradOnly
+
+    torch.manual_seed(0)
+    rec = make_expert("expert_00000", 32, 64)
+    # Clear eager optimizer state to test sparse/lazy allocation
+    rec.optim_state = {}
+
+    opt = SmaulOpt(SmaulOptHParams(lr=0.01))
+    g = torch.randn(64, 32)
+    # Only w_gate has gradients; w_up has no grad, w_down omitted
+    compute = {"w_gate": _GradOnly(g), "w_up": _GradOnly(None)}
+
+    opt.step_expert(rec, compute, 1.0, lr=0.01)
+
+    # Only w_gate must have optimizer state; w_up and w_down must NOT
+    assert "w_gate" in rec.optim_state
+    assert "w_up" not in rec.optim_state
+    assert "w_down" not in rec.optim_state
+
+
+def test_release_expert_computation_graphs_and_clear_external_grads():
+    from config import SmaulBrainConfig
+    from model import SmaulBrainModel
+
+    torch.manual_seed(0)
+    cfg = SmaulBrainConfig(d_model=32, n_heads=4, num_experts=4, top_k=2,
+                           expert_hidden=64, max_depth=2, context_length=16)
+    m = SmaulBrainModel(cfg)
+    ids = torch.randint(0, 256, (2, 16))
+    out = m(ids, ids, step=0)
+    out["loss"].backward()
+
+    # Before take_expert_grads, leaves exist and hold gradients
+    leaf_tensors = [leaf for copies in m._leaves.values() for c in copies for leaf in c.values()]
+    assert any(l.grad is not None for l in leaf_tensors)
+
+    # Calling take_expert_grads clears leaf.grad and releases m._leaves
+    grads = m.take_expert_grads()
+    assert len(grads) > 0
+    assert len(m._leaves) == 0
+    for l in leaf_tensors:
+        assert l.grad is None  # stale external gradients cleared
+    m.pager.close()
+
+
+def test_step_expert_row_range_preserves_untouched_fp8_bit_for_bit():
+    from experts import make_expert
+    from smaulopt import SmaulOpt, SmaulOptHParams
+    from train import _GradOnly
+
+    torch.manual_seed(0)
+    rec = make_expert("expert_00000", 32, 64, fp8_tile=64)
+    opt = SmaulOpt(SmaulOptHParams(lr=0.01))
+
+    orig_codes = {n: rec.weights_fp8[n].codes.clone() for n in ("w_gate", "w_up", "w_down")}
+    orig_scales = {n: rec.weights_fp8[n].scales.clone() for n in ("w_gate", "w_up", "w_down")}
+
+    # Update only rows [8:16] of w_gate
+    g = torch.randn(64, 32)
+    compute = {"w_gate": _GradOnly(g)}
+    opt.step_expert(rec, compute, 1.0, lr=0.01, row_range=(8, 16))
+
+    # Touched slice changed
+    assert not torch.equal(rec.weights_fp8["w_gate"].codes[8:16], orig_codes["w_gate"][8:16])
+
+    # Untouched rows of w_gate are preserved bit-for-bit
+    assert torch.equal(rec.weights_fp8["w_gate"].codes[:8], orig_codes["w_gate"][:8])
+    assert torch.equal(rec.weights_fp8["w_gate"].codes[16:], orig_codes["w_gate"][16:])
+    assert torch.equal(rec.weights_fp8["w_gate"].scales[:8], orig_scales["w_gate"][:8])
+    assert torch.equal(rec.weights_fp8["w_gate"].scales[16:], orig_scales["w_gate"][16:])
+
+    # Untouched weights (w_up, w_down) are completely preserved bit-for-bit
+    assert torch.equal(rec.weights_fp8["w_up"].codes, orig_codes["w_up"])
+    assert torch.equal(rec.weights_fp8["w_up"].scales, orig_scales["w_up"])
+    assert torch.equal(rec.weights_fp8["w_down"].codes, orig_codes["w_down"])
+    assert torch.equal(rec.weights_fp8["w_down"].scales, orig_scales["w_down"])
+

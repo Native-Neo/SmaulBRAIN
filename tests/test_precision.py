@@ -6,9 +6,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch
 from precision import (
     PRECISION_POLICY, compute_dtype, dequantize_fp8_blockwise,
-    dequantize_fp8_row_block, quantize_fp8_blockwise,
+    dequantize_fp8_row_block, quantize_fp8_blockwise, update_fp8_row_block,
 )
-from smaulopt import SmaulOpt, SmaulOptHParams, init_state, smaul_update
+from smaulopt import SmaulOpt, SmaulOptHParams, init_state, smaul_update, smaul_update_range
+
 
 
 def test_fp8_storage_not_relabeled_fp32():
@@ -110,3 +111,49 @@ def test_native_and_fallback_emit_identical_bytes(monkeypatch):
     nat = quantize_fp8_blockwise(w, tile=64)
     assert torch.equal(ref.codes, nat.codes)  # bit-exact dispatch
     assert torch.equal(ref.scales, nat.scales)
+
+
+def test_update_fp8_row_block_preserves_untouched_blocks_bit_for_bit():
+    torch.manual_seed(42)
+    w = torch.randn(16, 128)
+    t = quantize_fp8_blockwise(w, tile=64)
+    orig_codes = t.codes.clone()
+    orig_scales = t.scales.clone()
+
+    new_slice = torch.randn(6, 128)
+    update_fp8_row_block(t, new_slice, 4, 10)
+
+    # Touched slice updated
+    assert not torch.equal(t.codes[4:10], orig_codes[4:10])
+
+    # Untouched rows preserved bit-for-bit
+    assert torch.equal(t.codes[:4], orig_codes[:4])
+    assert torch.equal(t.codes[10:], orig_codes[10:])
+    assert torch.equal(t.scales[:4], orig_scales[:4])
+    assert torch.equal(t.scales[10:], orig_scales[10:])
+
+
+def test_smaul_update_range_updates_only_target_rows():
+    hp = SmaulOptHParams(state_dtype="bf16", factor_v=True)
+    st = init_state((16, 32), hp)
+    orig_m = st["m"].clone()
+    orig_vr = st["v_row"].clone()
+
+    w_slice = torch.randn(4, 32)
+    g_slice = torch.randn(4, 32)
+    new_w = smaul_update_range(w_slice, g_slice, st, hp, lr=1e-3, row_start=4, row_end=8)
+
+    assert new_w.shape == (4, 32)
+    assert torch.isfinite(new_w).all()
+    assert st["step"] == 1
+
+    # Touched rows in state updated
+    assert not torch.equal(st["m"][4:8], orig_m[4:8])
+    assert not torch.equal(st["v_row"][4:8], orig_vr[4:8])
+
+    # Untouched rows in state preserved bit-for-bit
+    assert torch.equal(st["m"][:4], orig_m[:4])
+    assert torch.equal(st["m"][8:], orig_m[8:])
+    assert torch.equal(st["v_row"][:4], orig_vr[:4])
+    assert torch.equal(st["v_row"][8:], orig_vr[8:])
+
