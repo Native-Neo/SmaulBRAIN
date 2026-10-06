@@ -3,9 +3,10 @@
 import sys, os, copy
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import pytest
 import torch
 from experts import ExpertPool, make_expert
-from growth import grow_expert, recombine_weights, select_parents
+from growth import grow_expert, grow_topk_clones, recombine_weights, select_parents
 from precision import dequantize_fp8_blockwise
 from routing import SparseRouter
 
@@ -73,6 +74,36 @@ def test_growth_reproducible_and_empty_pool_fallback():
     eid = grow_expert(empty, re_, 16, 32, step=0, seed=0)
     assert empty.experts[eid].source == "init"  # documented fallback
     assert len(empty) == re_.num_experts == 1  # restart stays pool/router synced
+
+
+def _synced(n=4):
+    pool = _pool(n=n)
+    return pool, SparseRouter(16, n, 2)
+
+
+def test_grow_topk_clones_never_exceeds_max_experts():
+    pool, r = _synced(n=4)
+    ids = grow_topk_clones(pool, r, 16, 32, step=10, seed=3, k=8, max_experts=6)
+    assert len(ids) == 2 and len(pool) == 6 and r.num_experts == 6
+    assert grow_topk_clones(pool, r, 16, 32, step=11, seed=4, k=8,
+                            max_experts=6) == []
+    assert len(pool) == 6 and r.num_experts == 6  # at cap: nothing mutates
+
+
+def test_grow_expert_at_capacity_raises_before_mutating():
+    pool, r = _synced(n=2)
+    with pytest.raises(ValueError):
+        grow_expert(pool, r, 16, 32, step=1, seed=0, max_experts=2)
+    assert len(pool) == 2 and r.num_experts == 2
+
+
+def test_grow_refuses_diverged_topology_without_mutating():
+    pool, _ = _synced(n=2)
+    r = SparseRouter(16, 3, 2)  # diverged: 2 experts vs 3 router rows
+    order = list(pool.order)
+    with pytest.raises(ValueError):
+        grow_expert(pool, r, 16, 32, step=1, seed=0)
+    assert pool.order == order and len(pool) == 2 and r.num_experts == 3
 
 
 def test_recombine_is_parent_mean_plus_noise():
