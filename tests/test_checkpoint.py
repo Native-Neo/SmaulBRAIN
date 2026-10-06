@@ -8,6 +8,22 @@ from config import SmaulBrainConfig
 from model import SmaulBrainModel
 from smaulopt import SmaulOpt, SmaulOptHParams
 from storage import load_expert_file, load_model, save_model
+from train import ReplayBuffer, run_training
+
+
+def _resume_model(**kw):
+    torch.manual_seed(0)
+    base = dict(d_model=32, n_heads=4, num_experts=4, top_k=2, expert_hidden=64,
+                max_depth=2, context_length=24, expert_lr=3e-2)
+    base.update(kw)
+    cfg = SmaulBrainConfig(**base)
+    return SmaulBrainModel(cfg), SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr)), cfg
+
+
+def _resume_seqs():
+    import random
+    rng = random.Random(11)
+    return [[rng.randrange(256) for _ in range(30)] for _ in range(16)]
 
 
 def _trained(tmp, seed=0):
@@ -97,3 +113,51 @@ def test_resume_step_and_saved_config_are_restored(tmp_path):
     assert m2.cfg.max_depth == 2
     assert m2.cfg.context_length == 12
     m.pager.close(); m2.pager.close()
+
+
+def _losses(hist):
+    return [(h["loss"], h["nll"], h["acc"], h["mean_depth"]) for h in hist]
+
+
+def test_save_resume_matches_uninterrupted_run(tmp_path):
+    """Mid-run checkpoint + resume == uninterrupted run, bit for bit.
+
+    Exercises the full scheduler/RNG restore path: periodic save carries
+    the loss edge, growth counter, replay buffer and RNG state; the
+    resumed run (fresh objects, replay rebuilt from snapshot) must
+    reproduce the uninterrupted trajectory exactly, including a growth
+    event on each leg.
+    """
+    seqs = _resume_seqs()
+    kw = dict(batch_size=2, replay_n=1, grow_every=2,
+              grow_loss_below=-1.0, seed=5, log_fn=lambda s: None)
+
+    m, opt, cfg = _resume_model()
+    ref = run_training(m, opt, cfg, seqs, steps=4,
+                       replay=ReplayBuffer(capacity=8, seed=7), **kw)
+    ref_losses = _losses(ref["history"])
+    ref_order = list(m.pool.order)
+    ref_embed = m.embed.weight.detach().clone()
+
+    d = str(tmp_path / "r")
+    m1, opt1, cfg1 = _resume_model()
+    leg1 = run_training(m1, opt1, cfg1, seqs, steps=2,
+                        replay=ReplayBuffer(capacity=8, seed=7),
+                        ckpt_dir=d, save_every=2, **kw)
+    assert leg1["steps_completed"] == 2
+    m1.pager.close()
+
+    m2, opt2, _ = _resume_model()
+    load_model(d, m2, opt2)
+    assert m2._resume_step == 1
+    assert m2._scheduler_snapshot.get("growth_events") == 1
+    cfg2 = m2.cfg  # checkpoint is authoritative for runtime config
+    leg2 = run_training(m2, opt2, cfg2, seqs, steps=2, batch_size=2,
+                        replay_n=1, grow_every=2, grow_loss_below=-1.0,
+                        seed=5, log_fn=lambda s: None)
+
+    got = _losses(leg1["history"]) + _losses(leg2["history"])
+    assert got == ref_losses
+    assert list(m2.pool.order) == ref_order
+    assert torch.equal(m2.embed.weight, ref_embed)
+    m2.pager.close(); m.pager.close()
