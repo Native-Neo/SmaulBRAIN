@@ -78,7 +78,7 @@ class SmaulBrainModel(nn.Module):
     def _eval_provider(self, expert_id: str) -> dict[str, torch.Tensor]:
         return self.pager.provider(expert_id)
 
-    def _moe_fn(self, train: bool, step: int):
+    def _moe_fn(self, train: bool, step: int, keep: torch.Tensor | None = None):
         def fn(x: torch.Tensor):
             # Capacity binds only in training: it is batch-size relative,
             # so enforcing it at inference would make chunked/streaming
@@ -87,7 +87,8 @@ class SmaulBrainModel(nn.Module):
             prov = self._train_provider if train else self._eval_provider
             y = self.pool.forward(x, plan.top_ids, plan.top_weights,
                                   plan.dropped, prov, step=step)
-            aux = self.router.balance_loss(plan.probs)
+            # Balance over scored positions only: padding must not dilute it.
+            aux = self.router.balance_loss(plan.probs, keep=keep)
             return y, aux, plan.top_ids
         return fn
 
@@ -116,6 +117,7 @@ class SmaulBrainModel(nn.Module):
         attn_states: list[LinearAttnState],
         train: bool,
         step: int,
+        keep: torch.Tensor | None = None,
     ):
         """Run the shared block; return per-step (h, halt_prob, aux) + depths.
 
@@ -123,6 +125,8 @@ class SmaulBrainModel(nn.Module):
         must each observe every token, or streaming inference would resume
         from incomplete states. Adaptivity lives in the per-token halting
         depths (which representation is read out), not in skipped compute.
+        ``keep`` (bool [B*T], training only) restricts the MoE balance loss
+        to scored positions so padding cannot dilute it.
         """
         B, T, _D = h.shape
         hs: list[torch.Tensor] = []
@@ -134,7 +138,7 @@ class SmaulBrainModel(nn.Module):
         n_executed = 0
         for depth in range(self.cfg.max_depth):
             h, attn_states[depth], halt_logit, aux = self.block(
-                h, attn_states[depth], self._moe_fn(train, step),
+                h, attn_states[depth], self._moe_fn(train, step, keep=keep),
                 chunk_size=self.cfg.attention_chunk_size,
             )
             aux_total = aux_total + aux  # keep router grad graph (training)
@@ -151,14 +155,14 @@ class SmaulBrainModel(nn.Module):
                 halted = halted | (cum >= self.cfg.halting_threshold)
         return hs, lams, aux_total, depths, n_executed
 
-    def _ponder(self, lams: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Halting distribution p_n and geometric-prior KL (FP32 stats)."""
+    def _ponder(self, lams: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Halting distribution p_n, mean geometric-prior KL, per-position KL."""
         B, T = lams[0].shape
         dev = lams[0].device
         p_pr = self.cfg.halt_prior
         probs: list[torch.Tensor] = []
         remaining = torch.ones(B, T, device=dev)
-        kl = torch.zeros((), device=dev)
+        kl_pos = torch.zeros(B, T, device=dev)
         for n, lam in enumerate(lams):
             if n == len(lams) - 1:
                 p = remaining  # force-stop: all remaining mass halts here
@@ -167,9 +171,9 @@ class SmaulBrainModel(nn.Module):
                 remaining = remaining * (1.0 - lam)
             probs.append(p)
             geom = p_pr * ((1.0 - p_pr) ** n)
-            kl = kl + (p * (torch.log(p.clamp_min(1e-9)) - math.log(max(geom, 1e-12)))).sum()
+            kl_pos = kl_pos + p * (torch.log(p.clamp_min(1e-9)) - math.log(max(geom, 1e-12)))
         P = torch.stack(probs, dim=0)  # [D, B, T]
-        return P, kl / (B * T)
+        return P, kl_pos.mean(), kl_pos
 
     # -- forward --
     def forward(
@@ -180,6 +184,9 @@ class SmaulBrainModel(nn.Module):
         self._leaves = {}
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
+        # Scored positions: padding is not data and is excluded from the MoE
+        # balance loss as well as the CE/KL/accuracy below.
+        valid = (targets != PAD_ID) if targets is not None else None
         h = self.n_init(self.embed(ids).to(compute))
         attn_states = [
             LinearAttnState.zeros(
@@ -189,9 +196,10 @@ class SmaulBrainModel(nn.Module):
             for _ in range(self.cfg.max_depth)
         ]
         hs, lams, aux, depths, n_executed = self._depth_loop(
-            h, attn_states, train=True, step=step
+            h, attn_states, train=True, step=step,
+            keep=valid.reshape(-1) if targets is not None else None,
         )
-        P, kl = self._ponder([l.float() for l in lams])
+        P, _kl_mean, kl_pos = self._ponder([l.float() for l in lams])
         if targets is None:
             logits = self.head(self.n_final(hs[-1])).float()
             return {"logits": logits, "depths": depths, "n_executed": n_executed}
@@ -199,7 +207,7 @@ class SmaulBrainModel(nn.Module):
         # Padding (PAD_ID) is not data: it is excluded from the loss via
         # ignore_index and every mean below normalizes over valid targets
         # only, so trailing-pad length cannot dilute (or NaN) the loss.
-        valid = (targets != PAD_ID)
+        assert valid is not None
         n_valid = int(valid.sum().item())
         ce_steps = []
         for h_n in hs:
@@ -209,8 +217,11 @@ class SmaulBrainModel(nn.Module):
                                  ignore_index=PAD_ID).reshape(B, T)
             ce_steps.append(ce)
         CE = torch.stack(ce_steps, dim=0)  # [D, B, T]
-        nll = (P * CE).sum() / max(1, n_valid)
-        kl_valid = kl * (B * T) / max(1, n_valid)  # _ponder means over B*T
+        # Mask before summing: the same valid values in the same order sum
+        # bit-identically regardless of how many pads surround them.
+        pondered = (P * CE).sum(dim=0)  # [B, T] per-position pondered CE
+        nll = pondered[valid].sum() / max(1, n_valid)
+        kl_valid = kl_pos[valid].sum() / max(1, n_valid)
         balance = aux / n_executed
         loss = nll + self.cfg.ponder_beta * kl_valid + self.cfg.moe_balance_weight * balance
         with torch.no_grad():
