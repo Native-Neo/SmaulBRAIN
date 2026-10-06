@@ -185,6 +185,9 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
             continue
         rec = model.pool.experts[eid]
         compute = {n: _GradOnly(g) for n, g in grads.items()}
+        # grad_scale stays 1.0: routing weights, ponder mass, and repeated
+        # depth applications already scale these grads through autograd;
+        # any manual factor here would double-count them.
         opt.step_expert(rec, compute, 1.0, cfg.expert_lr)
         model.pager.invalidate(eid)
         stepped.append(eid)
@@ -276,6 +279,7 @@ def run_training(
             model.pool, model.router, cfg.d_model, cfg.expert_hidden, step,
             seed=seed + salt, k=count, n_mutated=min(2, count),
             fp8_tile=cfg.fp8_tile, max_experts=cfg.max_experts,
+            optim_state=opt.router_state,
         )
         for eid in new_ids:
             log_fn(f"[grow] step={step} new={eid} pool={len(model.pool)}")
@@ -291,7 +295,8 @@ def run_training(
             # Pager traces are forgotten inside prune_experts (atomic with
             # removal); no separate caller loop to skip on partial failure.
             pruned = pruning_mod.prune_experts(model.pool, model.router, victims,
-                                               pager=model.pager)
+                                               pager=model.pager,
+                                               optim_state=opt.router_state)
             model.cfg.num_experts = len(model.pool)
             log_fn(f"[prune] step={step} removed={pruned} pool={len(model.pool)}")
     run_started = time.perf_counter()
