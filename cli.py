@@ -50,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Top-k routed experts per token (default: tiny=2).")
     p.add_argument("--max-experts", type=int, default=None, help="Expert pool ceiling (default: tiny=64).")
     p.add_argument("--min-experts", type=int, default=None, help="Expert pool floor (default: tiny=2).")
+    p.add_argument("--capacity-factor", type=float, default=None, dest="capacity_factor",
+                   help="Per-expert routing capacity multiple (default: tiny=1.5).")
     # --- adaptive depth ---
     p.add_argument("--max-depth", type=int, default=None, help="Max recurrent applications (default: tiny=3).")
     p.add_argument("--min-depth", type=int, default=None, help="Min recurrent applications (default: tiny=1).")
@@ -119,6 +121,10 @@ def config_from_args(args: argparse.Namespace) -> SmaulBrainConfig:
         # equal to a tiny default) always wins; otherwise the preset applies.
         return cli_value if cli_value is not None else preset[key]
 
+    def pick_cfg(cli_value, default: float):
+        # Non-preset knobs (no --full variant): explicit or built-in default.
+        return cli_value if cli_value is not None else default
+
     expert_hidden = args.expert_size
     if expert_hidden is None:
         expert_hidden = preset["expert_hidden"]
@@ -132,6 +138,7 @@ def config_from_args(args: argparse.Namespace) -> SmaulBrainConfig:
         expert_hidden=expert_hidden,
         max_depth=pick(args.max_depth, "max_depth"),
         min_depth=pick(args.min_depth, "min_depth"),
+        capacity_factor=pick_cfg(args.capacity_factor, 1.5),
         halting_threshold=pick(args.halting_threshold, "halting_threshold"),
         paging_method=args.pagingmthd.upper(),
         ram_cache=pick(args.ram_cache, "ram_cache"),
