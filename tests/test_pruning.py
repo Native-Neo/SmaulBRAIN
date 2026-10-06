@@ -137,3 +137,21 @@ def test_prune_keeps_survivor_momentum_aligned():
     for i, want in enumerate((100.0, 102.0, 103.0)):  # victim row excised
         assert torch.equal(got[i], torch.full((d,), want))
     assert opt.router_state["w"]["step"] == 7
+
+
+def test_failing_side_channel_leaves_topology_consistent():
+    """Rollback containment: if a side-channel (pager) blows up mid-sweep,
+    the committed prefix still has pool/router in lockstep and the error
+    surfaces instead of a silent divergence."""
+    pool, r = _pool()
+
+    class BoomPager:
+        def forget(self, eid):
+            raise RuntimeError("disk on fire")
+
+    with pytest.raises(RuntimeError):
+        prune_experts(pool, r, ["expert_00001", "expert_00002"],
+                      pager=BoomPager())
+    assert len(pool) == r.num_experts == 3  # committed prefix stays synced
+    assert "expert_00002" not in pool.experts  # highest index goes first
+    assert "expert_00001" in pool.experts  # uncommitted victim untouched
