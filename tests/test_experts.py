@@ -111,3 +111,39 @@ def test_dispatch_matches_admitted_weighted_combination():
         assert torch.allclose(out[t], expect, atol=1e-5), t
     assert torch.equal(out[5], torch.zeros(16))  # dropped token: pure residual
     assert pool.experts["expert_00000"].tokens_routed == 3  # live tokens only
+
+
+def test_train_step_leaves_unstepped_experts_bit_identical():
+    """Only routed (stepped) experts are decoded/updated/requantized.
+
+    Unstepped experts' FP8 codes AND scales must survive a training step
+    bit for bit — the expert-granularity half of the touched-blocks rule
+    (intra-expert row-block granularity is audit 028's follow-up).
+    """
+    import random
+    from config import SmaulBrainConfig
+    from model import SmaulBrainModel
+    from smaulopt import SmaulOpt, SmaulOptHParams
+    from train import train_step
+
+    torch.manual_seed(0)
+    random.seed(0)
+    cfg = SmaulBrainConfig(d_model=32, n_heads=4, num_experts=4, top_k=2,
+                           expert_hidden=64, max_depth=2, context_length=24)
+    m = SmaulBrainModel(cfg)
+    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
+    before = {eid: {n: (rec.weights_fp8[n].codes.clone(),
+                        rec.weights_fp8[n].scales.clone())
+                    for n in ("w_gate", "w_up", "w_down")}
+              for eid, rec in m.pool.experts.items()}
+    b = torch.randint(0, 256, (2, cfg.context_length + 1))
+    stats = train_step(m, opt, cfg, b[:, :cfg.context_length], b[:, 1:], step=0)
+    assert len(stats["stepped_experts"]) > 0  # update path actually ran
+    for eid, rec in m.pool.experts.items():
+        for n in ("w_gate", "w_up", "w_down"):
+            same_codes = torch.equal(rec.weights_fp8[n].codes, before[eid][n][0])
+            same_scales = torch.equal(rec.weights_fp8[n].scales, before[eid][n][1])
+            if eid in stats["stepped_experts"]:
+                continue  # stepped experts may legitimately change
+            assert same_codes and same_scales, (eid, n)  # untouched: bit identical
+    m.pager.close()
