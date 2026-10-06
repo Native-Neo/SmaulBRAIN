@@ -30,7 +30,13 @@ from dataclasses import dataclass
 
 import torch
 
-from precision import dequantize_fp8_blockwise, quantize_fp8_blockwise
+from precision import (
+    dequantize_fp8_blockwise,
+    dequantize_fp8_row_block,
+    quantize_fp8_blockwise,
+    update_fp8_row_block,
+)
+
 
 
 @dataclass
@@ -67,43 +73,117 @@ def init_state(shape: tuple[int, ...], hparams: SmaulOptHParams) -> dict:
 
 
 def smaul_update(
-    w: torch.Tensor, g: torch.Tensor, state: dict, hparams: SmaulOptHParams, lr: float
+    w: torch.Tensor,
+    g: torch.Tensor,
+    state: dict,
+    hparams: SmaulOptHParams,
+    lr: float,
+    row_start: int | None = None,
+    row_end: int | None = None,
 ) -> torch.Tensor:
-    """One SmaulOpt update in FP32. Returns the new weight (fp32, detached)."""
-    w32 = w.detach().float()
-    g32 = g.detach().float()
+    """One SmaulOpt update in FP32. Returns the new weight (fp32, detached).
+
+    Supports optional block/range updates via row_start and row_end. When
+    specified, only rows in [row_start:row_end] are updated in optimizer
+    state, and the updated row block is returned.
+    """
+    if row_start is None and row_end is None:
+        w32 = w.detach().float()
+        g32 = g.detach().float()
+        state["step"] = int(state.get("step", 0)) + 1
+        t = state["step"]
+        bm, bv = hparams.beta_m, hparams.beta_v
+        bc1 = 1.0 - bm**t
+        bc2 = 1.0 - bv**t
+
+        m = state["m"].float() * bm + g32 * (1.0 - bm)
+        ag = g32.abs()
+        if "v" in state:
+            v = state["v"].float() * bv + ag * (1.0 - bv)
+            state["v"] = v.to(_store_dtype(hparams.state_dtype))
+            v_hat = v / bc2
+        else:
+            vr = state["v_row"].float() * bv + ag.mean(dim=1, keepdim=True) * (1.0 - bv)
+            vc = state["v_col"].float() * bv + ag.mean(dim=0, keepdim=True) * (1.0 - bv)
+            state["v_row"] = vr.to(_store_dtype(hparams.state_dtype))
+            state["v_col"] = vc.to(_store_dtype(hparams.state_dtype))
+            vr_hat = vr / bc2
+            vc_hat = vc / bc2
+            # Reconstruct per row-block to bound transient memory (block=256).
+            v_hat = torch.empty_like(ag)
+            for o in range(0, ag.shape[0], 256):
+                rb = vr_hat[o : o + 256]
+                denom = rb.mean().clamp_min(1e-12)
+                v_hat[o : o + 256] = (rb * vc_hat) / denom
+        state["m"] = m.to(_store_dtype(hparams.state_dtype))
+        m_hat = m / bc1
+        u = m_hat / (v_hat + hparams.eps)
+        if hparams.state_dtype != "fp32":
+            u = u.clamp(-hparams.update_clip, hparams.update_clip)
+        decay = lr * hparams.wd
+        return (w32 * (1.0 - decay) - lr * u).detach()
+
+    total_rows = state["m"].shape[0] if "m" in state else w.shape[0]
+    r0 = 0 if row_start is None else int(row_start)
+    r1 = total_rows if row_end is None else int(row_end)
+    if r0 < 0 or r1 > total_rows or r0 >= r1:
+        raise ValueError(f"invalid row range [{r0}, {r1}) for total rows {total_rows}")
+
+    w_slice = w if w.shape[0] == (r1 - r0) else w[r0:r1]
+    g_slice = g if g.shape[0] == (r1 - r0) else g[r0:r1]
+    w32 = w_slice.detach().float()
+    g32 = g_slice.detach().float()
+
     state["step"] = int(state.get("step", 0)) + 1
     t = state["step"]
     bm, bv = hparams.beta_m, hparams.beta_v
     bc1 = 1.0 - bm**t
     bc2 = 1.0 - bv**t
 
-    m = state["m"].float() * bm + g32 * (1.0 - bm)
+    m_slice = state["m"][r0:r1].float() * bm + g32 * (1.0 - bm)
+    state["m"][r0:r1] = m_slice.to(_store_dtype(hparams.state_dtype))
+    m_hat = m_slice / bc1
     ag = g32.abs()
+
     if "v" in state:
-        v = state["v"].float() * bv + ag * (1.0 - bv)
-        state["v"] = v.to(_store_dtype(hparams.state_dtype))
-        v_hat = v / bc2
+        v_slice = state["v"][r0:r1].float() * bv + ag * (1.0 - bv)
+        state["v"][r0:r1] = v_slice.to(_store_dtype(hparams.state_dtype))
+        v_hat = v_slice / bc2
     else:
-        vr = state["v_row"].float() * bv + ag.mean(dim=1, keepdim=True) * (1.0 - bv)
+        vr_slice = state["v_row"][r0:r1].float() * bv + ag.mean(dim=1, keepdim=True) * (1.0 - bv)
+        state["v_row"][r0:r1] = vr_slice.to(_store_dtype(hparams.state_dtype))
         vc = state["v_col"].float() * bv + ag.mean(dim=0, keepdim=True) * (1.0 - bv)
-        state["v_row"] = vr.to(_store_dtype(hparams.state_dtype))
         state["v_col"] = vc.to(_store_dtype(hparams.state_dtype))
-        vr_hat = vr / bc2
+        vr_hat = vr_slice / bc2
         vc_hat = vc / bc2
-        # Reconstruct per row-block to bound transient memory (block=256).
         v_hat = torch.empty_like(ag)
         for o in range(0, ag.shape[0], 256):
             rb = vr_hat[o : o + 256]
             denom = rb.mean().clamp_min(1e-12)
             v_hat[o : o + 256] = (rb * vc_hat) / denom
-    state["m"] = m.to(_store_dtype(hparams.state_dtype))
-    m_hat = m / bc1
+
     u = m_hat / (v_hat + hparams.eps)
     if hparams.state_dtype != "fp32":
         u = u.clamp(-hparams.update_clip, hparams.update_clip)
     decay = lr * hparams.wd
     return (w32 * (1.0 - decay) - lr * u).detach()
+
+
+def smaul_update_range(
+    w: torch.Tensor,
+    g: torch.Tensor,
+    state: dict,
+    hparams: SmaulOptHParams,
+    lr: float,
+    row_start: int,
+    row_end: int,
+) -> torch.Tensor:
+    """Update only a row range [row_start:row_end] directly in optimizer state.
+
+    Returns the updated row block (fp32).
+    """
+    return smaul_update(w, g, state, hparams, lr, row_start=row_start, row_end=row_end)
+
 
 
 def global_grad_norm(grads: list[torch.Tensor]) -> float:
@@ -175,15 +255,20 @@ class SmaulOpt:
         compute: dict[str, torch.Tensor],  # dequantized leaf weights w/ .grad
         grad_scale: float,
         lr: float,
+        row_range: tuple[int, int] | None = None,
+        row_start: int | None = None,
+        row_end: int | None = None,
     ) -> float:
         """Apply grads to one expert and requantize its FP8 storage in place.
 
         Only this expert's blocks are decoded/updated/requantized — never the
         full model (avoids the old SmaulNative RQT full-matrix pathology).
+        When row_range or row_start/row_end is specified, only that row block
+        is updated, preserving untouched FP8 blocks bit-for-bit.
         Returns mean |update| as a gradient-activity signal (FP32 math).
         """
 
-        names = [n for n in ("w_gate", "w_up", "w_down") if compute[n].grad is not None]
+        names = [n for n in ("w_gate", "w_up", "w_down") if n in compute and compute[n].grad is not None]
         if not names:
             return 0.0
         norm = global_grad_norm([compute[n].grad for n in names])
@@ -196,18 +281,34 @@ class SmaulOpt:
             scale = self.hp.clip / (norm + 1e-12)
         activity = 0.0
         tile = record.weights_fp8["w_gate"].tile
+        if row_range is not None:
+            row_start, row_end = row_range
         with torch.no_grad():
             for n in names:
-                g = (compute[n].grad * scale * grad_scale).float()
-                st = record.optim_state.get(n)
+                grad_tensor = compute[n].grad
                 shape = tuple(compute[n].shape)
+                st = record.optim_state.get(n)
                 if st is None or tuple(st["m"].shape) != shape:
                     st = init_state(shape, self.hp)
                     record.optim_state[n] = st
-                base = dequantize_fp8_blockwise(record.weights_fp8[n], dtype=torch.float32)
-                new_w = smaul_update(base, g, st, self.hp, lr * scale)
-                record.weights_fp8[n] = quantize_fp8_blockwise(new_w, tile=tile)
-                activity += float((new_w - base).abs().mean().item())
+
+                if row_start is not None or row_end is not None:
+                    total_rows = record.weights_fp8[n].shape[0]
+                    r0 = 0 if row_start is None else row_start
+                    r1 = total_rows if row_end is None else row_end
+                    base_slice = dequantize_fp8_row_block(record.weights_fp8[n], r0, r1, dtype=torch.float32)
+                    g_slice = grad_tensor if grad_tensor.shape[0] == (r1 - r0) else grad_tensor[r0:r1]
+                    g = (g_slice * scale * grad_scale).float()
+                    new_slice = smaul_update(base_slice, g, st, self.hp, lr * scale, row_start=r0, row_end=r1)
+                    update_fp8_row_block(record.weights_fp8[n], new_slice, r0, r1)
+                    activity += float((new_slice - base_slice).abs().mean().item())
+                else:
+                    g = (grad_tensor * scale * grad_scale).float()
+                    base = dequantize_fp8_blockwise(record.weights_fp8[n], dtype=torch.float32)
+                    new_w = smaul_update(base, g, st, self.hp, lr * scale)
+                    record.weights_fp8[n] = quantize_fp8_blockwise(new_w, tile=tile)
+                    activity += float((new_w - base).abs().mean().item())
                 compute[n].grad = None
         record.grad_activity = 0.9 * record.grad_activity + 0.1 * (activity / max(1, len(names)))
         return record.grad_activity
+

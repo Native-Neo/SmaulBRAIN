@@ -31,9 +31,10 @@ from bytes import PAD_ID
 class _GradOnly:
     """Thin grad carrier: step_expert reads .grad; base weights come from FP8."""
 
-    def __init__(self, grad: torch.Tensor) -> None:
+    def __init__(self, grad: torch.Tensor | None) -> None:
         self.grad = grad
-        self.shape = tuple(grad.shape)
+        self.shape = tuple(grad.shape) if grad is not None else None
+
 
 
 _MODES = ("entire", "trunk", "experts", "selected", "new")
@@ -156,49 +157,54 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
         raise ValueError(f"empty batch {tuple(x.shape)} carries no gradient signal")
     model.train()
     model.zero_grad(set_to_none=True)
-    out = model(x, y, step=step)
-    loss = out["loss"]
-    loss.backward()
-    stepped: list[str] = []
-    train_trunk = mode in ("entire", "trunk")
-    train_router = mode in ("entire", "trunk", "experts", "selected", "new")
-    if train_trunk:
-        opt.step_trunk(model._trunk_params(), cfg.trunk_lr)
-    else:
-        for _, p in model._trunk_params():
-            p.grad = None
-    if train_router:
-        opt.step_router(model._router_params(), cfg.router_lr)
-    else:
-        for _, p in model._router_params():
-            p.grad = None
-    expert_grads = model.take_expert_grads()
-    if mode in ("entire", "experts"):
-        targets = list(expert_grads)
-    elif mode == "selected":
-        want = set(selected or [])
-        targets = [e for e in expert_grads if e in want]
-    elif mode == "new":
-        targets = [e for e in expert_grads
-                   if model.pool.experts[e].birth_step >= new_since_step]
-    else:  # trunk mode: experts frozen
-        targets = []
-    for eid in targets:
-        grads = expert_grads[eid]
-        if not grads:
-            continue
-        rec = model.pool.experts[eid]
-        compute = {n: _GradOnly(g) for n, g in grads.items()}
-        # grad_scale stays 1.0: routing weights, ponder mass, and repeated
-        # depth applications already scale these grads through autograd;
-        # any manual factor here would double-count them.
-        opt.step_expert(rec, compute, 1.0, cfg.expert_lr)
-        model.pager.invalidate(eid)
-        stepped.append(eid)
-    # Global optimizer steps: exactly one per train_step call, including
-    # steps whose updates were skipped (see skipped-step semantics). The
-    # per-tensor bias corrections use each tensor's own step counter.
-    opt.step_count += 1
+    try:
+        out = model(x, y, step=step)
+        loss = out["loss"]
+        loss.backward()
+        stepped: list[str] = []
+        train_trunk = mode in ("entire", "trunk")
+        train_router = mode in ("entire", "trunk", "experts", "selected", "new")
+        if train_trunk:
+            opt.step_trunk(model._trunk_params(), cfg.trunk_lr)
+        else:
+            for _, p in model._trunk_params():
+                p.grad = None
+        if train_router:
+            opt.step_router(model._router_params(), cfg.router_lr)
+        else:
+            for _, p in model._router_params():
+                p.grad = None
+        expert_grads = model.take_expert_grads()
+        if mode in ("entire", "experts"):
+            targets = list(expert_grads)
+        elif mode == "selected":
+            want = set(selected or [])
+            targets = [e for e in expert_grads if e in want]
+        elif mode == "new":
+            targets = [e for e in expert_grads
+                       if model.pool.experts[e].birth_step >= new_since_step]
+        else:  # trunk mode: experts frozen
+            targets = []
+        for eid in targets:
+            grads = expert_grads[eid]
+            if not grads:
+                continue
+            rec = model.pool.experts[eid]
+            compute = {n: _GradOnly(g) for n, g in grads.items()}
+            # grad_scale stays 1.0: routing weights, ponder mass, and repeated
+            # depth applications already scale these grads through autograd;
+            # any manual factor here would double-count them.
+            opt.step_expert(rec, compute, 1.0, cfg.expert_lr)
+            model.pager.invalidate(eid)
+            stepped.append(eid)
+        # Global optimizer steps: exactly one per train_step call, including
+        # steps whose updates were skipped (see skipped-step semantics). The
+        # per-tensor bias corrections use each tensor's own step counter.
+        opt.step_count += 1
+    except Exception:
+        model.clear_expert_grads(set_to_none=True)
+        raise
+
     return {
         "loss": float(loss.item()),
         "nll": float(out["nll"].item()),

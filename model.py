@@ -70,6 +70,8 @@ class SmaulBrainModel(nn.Module):
     # -- MoE wiring --
     def _train_provider(self, expert_id: str) -> dict[str, torch.Tensor]:
         base = self.pager.provider(expert_id)
+        if not torch.is_grad_enabled():
+            return base
         leaves = {k: v.detach().to(base[k].dtype).requires_grad_(True)
                   for k, v in base.items()}
         self._leaves.setdefault(expert_id, []).append(leaves)
@@ -92,23 +94,44 @@ class SmaulBrainModel(nn.Module):
             return y, aux, plan.top_ids
         return fn
 
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        super().zero_grad(set_to_none=set_to_none)
+        self.clear_expert_grads(set_to_none=set_to_none)
+
+    def clear_expert_grads(self, set_to_none: bool = True) -> None:
+        """Clear external gradients on active expert leaves and release references."""
+        for copies in self._leaves.values():
+            for leaves in copies:
+                for leaf in leaves.values():
+                    if leaf.grad is not None:
+                        if set_to_none:
+                            leaf.grad = None
+                        else:
+                            leaf.grad.zero_()
+        self._leaves.clear()
+
     def take_expert_grads(self) -> dict[str, dict[str, torch.Tensor]]:
         """Sum leaf grads per expert across depth-step copies; clear the buffer.
 
         Returns eid -> {wname: summed grad or None}. Call after loss.backward().
         """
         agg: dict[str, dict[str, torch.Tensor]] = {}
-        for eid, copies in self._leaves.items():
-            summed: dict[str, torch.Tensor] = {}
-            for leaves in copies:
-                for n, leaf in leaves.items():
-                    if leaf.grad is None:
-                        continue
-                    g = leaf.grad.detach().float()
-                    summed[n] = g if n not in summed else summed[n] + g
-            agg[eid] = summed
-        self._leaves = {}
-        return agg
+        try:
+            for eid, copies in self._leaves.items():
+                summed: dict[str, torch.Tensor] = {}
+                for leaves in copies:
+                    for n, leaf in leaves.items():
+                        if leaf.grad is None:
+                            continue
+                        g = leaf.grad.detach().float()
+                        summed[n] = g if n not in summed else summed[n] + g
+                        leaf.grad = None  # clear stale external gradients
+                if summed:
+                    agg[eid] = summed
+            return agg
+        finally:
+            self.clear_expert_grads()
+
 
     # -- adaptive depth loop --
     def _depth_loop(
@@ -194,8 +217,12 @@ class SmaulBrainModel(nn.Module):
         self._check_ids(ids, "ids")
         if targets is not None:
             self._check_ids(targets, "targets")
+        if self._leaves:
+            raise RuntimeError(
+                f"unconsumed expert leaves from prior forward ({len(self._leaves)} experts); "
+                "call take_expert_grads() or zero_grad() before running forward again"
+            )
         self._last_step = step
-        self._leaves = {}
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
         # Scored positions: padding is not data and is excluded from the MoE
@@ -209,57 +236,62 @@ class SmaulBrainModel(nn.Module):
             )
             for _ in range(self.cfg.max_depth)
         ]
-        hs, lams, aux, depths, n_executed = self._depth_loop(
-            h, attn_states, train=True, step=step,
-            keep=valid.reshape(-1) if targets is not None else None,
-        )
-        P, _kl_mean, kl_pos = self._ponder([l.float() for l in lams])
-        if targets is None:
-            # Same ponder-mixed readout as the scored path (no targets to
-            # mask; P sums to 1 per position regardless).
-            mixed = sum(P[n].detach() * self.head(self.n_final(hs[n])).float()
-                        for n in range(len(hs)))
-            return {"logits": mixed, "depths": depths, "n_executed": n_executed}
-        # Ponder-weighted CE: each step's logits score against halting mass.
-        # Padding (PAD_ID) is not data: it is excluded from the loss via
-        # ignore_index and every mean below normalizes over valid targets
-        # only, so trailing-pad length cannot dilute (or NaN) the loss.
-        assert valid is not None
-        n_valid = int(valid.sum().item())
-        ce_steps = []
-        mixed = 0.0  # ponder-mixed readout: the predictor the loss optimizes
-        for n, h_n in enumerate(hs):
-            logits_n = self.head(self.n_final(h_n)).float()
-            mixed = mixed + P[n].unsqueeze(-1).detach() * logits_n.detach()
-            ce = F.cross_entropy(logits_n.reshape(-1, self.cfg.vocab_size),
-                                 targets.reshape(-1), reduction="none",
-                                 ignore_index=PAD_ID).reshape(B, T)
-            ce_steps.append(ce)
-        CE = torch.stack(ce_steps, dim=0)  # [D, B, T]
-        # Mask before summing: the same valid values in the same order sum
-        # bit-identically regardless of how many pads surround them.
-        pondered = (P * CE).sum(dim=0)  # [B, T] per-position pondered CE
-        nll = pondered[valid].sum() / max(1, n_valid)
-        kl_valid = kl_pos[valid].sum() / max(1, n_valid)
-        balance = aux / n_executed
-        loss = nll + self.cfg.ponder_beta * kl_valid + self.cfg.moe_balance_weight * balance
-        with torch.no_grad():
-            # Accuracy uses the ponder-mixed readout (same predictor the
-            # loss scores), not the max-depth representation inference
-            # would not necessarily read out.
-            pred = mixed.argmax(-1)
-            acc = ((pred == targets) & valid).float().sum().item() / max(1, n_valid)
-            steps = torch.arange(1, len(hs) + 1, device=P.device).view(-1, 1, 1)
-            mean_depth = float((P * steps).sum().item() / (B * T))
-        return {
-            # The model's prediction is the ponder-mixed readout, matching
-            # the loss and the accuracy above (cached: no second head pass).
-            "logits": mixed,
-            "loss": loss, "nll": nll.detach(), "ponder_kl": kl_valid.detach(),
-            "balance": balance.detach() if torch.is_tensor(balance) else balance,
-            "acc": acc, "depths": depths, "mean_depth": mean_depth,
-            "n_executed": n_executed,
-        }
+        try:
+            hs, lams, aux, depths, n_executed = self._depth_loop(
+                h, attn_states, train=True, step=step,
+                keep=valid.reshape(-1) if targets is not None else None,
+            )
+            P, _kl_mean, kl_pos = self._ponder([l.float() for l in lams])
+            if targets is None:
+                # Same ponder-mixed readout as the scored path (no targets to
+                # mask; P sums to 1 per position regardless).
+                mixed = sum(P[n].unsqueeze(-1).detach() * self.head(self.n_final(hs[n])).float()
+                            for n in range(len(hs)))
+                return {"logits": mixed, "depths": depths, "n_executed": n_executed}
+            # Ponder-weighted CE: each step's logits score against halting mass.
+            # Padding (PAD_ID) is not data: it is excluded from the loss via
+            # ignore_index and every mean below normalizes over valid targets
+            # only, so trailing-pad length cannot dilute (or NaN) the loss.
+            assert valid is not None
+            n_valid = int(valid.sum().item())
+            ce_steps = []
+            mixed = 0.0  # ponder-mixed readout: the predictor the loss optimizes
+            for n, h_n in enumerate(hs):
+                logits_n = self.head(self.n_final(h_n)).float()
+                mixed = mixed + P[n].unsqueeze(-1).detach() * logits_n.detach()
+                ce = F.cross_entropy(logits_n.reshape(-1, self.cfg.vocab_size),
+                                     targets.reshape(-1), reduction="none",
+                                     ignore_index=PAD_ID).reshape(B, T)
+                ce_steps.append(ce)
+            CE = torch.stack(ce_steps, dim=0)  # [D, B, T]
+            # Mask before summing: the same valid values in the same order sum
+            # bit-identically regardless of how many pads surround them.
+            pondered = (P * CE).sum(dim=0)  # [B, T] per-position pondered CE
+            nll = pondered[valid].sum() / max(1, n_valid)
+            kl_valid = kl_pos[valid].sum() / max(1, n_valid)
+            balance = aux / n_executed
+            loss = nll + self.cfg.ponder_beta * kl_valid + self.cfg.moe_balance_weight * balance
+            with torch.no_grad():
+                # Accuracy uses the ponder-mixed readout (same predictor the
+                # loss scores), not the max-depth representation inference
+                # would not necessarily read out.
+                pred = mixed.argmax(-1)
+                acc = ((pred == targets) & valid).float().sum().item() / max(1, n_valid)
+                steps = torch.arange(1, len(hs) + 1, device=P.device).view(-1, 1, 1)
+                mean_depth = float((P * steps).sum().item() / (B * T))
+            return {
+                # The model's prediction is the ponder-mixed readout, matching
+                # the loss and the accuracy above (cached: no second head pass).
+                "logits": mixed,
+                "loss": loss, "nll": nll.detach(), "ponder_kl": kl_valid.detach(),
+                "balance": balance.detach() if torch.is_tensor(balance) else balance,
+                "acc": acc, "depths": depths, "mean_depth": mean_depth,
+                "n_executed": n_executed,
+            }
+        except Exception:
+            self.clear_expert_grads()
+            raise
+
 
     @torch.no_grad()
     def forward_infer(self, ids: torch.Tensor, step: int = 0) -> dict:

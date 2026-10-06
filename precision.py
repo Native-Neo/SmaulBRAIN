@@ -107,6 +107,23 @@ def dequantize_fp8_row_block(
     return dequantize_fp8_blockwise(sub, dtype=dtype)
 
 
+def update_fp8_row_block(
+    t: FP8BlockTensor, new_rows: torch.Tensor, row_start: int, row_end: int
+) -> None:
+    """Quantize and replace only row_start:row_end in an FP8BlockTensor in place.
+
+    Untouched rows (codes and scales) are preserved bit-for-bit.
+    """
+    if row_start < 0 or row_end > t.shape[0] or row_start >= row_end:
+        raise ValueError(
+            f"invalid row range [{row_start}, {row_end}) for tensor with {t.shape[0]} rows"
+        )
+    sub = quantize_fp8_blockwise(new_rows, tile=t.tile)
+    t.codes[row_start:row_end] = sub.codes
+    t.scales[row_start:row_end] = sub.scales
+
+
+
 # --- dtype policy table -----------------------------------------------------
 
 #: component -> (storage dtype, compute dtype)
