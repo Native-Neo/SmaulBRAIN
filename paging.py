@@ -269,4 +269,15 @@ class ExpertPager:
                 "ram_staged": len(self.ram_records)}
 
     def close(self) -> None:
+        # Cancel queued (not yet running) prefetches first so shutdown does
+        # not execute dead work; running ones finish, then the pool dies.
+        with self._lock:
+            pending = list(self._pending.values())
+            self._pending.clear()
+            self._prefetched.clear()
+        for fut in pending:
+            try:
+                fut.cancel()
+            except Exception:
+                pass
         self._exec.shutdown(wait=True)
