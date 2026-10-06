@@ -49,6 +49,7 @@ class ReplayBuffer:
 
     def add(self, seq: list[int]) -> None:
         self.seen += 1
+        seq = list(seq)  # ingress copy: later caller mutation must not corrupt replay
         if len(self.buf) < self.capacity:
             self.buf.append(seq)
         else:
