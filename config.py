@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
+from bytes import total_vocab
+
 
 __version__ = "0.1.0"
 
@@ -35,7 +37,10 @@ class SmaulBrainConfig:
     """Full SmaulBRAIN configuration. All CLI flags map onto these fields."""
 
     # --- core topology (tiny/CPU-friendly defaults; see --full in cli.py) ---
-    vocab_size: int = 256  # raw bytes; specials extend this (see bytes.py)
+    # Vocabulary covers raw bytes PLUS structural specials (bos/eos/pad/sep):
+    # the model must accept special ids without index errors, and padding
+    # uses PAD_ID (masked from the loss), never byte 0 (a real NUL byte).
+    vocab_size: int = total_vocab()
     d_model: int = 64
     n_heads: int = 4
     # --- recurrent block (shared, applied min_depth..max_depth times) ---
