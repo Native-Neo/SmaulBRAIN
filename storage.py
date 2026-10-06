@@ -173,6 +173,8 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
     os.makedirs(exp_dir, exist_ok=True)
     cfg_dict = model.cfg.to_dict()
     cfg_dict["num_experts"] = len(model.pool)
+    from config import __version__ as _schema
+    cfg_dict["schema_version"] = _schema
     # Pruning may reduce the pool below the configured floor; checkpoints
     # must remain constructible while still respecting top_k.
     cfg_dict["min_experts"] = min(model.cfg.min_experts, len(model.pool))
@@ -227,10 +229,17 @@ def make_disk_loader(ckpt_dir: str):
 
 def load_model(ckpt_dir: str, model, opt) -> dict:
     """Load weights/opt/router/experts into an existing model+opt. Returns manifest."""
-    from config import SmaulBrainConfig
+    from config import SmaulBrainConfig, __version__ as _schema
 
     with open(os.path.join(ckpt_dir, "config.json")) as f:
-        saved_cfg = SmaulBrainConfig.from_dict(json.load(f))
+        raw_cfg = json.load(f)
+    saved_schema = str(raw_cfg.get("schema_version", _schema))
+    if saved_schema.split(".")[0] != _schema.split(".")[0]:
+        raise ValueError(
+            f"checkpoint schema major {saved_schema!r} != runtime {_schema!r}: "
+            "migrate the checkpoint instead of loading across majors"
+        )
+    saved_cfg = SmaulBrainConfig.from_dict(raw_cfg)
     shape_fields = (
         "d_model", "vocab_size", "n_heads", "expert_hidden",
         "top_k", "dtype",
