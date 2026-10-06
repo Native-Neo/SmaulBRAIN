@@ -25,6 +25,7 @@ import torch
 
 import growth as growth_mod
 import pruning as pruning_mod
+from bytes import PAD_ID
 
 
 class _GradOnly:
@@ -88,8 +89,14 @@ class ReplayBuffer:
         return buf
 
 
-def batch_from_seqs(seqs: list[list[int]], context: int, pad_id: int = 0) -> torch.Tensor:
-    """Pack variable-length byte seqs into a [B, T] batch (truncate/pad)."""
+def batch_from_seqs(seqs: list[list[int]], context: int, pad_id: int = PAD_ID) -> torch.Tensor:
+    """Pack variable-length byte seqs into a [B, T] batch (truncate/pad).
+
+    Padding defaults to PAD_ID (a structural special, never a real byte),
+    so padded positions are distinguishable from data and masked from the
+    loss. Callers may pass an explicit byte pad only when the pad positions
+    are genuinely meant to score as data.
+    """
     rows = []
     for s in seqs:
         s = s[: context + 1]
@@ -101,16 +108,24 @@ def batch_from_seqs(seqs: list[list[int]], context: int, pad_id: int = 0) -> tor
 
 @torch.no_grad()
 def evaluate_loss(model, batch: torch.Tensor, context: int) -> dict:
-    """Old/new-data evaluation: mean NLL + accuracy (no gradients)."""
+    """Old/new-data evaluation: mean NLL + accuracy (no gradients).
+
+    Padding (PAD_ID) is excluded from both metrics; means normalize over
+    valid targets only so pad length cannot dilute the measurement.
+    """
     was_training = model.training
     model.eval()
     x = batch[:, :context]
     y = batch[:, 1 : context + 1]
     out = model.forward_infer(x)
     logits = out["logits"].float()
-    loss = torch.nn.functional.cross_entropy(logits.reshape(-1, model.cfg.vocab_size),
-                                             y.reshape(-1)).item()
-    acc = (logits.argmax(-1) == y).float().mean().item()
+    valid = (y != PAD_ID)
+    n_valid = int(valid.sum().item())
+    ce = torch.nn.functional.cross_entropy(logits.reshape(-1, model.cfg.vocab_size),
+                                           y.reshape(-1), reduction="none",
+                                           ignore_index=PAD_ID)
+    loss = (ce.sum() / max(1, n_valid)).item()
+    acc = (((logits.argmax(-1) == y) & valid).float().sum() / max(1, n_valid)).item()
     if was_training:
         model.train()
     return {"loss": loss, "acc": acc, "mean_executed": float(out["n_executed"])}
