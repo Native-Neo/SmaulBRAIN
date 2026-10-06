@@ -28,6 +28,8 @@ class SparseTopKHead(nn.Module):
 
     def __init__(self, vocab: int, d_model: int, fan_in: int = 32, seed: int = 0) -> None:
         super().__init__()
+        if not 1 <= fan_in <= d_model:
+            raise ValueError(f"fan_in must satisfy 1 <= fan_in <= d_model={d_model}, got {fan_in}")
         gen = torch.Generator().manual_seed(seed)
         cols = torch.stack([torch.randperm(d_model, generator=gen)[:fan_in]
                             for _ in range(vocab)])
@@ -37,6 +39,11 @@ class SparseTopKHead(nn.Module):
         self.fan_in = fan_in
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device != self.cols.device:
+            raise ValueError(
+                f"input device {x.device} != head device {self.cols.device}; "
+                "move the head (or input) first"
+            )
         gathered = x[..., self.cols]  # [..., V, K]
         return (gathered * self.values).sum(dim=-1)
 
@@ -45,14 +52,28 @@ class SparseTopKHead(nn.Module):
 
 
 def time_fn(fn, repeat: int = 20, warmup: int = 3) -> dict:
-    """Wall-time benchmark (CPU): median/mean per call in ms."""
-    for _ in range(warmup):
-        fn()
-    ts = []
-    for _ in range(repeat):
-        t0 = time.perf_counter()
-        fn()
-        ts.append((time.perf_counter() - t0) * 1000.0)
+    """Wall-time benchmark: median/mean per call in ms.
+
+    Runs under no_grad (benchmarks measure forward math, not autograd
+    bookkeeping) and synchronizes CUDA around each reading when available,
+    so async launches cannot leak into neighboring measurements.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    with torch.no_grad():
+        for _ in range(warmup):
+            fn()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        ts = []
+        for _ in range(repeat):
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            fn()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            ts.append((time.perf_counter() - t0) * 1000.0)
     ts.sort()
     return {"median_ms": ts[len(ts) // 2], "mean_ms": sum(ts) / len(ts),
             "min_ms": ts[0], "repeat": repeat}
