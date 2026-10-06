@@ -207,7 +207,8 @@ def main(argv: list[str] | None = None) -> int:
                           "bytes_processed": res["bytes_processed"],
                           "bytes_per_second": round(res["bytes_per_second"], 2)}, indent=2))
         if args.save_every == 0:
-            save_model(args.ckpt, model, opt, int(getattr(model, "_resume_step", -1)))
+            save_model(args.ckpt, model, opt, int(getattr(model, "_resume_step", -1)),
+                       extra_meta={"scheduler": res["scheduler"]})
     elif args.cmd == "infer":
         if os.path.exists(os.path.join(args.ckpt, "manifest.json")):
             # Serve future misses from the checkpoint files. load_model above
