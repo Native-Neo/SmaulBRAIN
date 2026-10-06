@@ -87,7 +87,7 @@ def test_checkpoint_correct_after_pruning(tmp_path):
     man = load_model(d, m2, SmaulOpt())
     assert man["expert_ids"] == [keep] and len(m2.pool) == 1
     ids = torch.randint(0, 256, (1, 8))
-    assert m2.forward_infer(ids)["logits"].shape == (1, 8, 256)
+    assert m2.forward_infer(ids)["logits"].shape == (1, 8, m2.cfg.vocab_size)
     m.pager.close(); m2.pager.close()
 
 
