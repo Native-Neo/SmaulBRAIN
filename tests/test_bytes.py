@@ -42,3 +42,23 @@ def test_streaming_split_tail():
     part1 = dec.feed([enc[0]])
     part2 = dec.feed([enc[1]])
     assert part1 + part2 + dec.flush() == "é"
+
+
+def test_invalid_byte_does_not_stall_decoder():
+    dec = IncrementalByteDecoder()
+    assert dec.feed([0xFF]) == "�"  # surfaced immediately, not buffered forever
+    assert dec.feed([65]) == "A"  # decoding continues after bad bytes
+    assert dec.flush() == ""
+
+
+def test_split_multibyte_across_single_byte_feeds():
+    raw = "héllo ✓ wörld".encode("utf-8")
+    dec = IncrementalByteDecoder()
+    assert "".join(dec.feed([b]) for b in raw) + dec.flush() == "héllo ✓ wörld"
+
+
+def test_trailing_split_tail_flushes_as_replacement():
+    dec = IncrementalByteDecoder()
+    assert dec.feed([0xC3]) == ""  # first byte of 2-byte seq stays buffered
+    assert dec.flush() == "�"
+    assert dec.feed([66]) == "B"  # reusable after flush
