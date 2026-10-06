@@ -65,6 +65,15 @@ def recombine_weights(
     return out
 
 
+def _check_topology_in_sync(pool: ExpertPool, router) -> None:
+    """Fail before mutating when pool and router have already diverged."""
+    if router.num_experts != len(pool):
+        raise ValueError(
+            f"pool/router out of sync: {len(pool)} experts vs "
+            f"{router.num_experts} router rows (refusing to mutate)"
+        )
+
+
 def grow_expert(
     pool: ExpertPool,
     router,  # SparseRouter (duck-typed)
@@ -75,28 +84,35 @@ def grow_expert(
     n_parents: int = 2,
     noise_std: float = 0.005,
     fp8_tile: int = 64,
+    max_experts: int | None = None,
 ) -> str:
     """Add one expert by recombination. Returns the new stable expert id.
 
     Reproducible: all randomness derives from ``seed``.
     Fallback: empty pool -> fresh random expert (documented, tested).
+    Capacity-safe: at ``max_experts`` (when given) raises before mutating.
+    Two-phase: the record and router row are fully built before either the
+    pool or the router is touched, so a build failure cannot leave them
+    diverged.
     """
+    _check_topology_in_sync(pool, router)
+    if max_experts is not None and len(pool) >= max_experts:
+        raise ValueError(f"at capacity: {len(pool)} >= max_experts={max_experts}")
     gen = torch.Generator().manual_seed(seed)
     if len(pool) == 0:
         rec = make_expert(pool.fresh_id(), d_model, expert_hidden, birth_step=step,
                           source="init", fp8_tile=fp8_tile, generator=gen)
-        pool.add(rec)
-        router.add_expert_row()
-        return rec.expert_id
-    parents = select_parents(pool, k=min(n_parents, len(pool)))
-    # Parent-mean router row gives the child a sane starting admission.
-    with torch.no_grad():
-        rows = torch.stack([router.proj.weight[pool.index_of(p)].float() for p in parents])
-        init_row = rows.mean(dim=0)
-    w = recombine_weights(pool, parents, noise_std=noise_std, generator=gen)
-    rec = make_expert(pool.fresh_id(), d_model, expert_hidden, weights=w, birth_step=step,
-                      parents=parents, source="recombine", fp8_tile=fp8_tile)
-    rec.optim_state = init_expert_optim_state(rec)
+        init_row = None
+    else:
+        parents = select_parents(pool, k=min(n_parents, len(pool)))
+        # Parent-mean router row gives the child a sane starting admission.
+        with torch.no_grad():
+            rows = torch.stack([router.proj.weight[pool.index_of(p)].float() for p in parents])
+            init_row = rows.mean(dim=0)
+        w = recombine_weights(pool, parents, noise_std=noise_std, generator=gen)
+        rec = make_expert(pool.fresh_id(), d_model, expert_hidden, weights=w, birth_step=step,
+                          parents=parents, source="recombine", fp8_tile=fp8_tile)
+        rec.optim_state = init_expert_optim_state(rec)
     pool.add(rec)
     router.add_expert_row(init=init_row)
     return rec.expert_id
@@ -113,6 +129,7 @@ def grow_topk_clones(
     n_mutated: int = 2,
     noise_std: float = 0.0005,
     fp8_tile: int = 64,
+    max_experts: int | None = None,
 ) -> list[str]:
     """Duplicate the top-k experts by contribution (exact copies + mutants).
 
@@ -122,15 +139,28 @@ def grow_topk_clones(
     for exploration; the rest are bit-identical consolidation with fresh
     (zero) optimizer state. Returns new ids in parent-rank order.
     Reproducible from ``seed``; birth steps grant prune grace periods.
+    Capacity-safe: never grows past ``max_experts`` (when given); returns
+    fewer (possibly zero) ids when room runs out.
+    Two-phase: all records and router rows are built before the pool or
+    the router is touched, so a build failure cannot commit a prefix and
+    leave pool/router diverged.
     """
+    _check_topology_in_sync(pool, router)
     ranked = sorted(
         pool.experts.values(),
         key=lambda r: (-r.contribution, -r.tokens_routed, r.expert_id),
     )
-    parents = ranked[: max(1, min(k, len(ranked)))]
+    want = max(1, min(k, len(ranked)))
+    if max_experts is not None:
+        room = max(0, max_experts - len(pool))
+        want = min(want, room)
+        if want <= 0:
+            return []
+    parents = ranked[:want]
     gen = torch.Generator().manual_seed(seed)
     mutated = set(torch.randperm(len(parents), generator=gen)[: max(0, min(n_mutated, len(parents)))].tolist())
-    new_ids: list[str] = []
+    # Phase 1 (pure build): records + router rows, no pool/router mutation.
+    built: list[tuple] = []
     for i, par in enumerate(parents):
         eid = pool.fresh_id()
         if i in mutated and noise_std > 0:
@@ -159,9 +189,14 @@ def grow_topk_clones(
                 source="clone",
             )
             rec.optim_state = init_expert_optim_state(rec)
-        pool.add(rec)
         with torch.no_grad():
             parent_row = router.proj.weight[pool.index_of(par.expert_id)].detach().clone()
+        built.append((rec, parent_row))
+    # Phase 2 (commit): infallible given phase-1 validation; pool and router
+    # move in lockstep so they cannot diverge mid-sweep.
+    new_ids: list[str] = []
+    for rec, parent_row in built:
+        pool.add(rec)
         router.add_expert_row(init=parent_row)
-        new_ids.append(eid)
+        new_ids.append(rec.expert_id)
     return new_ids
