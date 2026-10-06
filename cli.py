@@ -35,10 +35,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="smaulbrain",
                                 description="SmaulBRAIN recurrent byte-level MoE LM")
     # --- architecture (tiny defaults; see --full) ---
-    p.add_argument("--d-model", type=int, default=64, help="Shared trunk width.")
-    p.add_argument("--n-heads", type=int, default=4, help="Linear-attention heads.")
-    p.add_argument("--experts", type=int, default=8, dest="num_experts",
-                   help="Initial dynamic expert count.")
+    p.add_argument("--d-model", type=int, default=None, help="Shared trunk width (default: tiny=64).")
+    p.add_argument("--n-heads", type=int, default=None, help="Linear-attention heads (default: tiny=4).")
+    p.add_argument("--experts", type=int, default=None, dest="num_experts",
+                   help="Initial dynamic expert count (default: tiny=8).")
     p.add_argument("--expert-size", type=int, default=None, dest="expert_size",
                    help="Expert hidden dim. Omitted: 128, or 3328 with --full "
                         "(~=5.12M params/expert at d-model 512).")
@@ -46,27 +46,27 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Full-size preset: 64 experts, top-8 routing, ~5.12M "
                         "params/expert. Any architecture flag passed explicitly "
                         "overrides the preset.")
-    p.add_argument("--active-experts", type=int, default=2, dest="top_k",
-                   help="Top-k routed experts per token (active working set).")
-    p.add_argument("--max-experts", type=int, default=64, help="Expert pool ceiling.")
-    p.add_argument("--min-experts", type=int, default=2, help="Expert pool floor.")
+    p.add_argument("--active-experts", type=int, default=None, dest="top_k",
+                   help="Top-k routed experts per token (default: tiny=2).")
+    p.add_argument("--max-experts", type=int, default=None, help="Expert pool ceiling (default: tiny=64).")
+    p.add_argument("--min-experts", type=int, default=None, help="Expert pool floor (default: tiny=2).")
     # --- adaptive depth ---
-    p.add_argument("--max-depth", type=int, default=3, help="Max recurrent applications.")
-    p.add_argument("--min-depth", type=int, default=1, help="Min recurrent applications.")
-    p.add_argument("--halting-threshold", type=float, default=0.9,
-                   help="Cumulative halt prob that stops inference depth.")
+    p.add_argument("--max-depth", type=int, default=None, help="Max recurrent applications (default: tiny=3).")
+    p.add_argument("--min-depth", type=int, default=None, help="Min recurrent applications (default: tiny=1).")
+    p.add_argument("--halting-threshold", type=float, default=None,
+                   help="Cumulative halt prob that stops inference depth (default: tiny=0.9).")
     # --- paging ---
     p.add_argument("--pagingmthd", type=str, default="D2R",
                    choices=["D2R", "R2VR", "D2VR"],
                    help="D2R=disk->RAM, R2VR=RAM->VRAM (staged), D2VR=disk->VRAM direct.")
-    p.add_argument("--ram-cache", type=int, default=8, help="Max experts in RAM cache.")
-    p.add_argument("--vram-cache", type=int, default=4, help="Max experts in VRAM cache.")
+    p.add_argument("--ram-cache", type=int, default=None, help="Max experts in RAM cache (default: tiny=8).")
+    p.add_argument("--vram-cache", type=int, default=None, help="Max experts in VRAM cache (default: tiny=4).")
     # --- optimization ---
     p.add_argument("--expert-lr", type=float, default=2e-4, help="Expert learning rate.")
     p.add_argument("--trunk-lr-mult", type=float, default=0.1,
                    help="Shared-trunk LR multiplier (slow trunk vs fast experts).")
     # --- runtime ---
-    p.add_argument("--context-length", type=int, default=128, help="Training context.")
+    p.add_argument("--context-length", type=int, default=None, help="Training context (default: tiny=128).")
     p.add_argument("--attention-chunk-size", type=int, default=256,
                    help="Causal linear-attention training chunk size.")
     p.add_argument("--threads", type=int, default=2, help="Torch CPU threads.")
@@ -114,9 +114,9 @@ def config_from_args(args: argparse.Namespace) -> SmaulBrainConfig:
     preset = FULL_DEFAULTS if args.full else TINY_DEFAULTS
 
     def pick(cli_value, key: str):
-        # An explicitly passed architecture flag (differs from the tiny
-        # default) always wins; otherwise the active preset applies.
-        return cli_value if cli_value != TINY_DEFAULTS[key] else preset[key]
+        # Flags default to None, so an explicitly passed value (even one
+        # equal to a tiny default) always wins; otherwise the preset applies.
+        return cli_value if cli_value is not None else preset[key]
 
     expert_hidden = args.expert_size
     if expert_hidden is None:
@@ -137,6 +137,7 @@ def config_from_args(args: argparse.Namespace) -> SmaulBrainConfig:
         vram_cache=pick(args.vram_cache, "vram_cache"),
         expert_lr=args.expert_lr,
         trunk_lr_mult=args.trunk_lr_mult, context_length=pick(args.context_length, "context_length"),
+        attention_chunk_size=args.attention_chunk_size,
         threads=args.threads, dtype=args.dtype, seed=args.seed,
     )
 
