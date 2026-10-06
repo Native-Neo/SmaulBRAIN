@@ -3,6 +3,7 @@
 import sys, os, subprocess
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import pytest
 import torch
 from kernels import compare_heads, linear_attn_memory_bound, time_fn
 from rmsnorm import RMSNorm, rmsnorm_fn
@@ -57,3 +58,14 @@ def test_sparse_vs_dense_measured_not_assumed():
 
 def test_attn_memory_formula():
     assert linear_attn_memory_bound(8, 64) == (8 * 4096 + 8 * 64) * 4
+
+
+def test_sparse_head_rejects_bad_fan_in_and_device():
+    from kernels import SparseTopKHead
+    with pytest.raises(ValueError):
+        SparseTopKHead(16, 8, fan_in=9)  # wider than the model dim
+    with pytest.raises(ValueError):
+        SparseTopKHead(16, 8, fan_in=0)
+    h = SparseTopKHead(16, 8, fan_in=4)
+    out = h(torch.randn(5, 8))
+    assert out.shape == (5, 16) and torch.isfinite(out).all()
