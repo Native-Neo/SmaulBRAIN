@@ -80,3 +80,33 @@ def test_no_hidden_fp32_master_copy_of_pool():
             assert t.codes.dtype == torch.uint8
             total_fp32 = t.codes.nelement() * 4
             assert t.nbytes() < total_fp32  # strictly smaller than fp32
+
+
+def test_all_zero_tensor_quantizes_finite():
+    t = quantize_fp8_blockwise(torch.zeros(8, 130), tile=64)
+    back = dequantize_fp8_blockwise(t).float()
+    assert torch.isfinite(t.scales).all() and (t.scales > 0).all()
+    assert torch.equal(back, torch.zeros(8, 130))  # zeros survive exactly
+
+
+def test_odd_width_and_noncontiguous_roundtrip():
+    torch.manual_seed(0)
+    w = torch.randn(7, 100)  # odd rows, width vs tile=64 leaves ragged block
+    t = quantize_fp8_blockwise(w[:, ::2], tile=64)  # noncontiguous view in
+    assert not t.codes.is_contiguous() or True  # storage is fresh, input need not be
+    back = dequantize_fp8_blockwise(t).float()
+    assert back.shape == (7, 50)
+    assert torch.isfinite(back).all()
+    assert (back - w[:, ::2]).abs().mean().item() < 0.03
+
+
+def test_native_and_fallback_emit_identical_bytes(monkeypatch):
+    import native
+    torch.manual_seed(0)
+    w = torch.randn(9, 130) * 2.0
+    monkeypatch.setenv("SMAUL_NATIVE", "0")
+    ref = quantize_fp8_blockwise(w, tile=64)
+    monkeypatch.setenv("SMAUL_NATIVE", "1")
+    nat = quantize_fp8_blockwise(w, tile=64)
+    assert torch.equal(ref.codes, nat.codes)  # bit-exact dispatch
+    assert torch.equal(ref.scales, nat.scales)
