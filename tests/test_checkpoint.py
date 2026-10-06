@@ -215,3 +215,25 @@ def test_retile_updates_precision_metadata_and_reloads(tmp_path):
     load_model(d, m2, SmaulOpt(SmaulOptHParams()))
     assert m2.cfg.fp8_tile == 32 and len(m2.pool) == len(m.pool)
     m.pager.close(); m2.pager.close()
+
+
+def test_schema_major_mismatch_refuses(tmp_path):
+    import json
+    d = str(tmp_path / "c")
+    m, opt = _trained(d)
+    p = os.path.join(d, "config.json")
+    cfg = json.load(open(p))
+    cfg["schema_version"] = "1.0.0"
+    json.dump(cfg, open(p, "w"))
+    m2 = SmaulBrainModel(m.cfg)
+    with pytest.raises(ValueError):
+        load_model(d, m2, SmaulOpt(SmaulOptHParams()))
+    m.pager.close(); m2.pager.close()
+
+
+def test_config_rejects_nonsense_values():
+    bad = dict(grad_clip=-1.0, capacity_factor=0.0, expert_lr=0.0,
+               beta_m=1.5, fp8_tile=4, context_length=1, max_new_experts=0)
+    for k, v in bad.items():
+        with pytest.raises(AssertionError):
+            SmaulBrainConfig(**{k: v})
