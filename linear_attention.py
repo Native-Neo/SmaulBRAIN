@@ -49,6 +49,15 @@ class LinearAttnState:
     def clone(self) -> "LinearAttnState":
         return LinearAttnState(S=self.S.clone(), z=self.z.clone())
 
+    def matches(self, batch: int, heads: int, head_dim: int) -> bool:
+        """The one state contract: fp32 accumulators of exact expected shape."""
+        return (
+            self.S.shape == (batch, heads, head_dim, head_dim)
+            and self.z.shape == (batch, heads, head_dim)
+            and self.S.dtype == torch.float32
+            and self.z.dtype == torch.float32
+        )
+
     def nbytes(self) -> int:
         return self.S.nelement() * 4 + self.z.nelement() * 4
 
