@@ -313,7 +313,8 @@ def run_training(
         if prune_every and (step + 1) % prune_every == 0:
             prune_eval(step)
         if ckpt_dir and save_every and (step + 1) % save_every == 0:
-            save_model(ckpt_dir, model, opt, step)
+            save_model(ckpt_dir, model, opt, step,
+                       extra_meta={"scheduler": scheduler_snapshot()})
             model._resume_step = step
 
         elapsed = time.perf_counter() - step_started
@@ -349,4 +350,7 @@ def run_training(
         "elapsed_seconds": total_elapsed,
         "bytes_processed": bytes_processed,
         "bytes_per_second": bytes_processed / max(total_elapsed, 1e-12),
+        # Scheduler snapshot for exact resume: whoever saves the final
+        # checkpoint passes this as extra_meta (see cli train command).
+        "scheduler": scheduler_snapshot(),
     }
