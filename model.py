@@ -176,10 +176,24 @@ class SmaulBrainModel(nn.Module):
         return P, kl_pos.mean(), kl_pos
 
     # -- forward --
+    def _check_ids(self, ids: torch.Tensor, what: str) -> None:
+        """Fail loudly on out-of-vocabulary ids (never a cryptic IndexError)."""
+        if ids.numel() == 0:
+            return
+        lo, hi = int(ids.min().item()), int(ids.max().item())
+        if not 0 <= lo or hi >= self.cfg.vocab_size:
+            raise ValueError(
+                f"{what} has ids outside [0, {self.cfg.vocab_size}) "
+                f"(min={lo}, max={hi})"
+            )
+
     def forward(
         self, ids: torch.Tensor, targets: torch.Tensor | None = None, step: int = 0
     ) -> dict:
         """Training forward (grad enabled by caller). Returns logits/loss/stats."""
+        self._check_ids(ids, "ids")
+        if targets is not None:
+            self._check_ids(targets, "targets")
         self._last_step = step
         self._leaves = {}
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
@@ -240,6 +254,7 @@ class SmaulBrainModel(nn.Module):
     @torch.no_grad()
     def forward_infer(self, ids: torch.Tensor, step: int = 0) -> dict:
         """Inference forward: fixed-state recurrent pass with token-depth selection."""
+        self._check_ids(ids, "ids")
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
         h = self.n_init(self.embed(ids).to(compute))
@@ -288,6 +303,7 @@ class SmaulBrainModel(nn.Module):
         step: int = 0,
     ) -> tuple[dict, list[LinearAttnState]]:
         """Process a prompt/chunk and return its updated fixed-size recurrent states."""
+        self._check_ids(ids, "ids")
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, _T = ids.shape
         h = self.n_init(self.embed(ids).to(compute))
@@ -295,6 +311,13 @@ class SmaulBrainModel(nn.Module):
             attn_states = self.new_infer_state(B)
         if len(attn_states) != self.cfg.max_depth:
             raise ValueError("attention state depth does not match model max_depth")
+        for st in attn_states:
+            if not st.matches(B, self.cfg.n_heads, self.cfg.d_model // self.cfg.n_heads):
+                raise ValueError(
+                    "attention state width does not match model "
+                    f"(expected B={B} H={self.cfg.n_heads} "
+                    f"Dh={self.cfg.d_model // self.cfg.n_heads})"
+                )
         hs, lams, _aux, depths, n_executed = self._depth_loop(
             h, attn_states, train=False, step=step
         )
