@@ -163,10 +163,10 @@ class SparseRouter(nn.Module):
         signal; all-excluded also yields 0.
         """
         if probs.shape[0] == 0:
-            return torch.zeros((), dtype=probs.dtype)
+            return probs.new_zeros(())
         rows = probs if keep is None else probs[keep]
         if rows.shape[0] == 0:
-            return torch.zeros((), dtype=probs.dtype)
+            return probs.new_zeros(())
         top_ids = rows.argmax(dim=-1)
         onehot = F.one_hot(top_ids, num_classes=self.num_experts).float()
         frac = onehot.mean(dim=0)
@@ -222,7 +222,7 @@ class SparseRouter(nn.Module):
             new.bias[:] = self.proj.bias[keep]
         self.proj = new
         self.num_experts -= 1
-        mask = torch.ones(len(self.usage_counts), dtype=torch.bool)
+        mask = torch.ones(len(self.usage_counts), dtype=torch.bool, device=self.usage_counts.device)
         mask[index] = False
         self.register_buffer("usage_counts", self.usage_counts[mask].contiguous())
         self.register_buffer("admit_counts", self.admit_counts[mask].contiguous())
