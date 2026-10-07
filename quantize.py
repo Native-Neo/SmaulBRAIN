@@ -21,12 +21,82 @@ import torch
 from storage import EXPERT_NAMES, expert_from_payload, expert_to_payload, load_manifest
 
 
+def _fsync_file(path: str) -> None:
+    try:
+        with open(path, "rb") as f:
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _fsync_dir(dirpath: str) -> None:
+    try:
+        fd = os.open(dirpath or ".", os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+    finally:
+        os.close(fd)
+
+
+def _sweep_stale_tmp(directory: str) -> None:
+    """Remove leftover converter sidecars from a prior crash (best-effort)."""
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if name.startswith("tmp_quant_") or name.endswith(".convert_tmp"):
+            try:
+                os.remove(os.path.join(directory, name))
+            except OSError:
+                pass
+
+
+def _checked_torch_load(path: str):
+    try:
+        if os.stat(path).st_size == 0:
+            raise ValueError(
+                f"checkpoint validation failed: empty file {path}"
+            )
+    except FileNotFoundError:
+        raise
+    except ValueError:
+        raise
+    except OSError as e:
+        raise ValueError(
+            f"checkpoint validation failed: unreadable file {path}: {e}"
+        ) from e
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(
+            f"checkpoint validation failed: unreadable/truncated file {path}: {e}"
+        ) from e
+
+
 def _atomic_write_json(payload: dict, path: str) -> None:
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix="tmp_quant_")
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(payload, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        _fsync_file(tmp)
         os.replace(tmp, path)
+        _fsync_dir(os.path.dirname(path) or ".")
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -38,7 +108,9 @@ def convert_expert_file(src: str, dst: str, to: str = "fp8", tile: int = 64) -> 
         FP8BlockTensor, dequantize_fp8_row_block, quantize_fp8_blockwise
     )
 
-    rec = expert_from_payload(torch.load(src, map_location="cpu", weights_only=False))
+    if not os.path.exists(src):
+        raise FileNotFoundError(f"missing expert file (refusing): {src}")
+    rec = expert_from_payload(_checked_torch_load(src))
     before = {n: rec.weights_fp8[n].nbytes() for n in EXPERT_NAMES}
     if to == "fp8":
         # Any source precision -> canonical FP8 block storage (also re-tiles).
@@ -80,7 +152,9 @@ def convert_expert_file(src: str, dst: str, to: str = "fp8", tile: int = 64) -> 
     os.close(fd)
     try:
         torch.save(expert_to_payload(rec), tmp)
+        _fsync_file(tmp)
         os.replace(tmp, dst)
+        _fsync_dir(os.path.dirname(dst) or ".")
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -109,6 +183,10 @@ def convert_checkpoint(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[d
     manifest = load_manifest(ckpt_dir)
     man_path = os.path.join(ckpt_dir, "manifest.json")
     cfg_path = os.path.join(ckpt_dir, "config.json")
+    exp_dir = os.path.join(ckpt_dir, "experts")
+    # Drop crash leftovers before staging new sidecars.
+    _sweep_stale_tmp(ckpt_dir)
+    _sweep_stale_tmp(exp_dir)
     reports = []
     if to == "fp8":
         paths = [(eid, os.path.join(ckpt_dir, "experts", f"{eid}.pt"))
@@ -116,6 +194,11 @@ def convert_checkpoint(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[d
         missing = [eid for eid, p in paths if not os.path.exists(p)]
         if missing:
             raise FileNotFoundError(f"missing expert files (refusing): {missing}")
+        empty = [eid for eid, p in paths if os.stat(p).st_size == 0]
+        if empty:
+            raise ValueError(
+                f"checkpoint validation failed: empty expert files {empty}"
+            )
         staged: list[tuple[str, str]] = []
         try:
             for eid, p in paths:
@@ -124,12 +207,18 @@ def convert_checkpoint(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[d
                 staged.append((tmp, p))
             for tmp, p in staged:
                 os.replace(tmp, p)
+            _fsync_dir(exp_dir)
         finally:
             for tmp, _ in staged:
                 if os.path.exists(tmp):
                     os.remove(tmp)
-        with open(cfg_path) as f:
-            cfg_dict = json.load(f)
+        try:
+            with open(cfg_path) as f:
+                cfg_dict = json.load(f)
+        except Exception as e:
+            raise ValueError(
+                f"checkpoint validation failed: unreadable config.json: {e}"
+            ) from e
         cfg_dict["fp8_tile"] = tile
         _atomic_write_json(cfg_dict, cfg_path)
     # to == "bf16": experts intentionally stay FP8; only the trunk converts.
@@ -138,7 +227,11 @@ def convert_checkpoint(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[d
             p = os.path.join(ckpt_dir, name)
             if not os.path.exists(p):
                 continue
-            obj = torch.load(p, map_location="cpu", weights_only=False)
+            if os.stat(p).st_size == 0:
+                raise ValueError(
+                    f"checkpoint validation failed: empty file {p}"
+                )
+            obj = _checked_torch_load(p)
             if isinstance(obj, dict):
                 obj = {k: (v.to(torch.bfloat16) if torch.is_tensor(v) and v.is_floating_point() else v)
                        for k, v in obj.items()}
@@ -146,7 +239,9 @@ def convert_checkpoint(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[d
                 os.close(fd)
                 try:
                     torch.save(obj, tmp)
+                    _fsync_file(tmp)
                     os.replace(tmp, p)
+                    _fsync_dir(ckpt_dir)
                 finally:
                     if os.path.exists(tmp):
                         os.remove(tmp)
