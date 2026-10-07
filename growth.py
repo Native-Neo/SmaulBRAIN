@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import torch
 
-from experts import ExpertPool, ExpertRecord, init_expert_optim_state, make_expert
-from precision import FP8BlockTensor, dequantize_fp8_blockwise
+from experts import ExpertPool, init_expert_optim_state, make_expert
+from precision import dequantize_fp8_blockwise
 
 _EXPERT_WEIGHTS = ("w_gate", "w_up", "w_down")
 
@@ -243,19 +243,22 @@ def grow_topk_clones(
     step: int,
     seed: int = 0,
     k: int = 8,
-    n_mutated: int = 2,
-    noise_std: float = 0.0005,
+    min_pct: float = 0.01,
+    max_pct: float = 0.10,
     fp8_tile: int = 64,
     max_experts: int | None = None,
     optim_state: dict | None = None,
 ) -> list[str]:
-    """Duplicate the top-k experts by contribution (exact copies + mutants).
+    """Clone the top-k experts by contribution, mutating every clone.
 
     Each clone inherits its parent's router row, so traffic splits between
     twins — approximately output-preserving under top-k renormalization.
-    ``n_mutated`` clones (seeded choice) receive small Gaussian perturbation
-    for exploration; the rest are bit-identical consolidation with fresh
-    (zero) optimizer state. Returns new ids in parent-rank order.
+    Every clone is mutated (never the parent): each draws its own relative
+    perturbation ``u`` uniform in [``min_pct``, ``max_pct``] (default
+    1%-10%) with per-weight random signs, applied multiplicatively, so the
+    clone differs from the parent by exactly ``u`` in relative magnitude
+    (up to FP8 rounding). Fresh (zero) optimizer state per clone.
+    Returns new ids in parent-rank order.
     Reproducible from ``seed``; birth steps grant prune grace periods.
     Capacity-safe: never grows past ``max_experts`` (when given); returns
     fewer (possibly zero) ids when room runs out.
@@ -267,6 +270,8 @@ def grow_topk_clones(
     so the prior topology returns exactly with no consumed IDs.
     """
     _check_topology_in_sync(pool, router)
+    if not 0.0 <= min_pct <= max_pct:
+        raise ValueError(f"need 0 <= min_pct <= max_pct, got {min_pct!r}, {max_pct!r}")
     ranked = sorted(
         pool.experts.values(),
         key=lambda r: (-r.contribution, -r.tokens_routed, r.expert_id),
@@ -282,38 +287,30 @@ def grow_topk_clones(
     router_snap = _snapshot_router(router)
     parents = ranked[:want]
     gen = torch.Generator().manual_seed(seed)
-    mutated = set(torch.randperm(len(parents), generator=gen)[: max(0, min(n_mutated, len(parents)))].tolist())
     # Phase 1 (pure build): records + router rows, no pool/router mutation.
     built: list[tuple] = []
     try:
-        for i, par in enumerate(parents):
+        for par in parents:
             eid = pool.fresh_id()
-            if i in mutated and noise_std > 0:
-                w = {n: dequantize_fp8_blockwise(par.weights_fp8[n], torch.float32)
-                     for n in _EXPERT_WEIGHTS}
-                for n in w:
-                    noise = torch.empty_like(w[n])
-                    noise.normal_(0.0, noise_std, generator=gen)
-                    w[n] += noise
-                rec = make_expert(eid, d_model, expert_hidden, weights=w, birth_step=step,
-                                  parents=[par.expert_id], source="clone-mutated",
-                                  fp8_tile=fp8_tile)
-            else:
-                rec = ExpertRecord(
-                    expert_id=eid,
-                    d_model=d_model,
-                    expert_hidden=expert_hidden,
-                    weights_fp8={n: FP8BlockTensor(
-                        codes=par.weights_fp8[n].codes.clone(),
-                        scales=par.weights_fp8[n].scales.clone(),
-                        shape=par.weights_fp8[n].shape,
-                        tile=par.weights_fp8[n].tile,
-                    ) for n in _EXPERT_WEIGHTS},
-                    birth_step=step,
-                    parents=[par.expert_id],
-                    source="clone",
-                )
-                rec.optim_state = init_expert_optim_state(rec)
+            # Per-clone relative perturbation, uniform in [min_pct, max_pct]
+            # with per-weight random signs (seeded): the parent is never
+            # touched, and every clone differs from it by exactly u.
+            # (torch.empty has no generator kwarg on this build; draw via
+            # uniform_ like the signs below.)
+            u_draw = torch.empty(())
+            u_draw.uniform_(0.0, 1.0, generator=gen)
+            u = min_pct + (max_pct - min_pct) * u_draw.item()
+            w = {n: dequantize_fp8_blockwise(par.weights_fp8[n], torch.float32)
+                 for n in _EXPERT_WEIGHTS}
+            for n in w:
+                signs = torch.empty_like(w[n]).uniform_(-1.0, 1.0, generator=gen)
+                signs = torch.where(signs >= 0,
+                                    torch.ones((), dtype=w[n].dtype),
+                                    -torch.ones((), dtype=w[n].dtype))
+                w[n] = w[n] * (1.0 + u * signs)
+            rec = make_expert(eid, d_model, expert_hidden, weights=w, birth_step=step,
+                              parents=[par.expert_id], source="clone-mutated",
+                              fp8_tile=fp8_tile)
             with torch.no_grad():
                 parent_row = router.proj.weight[pool.index_of(par.expert_id)].detach().clone()
             built.append((rec, parent_row))
