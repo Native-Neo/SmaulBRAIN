@@ -420,3 +420,180 @@ def test_quantize_sweeps_stale_sidecars_and_refuses_empty(tmp_path):
     with pytest.raises(ValueError, match="validation failed|empty"):
         convert_checkpoint(d, to="fp8", tile=32)
     m.pager.close()
+
+
+def _snapshot_live(m, opt):
+    """Full live-state snapshot: pool/router/trunk/pager/optimizer survivors."""
+    import copy
+    snap = {}
+    snap["order"] = list(m.pool.order)
+    snap["embed"] = m.embed.weight.detach().clone()
+    snap["router_rows"] = m.router.num_experts
+    snap["router_weight"] = m.router.proj.weight.detach().clone()
+    snap["trunk_state"] = copy.deepcopy(opt.trunk_state)
+    snap["router_state"] = copy.deepcopy(opt.router_state)
+    snap["step_count"] = opt.step_count
+    snap["pager_ram"] = set(m.pager.ram.keys())
+    snap["pager_vram"] = set(m.pager.vram.keys())
+    snap["pager_records"] = set(getattr(m.pager, "ram_records", {}).keys())
+    return snap
+
+
+def _assert_live_untouched(m, opt, snap):
+    assert list(m.pool.order) == snap["order"]
+    assert torch.equal(m.embed.weight, snap["embed"])
+    assert m.router.num_experts == snap["router_rows"]
+    assert torch.equal(m.router.proj.weight, snap["router_weight"])
+    assert opt.trunk_state.keys() == snap["trunk_state"].keys()
+    for k in snap["trunk_state"]:
+        for sk in snap["trunk_state"][k]:
+            a, b = snap["trunk_state"][k][sk], opt.trunk_state[k][sk]
+            assert torch.equal(a, b) if torch.is_tensor(a) else a == b
+    assert opt.router_state.keys() == snap["router_state"].keys()
+    assert opt.step_count == snap["step_count"]
+    assert set(m.pager.ram.keys()) == snap["pager_ram"]
+    assert set(m.pager.vram.keys()) == snap["pager_vram"]
+    assert set(getattr(m.pager, "ram_records", {}).keys()) == snap["pager_records"]
+    ids = torch.randint(0, 256, (1, 12))
+    assert m.forward_infer(ids)["logits"].shape == (1, 12, m.cfg.vocab_size)
+
+
+def test_extra_expert_file_rejected_untouched(tmp_path):
+    """Unlisted expert file on disk fails validation; live model untouched."""
+    import shutil
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    src = os.path.join(d, "experts", m.pool.order[0] + ".pt")
+    shutil.copy(src, os.path.join(d, "experts", "expert_99999.pt"))
+    m2 = SmaulBrainModel(m.cfg)
+    opt2 = SmaulOpt(SmaulOptHParams())
+    snap = _snapshot_live(m2, opt2)
+    with pytest.raises(ValueError, match="validation failed"):
+        load_model(d, m2, opt2)
+    _assert_live_untouched(m2, opt2, snap)
+    m.pager.close(); m2.pager.close()
+
+
+def test_invalid_config_json_type_rejected_untouched(tmp_path):
+    """Non-numeric config value normalizes to ValueError; nothing mutates."""
+    import json as _j
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    p = os.path.join(d, "config.json")
+    cfg = _j.load(open(p))
+    cfg["d_model"] = "not-a-number"
+    _j.dump(cfg, open(p, "w"))
+    m2 = SmaulBrainModel(m.cfg)
+    opt2 = SmaulOpt(SmaulOptHParams())
+    snap = _snapshot_live(m2, opt2)
+    with pytest.raises(ValueError, match="validation failed"):
+        load_model(d, m2, opt2)
+    _assert_live_untouched(m2, opt2, snap)
+    m.pager.close(); m2.pager.close()
+
+
+def test_invalid_manifest_json_type_rejected_untouched(tmp_path):
+    """String manifest step is an invalid JSON type; load fails cleanly."""
+    import json as _j
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    p = os.path.join(d, "manifest.json")
+    man = _j.load(open(p))
+    man["step"] = "three"
+    _j.dump(man, open(p, "w"))
+    m2 = SmaulBrainModel(m.cfg)
+    opt2 = SmaulOpt(SmaulOptHParams())
+    snap = _snapshot_live(m2, opt2)
+    with pytest.raises(ValueError, match="validation failed"):
+        load_model(d, m2, opt2)
+    _assert_live_untouched(m2, opt2, snap)
+    m.pager.close(); m2.pager.close()
+
+
+def test_incompatible_topology_rejected_untouched(tmp_path):
+    """Saved expert_hidden != live topology fails before any mutation."""
+    import json as _j
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    p = os.path.join(d, "config.json")
+    cfg = _j.load(open(p))
+    cfg["expert_hidden"] = int(cfg["expert_hidden"]) + 1000
+    _j.dump(cfg, open(p, "w"))
+    m2 = SmaulBrainModel(m.cfg)
+    opt2 = SmaulOpt(SmaulOptHParams())
+    snap = _snapshot_live(m2, opt2)
+    with pytest.raises(ValueError, match="validation failed"):
+        load_model(d, m2, opt2)
+    _assert_live_untouched(m2, opt2, snap)
+    m.pager.close(); m2.pager.close()
+
+
+def test_trunk_missing_entry_rejected_untouched(tmp_path):
+    """Trunk missing one key must fail (no silent strict=False partial)."""
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    p = os.path.join(d, "trunk.pt")
+    obj = torch.load(p, map_location="cpu", weights_only=False)
+    obj.pop(next(iter(obj)))
+    torch.save(obj, p)
+    m2 = SmaulBrainModel(m.cfg)
+    opt2 = SmaulOpt(SmaulOptHParams())
+    snap = _snapshot_live(m2, opt2)
+    with pytest.raises(ValueError, match="validation failed"):
+        load_model(d, m2, opt2)
+    _assert_live_untouched(m2, opt2, snap)
+    m.pager.close(); m2.pager.close()
+
+
+def test_corrupt_optimizer_state_rejected_untouched(tmp_path):
+    """Non-tensor optimizer moment fails deep validation; opt untouched."""
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    p = os.path.join(d, "optim.pt")
+    obj = torch.load(p, map_location="cpu", weights_only=False)
+    k = next(iter(obj["trunk"]))
+    obj["trunk"][k]["m"] = "corrupted"
+    torch.save(obj, p)
+    m2 = SmaulBrainModel(m.cfg)
+    opt2 = SmaulOpt(SmaulOptHParams())
+    snap = _snapshot_live(m2, opt2)
+    with pytest.raises(ValueError, match="validation failed"):
+        load_model(d, m2, opt2)
+    _assert_live_untouched(m2, opt2, snap)
+    m.pager.close(); m2.pager.close()
+
+
+def test_corrupt_expert_optim_shape_rejected_untouched(tmp_path):
+    """Expert-local moment with wrong shape fails; pool/pager/opt untouched."""
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    eid = m.pool.order[0]
+    p = os.path.join(d, "experts", f"{eid}.pt")
+    obj = torch.load(p, map_location="cpu", weights_only=False)
+    obj["optim_state"]["w_gate"]["m"] = torch.zeros(2, 2, dtype=torch.bfloat16)
+    torch.save(obj, p)
+    m2 = SmaulBrainModel(m.cfg)
+    opt2 = SmaulOpt(SmaulOptHParams())
+    snap = _snapshot_live(m2, opt2)
+    with pytest.raises(ValueError, match="validation failed"):
+        load_model(d, m2, opt2)
+    _assert_live_untouched(m2, opt2, snap)
+    m.pager.close(); m2.pager.close()
+
+
+def test_corrupt_expert_meta_type_rejected_untouched(tmp_path):
+    """Non-numeric expert meta normalizes to ValueError; nothing mutates."""
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    eid = m.pool.order[0]
+    p = os.path.join(d, "experts", f"{eid}.pt")
+    obj = torch.load(p, map_location="cpu", weights_only=False)
+    obj["meta"]["tokens_routed"] = {"x": 1}
+    torch.save(obj, p)
+    m2 = SmaulBrainModel(m.cfg)
+    opt2 = SmaulOpt(SmaulOptHParams())
+    snap = _snapshot_live(m2, opt2)
+    with pytest.raises(ValueError, match="validation failed"):
+        load_model(d, m2, opt2)
+    _assert_live_untouched(m2, opt2, snap)
+    m.pager.close(); m2.pager.close()
