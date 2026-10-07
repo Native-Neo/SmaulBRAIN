@@ -57,13 +57,79 @@ def set_rng_snapshot(snap: dict) -> None:
         torch.cuda.set_rng_state_all(snap["cuda"])
 
 
+def _fsync_file(path: str) -> None:
+    """Flush one regular file's data+metadata to stable storage."""
+    try:
+        with open(path, "rb") as f:
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _fsync_dir(dirpath: str) -> None:
+    """Flush a directory entry table so a rename survives a crash."""
+    try:
+        fd = os.open(dirpath or ".", os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+    finally:
+        os.close(fd)
+
+
+def _sweep_stale_tmp(directory: str) -> None:
+    """Remove leftover atomic-write sidecars from a prior crash.
+
+    Matches this module's tmp prefixes plus converter sidecars that may
+    share the directory; best-effort so a concurrent writer never fails
+    the sweep.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if name.startswith(("tmp_ckpt_", "tmp_json_")) or name.endswith(".convert_tmp"):
+            try:
+                os.remove(os.path.join(directory, name))
+            except OSError:
+                pass
+
+
+def _checked_torch_load(path: str):
+    """torch.load with truncated-file detection normalized to ValueError."""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        raise
+    if st.st_size == 0:
+        raise ValueError(f"checkpoint validation failed: empty file {path}")
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(
+            f"checkpoint validation failed: unreadable/truncated file {path}: {e}"
+        ) from e
+
+
 def _atomic_save(obj, path: str) -> None:
     tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path) or ".",
                                         prefix="tmp_ckpt_")
     os.close(tmp_fd)
     try:
         torch.save(obj, tmp_path)
+        _fsync_file(tmp_path)
         os.replace(tmp_path, path)
+        _fsync_dir(os.path.dirname(path) or ".")
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -75,7 +141,14 @@ def _atomic_write_json(payload: dict, path: str) -> None:
     try:
         with os.fdopen(tmp_fd, "w") as f:
             json.dump(payload, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        _fsync_file(tmp_path)
         os.replace(tmp_path, path)
+        _fsync_dir(os.path.dirname(path) or ".")
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -131,12 +204,16 @@ def expert_from_payload(p: dict) -> ExpertRecord:
 
 
 def save_expert_file(rec: ExpertRecord, path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    _sweep_stale_tmp(parent)
     _atomic_save(expert_to_payload(rec), path)
 
 
 def load_expert_file(path: str) -> ExpertRecord:
-    return expert_from_payload(torch.load(path, map_location="cpu", weights_only=False))
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"missing expert file {path}")
+    return expert_from_payload(_checked_torch_load(path))
 
 
 def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = None) -> None:
@@ -171,6 +248,10 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
     os.makedirs(ckpt_dir, exist_ok=True)
     exp_dir = os.path.join(ckpt_dir, "experts")
     os.makedirs(exp_dir, exist_ok=True)
+    # Crash leftovers (tmp_ckpt_*/tmp_json_*/.convert_tmp) must not
+    # accumulate: sweep them now so the next load/save sees a clean dir.
+    _sweep_stale_tmp(ckpt_dir)
+    _sweep_stale_tmp(exp_dir)
     cfg_dict = model.cfg.to_dict()
     cfg_dict["num_experts"] = len(model.pool)
     from config import __version__ as _schema
@@ -207,17 +288,37 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
     # The manifest is the commit point. Once it is safely published, remove
     # expert files no longer referenced by the new topology.
     live = {f"{eid}.pt" for eid in model.pool.order}
-    for name in os.listdir(exp_dir):
+    try:
+        names = os.listdir(exp_dir)
+    except FileNotFoundError:
+        names = []
+    for name in names:
         if name.endswith(".pt") and name not in live:
             try:
                 os.remove(os.path.join(exp_dir, name))
-            except FileNotFoundError:
+            except OSError:
                 pass
+    _fsync_dir(exp_dir)
+    _fsync_dir(ckpt_dir)
 
 
 def load_manifest(ckpt_dir: str) -> dict:
-    with open(os.path.join(ckpt_dir, "manifest.json")) as f:
-        return json.load(f)
+    path = os.path.join(ckpt_dir, "manifest.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"missing checkpoint file {path}")
+    try:
+        if os.stat(path).st_size == 0:
+            raise ValueError(
+                f"checkpoint validation failed: empty file {path}"
+            )
+        with open(path) as f:
+            return json.load(f)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(
+            f"checkpoint validation failed: unreadable/truncated file {path}: {e}"
+        ) from e
 
 
 def make_disk_loader(ckpt_dir: str):
@@ -305,11 +406,22 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     def _path(*parts: str) -> str:
         p = os.path.join(ckpt_dir, *parts)
         _require(os.path.exists(p), f"missing checkpoint file {p}")
+        try:
+            _require(os.stat(p).st_size > 0, f"empty file {p}")
+        except OSError as e:
+            raise ValueError(f"checkpoint validation failed: unreadable file {p}: {e}") from e
         return p
 
     # ---- phase 1a: config + manifest (no live mutation) ----
-    with open(_path("config.json")) as f:
-        raw_cfg = json.load(f)
+    try:
+        with open(_path("config.json")) as f:
+            raw_cfg = json.load(f)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(
+            f"checkpoint validation failed: unreadable/truncated config.json: {e}"
+        ) from e
     saved_schema = str(raw_cfg.get("schema_version", _schema))
     _require(saved_schema.split(".")[0] == _schema.split(".")[0],
              f"schema major {saved_schema!r} != runtime {_schema!r}")
@@ -342,7 +454,7 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     saved_cfg.num_experts = len(eids)
 
     # ---- phase 1b: tensors (read + validate, no live mutation) ----
-    trunk = torch.load(_path("trunk.pt"), map_location="cpu", weights_only=False)
+    trunk = _checked_torch_load(_path("trunk.pt"))
     _require(isinstance(trunk, dict), "trunk.pt is not a dict")
     model_sd = model.state_dict()
     for k, v in trunk.items():
@@ -353,7 +465,7 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         else:
             _require(k.startswith("router.") or "usage_" in k or "admit_" in k,
                      f"trunk entry {k} matches nothing in the model")
-    router = torch.load(_path("router.pt"), map_location="cpu", weights_only=False)
+    router = _checked_torch_load(_path("router.pt"))
     _require(isinstance(router, dict), "router.pt is not a dict")
     rw, rb = router.get("weight"), router.get("bias")
     _require(torch.is_tensor(rw) and torch.is_floating_point(rw)
@@ -361,7 +473,7 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
              "router.pt weight must be [n_experts, d_model]")
     _require(torch.is_tensor(rb) and tuple(rb.shape) == (len(eids),),
              "router.pt bias must be [n_experts]")
-    optim = torch.load(_path("optim.pt"), map_location="cpu", weights_only=False)
+    optim = _checked_torch_load(_path("optim.pt"))
     _require(isinstance(optim, dict), "optim.pt is not a dict")
     _require(isinstance(optim.get("trunk"), dict)
              and isinstance(optim.get("router"), dict), "optim.pt bad state dicts")
@@ -374,12 +486,11 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     rng_path = os.path.join(ckpt_dir, "rng.pt")
     rng_snap = None
     if os.path.exists(rng_path):
-        rng_snap = torch.load(rng_path, map_location="cpu", weights_only=False)
+        rng_snap = _checked_torch_load(rng_path)
         _validate_rng_snapshot(rng_snap)
     payloads = []
     for eid in eids:
-        p = torch.load(_path("experts", f"{eid}.pt"),
-                       map_location="cpu", weights_only=False)
+        p = _checked_torch_load(_path("experts", f"{eid}.pt"))
         _validate_expert_payload(p, eid, saved_cfg)
         payloads.append(p)
 
