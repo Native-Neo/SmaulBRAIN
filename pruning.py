@@ -23,19 +23,46 @@ import torch.nn.functional as F
 from precision import dequantize_fp8_blockwise
 
 
+def _check_optim_width(optim_state: dict | None, expect: int) -> None:
+    """Validate-first: every momentum buffer must already match pool width.
+
+    Raises before mutating when a buffer's dim-0 disagrees with the pool,
+    so row drops cannot silently misalign survivors. Missing entries are
+    left alone (step_dense initializes them on next use).
+    """
+    if optim_state is None:
+        return
+    for st in optim_state.values():
+        if not isinstance(st, dict):
+            continue
+        for key in ("m", "v_row", "v"):
+            t = st.get(key)
+            if torch.is_tensor(t) and t.shape[0] > 0 and t.shape[0] != expect:
+                raise ValueError(
+                    f"optim_state out of sync: buffer {key} has "
+                    f"{t.shape[0]} rows vs {expect} experts (refusing to mutate)"
+                )
+
+
 def _drop_state_row(state: dict, index: int) -> None:
     """Delete dim-0 row ``index`` from every stored momentum buffer.
 
     Mirrors remove_expert_row so surviving rows keep their momentum aligned.
     ``v_col`` is per-column and untouched; the shared step counter is kept.
+    Two-phase: all replacements are built before any assignment, so a
+    failure leaves every buffer untouched instead of a half-dropped row.
     """
+    # Phase 1 (pure build): compute every replacement before assigning any.
+    pending: list[tuple] = []
     for st in state.values():
         if not isinstance(st, dict):
             continue
         for key in ("m", "v_row", "v"):
             t = st.get(key)
             if torch.is_tensor(t) and 0 <= index < t.shape[0]:
-                st[key] = torch.cat([t[:index], t[index + 1:]])
+                pending.append((st, key, torch.cat([t[:index], t[index + 1:]])))
+    for st, key, new in pending:
+        st[key] = new
 
 
 def dying_score(
@@ -130,10 +157,13 @@ def prune_experts(
 
     Validate-first: every victim must exist and pool/router widths must
     match before anything is removed, so a bad victim list cannot commit a
-    prefix and leave pool/router diverged. Router rows are removed
-    highest-index-first so surviving indices stay valid during the sweep.
-    Pager traces are forgotten inline (never served ghosts on direct calls);
-    the call is idempotent, so callers may also forget defensively.
+    prefix and leave pool/router diverged. Optimizer widths are validated
+    too, so a stale momentum table refuses before misaligning survivors.
+    Router rows are removed highest-index-first so surviving indices stay
+    valid during the sweep. Each momentum-row drop is two-phase (build
+    then assign) so one victim's drop cannot half-apply. Pager traces are
+    forgotten inline last (never served ghosts on direct calls); pool and
+    router stay in lockstep even if a side channel fails mid-sweep.
     Optimizer momentum rows are deleted inline at the same indices, so
     surviving rows keep their momentum instead of resetting on mismatch.
     Returns pruned ids in pool-order.
@@ -146,6 +176,7 @@ def prune_experts(
             f"pool/router out of sync: {len(pool)} experts vs "
             f"{router.num_experts} router rows (refusing to mutate)"
         )
+    _check_optim_width(optim_state, len(pool))
     ordered = sorted(victims, key=lambda eid: pool.index_of(eid), reverse=True)
     pruned: list[str] = []
     for eid in ordered:
