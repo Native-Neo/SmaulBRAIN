@@ -102,6 +102,7 @@ LAST_FALLBACK: dict[str, str] = {}
 _lock = threading.Lock()
 _libs: dict[str, ctypes.CDLL] = {}
 _build_failed: str | None = None
+_alias_seq = 0
 
 
 def reset_counters() -> None:
@@ -289,8 +290,12 @@ def _load_or_build(name: str, so: str) -> None:
 
     Every file is ISA-verified *before* dlopen, so a foreign-ISA .so planted
     in the cache is never executed — it is rebuilt from our baseline sources
-    and re-verified. Raises with the reason on failure.
+    and re-verified. A .so that loads but has the wrong symbols (stale cache)
+    is likewise rebuilt; this process then loads the rebuild through a unique
+    alias path, because dlopen caches by pathname and would otherwise keep
+    returning the stale mapping for the canonical name. Raises on failure.
     """
+    global _alias_seq
     if not os.path.exists(so):
         _compile(name, so)
     if not _verify_baseline_isa(so):
@@ -301,18 +306,30 @@ def _load_or_build(name: str, so: str) -> None:
             raise RuntimeError(f"{name}.so failed baseline-ISA verification")
     try:
         lib = ctypes.CDLL(so)
-    except OSError as e:  # ABI mismatch / corrupt / stale .so: rebuild once
+        _bind(lib, name)
+        _libs[name] = lib
+        return
+    except (OSError, RuntimeError):
+        pass  # corrupt/stale/ABI-mismatched: repair the cache, alias-load below
+    _rm(so)
+    _compile(name, so)  # raises with its own reason (timeout/compile error)
+    if not _verify_baseline_isa(so):
         _rm(so)
-        _compile(name, so)  # raises with its own reason (timeout/compile error)
-        if not _verify_baseline_isa(so):
-            _rm(so)
-            raise RuntimeError(f"{name}.so failed baseline-ISA verification")
-        try:
-            lib = ctypes.CDLL(so)
-        except OSError as e2:
-            _rm(so)
-            raise RuntimeError(f"load failed for {name} (ABI?) after rebuild: {e2}")
-    _bind(lib, name)
+        raise RuntimeError(f"{name}.so failed baseline-ISA verification")
+    _alias_seq += 1
+    alias = f"{so}.alias-{os.getpid()}-{_alias_seq}.so"
+    _rm(alias)
+    try:
+        shutil.copy(so, alias)  # new inode: dlopen treats it as a new object
+    except OSError as e:
+        raise RuntimeError(f"alias copy failed for {name}: {e}")
+    try:
+        lib = ctypes.CDLL(alias)
+        _bind(lib, name)
+    except (OSError, RuntimeError) as e2:
+        _rm(alias)
+        raise RuntimeError(f"load failed for {name} (ABI?) after rebuild: {e2}")
+    _rm(alias)  # directory entry gone; the live mapping keeps its inode
     _libs[name] = lib
 
 
