@@ -239,6 +239,10 @@ def _native_step(
     S, z = state.S, state.z
     if S.shape != (B, H, Dh, Dh) or z.shape != (B, H, Dh):
         return None
+    # Snapshot first: per-head updates mutate state in place, so a mid-loop
+    # failure must restore clean state — otherwise the caller's reference
+    # fallback would double-apply the already-mutated heads.
+    S0, z0 = S.clone(), z.clone()
     outs = torch.empty(B, H, Dh, dtype=torch.float32)
     ok = True
     for b in range(B):
@@ -256,5 +260,7 @@ def _native_step(
         if not ok:
             break
     if not ok:
+        S.copy_(S0)
+        z.copy_(z0)
         return None
     return outs.to(v.dtype)
