@@ -155,3 +155,55 @@ def test_failing_side_channel_leaves_topology_consistent():
     assert len(pool) == r.num_experts == 3  # committed prefix stays synced
     assert "expert_00002" not in pool.experts  # highest index goes first
     assert "expert_00001" in pool.experts  # uncommitted victim untouched
+
+
+def test_prune_rejects_mismatched_optim_width_without_mutating():
+    """Validate-first: stale momentum widths refuse before any removal."""
+    from smaulopt import SmaulOpt, SmaulOptHParams
+    pool, r = _pool()
+    opt = SmaulOpt(SmaulOptHParams())
+    d = r.proj.weight.shape[1]
+    # Stale width: 2 rows vs 4 experts (e.g. leftover from a prior crash).
+    opt.router_state["w"] = {"m": torch.zeros(2, d), "step": 3,
+                             "v_row": torch.zeros(2, 1),
+                             "v_col": torch.zeros(1, d)}
+    order = list(pool.order)
+    w_before = r.proj.weight.detach().clone()
+    with pytest.raises(ValueError):
+        prune_experts(pool, r, ["expert_00001"], optim_state=opt.router_state)
+    assert pool.order == order and r.num_experts == 4  # nothing mutates
+    assert torch.equal(r.proj.weight, w_before)
+    assert opt.router_state["w"]["m"].shape == (2, d)  # stale table untouched
+
+
+def test_prune_momentum_drop_is_two_phase_on_build_failure(monkeypatch):
+    """Atomic drop: a cat failure mid-build leaves every buffer untouched."""
+    import pruning as pruning_mod
+    pool, r = _pool()
+    from smaulopt import SmaulOpt, SmaulOptHParams
+    opt = SmaulOpt(SmaulOptHParams())
+    d = r.proj.weight.shape[1]
+    m = torch.stack([torch.full((d,), 100.0 + i) for i in range(4)])
+    opt.router_state["w"] = {"m": m.clone(), "step": 7,
+                             "v_row": torch.zeros(4, 1),
+                             "v_col": torch.zeros(1, d)}
+    m_before = opt.router_state["w"]["m"].clone()
+    vr_before = opt.router_state["w"]["v_row"].clone()
+    real_cat = torch.cat
+    calls = {"n": 0}
+
+    def boom_once(tensors, *a, **k):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("cat on fire")
+        return real_cat(tensors, *a, **k)
+    monkeypatch.setattr(torch, "cat", boom_once)
+    try:
+        with pytest.raises(RuntimeError):
+            pruning_mod._drop_state_row(opt.router_state, 1)
+    finally:
+        monkeypatch.setattr(torch, "cat", real_cat)
+    # Two-phase build: no partial assignment happened.
+    assert torch.equal(opt.router_state["w"]["m"], m_before)
+    assert torch.equal(opt.router_state["w"]["v_row"], vr_before)
+    assert opt.router_state["w"]["m"].shape == (4, d)
