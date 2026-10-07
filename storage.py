@@ -341,8 +341,15 @@ def _validate_expert_payload(p: dict, eid: str, saved_cfg) -> None:
     """Type/shape validation for one raw expert payload (pre-mutation)."""
     _require(isinstance(p, dict), f"{eid}: payload is not a dict")
     _require(p.get("expert_id") == eid, f"{eid}: id mismatch {p.get('expert_id')!r}")
-    _require(int(p.get("d_model", -1)) == saved_cfg.d_model, f"{eid}: bad d_model")
-    _require(int(p.get("expert_hidden", -1)) == saved_cfg.expert_hidden,
+    try:
+        d_model = int(p.get("d_model", -1))
+        expert_hidden = int(p.get("expert_hidden", -1))
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"checkpoint validation failed: {eid}: bad d_model/expert_hidden"
+        ) from None
+    _require(d_model == saved_cfg.d_model, f"{eid}: bad d_model")
+    _require(expert_hidden == saved_cfg.expert_hidden,
              f"{eid}: bad expert_hidden")
     want = {
         "w_gate": (saved_cfg.expert_hidden, saved_cfg.d_model),
@@ -361,22 +368,103 @@ def _validate_expert_payload(p: dict, eid: str, saved_cfg) -> None:
                  f"{eid}: {n} scales must be float32")
         _require(tuple(t.get("shape", ())) == want[n], f"{eid}: {n} bad shape")
         _require(tuple(codes.shape) == want[n], f"{eid}: {n} bad code shape")
-        tile = int(t.get("tile", 0))
+        try:
+            tile = int(t.get("tile", 0))
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"checkpoint validation failed: {eid}: {n} bad tile"
+            ) from None
         _require(tile >= 1, f"{eid}: {n} bad tile")
         n_blocks = (want[n][1] + tile - 1) // tile
         _require(tuple(scales.shape) == (want[n][0], n_blocks),
                  f"{eid}: {n} bad scale shape")
-    _require(isinstance(p.get("optim_state", {}), dict), f"{eid}: bad optim_state")
+    _validate_expert_optim_state(p.get("optim_state", {}), eid, want)
     meta = p.get("meta", {})
     _require(isinstance(meta, dict), f"{eid}: bad meta")
     for k in ("birth_step", "last_used_step", "tokens_routed"):
-        int(meta.get(k, 0))
+        try:
+            int(meta.get(k, 0))
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"checkpoint validation failed: {eid}: bad meta {k}"
+            ) from None
     for k in ("grad_activity", "contribution"):
-        float(meta.get(k, 0.0))
+        try:
+            float(meta.get(k, 0.0))
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"checkpoint validation failed: {eid}: bad meta {k}"
+            ) from None
     parents = meta.get("parents", [])
     _require(isinstance(parents, list) and all(isinstance(x, str) for x in parents),
              f"{eid}: parents must be a list of str")
     _require(isinstance(meta.get("source", "init"), str), f"{eid}: bad source")
+
+
+def _validate_opt_entry(st: dict, want_shape: tuple | None, label: str) -> None:
+    """Validate one SmaulOpt per-tensor state (m/v/step, pre-mutation)."""
+    _require(isinstance(st, dict), f"{label} is not a dict")
+    m = st.get("m")
+    _require(torch.is_tensor(m) and m.dtype in (torch.bfloat16, torch.float32),
+             f"{label} bad m (must be bf16/fp32 tensor)")
+    if want_shape is not None:
+        _require(tuple(m.shape) == tuple(want_shape), f"{label} bad m shape")
+    try:
+        step = int(st.get("step", -1))
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"checkpoint validation failed: {label} bad step"
+        ) from None
+    _require(step >= 0, f"{label} bad step")
+    has_v = "v" in st
+    has_factored = "v_row" in st or "v_col" in st
+    _require(has_v != has_factored, f"{label} bad v structure")
+    if has_v:
+        v = st["v"]
+        _require(torch.is_tensor(v) and v.dtype in (torch.bfloat16, torch.float32),
+                 f"{label} bad v")
+        _require(tuple(v.shape) == tuple(m.shape), f"{label} bad v shape")
+    else:
+        vr, vc = st["v_row"], st["v_col"]
+        _require(torch.is_tensor(vr) and vr.dtype in (torch.bfloat16, torch.float32),
+                 f"{label} bad v_row")
+        _require(torch.is_tensor(vc) and vc.dtype in (torch.bfloat16, torch.float32),
+                 f"{label} bad v_col")
+        _require(tuple(vr.shape) == (m.shape[0], 1), f"{label} bad v_row shape")
+        _require(tuple(vc.shape) == (1, m.shape[1]) if len(m.shape) == 2
+                 else tuple(vc.shape) == tuple(m.shape),
+                 f"{label} bad v_col shape")
+
+
+def _validate_expert_optim_state(ost: dict, eid: str, want: dict) -> None:
+    """Deep validation for one expert's local optimizer state (pre-mutation)."""
+    _require(isinstance(ost, dict), f"{eid}: bad optim_state")
+    for n, st in ost.items():
+        _require(n in EXPERT_NAMES, f"{eid}: unknown optim_state entry {n!r}")
+        _validate_opt_entry(st, want[n], f"{eid}: optim_state {n}")
+
+
+def _validate_optim_store(store: dict, expected: dict, label: str) -> None:
+    """Deep validation for a dense (trunk/router) optimizer store (pre-mutation)."""
+    _require(isinstance(store, dict), f"{label} bad state dict")
+    for k, st in store.items():
+        _require(isinstance(k, str), f"{label} bad key {k!r}")
+        if expected:
+            _require(k in expected, f"{label} unexpected entry {k!r}")
+        _validate_opt_entry(st, expected.get(k), f"{label} {k}")
+
+
+def _validate_opt_hparams(saved_hp: dict) -> None:
+    _require(isinstance(saved_hp, dict), "optim.pt bad hparams")
+    for k in ("lr", "beta_m", "beta_v", "eps", "wd", "clip", "update_clip"):
+        if k in saved_hp:
+            _require(_is_num(saved_hp[k]), f"optim.pt bad hparam {k}")
+    if "state_dtype" in saved_hp:
+        _require(saved_hp["state_dtype"] in ("bf16", "fp32"),
+                 "optim.pt bad hparam state_dtype")
+    if "factor_v" in saved_hp:
+        _require(isinstance(saved_hp["factor_v"], bool),
+                 "optim.pt bad hparam factor_v")
 
 
 def _validate_rng_snapshot(snap) -> None:
@@ -422,10 +510,18 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         raise ValueError(
             f"checkpoint validation failed: unreadable/truncated config.json: {e}"
         ) from e
+    _require(isinstance(raw_cfg, dict), "config.json is not a dict")
     saved_schema = str(raw_cfg.get("schema_version", _schema))
     _require(saved_schema.split(".")[0] == _schema.split(".")[0],
              f"schema major {saved_schema!r} != runtime {_schema!r}")
-    saved_cfg = SmaulBrainConfig.from_dict(raw_cfg)
+    try:
+        saved_cfg = SmaulBrainConfig.from_dict(raw_cfg)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(
+            f"checkpoint validation failed: bad config {e}"
+        ) from e
     for field in ("d_model", "vocab_size", "n_heads", "expert_hidden",
                   "top_k", "dtype"):
         _require(getattr(saved_cfg, field) == getattr(model.cfg, field),
@@ -457,6 +553,10 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     trunk = _checked_torch_load(_path("trunk.pt"))
     _require(isinstance(trunk, dict), "trunk.pt is not a dict")
     model_sd = model.state_dict()
+    expected_trunk = {k for k in model_sd
+                      if not (k.startswith("router.") or "usage_" in k or "admit_" in k)}
+    for k in expected_trunk:
+        _require(k in trunk, f"trunk.pt missing entry {k}")
     for k, v in trunk.items():
         _require(torch.is_tensor(v), f"trunk entry {k} is not a tensor")
         if k in model_sd:
@@ -481,8 +581,16 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         step_count = int(optim.get("step_count", 0))
     except (TypeError, ValueError):
         raise ValueError("checkpoint validation failed: bad optim step_count")
+    _require(step_count >= 0, "bad optim step_count")
     saved_hp = optim.get("hparams", {})
-    _require(isinstance(saved_hp, dict), "optim.pt bad hparams")
+    _validate_opt_hparams(saved_hp)
+    _trunk_shapes = {n: tuple(p.shape) for n, p in model._trunk_params()}
+    _validate_optim_store(optim["trunk"], _trunk_shapes, "optim.pt trunk")
+    # Router width is checkpoint-authoritative (growth may widen the pool
+    # beyond a fresh live model): validate against saved topology, not live.
+    _router_shapes = {"router.proj.weight": (len(eids), saved_cfg.d_model),
+                      "router.proj.bias": (len(eids),)}
+    _validate_optim_store(optim["router"], _router_shapes, "optim.pt router")
     rng_path = os.path.join(ckpt_dir, "rng.pt")
     rng_snap = None
     if os.path.exists(rng_path):
@@ -493,6 +601,15 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         p = _checked_torch_load(_path("experts", f"{eid}.pt"))
         _validate_expert_payload(p, eid, saved_cfg)
         payloads.append(p)
+    try:
+        on_disk = {n for n in os.listdir(os.path.join(ckpt_dir, "experts"))
+                   if n.endswith(".pt")}
+    except OSError as e:
+        raise ValueError(
+            f"checkpoint validation failed: unreadable experts dir: {e}"
+        ) from e
+    _require(on_disk == {f"{eid}.pt" for eid in eids},
+             f"experts dir mismatch: disk {sorted(on_disk)} vs manifest {eids}")
 
     # ---- phase 1c: build replacement objects (still no live mutation) ----
     import torch.nn as nn
