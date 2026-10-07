@@ -280,3 +280,255 @@ def test_sparse_update_factored_v_col_coupling_documented():
     assert torch.equal(st["v_row"][2:], torch.zeros(6, 1))
     assert not torch.equal(st["v_col"], torch.zeros(1, 4))  # shared moment moved
 
+
+def test_optimizer_state_validation_rejects_bad_shapes_dtypes_layouts():
+    from smaulopt import ensure_state, expected_layout, state_is_valid
+    hp = SmaulOptHParams(state_dtype="bf16", factor_v=True)
+    assert expected_layout((8, 16), hp) == "factored"
+    assert expected_layout((4,), hp) == "full"
+    assert expected_layout((1, 2), hp) == "full"
+    good = init_state((8, 16), hp)
+    good["step"] = 3
+    assert state_is_valid(good, (8, 16), hp)
+    # Wrong m shape.
+    bad = init_state((8, 16), hp)
+    bad["m"] = torch.zeros((8, 15), dtype=torch.bfloat16)
+    assert not state_is_valid(bad, (8, 16), hp)
+    # Stale full-v alongside factored moments.
+    stale = init_state((8, 16), hp)
+    stale["v"] = torch.zeros((8, 16), dtype=torch.bfloat16)
+    assert not state_is_valid(stale, (8, 16), hp)
+    # Stale factored buffers alongside a full-v layout (1-D param).
+    hp_full = SmaulOptHParams(state_dtype="bf16", factor_v=True)
+    full = init_state((4,), hp_full)
+    full["v_row"] = torch.zeros((4, 1), dtype=torch.bfloat16)
+    assert not state_is_valid(full, (4,), hp_full)
+    # Bad step types.
+    for bad_step in (-1, 1.5, True, None, "3"):
+        s = init_state((8, 16), hp)
+        s["step"] = bad_step
+        assert not state_is_valid(s, (8, 16), hp)
+    # Non-tensor / wrong-dtype moments are invalid.
+    s = init_state((8, 16), hp)
+    s["m"] = torch.zeros((8, 16), dtype=torch.float64)
+    assert not state_is_valid(s, (8, 16), hp)
+    # ensure_state replaces corrupt state with fresh canonical state.
+    fixed, action = ensure_state(bad, (8, 16), hp)
+    assert action == "init" and state_is_valid(fixed, (8, 16), hp)
+    assert fixed["step"] == 0
+
+
+def test_optimizer_factored_full_migration_explicit_and_cleans_stale():
+    from smaulopt import ensure_state, state_is_valid
+    torch.manual_seed(0)
+    hp_fact = SmaulOptHParams(state_dtype="fp32", factor_v=True)
+    hp_full = SmaulOptHParams(state_dtype="fp32", factor_v=False)
+    shape = (6, 8)
+    # Full -> factored: row/col means of stored v, step preserved, v removed.
+    full = init_state(shape, hp_full)
+    full["v"] = torch.rand(shape)
+    full["step"] = 5
+    v_before = full["v"].clone()
+    mig, action = ensure_state(full, shape, hp_fact)
+    assert action == "migrated"
+    assert "v" not in mig and "v_row" in mig and "v_col" in mig
+    assert mig["step"] == 5
+    assert torch.allclose(mig["v_row"], v_before.mean(dim=1, keepdim=True))
+    assert torch.allclose(mig["v_col"], v_before.mean(dim=0, keepdim=True))
+    assert state_is_valid(mig, shape, hp_fact)
+    # Factored -> full: exact outer(R, C) / mean(R) reconstruction.
+    fact = init_state(shape, hp_fact)
+    fact["v_row"] = torch.rand((shape[0], 1)) + 0.5
+    fact["v_col"] = torch.rand((1, shape[1])) + 0.5
+    fact["step"] = 7
+    rf, cf = fact["v_row"].clone(), fact["v_col"].clone()
+    mig2, action2 = ensure_state(fact, shape, hp_full)
+    assert action2 == "migrated"
+    assert "v" in mig2 and "v_row" not in mig2 and "v_col" not in mig2
+    assert mig2["step"] == 7
+    expect = (rf.float() * cf.float()) / rf.float().mean().clamp_min(1e-12)
+    assert torch.allclose(mig2["v"].float(), expect)
+    assert state_is_valid(mig2, shape, hp_full)
+
+
+def test_optimizer_dtype_cast_preserves_values_not_reset():
+    from smaulopt import ensure_state, state_is_valid
+    hp_bf16 = SmaulOptHParams(state_dtype="bf16", factor_v=False)
+    hp_fp32 = SmaulOptHParams(state_dtype="fp32", factor_v=False)
+    st = init_state((4, 4), hp_bf16)
+    st["m"] = (torch.randn(4, 4) * 0.1).to(torch.bfloat16)
+    st["v"] = (torch.rand(4, 4) * 0.01).to(torch.bfloat16)
+    st["step"] = 4
+    m_before, v_before = st["m"].float().clone(), st["v"].float().clone()
+    out, action = ensure_state(st, (4, 4), hp_fp32)
+    assert action == "kept"  # same layout: cast, not reset
+    assert out["step"] == 4 and out["m"].dtype == torch.float32
+    assert torch.allclose(out["m"].float(), m_before, atol=1e-3)
+    assert torch.allclose(out["v"].float(), v_before, atol=1e-3)
+    assert state_is_valid(out, (4, 4), hp_fp32)
+
+
+def test_dense_skips_grad_free_params_without_ticking_their_step():
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=False)
+    opt = SmaulOpt(hp)
+    a = torch.nn.Parameter(torch.randn(4, 4))
+    b = torch.nn.Parameter(torch.randn(4, 4))
+    a.grad = torch.randn(4, 4)
+    b.grad = None
+    opt.step_dense([("a", a), ("b", b)], lr=1e-3, store=opt.trunk_state)
+    assert "a" in opt.trunk_state and opt.trunk_state["a"]["step"] == 1
+    assert "b" not in opt.trunk_state  # no state allocated for grad-free param
+    assert a.grad is None and opt.step_count == 0  # global clock untouched here
+
+
+def test_dense_global_step_semantics_per_tensor_clock_only():
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=False)
+    opt = SmaulOpt(hp)
+    a = torch.nn.Parameter(torch.randn(2, 2))
+    a.grad = torch.ones(2, 2)
+    opt.step_dense([("a", a)], lr=1e-3, store=opt.trunk_state)
+    assert opt.trunk_state["a"]["step"] == 1 and opt.step_count == 0
+    # Skipped step (nonfinite) ticks nothing.
+    a.grad = torch.full((2, 2), float("inf"))
+    assert opt.step_dense([("a", a)], lr=1e-3, store=opt.trunk_state) == 0.0
+    assert opt.trunk_state["a"]["step"] == 1
+    assert opt.step_count == 0
+
+
+def test_nonfinite_handling_consistent_and_preserves_grads_dense_and_expert():
+    from experts import make_expert
+    from train import _GradOnly
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=False)
+    opt = SmaulOpt(hp)
+    # Dense: state + grads preserved on nonfinite.
+    p = torch.nn.Parameter(torch.randn(3, 3))
+    p.grad = torch.full((3, 3), float("nan"))
+    m_before = p.data.clone()
+    assert opt.step_dense([("p", p)], lr=1e-3, store=opt.trunk_state) == 0.0
+    assert "p" not in opt.trunk_state  # never allocated on a pure skip
+    assert p.grad is not None and torch.equal(p.data, m_before)
+    # Expert: state, version, bytes AND grads preserved on nonfinite.
+    torch.manual_seed(0)
+    rec = make_expert("expert_00000", 8, 8)
+    rec.optim_state = {}
+    codes_before = {n: rec.weights_fp8[n].codes.clone() for n in ("w_gate", "w_up", "w_down")}
+    g = torch.full((8, 8), float("inf"))
+    compute = {"w_gate": _GradOnly(g)}
+    assert opt.step_expert(rec, compute, 1.0, lr=1e-3) == 0.0
+    assert rec.optim_state == {} and rec.version == 0
+    assert compute["w_gate"].grad is not None  # preserved for retry
+    for n in ("w_gate", "w_up", "w_down"):
+        assert torch.equal(rec.weights_fp8[n].codes, codes_before[n])
+
+
+def test_skipped_step_retry_equivalent_dense_and_expert():
+    from experts import make_expert
+    from train import _GradOnly
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=False)
+    # Dense retry: skip-then-apply == apply-only (bit-identical).
+    opt = SmaulOpt(hp)
+    ref = SmaulOpt(SmaulOptHParams(state_dtype="fp32", factor_v=False))
+    w0 = torch.randn(4, 4)
+    p1 = torch.nn.Parameter(w0.clone())
+    p2 = torch.nn.Parameter(w0.clone())
+    p1.grad = torch.full((4, 4), float("inf"))
+    assert opt.step_dense([("w", p1)], lr=1e-3, store=opt.trunk_state) == 0.0
+    g = torch.randn(4, 4)
+    p1.grad = g.clone()
+    p2.grad = g.clone()
+    opt.step_dense([("w", p1)], lr=1e-3, store=opt.trunk_state)
+    ref.step_dense([("w", p2)], lr=1e-3, store=ref.trunk_state)
+    assert torch.equal(p1.data, p2.data)
+    assert torch.equal(opt.trunk_state["w"]["m"], ref.trunk_state["w"]["m"])
+    assert torch.equal(opt.trunk_state["w"]["v"], ref.trunk_state["w"]["v"])
+    # Expert retry: skip-then-apply == apply-only (FP8 bytes identical).
+    torch.manual_seed(1)
+    rec1 = make_expert("expert_00000", 8, 8)
+    torch.manual_seed(1)
+    rec2 = make_expert("expert_00000", 8, 8)
+    opt_e = SmaulOpt(hp)
+    ref_e = SmaulOpt(SmaulOptHParams(state_dtype="fp32", factor_v=False))
+    bad = {"w_gate": _GradOnly(torch.full((8, 8), float("nan")))}
+    assert opt_e.step_expert(rec1, bad, 1.0, lr=1e-3) == 0.0
+    gg = torch.randn(8, 8)
+    opt_e.step_expert(rec1, {"w_gate": _GradOnly(gg.clone())}, 1.0, lr=1e-3)
+    ref_e.step_expert(rec2, {"w_gate": _GradOnly(gg.clone())}, 1.0, lr=1e-3)
+    for n in ("w_gate", "w_up", "w_down"):
+        assert torch.equal(rec1.weights_fp8[n].codes, rec2.weights_fp8[n].codes)
+
+
+def test_tied_parameters_update_once_and_stay_identical():
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=False)
+    opt = SmaulOpt(hp)
+    torch.manual_seed(123)
+    base = torch.randn(4, 4)
+    gg = torch.randn(4, 4)
+    p = torch.nn.Parameter(base.clone())
+    p.grad = gg.clone()
+    s = opt.step_dense([("embed.w", p), ("head.w", p)], lr=1e-3, store=opt.trunk_state)
+    assert s != 0.0
+    assert opt.trunk_state["embed.w"] is opt.trunk_state["head.w"]  # one shared state
+    assert opt.trunk_state["embed.w"]["step"] == 1  # single tick, not double
+    # Same grad through an untied single update matches bit-for-bit.
+    q = torch.nn.Parameter(base.clone())
+    q.grad = gg.clone()
+    opt2 = SmaulOpt(SmaulOptHParams(state_dtype="fp32", factor_v=False))
+    opt2.step_dense([("w", q)], lr=1e-3, store=opt2.trunk_state)
+    assert torch.equal(p.data, q.data)
+    assert torch.equal(opt.trunk_state["embed.w"]["m"], opt2.trunk_state["w"]["m"])
+
+
+def test_tied_single_update_matches_untied_reference():
+    torch.manual_seed(9)
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=False)
+    w0 = torch.randn(3, 3)
+    gg = torch.randn(3, 3)
+    tied = torch.nn.Parameter(w0.clone())
+    tied.grad = gg.clone()
+    opt_t = SmaulOpt(SmaulOptHParams(state_dtype="fp32", factor_v=False))
+    opt_t.step_dense([("a", tied), ("b", tied)], lr=2e-3, store=opt_t.trunk_state)
+    solo = torch.nn.Parameter(w0.clone())
+    solo.grad = gg.clone()
+    opt_s = SmaulOpt(SmaulOptHParams(state_dtype="fp32", factor_v=False))
+    opt_s.step_dense([("a", solo)], lr=2e-3, store=opt_s.trunk_state)
+    assert torch.equal(tied.data, solo.data)  # one update, not two
+    assert torch.equal(opt_t.trunk_state["a"]["m"], opt_s.trunk_state["a"]["m"])
+
+
+def test_replaced_state_cleaned_on_shape_change_and_migration():
+    from smaulopt import ensure_state, state_is_valid
+    hp_fact = SmaulOptHParams(state_dtype="bf16", factor_v=True)
+    # Shape change: old state discarded wholesale, canonical fresh state in.
+    old = init_state((8, 16), hp_fact)
+    old["step"] = 10
+    new, action = ensure_state(old, (4, 4), hp_fact)
+    assert action == "init" and state_is_valid(new, (4, 4), hp_fact)
+    assert new["step"] == 0 and "v" not in new
+    # Layout flip cleans the replaced buffers (no stale keys survive).
+    hp_full = SmaulOptHParams(state_dtype="bf16", factor_v=False)
+    full = init_state((6, 8), hp_full)
+    full["v"] = torch.rand(6, 8).to(torch.bfloat16)
+    full["step"] = 2
+    mig, _ = ensure_state(full, (6, 8), hp_fact)
+    assert "v" not in mig and state_is_valid(mig, (6, 8), hp_fact)
+    mig_back, _ = ensure_state(mig, (6, 8), hp_full)
+    assert "v_row" not in mig_back and "v_col" not in mig_back
+    assert state_is_valid(mig_back, (6, 8), hp_full)
+
+
+def test_validated_state_keeps_update_math_bit_identical():
+    torch.manual_seed(3)
+    hp = SmaulOptHParams(state_dtype="bf16", factor_v=True)
+    w = torch.randn(8, 16)
+    g = torch.randn(8, 16)
+    st_fresh = init_state((8, 16), hp)
+    st_valid, action = __import__("smaulopt").ensure_state(
+        {"m": st_fresh["m"].clone(), "v_row": st_fresh["v_row"].clone(),
+         "v_col": st_fresh["v_col"].clone(), "step": 0}, (8, 16), hp)
+    assert action == "kept"
+    w1 = smaul_update(w.clone(), g.clone(), st_fresh, hp, lr=1e-3)
+    w2 = smaul_update(w.clone(), g.clone(), st_valid, hp, lr=1e-3)
+    assert torch.equal(w1, w2)  # validation path changes no update math
+    assert torch.equal(st_fresh["m"], st_valid["m"])
+
+
