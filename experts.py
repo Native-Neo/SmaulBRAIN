@@ -68,6 +68,8 @@ class ExpertRecord:
     # Expert-local optimizer state: {wname: {"m": bf16, "v_row": bf16, "v_col": bf16}}
     # (factored second moment, following the verified SmaulOpt layout).
     optim_state: dict = field(default_factory=dict)
+    version: int = 0
+
 
     @property
     def param_count(self) -> int:
