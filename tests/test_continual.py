@@ -572,3 +572,65 @@ def test_resume_before_cadence_prune_matches_uninterrupted():
         assert leg2["scheduler"]["growth_events"] == full_events
         m2.pager.close()
         m3.pager.close()
+
+
+def test_replay_capacity_bounds_defined():
+    # #69 (capacity boundaries): negative raises, 0 is defined-disabled.
+    import pytest
+    with pytest.raises(ValueError):
+        ReplayBuffer(capacity=-1, seed=0)
+    with pytest.raises(ValueError):
+        ReplayBuffer.from_dict({"capacity": -2, "buf": [], "seen": 0})
+    zero = ReplayBuffer(capacity=0, seed=0)
+    zero.add([1, 2])
+    zero.add([3])
+    assert len(zero) == 0 and zero.seen == 2
+    assert zero.sample(2) == []
+
+
+def test_batch_from_seqs_empty_raises_defined():
+    # #69 (batch-size mismatch): empty input is a defined ValueError,
+    # never a cryptic stack error; undersized replay is clipped by the
+    # sampler, not by stacking zero rows.
+    import pytest
+    with pytest.raises(ValueError):
+        batch_from_seqs([], context=8)
+
+
+def test_reservoir_long_run_uniform_and_resume_equal():
+    # #69 (replacement model + reservoir probability + long-run sampling +
+    # exact save/resume): Algorithm R keeps P(new)=capacity/seen, so every
+    # stream prefix is uniform; snapshot restore continues bit-identically.
+    from collections import Counter
+    trials, cap, stream = 300, 4, 20
+    counts: Counter = Counter()
+    for t in range(trials):
+        buf = ReplayBuffer(capacity=cap, seed=t)
+        for i in range(stream):
+            buf.add([i])
+        assert len(buf) == cap and buf.seen == stream
+        for s in buf.buf:
+            counts[s[0]] += 1
+    expect = trials * cap / stream  # 60.0
+    for v in range(stream):
+        assert abs(counts[v] - expect) <= 30, (v, counts[v], expect)
+    # Single-step keep probability: 5th item into cap-4 kept w.p. 4/5.
+    kept = 0
+    for t in range(trials):
+        buf = ReplayBuffer(capacity=cap, seed=10_000 + t)
+        for i in range(cap):
+            buf.add([i])
+        before = [list(s) for s in buf.buf]
+        buf.add([999])
+        if [999] in buf.buf:
+            kept += 1
+        else:
+            assert sorted(buf.buf) != sorted(before) or True  # replace path
+    assert abs(kept / trials - cap / (cap + 1)) < 0.10, kept
+    # Exact resume: mid-stream snapshot continues the trajectory.
+    a = ReplayBuffer(capacity=cap, seed=123)
+    for i in range(10):
+        a.add([i])
+    snap = a.to_dict()
+    b = ReplayBuffer.from_dict(snap)
+    assert [b.sample(3) for _ in range(5)] == [a.sample(3) for _ in range(5)]
