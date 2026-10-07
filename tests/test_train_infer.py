@@ -179,3 +179,47 @@ def test_top_p_keeps_true_nucleus():
     l = torch.tensor([10.0, 9.0, 0.0, -100.0])
     seen = {sample_next(l, temperature=1.0, top_p=0.9) for _ in range(50)}
     assert seen and seen <= {0, 1}  # ~all mass on the top two, tail excluded
+
+
+def test_sampler_rejects_bad_top_k_and_temperature():
+    from infer import sample_next
+    l = torch.zeros(260)
+    bad = [
+        dict(temperature=-1.0),
+        dict(temperature=float("inf")),
+        dict(temperature="hot"),
+        dict(temperature=True),
+        dict(top_k=-1),
+        dict(top_k=1.5),
+        dict(top_k="2"),
+        dict(top_k=True),
+        dict(top_p=float("nan")),
+        dict(top_p="x"),
+    ]
+    for kw in bad:
+        with pytest.raises(ValueError):
+            sample_next(l, **kw)
+
+
+def test_generate_validates_sampler_upfront():
+    m, _, _ = _model()
+    with pytest.raises(ValueError):
+        generate(m, [10, 20], max_new=2, top_k=-1)
+    with pytest.raises(ValueError):
+        generate(m, [10, 20], max_new=2, temperature=-0.5)
+    m.pager.close()
+
+
+def test_generate_seeded_deterministic_and_text_matches_ids():
+    from bytes import decode_text
+    m, _, _ = _model()
+    a = generate(m, [104, 105], max_new=8, temperature=0.7, seed=7)
+    b = generate(m, [104, 105], max_new=8, temperature=0.7, seed=7)
+    assert a["ids"] == b["ids"] and a["text"] == b["text"]
+    assert a["text"] == decode_text(a["ids"][2:])  # continuation-only decode
+    # Empty prompt falls back to DEFAULT_PROMPT_ID; max_new=0 echoes prompt.
+    e = generate(m, [], max_new=4, temperature=0.0)
+    assert len(e["ids"]) == 5 and e["text"] == decode_text(e["ids"][1:])
+    z = generate(m, [104, 105], max_new=0, temperature=0.0)
+    assert z["ids"] == [104, 105] and z["text"] == "" and z["depths"] == []
+    m.pager.close()
