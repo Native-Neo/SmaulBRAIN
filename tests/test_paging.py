@@ -220,3 +220,171 @@ def test_caches_stay_bounded_and_close_is_repeatable():
     assert not pg._pending and not pg._prefetched  # nothing left in flight
     pg.close()
     pg.close()  # repeatable shutdown
+
+
+def test_update_vs_prefetch_no_ghost_hit():
+    import time
+    pool = _pool()
+    pg = ExpertPager(pool, mode="D2R", load_from_disk=_counting(pool))
+    eid = pool.order[0]
+    pg.prefetch([eid])
+    import time as _t
+    _t.sleep(0.05)
+    rec = pool.experts[eid]
+    from precision import dequantize_fp8_blockwise, quantize_fp8_blockwise
+    base = dequantize_fp8_blockwise(rec.weights_fp8["w_gate"], dtype=torch.float32)
+    rec.weights_fp8["w_gate"] = quantize_fp8_blockwise(
+        base + 5.0, tile=rec.weights_fp8["w_gate"].tile)
+    pg.invalidate(eid)  # update won the race: prior prefetch bytes are stale
+    assert eid not in pg._prefetched  # invalidate discards the stale flag
+    pg.await_prefetch()
+    assert pg.stats.prefetch_hits == 0  # ghost hit must not be counted
+    w = pg.provider(eid)  # fresh post-update bytes
+    live = dequantize_fp8_blockwise(
+        pool.experts[eid].weights_fp8["w_gate"], dtype=torch.float32)
+    live = live.to(pg.compute_dtype).float()
+    assert torch.allclose(w["w_gate"].float().cpu(), live.cpu(), atol=1e-3)
+    pg.close()
+
+
+def test_prune_vs_load_no_ghost():
+    import threading
+    import time
+    pool = _pool()
+    pg = ExpertPager(pool, mode="D2R", load_from_disk=_counting(pool))
+    eid = pool.order[0]
+
+    def slow(e):
+        time.sleep(0.08)
+        return pool.experts[e]
+    pg.load_from_disk = slow
+    t = threading.Thread(target=lambda: pg.prefetch([eid]))
+    t.start()
+    t.join(timeout=60)
+    pg.forget(eid)  # prune won the race while the load was in flight
+    try:
+        pg.provider(eid)
+        assert False, "pruned expert must raise"
+    except KeyError:
+        pass
+    pg.await_prefetch()
+    assert pg.stats.prefetch_hits == 0
+    assert eid not in pg.ram and eid not in pg._pending
+    pg.close()
+
+
+def test_restore_vs_prefetch_readable():
+    from experts import make_expert
+    pool = _pool()
+    pg = ExpertPager(pool, mode="D2R", load_from_disk=_counting(pool))
+    eid = pool.order[0]
+    pg.provider(eid)
+    pg.forget(eid)
+    try:
+        pg.provider(eid)
+        assert False, "forgotten id must stay unreadable until restore"
+    except KeyError:
+        pass
+    rec = make_expert(eid, 16, 32)  # restored under the same stable id
+    pool.experts[eid] = rec
+    if eid not in pool.order:
+        pool.order.append(eid)
+    pg.restore(eid)
+    w = pg.provider(eid)  # readable again, and tagged to the new object
+    assert w is not None
+    pg.prefetch([eid])  # post-restore prefetch collapses on the fresh entry
+    pg.await_prefetch()
+    assert eid in pg.ram
+    pg.close()
+
+
+def test_replace_without_invalidate_serves_fresh():
+    from experts import make_expert
+    pool = _pool()
+    pg = ExpertPager(pool, mode="D2R", load_from_disk=_counting(pool))
+    eid = pool.order[0]
+    w0 = pg.provider(eid)
+    pool.experts[eid] = make_expert(eid, 16, 32)  # incompatible replacement
+    w1 = pg.provider(eid)  # tag (version+identity) must force a reload
+    assert w1 is not w0
+    pg.close()
+
+
+def test_rapid_version_changes_converge():
+    import threading
+    import time
+    from precision import dequantize_fp8_blockwise, quantize_fp8_blockwise
+    for mode in ("D2R", "R2VR", "D2VR"):
+        pool = _pool()
+        pg = ExpertPager(pool, mode=mode, load_from_disk=_counting(pool))
+        eid = pool.order[0]
+        pg.provider(eid)
+        errors: list = []
+
+        def updater():
+            try:
+                for _ in range(15):
+                    rec = pool.experts[eid]
+                    base = dequantize_fp8_blockwise(
+                        rec.weights_fp8["w_gate"], dtype=torch.float32)
+                    rec.weights_fp8["w_gate"] = quantize_fp8_blockwise(
+                        base + 1.0, tile=rec.weights_fp8["w_gate"].tile)
+                    pg.invalidate(eid)
+                    pg.prefetch([eid])
+                    time.sleep(0.002)
+            except Exception as e:  # noqa: BLE001 - collected
+                errors.append(e)
+
+        def reader():
+            try:
+                for _ in range(25):
+                    try:
+                        pg.provider(eid)
+                    except KeyError:
+                        pass
+                    time.sleep(0.001)
+            except Exception as e:  # noqa: BLE001 - collected
+                errors.append(e)
+
+        up = threading.Thread(target=updater)
+        readers = [threading.Thread(target=reader) for _ in range(3)]
+        up.start()
+        for r in readers:
+            r.start()
+        up.join(timeout=60)
+        for r in readers:
+            r.join(timeout=60)
+        assert not errors
+        pg.await_prefetch()
+        w = pg.provider(eid)
+        live = dequantize_fp8_blockwise(
+            pool.experts[eid].weights_fp8["w_gate"], dtype=torch.float32)
+        live = live.to(pg.compute_dtype).float()
+        if mode == "R2VR" or mode == "D2VR":
+            live = live.to(pg.vram_device).float()
+        assert torch.allclose(w["w_gate"].float().cpu(), live.cpu(), atol=1e-3)
+        pg.close()
+
+
+def test_stats_snapshot_thread_safe_under_contention():
+    import threading
+    pool = _pool()
+    pg = ExpertPager(pool, mode="D2R", ram_cache=8, load_from_disk=_counting(pool))
+    for eid in pool.order:
+        pg.provider(eid)
+    base = pg.snapshot_stats()["ram_hits"]
+    n, m = 8, 50
+
+    def hammer():
+        for _ in range(m):
+            for eid in pool.order:
+                pg.provider(eid)
+
+    threads = [threading.Thread(target=hammer) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    snap = pg.snapshot_stats()
+    assert snap["ram_hits"] == base + n * m * len(pool.order)
+    pg.close()
