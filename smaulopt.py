@@ -309,6 +309,8 @@ class SmaulOpt:
                     record.weights_fp8[n] = quantize_fp8_blockwise(new_w, tile=tile)
                     activity += float((new_w - base).abs().mean().item())
                 compute[n].grad = None
+        record.version = getattr(record, "version", 0) + 1
         record.grad_activity = 0.9 * record.grad_activity + 0.1 * (activity / max(1, len(names)))
         return record.grad_activity
+
 
