@@ -68,6 +68,11 @@ static inline float e4m3_to_f32(uint8_t c) {
 extern "C" void smaul_fp8_quant_row_block(
     const float* w, uint8_t* codes, float* scales,
     std::size_t rows, std::size_t cols, std::size_t tile) {
+  // Safety: tile==0 would divide by zero; null/empty are no-ops.
+  // Baseline x86-64 only: no AVX/intrinsics, safe on Ivy Bridge and later.
+  // NaN/Inf inputs saturate to finite codes via f32_to_e4m3 (never emit NaN).
+  if (!w || !codes || !scales) return;
+  if (rows == 0 || cols == 0 || tile == 0) return;
   for (std::size_t r = 0; r < rows; ++r) {
     for (std::size_t b = 0, nb = (cols + tile - 1) / tile; b < nb; ++b) {
       float amax = 1e-12f;
@@ -87,6 +92,9 @@ extern "C" void smaul_fp8_quant_row_block(
 extern "C" void smaul_fp8_dequant_row_block(
     const uint8_t* codes, const float* scales, float* w,
     std::size_t rows, std::size_t cols, std::size_t tile) {
+  // Same guards as quantize: never divide by zero or fault on null/empty.
+  if (!codes || !scales || !w) return;
+  if (rows == 0 || cols == 0 || tile == 0) return;
   for (std::size_t r = 0; r < rows; ++r) {
     for (std::size_t b = 0, nb = (cols + tile - 1) / tile; b < nb; ++b) {
       float s = scales[r * ((cols + tile - 1) / tile) + b];
