@@ -312,8 +312,13 @@ def run_training(
       * trigger RNG is deterministic: scheduled growth seeds
         ``seed + step * max(1, max_new_experts)``, loss-edge growth adds a
         +7919 salt offset. Same ``(seed, step, max_new_experts)`` reproduces
-        the same children; resuming with a different ``seed`` intentionally
-        re-bases the stream.
+        the same children; resuming with a different ``seed`` or
+        ``max_new_experts`` intentionally re-bases the stream (both are
+        pinned in the scheduler snapshot). The growth stream uses an
+        isolated ``torch.Generator`` per event and the replay sampler uses
+        an owned ``random.Random``: dirtying the global torch/python RNG
+        between save and resume never perturbs the trajectory, while
+        ``rng.pt`` still restores the global RNG state itself.
     Returns history + optional retention report (old_seqs evaluated before
     and after) so continual-learning retention is measured, not claimed.
     """
@@ -349,6 +354,10 @@ def run_training(
     except (TypeError, ValueError):
         prev_loss = None  # corrupt entry: lose edge memory, never crash here
     if replay is None and isinstance(_snap.get("replay"), dict):
+        # Snapshot restore (checkpoint-authoritative): passing replay=None on
+        # resume continues the exact sampling trajectory. Passing an explicit
+        # ReplayBuffer intentionally re-bases the sampler (fresh trajectory);
+        # bit-equality with an uninterrupted run requires the None path.
         replay = ReplayBuffer.from_dict(_snap["replay"])
 
     def scheduler_snapshot() -> dict:
@@ -356,8 +365,11 @@ def run_training(
         # global step; batch_size/dataset_len/next_step pin the batch formula
         # (resuming with different values intentionally re-bases the cursor).
         # Scheduler knobs ride along so a resumer can reuse them exactly:
-        # growths_per_prune/grow_every/prune_every/grow_loss_below/seed
-        # otherwise silently re-base trigger cadences and RNG streams.
+        # growths_per_prune/grow_every/prune_every/grow_loss_below/seed/
+        # replay_n/max_new_experts otherwise silently re-base trigger
+        # cadences, batch composition, and RNG streams. max_new_experts pins
+        # the growth salt (seed + step*max(1,max_new_experts)); replay_n pins
+        # the interleaving width (batch_size + min(replay_n, len(buf))).
         return {
             "prev_loss": prev_loss,
             "growth_events": growth_events,
@@ -370,6 +382,8 @@ def run_training(
             "prune_every": prune_every,
             "grow_loss_below": grow_loss_below,
             "seed": seed,
+            "replay_n": replay_n,
+            "max_new_experts": int(cfg.max_new_experts),
         }
 
     def grow_batch(step: int, salt: int) -> list[str]:
