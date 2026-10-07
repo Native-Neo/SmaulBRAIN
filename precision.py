@@ -11,6 +11,42 @@ FP8 format: E4M3 with per-block (tile) FP32 scales. A stored tensor is
 ``(codes: uint8, scales: float32, shape)`` — genuinely FP8 bytes on disk/RAM,
 not relabeled FP32. Dequantization happens per expert on activation (one
 expert at a time), never as a full-model FP32 transient.
+
+Sparse update contract (audit 028 — expert / row-range / tile-block):
+  Level 1 (expert): a step touching selected experts decodes/updates/
+    requantizes only those experts' tensors. Unstepped experts keep stored
+    bytes bit-identical (proven by expert-level tests elsewhere).
+  Level 2 (row range): ``dequantize_fp8_row_block`` / ``update_fp8_row_block``
+    touch only rows ``[row_start:row_end)``. Untouched rows' codes AND scales
+    are preserved bit-for-bit; no full-matrix transient is materialized.
+  Level 3 (tile block): ``dequantize_fp8_block`` / ``update_fp8_tile_block``
+    touch only rows ``[row_start:row_end)`` × columns ``[col_start:col_end)``.
+    Reads accept any column window (no full-row transient). Writes require a
+    tile-aligned column window (``col_start % tile == 0`` and ``col_end % tile
+    == 0`` or ``col_end == n_cols``), because one FP32 scale is shared by a
+    whole ``tile``-wide block: rewriting a partial tile from partial data
+    would silently re-derive the shared scale and corrupt sibling columns.
+    Touched tiles are requantized from the new values alone, which is exactly
+    what a full-row requant would have written there (amax is per
+    (row, block); zero padding of a ragged tail never changes an amax), while
+    untouched tiles stay bit-identical.
+
+Optimizer-state semantics for sparse updates (Adam-style SmaulOpt):
+  Frozen means frozen, NOT zero-gradient: rows/tiles outside the update range
+    keep their stored moments (``m``, ``v``/``v_row``) bit-identical. No
+    ``beta`` decay is applied to them (a dense step with ``g == 0`` on those
+    rows WOULD decay ``m *= beta_m`` — sparse updates deliberately do not).
+  Global clock still ticks: the per-tensor ``step`` counter increments even
+    on a sparse update, so bias-correction denominators (``1 - beta**t``)
+    advance for frozen rows too. Their *stored* moments are untouched, but
+    their *effective* ``m_hat``/``v_hat`` drift with ``t``. Exact pause-time
+    equivalence would need per-row step counters (optimizer-side decision —
+    see NEEDS-OPTIMIZER-HUNK notes in the issue thread).
+  Factored-``v`` coupling: ``v_col`` is shared across ALL rows. A sparse row
+    update still folds the slice's column means into the global ``v_col``,
+    so future updates of untouched rows are perturbed through it even though
+    their stored bytes/moments are bit-identical. Fully isolated sparse
+    steps would need ``v_col`` frozen on range updates (optimizer-side).
 """
 
 from __future__ import annotations
@@ -113,14 +149,133 @@ def update_fp8_row_block(
     """Quantize and replace only row_start:row_end in an FP8BlockTensor in place.
 
     Untouched rows (codes and scales) are preserved bit-for-bit.
+    ``new_rows`` must match the slice shape exactly:
+    ``(row_end - row_start, *t.shape[1:])``.
     """
     if row_start < 0 or row_end > t.shape[0] or row_start >= row_end:
         raise ValueError(
             f"invalid row range [{row_start}, {row_end}) for tensor with {t.shape[0]} rows"
         )
+    expect = (row_end - row_start, *t.shape[1:])
+    if tuple(new_rows.shape) != tuple(expect):
+        raise ValueError(
+            f"new_rows shape {tuple(new_rows.shape)} != slice shape {tuple(expect)} "
+            f"for row range [{row_start}, {row_end})"
+        )
     sub = quantize_fp8_blockwise(new_rows, tile=t.tile)
     t.codes[row_start:row_end] = sub.codes
     t.scales[row_start:row_end] = sub.scales
+
+
+def dequantize_fp8_block(
+    t: FP8BlockTensor,
+    row_start: int,
+    row_end: int,
+    col_start: int,
+    col_end: int,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Dequantize only rows [row_start:row_end) × cols [col_start:col_end).
+
+    Level-3 (tile-block) read: no full-matrix and no full-row transient —
+    only the requested ``(row_end - row_start) × (col_end - col_start)``
+    window is materialized. Any column window is accepted (partial tiles are
+    fine for reads: each element keeps its own block's scale). The result is
+    bit-exact vs. slicing ``dequantize_fp8_blockwise(t)`` (same elementwise
+    ``f32(code) * scale`` math; native/fallback parity is proven elsewhere).
+
+    Contract: 2-D tensors (rows × cols, the expert-weight case). Higher-dim
+    storage must use the row-range helpers.
+    """
+    if t.codes.ndim != 2 or len(t.shape) != 2:
+        raise ValueError(
+            "tile-block reads require a 2-D (rows x cols) FP8BlockTensor, "
+            f"got codes.ndim={t.codes.ndim} shape={t.shape}"
+        )
+    n_rows, n_cols = int(t.shape[0]), int(t.shape[-1])
+    if not (0 <= row_start < row_end <= n_rows):
+        raise ValueError(f"invalid row range [{row_start}, {row_end}) for {n_rows} rows")
+    if not (0 <= col_start < col_end <= n_cols):
+        raise ValueError(f"invalid col range [{col_start}, {col_end}) for {n_cols} cols")
+    codes_2d = t.codes.reshape(-1, n_cols)
+    scales_2d = t.scales.reshape(-1, t.scales.shape[-1])
+    sub_codes = codes_2d[row_start:row_end, col_start:col_end].contiguous()
+    block_idx = torch.arange(col_start, col_end, device=scales_2d.device) // t.tile
+    sub_scales = scales_2d[row_start:row_end][:, block_idx]
+    codes_f8 = sub_codes.view(FP8_DTYPE).to(torch.float32)
+    out = codes_f8 * sub_scales.to(codes_f8.device)
+    return out.to(dtype)
+
+
+def update_fp8_tile_block(
+    t: FP8BlockTensor,
+    new_slice: torch.Tensor,
+    row_start: int,
+    row_end: int,
+    col_start: int,
+    col_end: int,
+) -> None:
+    """Quantize and replace only rows [row_start:row_end) × cols [col_start:col_end).
+
+    Level-3 (tile-block) write, in place. Untouched tiles (codes AND scales)
+    are preserved bit-for-bit — no full-row or full-matrix requant.
+
+    Contract:
+      * 2-D tensors (rows × cols, the expert-weight case).
+      * Column window must be tile-aligned: ``col_start % tile == 0`` and
+        (``col_end % tile == 0`` or ``col_end == n_cols``). A partial tile
+        shares its FP32 scale with sibling columns outside the window, so a
+        partial-tile rewrite would corrupt them; alignment is enforced loudly.
+      * ``new_slice.shape`` must be exactly ``(row_end - row_start,
+        col_end - col_start)``.
+      * Storage equivalence: each touched (row, block) is requantized from
+        the new values alone with the same per-block amax math as
+        ``quantize_fp8_blockwise`` (zero padding of a ragged tail never
+        changes an amax), so touched tiles equal what a full-row requant of
+        the same new rows would have written there.
+
+    Optimizer note: freezing untouched tiles' stored bytes does NOT freeze
+    the optimizer clock — the per-tensor ``step`` still ticks (bias
+    corrections drift) and factored ``v_col`` is still shared. See the module
+    docstring; per-column optimizer ranges are an optimizer-side hunk.
+    """
+    if t.codes.ndim != 2 or len(t.shape) != 2:
+        raise ValueError(
+            "tile-block updates require a 2-D (rows x cols) FP8BlockTensor, "
+            f"got codes.ndim={t.codes.ndim} shape={t.shape}"
+        )
+    n_rows, n_cols = int(t.shape[0]), int(t.shape[-1])
+    if not (0 <= row_start < row_end <= n_rows):
+        raise ValueError(f"invalid row range [{row_start}, {row_end}) for {n_rows} rows")
+    if not (0 <= col_start < col_end <= n_cols):
+        raise ValueError(f"invalid col range [{col_start}, {col_end}) for {n_cols} cols")
+    if col_start % t.tile != 0 or (col_end % t.tile != 0 and col_end != n_cols):
+        raise ValueError(
+            f"column range [{col_start}, {col_end}) must be tile-aligned "
+            f"(tile={t.tile}): col_start % tile == 0 and "
+            f"(col_end % tile == 0 or col_end == {n_cols})"
+        )
+    expect = (row_end - row_start, col_end - col_start)
+    if tuple(new_slice.shape) != tuple(expect):
+        raise ValueError(
+            f"new_slice shape {tuple(new_slice.shape)} != window shape {tuple(expect)} "
+            f"for rows [{row_start}, {row_end}) cols [{col_start}, {col_end})"
+        )
+    # Reference per-tile math (proven bit-exact vs. native dispatch): amax per
+    # (row, block) over the new values alone, then genuine E4M3 rounding.
+    w32 = new_slice.detach().to(torch.float32)
+    b0 = col_start // t.tile
+    b1 = min((col_end + t.tile - 1) // t.tile, int(t.scales.shape[-1]))
+    for b in range(b0, b1):
+        bc0 = b * t.tile
+        bw = min(t.tile, n_cols - bc0)  # ragged tail block is narrower
+        src = w32[:, bc0 - col_start : bc0 - col_start + bw]
+        amax = src.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+        scale = (amax / FP8_MAX).reshape(-1)
+        q = (src / amax * FP8_MAX).to(FP8_DTYPE)
+        # Direct 2-D indexing: guaranteed in-place even if storage is a view.
+        t.codes[row_start:row_end, bc0 : bc0 + bw] = q.view(torch.uint8)
+        t.scales[row_start:row_end, b] = scale
 
 
 
