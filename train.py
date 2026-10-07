@@ -366,10 +366,15 @@ def run_training(
         # (resuming with different values intentionally re-bases the cursor).
         # Scheduler knobs ride along so a resumer can reuse them exactly:
         # growths_per_prune/grow_every/prune_every/grow_loss_below/seed/
-        # replay_n/max_new_experts otherwise silently re-base trigger
+        # replay_n/max_new_experts/prune_survival_steps/prune_min_usage/
+        # min_experts/max_experts otherwise silently re-base trigger
         # cadences, batch composition, and RNG streams. max_new_experts pins
         # the growth salt (seed + step*max(1,max_new_experts)); replay_n pins
         # the interleaving width (batch_size + min(replay_n, len(buf))).
+        # prune_survival_steps/prune_min_usage/min_experts pin the prune
+        # cooldown (grace period), hysteresis floor, and capacity floor:
+        # resuming with different values intentionally re-bases prune
+        # decisions (config.json stays checkpoint-authoritative via storage).
         return {
             "prev_loss": prev_loss,
             "growth_events": growth_events,
@@ -384,6 +389,10 @@ def run_training(
             "seed": seed,
             "replay_n": replay_n,
             "max_new_experts": int(cfg.max_new_experts),
+            "prune_survival_steps": int(cfg.prune_survival_steps),
+            "prune_min_usage": float(cfg.prune_min_usage),
+            "min_experts": int(cfg.min_experts),
+            "max_experts": int(cfg.max_experts),
         }
 
     def grow_batch(step: int, salt: int) -> list[str]:
