@@ -3,8 +3,11 @@
 import sys, os, subprocess
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import platform
+
 import pytest
 import torch
+import native
 from kernels import compare_heads, linear_attn_memory_bound, time_fn
 from rmsnorm import RMSNorm, rmsnorm_fn
 
@@ -69,3 +72,55 @@ def test_sparse_head_rejects_bad_fan_in_and_device():
     h = SparseTopKHead(16, 8, fan_in=4)
     out = h(torch.randn(5, 8))
     assert out.shape == (5, 16) and torch.isfinite(out).all()
+
+
+def test_native_build_pins_baseline_isa():
+    """Ivy Bridge portability: baseline flags, never -march=native/fast-math."""
+    flags = native._build_flags()
+    assert "-march=native" not in " ".join(flags)
+    assert "-ffast-math" not in flags and "-fno-fast-math" in flags
+    if platform.machine().lower() in ("x86_64", "amd64"):
+        assert "-march=x86-64" in flags and "-mtune=generic" in flags
+
+
+def test_native_build_with_baseline_flags_compiles(tmp_path):
+    for src in ("rmsnorm.cpp", "linear_attn.cpp", "fp8_quant.cpp"):
+        so = os.path.join(str(tmp_path), src.replace(".cpp", ".so"))
+        r = subprocess.run(
+            ["g++", *native._build_flags(),
+             os.path.join(ROOT, "kernels_cpp", src), "-o", so],
+            capture_output=True, text=True, timeout=300)
+        assert r.returncode == 0, r.stderr
+        assert os.path.exists(so)
+
+
+def test_cpu_capability_label_sane():
+    cap = native.cpu_capability()
+    assert isinstance(cap, str) and cap.strip()
+    assert "\n" not in cap  # single-line label, safe to log/cache on
+
+
+def test_native_self_test_passes_after_build():
+    native._libs.clear()
+    native._build_failed = None
+    try:
+        assert native.ensure_native()  # builds with baseline flags if needed
+        native._self_test()  # raises on any kernel mismatch
+        assert set(native._libs) == {"rmsnorm", "linear_attn", "fp8_quant"}
+    finally:
+        pass  # keep the warm cache for the remaining tests
+
+
+def test_bind_rejects_symbol_less_library(tmp_path):
+    """ABI mismatch: a .so without our symbols must fail loudly, not bind."""
+    import ctypes
+    src = tmp_path / "empty.cpp"
+    src.write_text("extern \"C\" void dummy() {}\n")
+    so = str(tmp_path / "empty.so")
+    r = subprocess.run(["g++", "-shared", "-fPIC", str(src), "-o", so],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr
+    lib = ctypes.CDLL(so)
+    for name in ("rmsnorm", "linear_attn", "fp8_quant"):
+        with pytest.raises(RuntimeError, match="ABI"):
+            native._bind(lib, name)
