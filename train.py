@@ -291,6 +291,29 @@ def run_training(
     newly dips below ``grow_loss_below`` (falling edge; negative disables).
     After every ``growths_per_prune`` growth events one prune evaluation
     runs, on top of the ``prune_every`` schedule.
+
+    Exact trigger semantics (global steps, 0-indexed):
+      * scheduled growth fires when ``(global_step + 1) % grow_every == 0``
+        (``grow_every <= 0`` disables); scheduled prune uses the same rule
+        with ``prune_every``. Both are evaluated on the global step so a
+        resume continues the cadence (no repeat/skip).
+      * loss-edge growth fires when ``prev_loss >= grow_loss_below >
+        loss_now`` (strict falling edge). ``prev_loss`` is the previous
+        step's loss; the first step of a fresh run never fires (no
+        previous loss). ``grow_loss_below is None`` or negative disables
+        the edge (callers pass a negative value to disable).
+      * only successful growths (new experts actually added; at-cap
+        attempts return no ids) increment ``growth_events``. The cadence
+        prune fires when the post-increment counter satisfies
+        ``growth_events % growths_per_prune == 0``.
+      * ordering per step is grow-then-prune; at most one prune evaluation
+        runs per step (cadence and schedule triggers coalesce), so a step
+        can never prune twice ``max_victims``.
+      * trigger RNG is deterministic: scheduled growth seeds
+        ``seed + step * max(1, max_new_experts)``, loss-edge growth adds a
+        +7919 salt offset. Same ``(seed, step, max_new_experts)`` reproduces
+        the same children; resuming with a different ``seed`` intentionally
+        re-bases the stream.
     Returns history + optional retention report (old_seqs evaluated before
     and after) so continual-learning retention is measured, not claimed.
     """
@@ -332,6 +355,9 @@ def run_training(
         # Dataset/batch cursor for exact resume: manifest step carries the
         # global step; batch_size/dataset_len/next_step pin the batch formula
         # (resuming with different values intentionally re-bases the cursor).
+        # Scheduler knobs ride along so a resumer can reuse them exactly:
+        # growths_per_prune/grow_every/prune_every/grow_loss_below/seed
+        # otherwise silently re-base trigger cadences and RNG streams.
         return {
             "prev_loss": prev_loss,
             "growth_events": growth_events,
@@ -339,13 +365,23 @@ def run_training(
             "batch_size": batch_size,
             "dataset_len": n,
             "next_step": start_step + len(hist),
+            "growths_per_prune": growths_per_prune,
+            "grow_every": grow_every,
+            "prune_every": prune_every,
+            "grow_loss_below": grow_loss_below,
+            "seed": seed,
         }
 
-    def grow_batch(step: int, salt: int) -> bool:
-        """Clone the top experts (callee enforces the max_experts cap)."""
+    def grow_batch(step: int, salt: int) -> list[str]:
+        """Clone the top experts (callee enforces the max_experts cap).
+
+        Returns the new expert ids (empty when at cap): callers use the
+        non-emptiness as the success signal so failed at-cap attempts never
+        advance the growths_per_prune cadence.
+        """
         count = min(cfg.max_new_experts, cfg.max_experts - len(model.pool))
         if count <= 0:
-            return False
+            return []
         new_ids = growth_mod.grow_topk_clones(
             model.pool, model.router, cfg.d_model, cfg.expert_hidden, step,
             seed=seed + salt, k=count, n_mutated=min(2, count),
@@ -355,9 +391,9 @@ def run_training(
         for eid in new_ids:
             log_fn(f"[grow] step={step} new={eid} pool={len(model.pool)}")
         model.cfg.num_experts = len(model.pool)
-        return bool(new_ids)
+        return list(new_ids)
 
-    def prune_eval(step: int) -> None:
+    def prune_eval(step: int) -> list[str]:
         victims = pruning_mod.find_victims(model.pool, step,
                                            survival_steps=cfg.prune_survival_steps,
                                            min_experts=cfg.min_experts,
@@ -370,8 +406,11 @@ def run_training(
                                                optim_state=opt.router_state)
             model.cfg.num_experts = len(model.pool)
             log_fn(f"[prune] step={step} removed={pruned} pool={len(model.pool)}")
+            return list(pruned)
+        return []
     run_started = time.perf_counter()
     bytes_processed = 0
+    events: list[dict] = []  # machine-readable growth/pruning ledger
     for local_step in range(steps):
         step_started = time.perf_counter()
         step = start_step + local_step
@@ -395,22 +434,36 @@ def run_training(
         step_bytes = int((b[:, : cfg.context_length] != PAD_ID).sum().item())
         bytes_processed += step_bytes
         hist.append(stats)
-        grew = False
+        # Grow-then-prune ordering per step. At most one prune evaluation
+        # runs per step: cadence (growths_per_prune) and schedule
+        # (prune_every) triggers coalesce into a single prune_eval call.
+        new_ids: list[str] = []
         if grow_every and (step + 1) % grow_every == 0:
-            grew = grow_batch(step, step * max(1, cfg.max_new_experts)) or grew
+            new_ids += grow_batch(step, step * max(1, cfg.max_new_experts))
         # Loss-triggered growth on the falling edge below the threshold; the
         # salt offset keeps its seeds distinct from scheduled growth.
         loss_now = float(stats["loss"])
         if (grow_loss_below is not None and prev_loss is not None
                 and prev_loss >= grow_loss_below > loss_now):
-            grew = grow_batch(step, step * max(1, cfg.max_new_experts) + 7919) or grew
+            new_ids += grow_batch(step, step * max(1, cfg.max_new_experts) + 7919)
         prev_loss = loss_now
+        grew = bool(new_ids)
+        if new_ids:
+            events.append({"step": step, "type": "grow", "ids": list(new_ids)})
         if grew:
             growth_events += 1
-            if growth_events % growths_per_prune == 0:
-                prune_eval(step)
+        prune_due = False
+        if grew and growth_events % growths_per_prune == 0:
+            prune_due = True
         if prune_every and (step + 1) % prune_every == 0:
-            prune_eval(step)
+            prune_due = True
+        pruned_ids: list[str] = prune_eval(step) if prune_due else []
+        if pruned_ids:
+            events.append({"step": step, "type": "prune", "ids": list(pruned_ids)})
+        # Machine-readable per-step ledger (history entries stay JSON-safe).
+        stats["grew"] = grew
+        stats["new_experts"] = list(new_ids)
+        stats["pruned_experts"] = list(pruned_ids)
         if ckpt_dir and save_every and (step + 1) % save_every == 0:
             save_model(ckpt_dir, model, opt, step,
                        extra_meta={"scheduler": scheduler_snapshot()})
@@ -452,4 +505,8 @@ def run_training(
         # Scheduler snapshot for exact resume: whoever saves the final
         # checkpoint passes this as extra_meta (see cli train command).
         "scheduler": scheduler_snapshot(),
+        # Machine-readable growth/pruning ledger: one entry per event in
+        # execution order (grow entries precede same-step prune entries).
+        "growth_prune_events": [dict(e) for e in events],
+        "growth_events": growth_events,
     }
