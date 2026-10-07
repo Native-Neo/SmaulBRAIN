@@ -100,3 +100,76 @@ def test_saturated_halt_logits_stay_finite():
     for key in ("loss", "nll", "ponder_kl", "balance"):
         assert torch.isfinite(out[key].detach()).all(), key
     m.pager.close()
+
+
+def test_ponder_gated_by_min_depth():
+    # P must put zero mass below min_depth; inference can never select
+    # those depths, so the ponder weights must not score them either.
+    m = _model(min_depth=2, max_depth=4, dtype="fp32")
+    ids = torch.randint(0, 256, (2, 8))
+    out = m(ids, ids, step=0)
+    assert out["depths"].min().item() >= 2 and out["depths"].max().item() <= 4
+    assert 2.0 <= out["mean_depth"] <= 4.0
+    # Direct P check: depth-1 mass is exactly zero, rows still sum to 1.
+    h = m.n_init(m.embed(ids).to(torch.float32))
+    from linear_attention import LinearAttnState
+    states = [LinearAttnState.zeros(2, 4, 8) for _ in range(4)]
+    with torch.no_grad():
+        hs, lams, _, _, _ = m._depth_loop(
+            h, states, train=True, step=0,
+            keep=torch.ones(2 * 8, dtype=torch.bool),
+        )
+        P, _, _ = m._ponder([l.float() for l in lams])
+    assert torch.equal(P[0], torch.zeros_like(P[0]))
+    assert torch.allclose(P.sum(dim=0), torch.ones_like(P.sum(dim=0)))
+    m.clear_expert_grads()
+    m.pager.close()
+
+
+def test_train_depths_share_infer_threshold_rule():
+    # Saturated halt: ponder expectation ~1, so both training (diagnostic)
+    # and inference (readout) depths must select depth 1.
+    m = _model(min_depth=1, max_depth=3, dtype="fp32")
+    with torch.no_grad():
+        m.block.halt.bias.fill_(50.0)
+    ids = torch.randint(0, 256, (2, 8))
+    train_depths = m(ids, ids, step=0)["depths"]
+    infer_depths = m.forward_infer(ids)["depths"]
+    assert torch.equal(train_depths, torch.ones_like(train_depths))
+    assert torch.equal(train_depths, infer_depths)
+    m.pager.close()
+
+
+def test_mean_depth_is_valid_only_and_readout_is_ponder_mixed():
+    from bytes import PAD_ID
+    from train import batch_from_seqs
+    torch.manual_seed(0)
+    m = _model(min_depth=1, max_depth=3, dtype="fp32")
+    m.eval()
+    seq = [10, 20, 30, 40, 50, 60]
+    b = batch_from_seqs([seq], context=8)
+    x, y = b[:, :8], b[:, 1:]
+    valid = (y != PAD_ID)
+    with torch.no_grad():
+        out = m(x, y, step=0)
+    # Manual valid-only ponder expectation matches the diagnostic.
+    h = m.n_init(m.embed(x).to(torch.float32))
+    from linear_attention import LinearAttnState
+    states = [LinearAttnState.zeros(1, 4, 8) for _ in range(3)]
+    with torch.no_grad():
+        hs, lams, _, _, _ = m._depth_loop(
+            h, states, train=True, step=0, keep=valid.reshape(-1))
+        P, _, _ = m._ponder([l.float() for l in lams])
+    m.clear_expert_grads()
+    steps = torch.arange(1, 4).view(-1, 1, 1)
+    expected = float((P * steps).sum(dim=0)[valid].sum().item()
+                     / max(1, int(valid.sum().item())))
+    assert out["mean_depth"] == expected
+    # KL-vs-readout alignment: the returned logits are the ponder-mixed
+    # predictor the loss scores (same P, same per-step logits).
+    with torch.no_grad():
+        manual = sum(P[n].unsqueeze(-1) * m.head(m.n_final(hs[n])).float()
+                     for n in range(3))
+    assert torch.allclose(out["logits"].detach(), manual, atol=1e-5)
+    assert torch.allclose(P.sum(dim=0), torch.ones_like(P.sum(dim=0)))
+    m.pager.close()
