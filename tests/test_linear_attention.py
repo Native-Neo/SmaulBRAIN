@@ -219,3 +219,25 @@ def test_long_stream_step_matches_forward_and_memory_constant():
                                     state=trunc)
     assert torch.isfinite(tstate.S).all()
     assert not torch.allclose(tstate.S, bstate.S, atol=1e-6, rtol=1e-6)
+
+
+def test_native_step_failure_restores_clean_state(monkeypatch):
+    import native
+    from linear_attention import _native_step
+    torch.manual_seed(0)
+    B, H, Dh = 1, 2, 8
+    q = torch.randn(B, H, Dh); k = torch.randn(B, H, Dh); v = torch.randn(B, H, Dh)
+    st = LinearAttnState.zeros(B, H, Dh)
+    calls = {"n": 0}
+    real = native.call_attn_step
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:  # second head fails after the first mutated state
+            return False
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(native, "call_attn_step", flaky)
+    assert _native_step(st, q, k, v, 1e-6) is None
+    assert torch.equal(st.S, torch.zeros(B, H, Dh, Dh))  # no partial apply
+    assert torch.equal(st.z, torch.zeros(B, H, Dh))
