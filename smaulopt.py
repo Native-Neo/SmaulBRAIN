@@ -19,6 +19,46 @@ there; AdamW is NOT used in its training path). Ported behavior:
     they follow the expert across disk/RAM/VRAM and die on pruning; trunk
     states are name-keyed in the optimizer.
 
+Step / skip semantics (audit 035 — the contract pinned by tests):
+
+  * Counters. ``SmaulOpt.step_count`` is the global train-step clock owned
+    by ``train.train_step``: exactly one increment per ``train_step`` call,
+    INCLUDING skipped steps. The optimizer never touches or reads it —
+    per-tensor update math uses only each tensor's own ``state["step"]``,
+    so LR/ponder/scheduler streams driven by the global step cannot diverge
+    after a skip. Per-tensor ``state["step"]`` ticks exactly once per
+    APPLIED update of that tensor (dense, sparse row-range, or expert),
+    and never on a skip. Expert ``record.version`` bumps by exactly one per
+    applied expert step (all-or-nothing across that expert's weights);
+    ``record.grad_activity`` advances only on applied steps via
+    ``0.9 * old + 0.1 * mean|delta|``.
+  * Skips. A group step is skipped (returns ``0.0``) when the group has no
+    grads at all, or when its global grad norm is non-finite. A skip
+    mutates nothing — no state allocation, no moment change, no per-tensor
+    tick, no version bump, no FP8 rewrite — and preserves grads, so a retry
+    with the same grads is bit-identical to the first attempt.
+  * Grad-free vs zero grad. ``grad is None`` means "not participating":
+    no state is allocated and no counter ticks for that tensor. An
+    all-zero grad tensor DOES participate: moments decay, weight decay
+    still moves the weight, and the per-tensor clock ticks.
+  * Scope. Clipping and non-finite guards are per-group: the trunk dense
+    group, the router dense group, and each expert separately compute
+    their own global norm over their own grads. A non-finite trunk norm
+    skips only the trunk group (all-or-nothing within the group); router
+    and experts are unaffected, and one expert's skip never blocks
+    another. Within a dense group a single non-finite grad skips every
+    tensor in that group. Within an expert a single non-finite grad skips
+    the whole expert. There is deliberately no partial tensor update.
+  * Clipping. Applied steps use ``scale = clip / (norm + 1e-12)`` when
+    ``clip > 0`` and ``norm > clip`` else ``1.0`` (see :func:`clip_scale`);
+    the scaled grad ``g * scale`` feeds the moment update and the scaled
+    LR ``lr * scale`` feeds the weight step. ``grad_scale`` (expert
+    path) likewise scales the grad but never triggers a skip, even at 0.
+  * Sparse ranges tick the per-tensor clock once although only rows
+    ``[row_start:row_end)`` move; frozen rows' stored moments stay
+    bit-identical (no zero-grad decay). See ``precision.py`` for the
+    storage-side contract.
+
 What was NOT ported: nothing was invented — Lion (the other SmaulNative
 optimizer) is intentionally omitted; SmaulBRAIN standardizes on SmaulOpt.
 """
@@ -399,6 +439,20 @@ def global_grad_norm(grads: list[torch.Tensor]) -> float:
     return math.sqrt(total)
 
 
+def clip_scale(norm: float, clip: float) -> float:
+    """Applied global-scale for a grad norm (pure; no state).
+
+    Returns ``clip / (norm + 1e-12)`` when ``clip > 0`` and
+    ``norm > clip``, else ``1.0``. Non-finite norms never reach here —
+    callers skip before clipping — so no finiteness guard lives in this
+    helper. Single source of truth for the clipping formula used by
+    ``step_dense`` / ``step_expert``.
+    """
+    if clip > 0 and norm > clip:
+        return clip / (norm + 1e-12)
+    return 1.0
+
+
 class SmaulOpt:
     """SmaulOpt with trunk/expert/router LR groups and expert-local states."""
 
@@ -449,9 +503,7 @@ class SmaulOpt:
             # Skipped step: leave state AND grads untouched for retry
             # equivalence (mirrors step_expert).
             return 0.0
-        scale = 1.0
-        if self.hp.clip > 0 and norm > self.hp.clip:
-            scale = self.hp.clip / (norm + 1e-12)
+        scale = clip_scale(norm, self.hp.clip)
         eff_lr = lr * scale
         # NOTE: no step_count increment here. step_dense runs once per
         # parameter group (trunk, router, ...), so counting here would
@@ -536,9 +588,7 @@ class SmaulOpt:
             # Skipped step: leave state, version, FP8 bytes AND grads
             # untouched for retry equivalence (mirrors step_dense).
             return 0.0
-        scale = 1.0
-        if self.hp.clip > 0 and norm > self.hp.clip:
-            scale = self.hp.clip / (norm + 1e-12)
+        scale = clip_scale(norm, self.hp.clip)
         activity = 0.0
         tile = record.weights_fp8["w_gate"].tile
         if row_range is not None:
