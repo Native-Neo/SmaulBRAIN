@@ -597,3 +597,145 @@ def test_corrupt_expert_meta_type_rejected_untouched(tmp_path):
         load_model(d, m2, opt2)
     _assert_live_untouched(m2, opt2, snap)
     m.pager.close(); m2.pager.close()
+
+
+# ---- issue #64: atomic publication and crash recovery ----
+
+
+def test_staged_publish_manifest_last(tmp_path, monkeypatch):
+    """Publish order: slow staging off to the side, manifest replaced last."""
+    import storage as _st
+    d = str(tmp_path / "c")
+    m, opt = _trained(d)
+    order = []
+    real_replace = os.replace
+
+    def _recording_replace(src, dst):
+        order.append(os.path.basename(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", _recording_replace)
+    save_model(d, m, opt, step=7)
+    assert order and order[-1] == "manifest.json"  # commit point last
+    assert _st.load_manifest(d)["step"] == 7
+    assert not [n for n in os.listdir(d) if n.startswith("tmp_ckpt_gen_")]
+    m.pager.close()
+
+
+def test_crash_during_staging_leaves_previous_intact(tmp_path, monkeypatch):
+    """Interrupted staging (slow phase) never clobbers the previous generation."""
+    import storage as _st
+    d = str(tmp_path / "c")
+    m, opt = _trained(d)
+    assert _st.load_manifest(d)["step"] == 3
+    trunk_before = open(os.path.join(d, "trunk.pt"), "rb").read()
+
+    real_atomic = _st._atomic_save
+
+    def _boom_once(obj, path):
+        _boom_once.calls += 1
+        if _boom_once.calls == 1:
+            raise RuntimeError("simulated crash mid-staging")
+        return real_atomic(obj, path)
+    _boom_once.calls = 0
+    monkeypatch.setattr(_st, "_atomic_save", _boom_once)
+    with torch.no_grad():
+        m.embed.weight.add_(1.0)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        save_model(d, m, opt, step=99)
+    # Previous generation untouched and loadable.
+    assert _st.load_manifest(d)["step"] == 3
+    assert open(os.path.join(d, "trunk.pt"), "rb").read() == trunk_before
+    m2 = SmaulBrainModel(m.cfg)
+    assert load_model(d, m2, SmaulOpt(SmaulOptHParams()))["step"] == 3
+    # Next save sweeps any staging leftovers and succeeds.
+    monkeypatch.undo()
+    save_model(d, m, opt, step=5)
+    assert _st.load_manifest(d)["step"] == 5
+    assert not [n for n in os.listdir(d) if n.startswith("tmp_ckpt_gen_")]
+    m.pager.close(); m2.pager.close()
+
+
+def test_stale_generations_and_cross_tmp_swept_on_save(tmp_path):
+    """Stale generation dirs + cross-module tmp sidecars are swept on save."""
+    import storage as _st
+    d = str(tmp_path / "c")
+    m, opt = _trained(d)
+    exp_dir = os.path.join(d, "experts")
+    stale_gen = os.path.join(d, "tmp_ckpt_gen_stale")
+    os.makedirs(os.path.join(stale_gen, "experts"), exist_ok=True)
+    with open(os.path.join(stale_gen, "trunk.pt"), "w") as f:
+        f.write("stale")
+    for p in [os.path.join(d, "tmp_quant_crash"),
+              os.path.join(d, "tmp_json_crash"),
+              os.path.join(exp_dir, "tmp_quant_crash"),
+              os.path.join(exp_dir, "stale.convert_tmp"),
+              os.path.join(exp_dir, "tmp_ckpt_crash")]:
+        with open(p, "w") as f:
+            f.write("stale")
+    save_model(d, m, opt, step=11)
+    assert _st.load_manifest(d)["step"] == 11
+    for root, dirs, files in os.walk(d):
+        assert not [f for f in files if f.startswith(("tmp_ckpt_", "tmp_json_", "tmp_quant_"))]
+        assert not [f for f in files if f.endswith(".convert_tmp")]
+        assert not [x for x in dirs if x.startswith("tmp_ckpt_gen_")]
+    m.pager.close()
+
+
+def test_quantize_failure_leaves_pool_intact_no_sidecars(tmp_path):
+    """A failed conversion never leaves a half-converted pool behind."""
+    from quantize import convert_checkpoint
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    exp_dir = os.path.join(d, "experts")
+    before = {f: open(os.path.join(exp_dir, f), "rb").read()
+              for f in os.listdir(exp_dir) if f.endswith(".pt")}
+    # Corrupt one expert payload so conversion of that file raises.
+    eid = m.pool.order[0]
+    p = os.path.join(exp_dir, f"{eid}.pt")
+    obj = torch.load(p, map_location="cpu", weights_only=False)
+    obj["weights"]["w_gate"]["codes"] = "corrupted"
+    torch.save(obj, p)
+    with pytest.raises((ValueError, RuntimeError, AttributeError, TypeError)):
+        convert_checkpoint(d, to="fp8", tile=32)
+    # Uncorrupted experts are bit-identical; no sidecars remain.
+    for f, blob in before.items():
+        if f != f"{eid}.pt":
+            assert open(os.path.join(exp_dir, f), "rb").read() == blob
+    assert not [f for f in os.listdir(exp_dir) if f.endswith(".convert_tmp")]
+    assert not [f for f in os.listdir(exp_dir) if f.startswith("tmp_quant_")]
+    m.pager.close()
+
+
+def test_concurrent_readers_see_old_or_new_never_mixed(tmp_path):
+    """Flocked readers under concurrent saves see whole generations only."""
+    import threading
+    import storage as _st
+    d = str(tmp_path / "c")
+    m, opt = _trained(d)
+    seen_steps = []
+    errors = []
+
+    def _reader(n=12):
+        try:
+            for _ in range(n):
+                m2 = SmaulBrainModel(m.cfg)
+                man = load_model(d, m2, SmaulOpt(SmaulOptHParams()))
+                assert man["step"] in (3, 4, 5)
+                assert set(man["expert_ids"]) == set(m.pool.order)
+                seen_steps.append(man["step"])
+                m2.pager.close()
+        except Exception as e:  # noqa: BLE001 - collected and re-raised below
+            errors.append(e)
+
+    readers = [threading.Thread(target=_reader) for _ in range(4)]
+    for t in readers:
+        t.start()
+    for step in (4, 5):
+        save_model(d, m, opt, step=step)
+    for t in readers:
+        t.join()
+    assert not errors
+    assert seen_steps and all(s in (3, 4, 5) for s in seen_steps)
+    assert _st.load_manifest(d)["step"] == 5
+    m.pager.close()
