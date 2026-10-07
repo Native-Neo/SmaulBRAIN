@@ -41,7 +41,13 @@ _MODES = ("entire", "trunk", "experts", "selected", "new")
 
 
 class ReplayBuffer:
-    """Reservoir of past batches (byte-id sequences) for interleaving."""
+    """Reservoir of past batches (byte-id sequences) for interleaving.
+
+    Deterministic: all randomness derives from the owned ``random.Random``
+    instance (seeded at construction, state persisted via to_dict/from_dict).
+    No global RNG, no hash-order iteration (storage is a deque, sampling uses
+    indexed choice, persistence preserves order).
+    """
 
     def __init__(self, capacity: int = 512, seed: int = 0) -> None:
         self.capacity = capacity
@@ -60,7 +66,16 @@ class ReplayBuffer:
                 self.buf[j] = seq
 
     def sample(self, n: int) -> list[list[int]]:
-        if not self.buf:
+        """Draw up to ``n`` past seqs, with replacement.
+
+        Semantics (defined): each draw is an independent
+        ``rng.choice(buf)``; duplicates are possible even when
+        ``n <= len(buf)``. Returns ``min(max(n, 0), len(buf))`` copies
+        (empty buffer or ``n <= 0`` -> ``[]``); callers must not assume a
+        fixed output length until the buffer holds ``>= n`` items. Egress
+        values are copies: mutating them cannot corrupt replay.
+        """
+        if n <= 0 or not self.buf:
             return []
         return [list(self.rng.choice(self.buf)) for _ in range(min(n, len(self.buf)))]
 
@@ -68,7 +83,13 @@ class ReplayBuffer:
         return len(self.buf)
 
     def to_dict(self) -> dict:
-        """JSON-safe snapshot: sequences, cursor, and sampler RNG state."""
+        """JSON-safe snapshot: complete state (sequences, cursor, sampler RNG).
+
+        Complete means: ``capacity`` + ordered ``buf`` contents + ``seen``
+        (reservoir cursor) + full ``rng`` state. Restoring via from_dict
+        continues the exact sampling trajectory; no hidden cursor lives
+        outside this dict.
+        """
         version, inner, gauss = self.rng.getstate()
         return {
             "capacity": self.capacity,
@@ -175,14 +196,25 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
             for _, p in model._router_params():
                 p.grad = None
         expert_grads = model.take_expert_grads()
+        # Deterministic update order: pool.order when available (never dict
+        # activation/insertion order, never hash/set order), else sorted ids.
+        # Routing activation order must not affect optimizer/pager sequencing.
+        _order = getattr(getattr(model, "pool", None), "order", None)
+        if isinstance(_order, list) and _order:
+            _rank = {eid: i for i, eid in enumerate(_order)}
+            _key = lambda eid: (_rank.get(eid, 1 << 30), eid)
+        else:
+            _key = lambda eid: ("", eid)
         if mode in ("entire", "experts"):
-            targets = list(expert_grads)
+            targets = sorted(expert_grads, key=_key)
         elif mode == "selected":
             want = set(selected or [])
-            targets = [e for e in expert_grads if e in want]
+            targets = sorted((e for e in expert_grads if e in want), key=_key)
         elif mode == "new":
-            targets = [e for e in expert_grads
-                       if model.pool.experts[e].birth_step >= new_since_step]
+            targets = sorted(
+                (e for e in expert_grads
+                 if model.pool.experts[e].birth_step >= new_since_step),
+                key=_key)
         else:  # trunk mode: experts frozen
             targets = []
         for eid in targets:
@@ -239,7 +271,22 @@ def run_training(
 ) -> dict:
     """Small-driver training over in-memory byte sequences.
 
-    ``train_seqs`` are byte-id lists; batches cycle deterministically.
+    ``train_seqs`` are byte-id lists; batches cycle deterministically via the
+    global step: ``train_seqs[(step * batch_size + i) % len]``. Resuming from
+    ``model._resume_step`` continues the exact sequence (no repeat/skip) when
+    the dataset order/length and ``batch_size`` are unchanged.
+
+    Replay (when ``replay`` is not None and ``replay_n > 0``): each step
+    samples past data only (pre-ingress buffer), so the current fresh batch
+    can never duplicate itself via replay; the full fresh batch (all
+    ``batch_size`` seqs) is then added to the reservoir. Total batch size is
+    ``batch_size + min(replay_n, len(buffer pre-step))``: early steps run
+    smaller until the buffer fills (defined behavior). Sampling is with
+    replacement (see ReplayBuffer.sample). Loss is the mean over valid
+    (non-PAD) tokens only, so fresh and replay tokens carry equal per-token
+    weight and padding length cannot dilute the measurement; throughput
+    (``bytes_processed``) likewise counts valid data bytes only.
+
     Growth fires on schedule (``grow_every``) and whenever the step loss
     newly dips below ``grow_loss_below`` (falling edge; negative disables).
     After every ``growths_per_prune`` growth events one prune evaluation
@@ -282,10 +329,16 @@ def run_training(
         replay = ReplayBuffer.from_dict(_snap["replay"])
 
     def scheduler_snapshot() -> dict:
+        # Dataset/batch cursor for exact resume: manifest step carries the
+        # global step; batch_size/dataset_len/next_step pin the batch formula
+        # (resuming with different values intentionally re-bases the cursor).
         return {
             "prev_loss": prev_loss,
             "growth_events": growth_events,
             "replay": replay.to_dict() if replay is not None else None,
+            "batch_size": batch_size,
+            "dataset_len": n,
+            "next_step": start_step + len(hist),
         }
 
     def grow_batch(step: int, salt: int) -> bool:
@@ -322,17 +375,24 @@ def run_training(
     for local_step in range(steps):
         step_started = time.perf_counter()
         step = start_step + local_step
-        batch_seqs = [train_seqs[(step * batch_size + i) % n] for i in range(batch_size)]
+        fresh_seqs = [train_seqs[(step * batch_size + i) % n] for i in range(batch_size)]
         if replay is not None and replay_n > 0:
-            for s in train_seqs[(step * batch_size) % n : (step * batch_size) % n + 1]:
-                replay.add(list(s))
-            batch_seqs = batch_seqs + replay.sample(replay_n)
+            # Past-only sampling: sample BEFORE ingress so the current fresh
+            # batch cannot echo itself inside the same step.
+            replay_batch = replay.sample(replay_n)
+            batch_seqs = fresh_seqs + replay_batch
+            for s in fresh_seqs:
+                replay.add(s)
+        else:
+            batch_seqs = fresh_seqs
         b = batch_from_seqs(batch_seqs, cfg.context_length)
         stats = train_step(model, opt, cfg, b[:, : cfg.context_length],
                            b[:, 1 : cfg.context_length + 1], step, mode=mode,
                            selected=selected, new_since_step=new_since_step)
         stats["step"] = step
-        step_bytes = int(b[:, : cfg.context_length].numel())
+        # Throughput counts valid data bytes only: padded positions are
+        # structural (PAD_ID, masked from the loss), not processed data.
+        step_bytes = int((b[:, : cfg.context_length] != PAD_ID).sum().item())
         bytes_processed += step_bytes
         hist.append(stats)
         grew = False
