@@ -19,21 +19,76 @@ from precision import FP8BlockTensor, dequantize_fp8_blockwise
 _EXPERT_WEIGHTS = ("w_gate", "w_up", "w_down")
 
 
+def _check_optim_width(optim_state: dict | None, expect: int) -> None:
+    """Validate-first: every momentum buffer must already match pool width.
+
+    Raises before mutating when a buffer's dim-0 disagrees with the pool,
+    so padding cannot compound a prior mismatch into silent misalignment.
+    Missing entries are left alone: step_dense initializes them at the
+    post-growth width on next use.
+    """
+    if optim_state is None:
+        return
+    for st in optim_state.values():
+        if not isinstance(st, dict):
+            continue
+        for key in ("m", "v_row", "v"):
+            t = st.get(key)
+            if torch.is_tensor(t) and t.shape[0] > 0 and t.shape[0] != expect:
+                raise ValueError(
+                    f"optim_state out of sync: buffer {key} has "
+                    f"{t.shape[0]} rows vs {expect} experts (refusing to mutate)"
+                )
+
+
+def _snapshot_router(router) -> tuple:
+    """Capture router topology for exact rollback (handles 0->1 undo)."""
+    return (
+        router.num_experts,
+        router.proj.weight.detach().clone(),
+        router.proj.bias.detach().clone(),
+        router.usage_counts.detach().clone(),
+        router.admit_counts.detach().clone(),
+    )
+
+
+def _restore_router(router, snap: tuple) -> None:
+    """Restore a snapshot from _snapshot_router (no validation, rollback only)."""
+    n, w, b, u, a = snap
+    new = router._proj_like(n)
+    with torch.no_grad():
+        if n > 0:
+            new.weight.copy_(w)
+            new.bias.copy_(b)
+    router.proj = new
+    router.num_experts = n
+    router.register_buffer("usage_counts", u.clone())
+    router.register_buffer("admit_counts", a.clone())
+
+
 def _pad_state_rows(state: dict, n_new: int) -> None:
     """Append zero rows to dim 0 of every stored momentum buffer.
 
     Newborn router rows start with zero momentum (same as fresh init_state);
     surviving rows keep theirs bit-identically. Missing entries are left
     alone: step_dense initializes them at the post-growth width on next use.
+    Two-phase: all replacements are built before any assignment, so a
+    build failure (e.g. OOM in torch.cat) leaves every buffer untouched.
     """
+    # Phase 1 (pure build): compute every replacement before assigning any,
+    # so a failure leaves all buffers untouched.
+    pending: list[tuple] = []
     for st in state.values():
         if not isinstance(st, dict):
             continue
         for key in ("m", "v_row", "v"):
             t = st.get(key)
             if torch.is_tensor(t) and t.shape[0] > 0:
-                st[key] = torch.cat([t, torch.zeros(
-                    (n_new, *t.shape[1:]), dtype=t.dtype, device=t.device)])
+                pending.append((st, key, torch.cat([t, torch.zeros(
+                    (n_new, *t.shape[1:]), dtype=t.dtype, device=t.device)])))
+    # Phase 2 (commit): assignments only; infallible after phase-1 build.
+    for st, key, new in pending:
+        st[key] = new
 
 
 def select_parents(pool: ExpertPool, k: int = 2) -> list[str]:
@@ -121,30 +176,62 @@ def grow_expert(
     diverged.
     ``optim_state`` (e.g. SmaulOpt.router_state) gains one zero row per new
     router row so surviving rows keep their momentum instead of the whole
-    table resetting on shape mismatch.
+    table resetting on shape mismatch. Validate-first: topology, capacity,
+    and optimizer widths are checked before anything mutates. Any commit
+    failure (router append, momentum pad) rolls back the pool addition and
+    restores the ID cursor, so the prior topology returns exactly with no
+    consumed IDs.
     """
     _check_topology_in_sync(pool, router)
     if max_experts is not None and len(pool) >= max_experts:
         raise ValueError(f"at capacity: {len(pool)} >= max_experts={max_experts}")
+    _check_optim_width(optim_state, len(pool))
+    next_before = pool._next_id
+    router_snap = _snapshot_router(router)
     gen = torch.Generator().manual_seed(seed)
-    if len(pool) == 0:
-        rec = make_expert(pool.fresh_id(), d_model, expert_hidden, birth_step=step,
-                          source="init", fp8_tile=fp8_tile, generator=gen)
-        init_row = None
-    else:
-        parents = select_parents(pool, k=min(n_parents, len(pool)))
-        # Parent-mean router row gives the child a sane starting admission.
-        with torch.no_grad():
-            rows = torch.stack([router.proj.weight[pool.index_of(p)].float() for p in parents])
-            init_row = rows.mean(dim=0)
-        w = recombine_weights(pool, parents, noise_std=noise_std, generator=gen)
-        rec = make_expert(pool.fresh_id(), d_model, expert_hidden, weights=w, birth_step=step,
-                          parents=parents, source="recombine", fp8_tile=fp8_tile)
-        rec.optim_state = init_expert_optim_state(rec)
-    pool.add(rec)
-    router.add_expert_row(init=init_row)
-    if optim_state is not None:
-        _pad_state_rows(optim_state, 1)
+    try:
+        if len(pool) == 0:
+            rec = make_expert(pool.fresh_id(), d_model, expert_hidden, birth_step=step,
+                              source="init", fp8_tile=fp8_tile, generator=gen)
+            init_row = None
+        else:
+            parents = select_parents(pool, k=min(n_parents, len(pool)))
+            # Parent-mean router row gives the child a sane starting admission.
+            with torch.no_grad():
+                rows = torch.stack([router.proj.weight[pool.index_of(p)].float() for p in parents])
+                init_row = rows.mean(dim=0)
+            w = recombine_weights(pool, parents, noise_std=noise_std, generator=gen)
+            rec = make_expert(pool.fresh_id(), d_model, expert_hidden, weights=w, birth_step=step,
+                              parents=parents, source="recombine", fp8_tile=fp8_tile)
+            rec.optim_state = init_expert_optim_state(rec)
+    except Exception:
+        pool._next_id = next_before
+        raise
+    pool_added = False
+    router_added = False
+    try:
+        pool.add(rec)
+        pool_added = True
+        router.add_expert_row(init=init_row)
+        router_added = True
+        if optim_state is not None:
+            _pad_state_rows(optim_state, 1)
+    except Exception:
+        # Exact rollback: pool entry out, router topology restored, ID
+        # cursor restored. _pad is two-phase so optim_state is untouched
+        # on pad-build failure; a pad that already committed cannot occur
+        # because pad is the last step.
+        try:
+            if router_added:
+                _restore_router(router, router_snap)
+            if pool_added:
+                try:
+                    pool.remove(rec.expert_id)
+                except KeyError:
+                    pass
+        finally:
+            pool._next_id = next_before
+        raise
     return rec.expert_id
 
 
@@ -174,7 +261,10 @@ def grow_topk_clones(
     fewer (possibly zero) ids when room runs out.
     Two-phase: all records and router rows are built before the pool or
     the router is touched, so a build failure cannot commit a prefix and
-    leave pool/router diverged.
+    leave pool/router diverged. Validate-first: topology, capacity, and
+    optimizer widths are checked before anything mutates. Any commit
+    failure rolls back the committed prefix and restores the ID cursor,
+    so the prior topology returns exactly with no consumed IDs.
     """
     _check_topology_in_sync(pool, router)
     ranked = sorted(
@@ -187,49 +277,73 @@ def grow_topk_clones(
         want = min(want, room)
         if want <= 0:
             return []
+    _check_optim_width(optim_state, len(pool))
+    next_before = pool._next_id
+    router_snap = _snapshot_router(router)
     parents = ranked[:want]
     gen = torch.Generator().manual_seed(seed)
     mutated = set(torch.randperm(len(parents), generator=gen)[: max(0, min(n_mutated, len(parents)))].tolist())
     # Phase 1 (pure build): records + router rows, no pool/router mutation.
     built: list[tuple] = []
-    for i, par in enumerate(parents):
-        eid = pool.fresh_id()
-        if i in mutated and noise_std > 0:
-            w = {n: dequantize_fp8_blockwise(par.weights_fp8[n], torch.float32)
-                 for n in _EXPERT_WEIGHTS}
-            for n in w:
-                noise = torch.empty_like(w[n])
-                noise.normal_(0.0, noise_std, generator=gen)
-                w[n] += noise
-            rec = make_expert(eid, d_model, expert_hidden, weights=w, birth_step=step,
-                              parents=[par.expert_id], source="clone-mutated",
-                              fp8_tile=fp8_tile)
-        else:
-            rec = ExpertRecord(
-                expert_id=eid,
-                d_model=d_model,
-                expert_hidden=expert_hidden,
-                weights_fp8={n: FP8BlockTensor(
-                    codes=par.weights_fp8[n].codes.clone(),
-                    scales=par.weights_fp8[n].scales.clone(),
-                    shape=par.weights_fp8[n].shape,
-                    tile=par.weights_fp8[n].tile,
-                ) for n in _EXPERT_WEIGHTS},
-                birth_step=step,
-                parents=[par.expert_id],
-                source="clone",
-            )
-            rec.optim_state = init_expert_optim_state(rec)
-        with torch.no_grad():
-            parent_row = router.proj.weight[pool.index_of(par.expert_id)].detach().clone()
-        built.append((rec, parent_row))
-    # Phase 2 (commit): infallible given phase-1 validation; pool and router
-    # move in lockstep so they cannot diverge mid-sweep.
+    try:
+        for i, par in enumerate(parents):
+            eid = pool.fresh_id()
+            if i in mutated and noise_std > 0:
+                w = {n: dequantize_fp8_blockwise(par.weights_fp8[n], torch.float32)
+                     for n in _EXPERT_WEIGHTS}
+                for n in w:
+                    noise = torch.empty_like(w[n])
+                    noise.normal_(0.0, noise_std, generator=gen)
+                    w[n] += noise
+                rec = make_expert(eid, d_model, expert_hidden, weights=w, birth_step=step,
+                                  parents=[par.expert_id], source="clone-mutated",
+                                  fp8_tile=fp8_tile)
+            else:
+                rec = ExpertRecord(
+                    expert_id=eid,
+                    d_model=d_model,
+                    expert_hidden=expert_hidden,
+                    weights_fp8={n: FP8BlockTensor(
+                        codes=par.weights_fp8[n].codes.clone(),
+                        scales=par.weights_fp8[n].scales.clone(),
+                        shape=par.weights_fp8[n].shape,
+                        tile=par.weights_fp8[n].tile,
+                    ) for n in _EXPERT_WEIGHTS},
+                    birth_step=step,
+                    parents=[par.expert_id],
+                    source="clone",
+                )
+                rec.optim_state = init_expert_optim_state(rec)
+            with torch.no_grad():
+                parent_row = router.proj.weight[pool.index_of(par.expert_id)].detach().clone()
+            built.append((rec, parent_row))
+    except Exception:
+        # Build touched only the ID cursor (fresh_id per iteration); pool,
+        # router, and optimizer state are still pristine.
+        pool._next_id = next_before
+        raise
+    # Phase 2 (commit): pool and router move in lockstep; any failure
+    # rolls back the prefix so the prior topology returns exactly.
     new_ids: list[str] = []
-    for rec, parent_row in built:
-        pool.add(rec)
-        router.add_expert_row(init=parent_row)
-        new_ids.append(rec.expert_id)
-    if optim_state is not None and new_ids:
-        _pad_state_rows(optim_state, len(new_ids))
+    try:
+        for rec, parent_row in built:
+            pool.add(rec)
+            router.add_expert_row(init=parent_row)
+            new_ids.append(rec.expert_id)
+        if optim_state is not None and new_ids:
+            _pad_state_rows(optim_state, len(new_ids))
+    except Exception:
+        # Exact rollback: committed prefix out, router topology restored,
+        # ID cursor restored. _pad is two-phase so optim_state is untouched
+        # on pad-build failure (pad is last, so no partial optim prefix).
+        try:
+            _restore_router(router, router_snap)
+            for eid in reversed(new_ids):
+                try:
+                    pool.remove(eid)
+                except KeyError:
+                    pass
+        finally:
+            pool._next_id = next_before
+        raise
     return new_ids
