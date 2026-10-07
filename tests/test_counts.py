@@ -3,6 +3,7 @@
 import sys, os, json, subprocess
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import pytest
 import torch
 from config import SmaulBrainConfig
 from growth import grow_expert
@@ -76,4 +77,61 @@ def test_stored_bytes_track_growth_and_undercut_logical():
     grow_expert(m.pool, m.router, 32, 64, step=1, seed=0)
     after = m.param_counts()
     assert after["stored_expert_bytes"] > before["stored_expert_bytes"]
+    m.pager.close()
+
+
+def test_config_roundtrip_exact():
+    cfg = SmaulBrainConfig(d_model=32, n_heads=4, num_experts=4, top_k=2,
+                           expert_hidden=64, max_depth=1)
+    d = cfg.to_dict()
+    assert SmaulBrainConfig.from_dict(d).to_dict() == d
+    # Storage stamps schema_version alongside the config; loading must
+    # tolerate it without changing the round-trip.
+    stamped = dict(d, schema_version="0.1.0")
+    assert SmaulBrainConfig.from_dict(stamped).to_dict() == d
+
+
+def test_config_omitted_vs_explicit_null():
+    assert SmaulBrainConfig.from_dict({}).d_model == SmaulBrainConfig().d_model
+    with pytest.raises(ValueError):
+        SmaulBrainConfig.from_dict({"d_model": None})
+
+
+def test_config_unknown_fields_tolerated():
+    cfg = SmaulBrainConfig(d_model=32, n_heads=4, num_experts=4, top_k=2,
+                           expert_hidden=64, max_depth=1)
+    d = dict(cfg.to_dict(), future_knob=123, schema_version="0.1.0")
+    got = SmaulBrainConfig.from_dict(d)
+    assert got.to_dict() == cfg.to_dict()
+    assert "future_knob" not in got.to_dict()
+
+
+def test_config_rejects_active_topk_mismatch():
+    cfg = SmaulBrainConfig(d_model=32, n_heads=4, num_experts=4, top_k=2,
+                           expert_hidden=64, max_depth=1)
+    d = dict(cfg.to_dict(), active_experts=99)
+    assert d["top_k"] == 2
+    with pytest.raises(ValueError):
+        SmaulBrainConfig.from_dict(d)
+
+
+def test_config_rejects_impossible_min_experts():
+    # min_experts < top_k must raise instead of being silently clamped.
+    with pytest.raises(AssertionError):
+        SmaulBrainConfig.from_dict(
+            {"num_experts": 8, "top_k": 4, "min_experts": 2})
+
+
+def test_config_counts_match_live_model():
+    m = _model()
+    dc = m.cfg.describe_counts()
+    c = m.param_counts()
+    assert dc["total_params"] == dc["shared_params"] + dc["router_params"] + dc["expert_params_total"]
+    assert dc["logical_params"] == dc["total_params"] == dc["unique_params"]
+    assert dc["resident_ram_params"] is None  # resident needs a live model
+    assert dc["stored_expert_bytes"] is None  # on-disk needs a live model
+    for k in ("shared_params", "router_params", "per_expert_params",
+              "expert_count", "expert_params_total", "total_params",
+              "active_params"):
+        assert dc[k] == c[k]
     m.pager.close()
