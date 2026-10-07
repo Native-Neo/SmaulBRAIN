@@ -144,3 +144,63 @@ def test_train_step_invalidates_only_stepped_experts():
         else:
             assert eid in m.pager.ram  # untouched: cache hums along
     m.pager.close()
+
+
+def _stress_provider(mode):
+    import random
+    import threading
+    pool = _pool()
+    pg = ExpertPager(pool, mode=mode, load_from_disk=_counting(pool))
+    ref = {}
+    for eid in pool.order:
+        ref[eid] = {k: v.clone() for k, v in pg.provider(eid).items()}
+    pg.ram.clear(); pg.vram.clear(); pg.ram_records.clear()
+    rng = random.Random(0)
+    plans = [[pool.order[rng.randrange(len(pool))] for _ in range(20)] for _ in range(8)]
+    barrier = threading.Barrier(len(plans) + 1)
+    errors: list = []
+
+    def worker(p):
+        try:
+            barrier.wait(timeout=30)
+            for eid in p:
+                got = pg.provider(eid)
+                for k in got:
+                    assert torch.equal(got[k], ref[eid][k])
+        except Exception as e:  # noqa: BLE001 - collected, then asserted
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(p,)) for p in plans]
+    for t in threads:
+        t.start()
+    barrier.wait(timeout=30)
+    for t in threads:
+        t.join(timeout=60)
+    assert not errors
+    assert all(not t.is_alive() for t in threads)
+    pg.close()
+
+
+def test_concurrent_providers_match_sequential():
+    _stress_provider("D2R")
+    _stress_provider("R2VR")
+
+
+def test_concurrent_duplicate_prefetch_collapses():
+    import threading
+    pool = _pool()
+    pg = ExpertPager(pool, mode="D2R", load_from_disk=_counting(pool))
+    barrier = threading.Barrier(4)
+
+    def storm():
+        barrier.wait(timeout=30)
+        pg.prefetch([pool.order[0], pool.order[1], pool.order[0]])
+
+    threads = [threading.Thread(target=storm) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert pg.stats.prefetch_submitted == 2  # collapsed despite the race
+    pg.await_prefetch()
+    pg.close()
