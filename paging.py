@@ -73,10 +73,14 @@ class ExpertPager:
         self.vram: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
         self.ram_records: OrderedDict = OrderedDict()  # R2VR staging area
         self.stats = PagingStats()
-        self._lock = threading.Lock()  # prefetch thread vs mutating main thread
-        self._exec = ThreadPoolExecutor(max_workers=1)
+        self._lock = threading.Lock()  # protects cache dicts, stats, and metadata
+        self._exec = ThreadPoolExecutor(max_workers=4)
         self._pending: dict[str, Future] = {}
         self._prefetched: set[str] = set()
+        self._forgotten: set[str] = set()
+        self._versions: dict[str, int] = {}
+        self._in_flight: dict[str, threading.Event] = {}
+        self._closed: bool = False
         self._tls = threading.local()  # marks the prefetch worker thread
 
     # -- device handling --
@@ -90,13 +94,28 @@ class ExpertPager:
         dev = self.vram_device
         return {k: (v.to(dev) if v.device != dev else v) for k, v in w.items()}
 
+    # -- version tracking --
+    def _get_version(self, expert_id: str) -> int:
+        try:
+            rec_ver = getattr(self.pool.experts.get(expert_id), "version", 0) or 0
+        except Exception:
+            rec_ver = 0
+        return rec_ver + self._versions.get(expert_id, 0)
+
     # -- disk --
     def _read_disk(self, expert_id: str):
-        """Authoritative disk read. Counts once per physical read."""
-        self.stats.disk_reads += 1
+        """Authoritative disk read. Counts once per physical read. Runs without global lock."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("pager is closed")
+            if expert_id in self._forgotten:
+                raise KeyError(f"expert {expert_id!r} was pruned")
+            self.stats.disk_reads += 1
         if self.load_from_disk is not None:
-            return self.load_from_disk(expert_id)
-        return self.pool.experts[expert_id]
+            rec = self.load_from_disk(expert_id)
+        else:
+            rec = self.pool.experts[expert_id]
+        return rec
 
     # -- public API --
     def provider(self, expert_id: str) -> dict[str, torch.Tensor]:
@@ -108,21 +127,146 @@ class ExpertPager:
         prefetch worker itself bypasses the join (thread-local flag) —
         joining your own future would deadlock.
         """
-        if not getattr(self._tls, "prefetching", False):
+        while True:
+            # 1. Join in-flight prefetch if present (outside global lock)
+            if not getattr(self._tls, "prefetching", False):
+                with self._lock:
+                    fut = self._pending.pop(expert_id, None)
+                if fut is not None:
+                    try:
+                        fut.result()
+                    except Exception:
+                        with self._lock:
+                            self._prefetched.discard(expert_id)
+                        raise
+                    finally:
+                        with self._lock:
+                            self._prefetched.discard(expert_id)
+
+            # 2. Check cache hit under lock
             with self._lock:
-                fut = self._pending.pop(expert_id, None)
-            if fut is not None:
-                try:
-                    fut.result()
-                finally:
-                    with self._lock:
-                        self._prefetched.discard(expert_id)
-        with self._lock:
+                if self._closed:
+                    raise RuntimeError("pager is closed")
+                if expert_id in self._forgotten:
+                    raise KeyError(f"expert {expert_id!r} was pruned")
+
+                if self.mode == "D2R" and expert_id in self.ram:
+                    self.stats.ram_hits += 1
+                    self.ram.move_to_end(expert_id)
+                    return self.ram[expert_id]
+                elif self.mode in ("R2VR", "D2VR") and expert_id in self.vram:
+                    self.stats.vram_hits += 1
+                    self.vram.move_to_end(expert_id)
+                    return self.vram[expert_id]
+
+                # If another consumer thread is already loading this expert, wait for it
+                if not getattr(self._tls, "prefetching", False) and expert_id in self._in_flight:
+                    event = self._in_flight[expert_id]
+                else:
+                    event = None
+                    if not getattr(self._tls, "prefetching", False):
+                        self._in_flight[expert_id] = threading.Event()
+                    break
+
+            if event is not None:
+                event.wait()
+
+        # 3. Perform load/dequantization without holding global lock
+        evt_to_set = self._in_flight.get(expert_id) if not getattr(self._tls, "prefetching", False) else None
+        try:
+            ver_before = self._get_version(expert_id)
             if self.mode == "D2R":
-                return self._get_d2r(expert_id)
-            if self.mode == "R2VR":
-                return self._get_r2vr(expert_id)
-            return self._get_d2vr(expert_id)
+                w = self._load_d2r(expert_id, ver_before)
+            elif self.mode == "R2VR":
+                w = self._load_r2vr(expert_id, ver_before)
+            else:
+                w = self._load_d2vr(expert_id, ver_before)
+            return w
+        finally:
+            if evt_to_set is not None:
+                with self._lock:
+                    self._in_flight.pop(expert_id, None)
+                evt_to_set.set()
+
+    def _load_d2r(self, expert_id: str, ver_before: int) -> dict[str, torch.Tensor]:
+        rec = self._read_disk(expert_id)
+        w = {k: v.to(self.compute_dtype) for k, v in rec.dequantize(torch.float32).items()}
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("pager is closed")
+            if expert_id in self._forgotten or expert_id not in self.pool.experts:
+                raise KeyError(f"expert {expert_id!r} was pruned")
+            if self._get_version(expert_id) != ver_before:
+                rec = self.pool.experts[expert_id]
+                w = {k: v.to(self.compute_dtype) for k, v in rec.dequantize(torch.float32).items()}
+            if expert_id in self.ram:
+                return self.ram[expert_id]
+            self.ram[expert_id] = w
+            while len(self.ram) > self.ram_cache:
+                self.ram.popitem(last=False)
+                self.stats.ram_evictions += 1
+            assert len(self.vram) == 0, "D2R path must never populate VRAM"
+            return w
+
+    def _load_r2vr(self, expert_id: str, ver_before: int) -> dict[str, torch.Tensor]:
+        with self._lock:
+            in_staged = expert_id in self.ram_records
+        if not in_staged:
+            rec = self._read_disk(expert_id)
+            with self._lock:
+                if expert_id not in self._forgotten:
+                    self.stats.ram_loads += 1
+                    self.ram_records[expert_id] = rec
+                    self.ram_records.move_to_end(expert_id)
+                    while len(self.ram_records) > self.max_staged:
+                        self.ram_records.popitem(last=False)
+        with self._lock:
+            if expert_id in self._forgotten or expert_id not in self.ram_records:
+                raise KeyError(f"expert {expert_id!r} was pruned")
+            self.ram_records.move_to_end(expert_id)
+            rec = self.ram_records[expert_id]
+
+        w = self._to_vram({k: v.to(self.compute_dtype)
+                           for k, v in rec.dequantize(torch.float32).items()})
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("pager is closed")
+            if expert_id in self._forgotten or expert_id not in self.pool.experts:
+                raise KeyError(f"expert {expert_id!r} was pruned")
+            if self._get_version(expert_id) != ver_before:
+                rec = self.pool.experts[expert_id]
+                w = self._to_vram({k: v.to(self.compute_dtype)
+                                   for k, v in rec.dequantize(torch.float32).items()})
+            if expert_id in self.vram:
+                return self.vram[expert_id]
+            self.vram[expert_id] = w
+            self.stats.vram_loads += 1
+            while len(self.vram) > self.vram_cache:
+                self.vram.popitem(last=False)
+                self.stats.vram_evictions += 1
+            return w
+
+    def _load_d2vr(self, expert_id: str, ver_before: int) -> dict[str, torch.Tensor]:
+        rec = self._read_disk(expert_id)
+        w = self._to_vram({k: v.to(self.compute_dtype)
+                           for k, v in rec.dequantize(torch.float32).items()})
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("pager is closed")
+            if expert_id in self._forgotten or expert_id not in self.pool.experts:
+                raise KeyError(f"expert {expert_id!r} was pruned")
+            if self._get_version(expert_id) != ver_before:
+                rec = self.pool.experts[expert_id]
+                w = self._to_vram({k: v.to(self.compute_dtype)
+                                   for k, v in rec.dequantize(torch.float32).items()})
+            if expert_id in self.vram:
+                return self.vram[expert_id]
+            self.vram[expert_id] = w
+            self.stats.vram_loads += 1
+            while len(self.vram) > self.vram_cache:
+                self.vram.popitem(last=False)
+                self.stats.vram_evictions += 1
+            return w
 
     def invalidate(self, expert_id: str) -> None:
         """Drop cached compute weights after an optimizer rewrite.
@@ -131,9 +275,13 @@ class ExpertPager:
         place by the optimizer) instead of re-reading a stale disk file.
         """
         with self._lock:
+            self._versions[expert_id] = self._versions.get(expert_id, 0) + 1
+            if expert_id in self.pool.experts:
+                rec = self.pool.experts[expert_id]
+                rec.version = getattr(rec, "version", 0) + 1
             self.ram.pop(expert_id, None)
             self.vram.pop(expert_id, None)
-            if expert_id in self.ram_records:
+            if expert_id in self.ram_records and expert_id in self.pool.experts:
                 self.ram_records[expert_id] = self.pool.experts[expert_id]
 
     def forget(self, expert_id: str) -> None:
@@ -144,11 +292,11 @@ class ExpertPager:
         exists in the pool.
         """
         with self._lock:
+            self._forgotten.add(expert_id)
+            self._versions[expert_id] = self._versions.get(expert_id, 0) + 1
             self.ram.pop(expert_id, None)
             self.vram.pop(expert_id, None)
             self.ram_records.pop(expert_id, None)
-            # In-flight background loads must not resurrect the pruned
-            # expert: drop (and cancel where still queued) its prefetch.
             fut = self._pending.pop(expert_id, None)
             if fut is not None:
                 try:
@@ -157,121 +305,109 @@ class ExpertPager:
                     pass
             self._prefetched.discard(expert_id)
 
-    # -- D2R: disk -> RAM --
-    def _get_d2r(self, expert_id: str) -> dict[str, torch.Tensor]:
-        if expert_id in self.ram:
-            self.stats.ram_hits += 1
-            self.ram.move_to_end(expert_id)
-            return self.ram[expert_id]
-        rec = self._read_disk(expert_id)
-        w = {k: v.to(self.compute_dtype) for k, v in rec.dequantize(torch.float32).items()}
-        self.ram[expert_id] = w
-        while len(self.ram) > self.ram_cache:
-            self.ram.popitem(last=False)
-            self.stats.ram_evictions += 1
-        assert len(self.vram) == 0, "D2R path must never populate VRAM"
-        return w
-
     def _stage(self, expert_id: str):
         """Disk -> RAM staging with LRU bound; evicted records re-read later."""
         rec = self._read_disk(expert_id)
-        self.stats.ram_loads += 1
-        self.ram_records[expert_id] = rec
-        self.ram_records.move_to_end(expert_id)
-        while len(self.ram_records) > self.max_staged:
-            self.ram_records.popitem(last=False)
+        with self._lock:
+            if expert_id not in self._forgotten:
+                self.stats.ram_loads += 1
+                self.ram_records[expert_id] = rec
+                self.ram_records.move_to_end(expert_id)
+                while len(self.ram_records) > self.max_staged:
+                    self.ram_records.popitem(last=False)
 
     # -- R2VR: RAM -> VRAM (disk only via warm_ram) --
     def warm_ram(self) -> None:
-        """Bulk-stage expert records from disk into RAM at startup.
-
-        Later misses stage on demand through the same disk -> RAM path;
-        VRAM is only ever fed from staged RAM records, never from disk.
-        Staging never exceeds max_staged entries (LRU); evicted records
-        are re-read from disk on their next miss.
-        """
-        for eid in self.pool.order:
+        """Bulk-stage expert records from disk into RAM at startup."""
+        for eid in list(self.pool.order):
             self._stage(eid)
-
-    def _get_r2vr(self, expert_id: str) -> dict[str, torch.Tensor]:
-        if expert_id in self.vram:
-            self.stats.vram_hits += 1
-            self.vram.move_to_end(expert_id)
-            return self.vram[expert_id]
-        if expert_id not in self.ram_records:
-            # On-demand staging disk -> RAM (supports post-growth experts).
-            # The RAM stage is never skipped: VRAM is only ever fed from RAM.
-            self._stage(expert_id)
-        else:
-            self.ram_records.move_to_end(expert_id)
-        rec = self.ram_records[expert_id]  # RAM-staged record, no disk IO below
-        w = self._to_vram({k: v.to(self.compute_dtype)
-                           for k, v in rec.dequantize(torch.float32).items()})
-        self.vram[expert_id] = w
-        self.stats.vram_loads += 1
-        while len(self.vram) > self.vram_cache:
-            self.vram.popitem(last=False)
-            self.stats.vram_evictions += 1
-        return w
-
-    # -- D2VR: disk -> VRAM, bypassing RAM --
-    def _get_d2vr(self, expert_id: str) -> dict[str, torch.Tensor]:
-        if expert_id in self.vram:
-            self.stats.vram_hits += 1
-            self.vram.move_to_end(expert_id)
-            return self.vram[expert_id]
-        rec = self._read_disk(expert_id)
-        w = self._to_vram({k: v.to(self.compute_dtype)
-                           for k, v in rec.dequantize(torch.float32).items()})
-        self.vram[expert_id] = w
-        self.stats.vram_loads += 1
-        while len(self.vram) > self.vram_cache:
-            self.vram.popitem(last=False)
-            self.stats.vram_evictions += 1
-        return w
 
     # -- async prefetch --
     def prefetch(self, expert_ids: list[str]) -> None:
-        """Begin loading predicted experts in the background."""
-        for eid in expert_ids:
-            if eid in self.ram or eid in self.vram or eid in self._pending:
-                continue
-            self.stats.prefetch_submitted += 1
-            self._pending[eid] = self._exec.submit(self._prefetch_one, eid)
+        """Begin loading predicted experts in the background. Collapses duplicates."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("pager is closed")
+            unique_ids = []
+            seen = set()
+            for eid in expert_ids:
+                if eid not in seen:
+                    seen.add(eid)
+                    unique_ids.append(eid)
 
-    def _prefetch_one(self, expert_id: str) -> None:
+            for eid in unique_ids:
+                if eid in self._forgotten:
+                    continue
+                if eid in self.ram or eid in self.vram:
+                    continue
+                if eid in self._pending:
+                    continue  # already in flight: collapsed!
+                expected_ver = self._get_version(eid)
+                self.stats.prefetch_submitted += 1
+                self._pending[eid] = self._exec.submit(self._prefetch_one, eid, expected_ver)
+
+    def _prefetch_one(self, expert_id: str, expected_version: int) -> None:
         self._tls.prefetching = True
         try:
+            with self._lock:
+                if self._closed or expert_id in self._forgotten or expert_id not in self.pool.experts:
+                    return
             try:
                 w = self.provider(expert_id)
             except KeyError:
-                # Pruned mid-flight: the expert is gone from the pool, so there
-                # is nothing to stage. A KeyError for a live expert is a real
-                # bug and must still surface via the future.
-                if expert_id in self.pool.experts:
-                    raise
+                with self._lock:
+                    if expert_id in self.pool.experts and expert_id not in self._forgotten:
+                        raise
                 return
+
+            with self._lock:
+                current_ver = self._get_version(expert_id)
+                if self._closed or expert_id in self._forgotten or current_ver != expected_version:
+                    self.ram.pop(expert_id, None)
+                    self.vram.pop(expert_id, None)
+                    self.ram_records.pop(expert_id, None)
+                    return
+                self._prefetched.add(expert_id)
+            _ = w
         finally:
             self._tls.prefetching = False
-        self._prefetched.add(expert_id)
-        _ = w
 
     def await_prefetch(self, timeout: float | None = None) -> None:
-        for eid, fut in list(self._pending.items()):
-            fut.result(timeout=timeout)
-            if eid in self._prefetched:
-                self.stats.prefetch_hits += 1
-            del self._pending[eid]
-        self._prefetched.clear()
+        with self._lock:
+            items = list(self._pending.items())
+        errors = []
+        for eid, fut in items:
+            try:
+                fut.result(timeout=timeout)
+                with self._lock:
+                    if eid in self._prefetched:
+                        self.stats.prefetch_hits += 1
+            except Exception as e:
+                errors.append((eid, e))
+            finally:
+                with self._lock:
+                    self._pending.pop(eid, None)
+                    self._prefetched.discard(eid)
+        if errors:
+            raise errors[0][1]
 
     def resident_counts(self) -> dict:
-        return {"ram": len(self.ram), "vram": len(self.vram),
-                "ram_staged": len(self.ram_records)}
+        with self._lock:
+            for d in (self.ram, self.vram, self.ram_records):
+                stale = [eid for eid in d if eid in self._forgotten or eid not in self.pool.experts]
+                for eid in stale:
+                    d.pop(eid, None)
+            return {
+                "ram": len(self.ram),
+                "vram": len(self.vram),
+                "ram_staged": len(self.ram_records),
+            }
 
     def close(self) -> None:
-        # Cancel queued (not yet running) prefetches first so shutdown does
-        # not execute dead work; running ones finish, then the pool dies.
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             pending = list(self._pending.values())
             self._pending.clear()
             self._prefetched.clear()
