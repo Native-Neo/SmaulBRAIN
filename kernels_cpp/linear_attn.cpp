@@ -16,6 +16,11 @@ extern "C" void smaul_linear_attn_step_buf(
     float* S, float* z,           // [Dh,Dh] row-major accumulator, [Dh] normalizer (in/out)
     const float* q, const float* k, const float* v,
     float* y, float* scratch, std::size_t Dh, float eps) {
+  // Safety: never fault on bad pointers/sizes (Python validates first).
+  // Baseline x86-64 only: no AVX/intrinsics, safe on Ivy Bridge and later.
+  if (!S || !z || !q || !k || !v || !y || !scratch) return;
+  if (Dh == 0) return;
+  if (!(eps >= 0.0f) || !std::isfinite(eps)) return;
   float* qf = scratch;
   float* kf = scratch + Dh;
   float nrm = 0.0f;
