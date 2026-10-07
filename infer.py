@@ -24,18 +24,23 @@ def _check_ids(ids: list[int], vocab_size: int, what: str) -> None:
         )
 
 
-def _check_sampler(temperature: float, top_p: float) -> None:
+def _check_sampler(temperature: float, top_k: int = 0, top_p: float = 1.0) -> None:
     import math
-    if not math.isfinite(temperature):
-        raise ValueError(f"temperature must be finite, got {temperature!r}")
-    if not (isinstance(top_p, (int, float)) and 0.0 < top_p <= 1.0):
+    if (isinstance(temperature, bool) or not isinstance(temperature, (int, float))
+            or not math.isfinite(temperature) or temperature < 0):
+        raise ValueError(f"temperature must be a finite number >= 0, got {temperature!r}")
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 0:
+        raise ValueError(f"top_k must be a non-negative int, got {top_k!r}")
+    if (isinstance(top_p, bool) or not isinstance(top_p, (int, float))
+            or not 0.0 < top_p <= 1.0
+            or (isinstance(top_p, float) and not math.isfinite(top_p))):
         raise ValueError(f"top_p must be in (0, 1], got {top_p!r}")
 
 
 def sample_next(logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0,
                 top_p: float = 1.0, generator: torch.Generator | None = None) -> int:
     """Sample one id from last-position logits [V]."""
-    _check_sampler(temperature, top_p)
+    _check_sampler(temperature, top_k, top_p)
     l = logits.float()
     if temperature <= 0:
         return int(l.argmax().item())
@@ -86,6 +91,7 @@ def generate(
     ctx = model.cfg.context_length if context is None else int(context)
     if ctx <= 0:
         raise ValueError(f"context must be positive, got {context!r}")
+    _check_sampler(temperature, top_k, top_p)
     gen = torch.Generator().manual_seed(seed)
     ids = list(prompt_ids) or [DEFAULT_PROMPT_ID]
     _check_ids(ids, model.cfg.vocab_size, "prompt_ids")
