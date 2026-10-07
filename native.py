@@ -33,8 +33,12 @@ code only when it is provably safe, and says so out loud otherwise:
     and run with no Python callbacks (ctypes releases the GIL during the
     call); outputs are fresh tensors owned by Python, and grad-tracked
     float-reordering inputs fall back so autograd is never silently cut.
-  * ``SMAUL_NATIVE`` controls dispatch: ``auto`` (default), ``1``/``force``
-    (raise if native is unavailable), ``0``/``off`` (reference paths only).
+  * ``SMAUL_NATIVE`` controls dispatch: ``auto`` (default),
+    ``1``/``force``/``on``/``true`` (raise if native is unavailable),
+    ``0``/``off``/``false`` (reference paths only). Forced infrastructure
+    failures (unsupported host, failed build, kernel exception) record a
+    fallback count/reason and then raise; per-call inapplicability (shapes,
+    dtypes, autograd, non-finite) falls back even when forced.
   * Every call site records native vs fallback counts plus the last fallback
     reason in ``COUNTERS``/``LAST_FALLBACK`` — dispatch is observable, and a
     broken native path degrades loudly instead of hiding.
@@ -190,9 +194,9 @@ def host_supports_baseline() -> bool:
 
 def native_mode() -> str:
     v = os.environ.get(ENV_VAR, "auto").strip().lower()
-    if v in ("1", "force", "on"):
+    if v in ("1", "force", "on", "true", "yes", "enable", "enabled"):
         return "force"
-    if v in ("0", "off", "no", "disable"):
+    if v in ("0", "off", "no", "disable", "disabled", "false"):
         return "off"
     return "auto"
 
@@ -479,14 +483,15 @@ def _want_native(op: str) -> bool:
     if not host_supports_baseline():
         reason = ("host CPU lacks %s (capability=%s)"
                   % (REQUIRED_ISA, cpu_capability()))
+        _note(op, False, reason)
         if mode == "force":
             raise RuntimeError(f"native {op} forced but unsupported: {reason}")
-        _note(op, False, reason)
         return False
     if not ensure_native():
+        reason = _build_failed or "build failed"
+        _note(op, False, reason)
         if mode == "force":
-            raise RuntimeError(f"native {op} forced but unavailable: {_build_failed}")
-        _note(op, False, _build_failed or "build failed")
+            raise RuntimeError(f"native {op} forced but unavailable: {reason}")
         return False
     return True
 
@@ -551,10 +556,12 @@ def call_rmsnorm(x_2d: torch.Tensor, w_1d: torch.Tensor, eps: float) -> torch.Te
             _ptr(y, ctypes.c_float),
             rows, cols, e,
         )
-        COUNTERS["rmsnorm_native"] += 1
+        _note("rmsnorm", True)
         return y
     except Exception as e:  # noqa: BLE001 - fall back loudly, never crash
         _note("rmsnorm", False, f"{type(e).__name__}: {e}")
+        if native_mode() == "force":
+            raise
         return None
 
 
@@ -609,10 +616,12 @@ def call_attn_step(
             _ptr(y, ctypes.c_float), _ptr(scratch, ctypes.c_float),
             Dh, e,
         )
-        COUNTERS["attn_step_native"] += 1
+        _note("attn_step", True)
         return True
     except Exception as e:  # noqa: BLE001
         _note("attn_step", False, f"{type(e).__name__}: {e}")
+        if native_mode() == "force":
+            raise
         return False
 
 
@@ -668,10 +677,12 @@ def call_fp8_quant(
             _ptr(scales, ctypes.c_float),
             S(rows), S(cols), S(tile),
         )
-        COUNTERS["fp8_quant_native"] += 1
+        _note("fp8_quant", True)
         return True
     except Exception as e:  # noqa: BLE001
         _note("fp8_quant", False, f"{type(e).__name__}: {e}")
+        if native_mode() == "force":
+            raise
         return False
 
 
@@ -720,8 +731,10 @@ def call_fp8_dequant(
             _ptr(out, ctypes.c_float),
             S(rows), S(cols), S(tile),
         )
-        COUNTERS["fp8_dequant_native"] += 1
+        _note("fp8_dequant", True)
         return True
     except Exception as e:  # noqa: BLE001
         _note("fp8_dequant", False, f"{type(e).__name__}: {e}")
+        if native_mode() == "force":
+            raise
         return False
