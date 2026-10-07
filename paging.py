@@ -80,6 +80,13 @@ class ExpertPager:
         self._forgotten: set[str] = set()
         self._versions: dict[str, int] = {}
         self._in_flight: dict[str, threading.Event] = {}
+        # Version+identity tags for cached compute weights and staged records.
+        # Each tag is (version, id(record)) captured at insertion; hits validate
+        # against the live pool so replaced/updated experts can never be served
+        # stale, and stale prefetches only evict entries they actually wrote.
+        self._ram_tag: dict[str, tuple[int, int]] = {}
+        self._vram_tag: dict[str, tuple[int, int]] = {}
+        self._staged_tag: dict[str, tuple[int, int]] = {}
         self._closed: bool = False
         self._tls = threading.local()  # marks the prefetch worker thread
 
@@ -101,6 +108,31 @@ class ExpertPager:
         except Exception:
             rec_ver = 0
         return rec_ver + self._versions.get(expert_id, 0)
+
+    def _live_tag(self, expert_id: str) -> tuple[int, int] | None:
+        """Live (version, identity) for ``expert_id``; None if absent.
+
+        Reads the pool without the pager lock (pool mutation never holds the
+        pager lock, so holding it would not exclude writers anyway). Callers
+        combine this with the pager lock to make check+insert atomic against
+        invalidate/forget/restore, which do hold the pager lock.
+        """
+        try:
+            rec = self.pool.experts.get(expert_id)
+        except Exception:
+            return None
+        if rec is None:
+            return None
+        try:
+            rec_ver = getattr(rec, "version", 0) or 0
+        except Exception:
+            rec_ver = 0
+        return (rec_ver + self._versions.get(expert_id, 0), id(rec))
+
+    def snapshot_stats(self) -> dict:
+        """Thread-safe statistics snapshot (locked copy for contention)."""
+        with self._lock:
+            return self.stats.to_dict()
 
     # -- disk --
     def _read_disk(self, expert_id: str):
@@ -143,7 +175,8 @@ class ExpertPager:
                         with self._lock:
                             self._prefetched.discard(expert_id)
 
-            # 2. Check cache hit under lock
+            # 2. Check cache hit under lock (version+identity validated: a
+            # replaced or concurrently updated expert never serves stale).
             with self._lock:
                 if self._closed:
                     raise RuntimeError("pager is closed")
@@ -151,13 +184,22 @@ class ExpertPager:
                     raise KeyError(f"expert {expert_id!r} was pruned")
 
                 if self.mode == "D2R" and expert_id in self.ram:
-                    self.stats.ram_hits += 1
-                    self.ram.move_to_end(expert_id)
-                    return self.ram[expert_id]
+                    live = self._live_tag(expert_id)
+                    if live is not None and self._ram_tag.get(expert_id) == live:
+                        self.stats.ram_hits += 1
+                        self.ram.move_to_end(expert_id)
+                        return self.ram[expert_id]
+                    # Stale (updated/replaced) entry: drop and reload fresh.
+                    self.ram.pop(expert_id, None)
+                    self._ram_tag.pop(expert_id, None)
                 elif self.mode in ("R2VR", "D2VR") and expert_id in self.vram:
-                    self.stats.vram_hits += 1
-                    self.vram.move_to_end(expert_id)
-                    return self.vram[expert_id]
+                    live = self._live_tag(expert_id)
+                    if live is not None and self._vram_tag.get(expert_id) == live:
+                        self.stats.vram_hits += 1
+                        self.vram.move_to_end(expert_id)
+                        return self.vram[expert_id]
+                    self.vram.pop(expert_id, None)
+                    self._vram_tag.pop(expert_id, None)
 
                 # If another consumer thread is already loading this expert, wait for it
                 if not getattr(self._tls, "prefetching", False) and expert_id in self._in_flight:
@@ -174,13 +216,14 @@ class ExpertPager:
         # 3. Perform load/dequantization without holding global lock
         evt_to_set = self._in_flight.get(expert_id) if not getattr(self._tls, "prefetching", False) else None
         try:
-            ver_before = self._get_version(expert_id)
+            tag_before = self._live_tag(expert_id)
+            ver_before = tag_before[0] if tag_before is not None else self._get_version(expert_id)
             if self.mode == "D2R":
-                w = self._load_d2r(expert_id, ver_before)
+                w = self._load_d2r(expert_id, tag_before)
             elif self.mode == "R2VR":
-                w = self._load_r2vr(expert_id, ver_before)
+                w = self._load_r2vr(expert_id, tag_before)
             else:
-                w = self._load_d2vr(expert_id, ver_before)
+                w = self._load_d2vr(expert_id, tag_before)
             return w
         finally:
             if evt_to_set is not None:
@@ -188,91 +231,203 @@ class ExpertPager:
                     self._in_flight.pop(expert_id, None)
                 evt_to_set.set()
 
-    def _load_d2r(self, expert_id: str, ver_before: int) -> dict[str, torch.Tensor]:
+    def _insert_ram_locked(self, expert_id: str, w: dict, tag: tuple[int, int]) -> dict:
+        """Insert into RAM LRU under lock; return resident entry (fresh wins)."""
+        existing = self._ram_tag.get(expert_id)
+        if expert_id in self.ram and existing == tag:
+            return self.ram[expert_id]
+        # Stale resident (if any) loses to the fresh write.
+        self.ram[expert_id] = w
+        self._ram_tag[expert_id] = tag
+        self.ram.move_to_end(expert_id)
+        while len(self.ram) > self.ram_cache:
+            old, _ = self.ram.popitem(last=False)
+            self._ram_tag.pop(old, None)
+            self.stats.ram_evictions += 1
+        assert len(self.vram) == 0, "D2R path must never populate VRAM"
+        return w
+
+    def _insert_vram_locked(self, expert_id: str, w: dict, tag: tuple[int, int]) -> dict:
+        """Insert into VRAM LRU under lock; return resident entry (fresh wins)."""
+        existing = self._vram_tag.get(expert_id)
+        if expert_id in self.vram and existing == tag:
+            return self.vram[expert_id]
+        # If a fresher entry landed first, keep it instead of overwriting.
+        if expert_id in self.vram and existing is not None and existing != tag:
+            live = self._live_tag(expert_id)
+            if live is not None and existing == live:
+                return self.vram[expert_id]
+        self.vram[expert_id] = w
+        self._vram_tag[expert_id] = tag
+        self.stats.vram_loads += 1
+        while len(self.vram) > self.vram_cache:
+            old, _ = self.vram.popitem(last=False)
+            self._vram_tag.pop(old, None)
+            self.stats.vram_evictions += 1
+        return w
+
+    def _load_d2r(self, expert_id: str, tag_before: tuple[int, int] | None) -> dict[str, torch.Tensor]:
         rec = self._read_disk(expert_id)
         w = {k: v.to(self.compute_dtype) for k, v in rec.dequantize(torch.float32).items()}
+        # Fine-grained: dequantize never holds the global lock. Revalidate the
+        # live tag under lock; a concurrent update/replace bumps version or
+        # identity so stale reads recompute from live instead of surviving.
+        # A stale disk file (lagging a prior update) is also detected: when the
+        # disk snapshot is not the live object and the live tag is dirty, the
+        # live pool is authoritative.
+        for _ in range(8):
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("pager is closed")
+                if expert_id in self._forgotten or expert_id not in self.pool.experts:
+                    raise KeyError(f"expert {expert_id!r} was pruned")
+                cur = self._live_tag(expert_id)
+                if cur is None:
+                    raise KeyError(f"expert {expert_id!r} was pruned")
+                live_rec = self.pool.experts[expert_id]
+                stale_concurrent = (cur != tag_before)
+                stale_file = (live_rec is not rec and cur[0] != 0)
+                if not stale_concurrent and not stale_file:
+                    return self._insert_ram_locked(expert_id, w, cur)
+                refresh_rec = live_rec
+                refresh_tag = cur
+            w = {k: v.to(self.compute_dtype)
+                 for k, v in refresh_rec.dequantize(torch.float32).items()}
+            rec = refresh_rec
+            tag_before = refresh_tag
         with self._lock:
             if self._closed:
                 raise RuntimeError("pager is closed")
             if expert_id in self._forgotten or expert_id not in self.pool.experts:
                 raise KeyError(f"expert {expert_id!r} was pruned")
-            if self._get_version(expert_id) != ver_before:
-                rec = self.pool.experts[expert_id]
-                w = {k: v.to(self.compute_dtype) for k, v in rec.dequantize(torch.float32).items()}
-            if expert_id in self.ram:
-                return self.ram[expert_id]
-            self.ram[expert_id] = w
-            while len(self.ram) > self.ram_cache:
-                self.ram.popitem(last=False)
-                self.stats.ram_evictions += 1
-            assert len(self.vram) == 0, "D2R path must never populate VRAM"
-            return w
+            cur = self._live_tag(expert_id)
+            if cur is None:
+                raise KeyError(f"expert {expert_id!r} was pruned")
+            return self._insert_ram_locked(expert_id, w, cur)
 
-    def _load_r2vr(self, expert_id: str, ver_before: int) -> dict[str, torch.Tensor]:
+    def _load_r2vr(self, expert_id: str, tag_before: tuple[int, int] | None) -> dict[str, torch.Tensor]:
+        # Staging uses the live tag: a staged entry whose tag mismatches live
+        # is refreshed to the live record without a disk read; a stale disk
+        # snapshot never overwrites a fresher staged entry.
         with self._lock:
+            if expert_id in self.ram_records and expert_id in self.pool.experts \
+                    and expert_id not in self._forgotten:
+                live = self._live_tag(expert_id)
+                if live is not None and self._staged_tag.get(expert_id) != live:
+                    self.ram_records[expert_id] = self.pool.experts[expert_id]
+                    self._staged_tag[expert_id] = live
+                    self.ram_records.move_to_end(expert_id)
             in_staged = expert_id in self.ram_records
         if not in_staged:
             rec = self._read_disk(expert_id)
             with self._lock:
-                if expert_id not in self._forgotten:
-                    self.stats.ram_loads += 1
-                    self.ram_records[expert_id] = rec
+                if self._closed:
+                    raise RuntimeError("pager is closed")
+                if expert_id in self._forgotten or expert_id not in self.pool.experts:
+                    raise KeyError(f"expert {expert_id!r} was pruned")
+                if expert_id in self.ram_records:
+                    # Another thread staged fresh first: keep it, drop ours.
+                    pass
+                else:
+                    cur = self._live_tag(expert_id)
+                    live_rec = self.pool.experts[expert_id]
+                    if cur is not None and (cur != tag_before or
+                            (live_rec is not rec and cur[0] != 0)):
+                        # Disk snapshot went stale during the read: stage live.
+                        self.ram_records[expert_id] = live_rec
+                        self._staged_tag[expert_id] = cur
+                    else:
+                        self.stats.ram_loads += 1
+                        self.ram_records[expert_id] = rec
+                        if cur is not None:
+                            self._staged_tag[expert_id] = cur
                     self.ram_records.move_to_end(expert_id)
                     while len(self.ram_records) > self.max_staged:
-                        self.ram_records.popitem(last=False)
+                        old, _ = self.ram_records.popitem(last=False)
+                        self._staged_tag.pop(old, None)
         with self._lock:
             if expert_id in self._forgotten or expert_id not in self.ram_records:
                 raise KeyError(f"expert {expert_id!r} was pruned")
+            # Refresh a staged entry that went stale while we were away.
+            if expert_id in self.pool.experts and expert_id not in self._forgotten:
+                live = self._live_tag(expert_id)
+                if live is not None and self._staged_tag.get(expert_id) != live:
+                    self.ram_records[expert_id] = self.pool.experts[expert_id]
+                    self._staged_tag[expert_id] = live
             self.ram_records.move_to_end(expert_id)
             rec = self.ram_records[expert_id]
+            staged_tag = self._staged_tag.get(expert_id)
 
         w = self._to_vram({k: v.to(self.compute_dtype)
                            for k, v in rec.dequantize(torch.float32).items()})
+        for _ in range(8):
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("pager is closed")
+                if expert_id in self._forgotten or expert_id not in self.pool.experts:
+                    raise KeyError(f"expert {expert_id!r} was pruned")
+                cur = self._live_tag(expert_id)
+                if cur is None:
+                    raise KeyError(f"expert {expert_id!r} was pruned")
+                if cur == tag_before and cur == staged_tag:
+                    return self._insert_vram_locked(expert_id, w, cur)
+                refresh_rec = self.pool.experts[expert_id]
+                refresh_tag = cur
+            w = self._to_vram({k: v.to(self.compute_dtype)
+                               for k, v in refresh_rec.dequantize(torch.float32).items()})
+            tag_before = refresh_tag
+            staged_tag = refresh_tag
         with self._lock:
             if self._closed:
                 raise RuntimeError("pager is closed")
             if expert_id in self._forgotten or expert_id not in self.pool.experts:
                 raise KeyError(f"expert {expert_id!r} was pruned")
-            if self._get_version(expert_id) != ver_before:
-                rec = self.pool.experts[expert_id]
-                w = self._to_vram({k: v.to(self.compute_dtype)
-                                   for k, v in rec.dequantize(torch.float32).items()})
-            if expert_id in self.vram:
-                return self.vram[expert_id]
-            self.vram[expert_id] = w
-            self.stats.vram_loads += 1
-            while len(self.vram) > self.vram_cache:
-                self.vram.popitem(last=False)
-                self.stats.vram_evictions += 1
-            return w
+            cur = self._live_tag(expert_id)
+            if cur is None:
+                raise KeyError(f"expert {expert_id!r} was pruned")
+            return self._insert_vram_locked(expert_id, w, cur)
 
-    def _load_d2vr(self, expert_id: str, ver_before: int) -> dict[str, torch.Tensor]:
+    def _load_d2vr(self, expert_id: str, tag_before: tuple[int, int] | None) -> dict[str, torch.Tensor]:
         rec = self._read_disk(expert_id)
         w = self._to_vram({k: v.to(self.compute_dtype)
                            for k, v in rec.dequantize(torch.float32).items()})
+        for _ in range(8):
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("pager is closed")
+                if expert_id in self._forgotten or expert_id not in self.pool.experts:
+                    raise KeyError(f"expert {expert_id!r} was pruned")
+                cur = self._live_tag(expert_id)
+                if cur is None:
+                    raise KeyError(f"expert {expert_id!r} was pruned")
+                live_rec = self.pool.experts[expert_id]
+                stale_concurrent = (cur != tag_before)
+                stale_file = (live_rec is not rec and cur[0] != 0)
+                if not stale_concurrent and not stale_file:
+                    return self._insert_vram_locked(expert_id, w, cur)
+                refresh_rec = live_rec
+                refresh_tag = cur
+            w = self._to_vram({k: v.to(self.compute_dtype)
+                               for k, v in refresh_rec.dequantize(torch.float32).items()})
+            rec = refresh_rec
+            tag_before = refresh_tag
         with self._lock:
             if self._closed:
                 raise RuntimeError("pager is closed")
             if expert_id in self._forgotten or expert_id not in self.pool.experts:
                 raise KeyError(f"expert {expert_id!r} was pruned")
-            if self._get_version(expert_id) != ver_before:
-                rec = self.pool.experts[expert_id]
-                w = self._to_vram({k: v.to(self.compute_dtype)
-                                   for k, v in rec.dequantize(torch.float32).items()})
-            if expert_id in self.vram:
-                return self.vram[expert_id]
-            self.vram[expert_id] = w
-            self.stats.vram_loads += 1
-            while len(self.vram) > self.vram_cache:
-                self.vram.popitem(last=False)
-                self.stats.vram_evictions += 1
-            return w
+            cur = self._live_tag(expert_id)
+            if cur is None:
+                raise KeyError(f"expert {expert_id!r} was pruned")
+            return self._insert_vram_locked(expert_id, w, cur)
 
     def invalidate(self, expert_id: str) -> None:
         """Drop cached compute weights after an optimizer rewrite.
 
         The RAM stage keeps pointing at the pool's live record (updated in
         place by the optimizer) instead of re-reading a stale disk file.
+        A previously prefetched flag for this expert is discarded: the cached
+        bytes it counted are gone, so a later await must not count a ghost hit.
         """
         with self._lock:
             self._versions[expert_id] = self._versions.get(expert_id, 0) + 1
@@ -280,9 +435,15 @@ class ExpertPager:
                 rec = self.pool.experts[expert_id]
                 rec.version = getattr(rec, "version", 0) + 1
             self.ram.pop(expert_id, None)
+            self._ram_tag.pop(expert_id, None)
             self.vram.pop(expert_id, None)
+            self._vram_tag.pop(expert_id, None)
+            self._prefetched.discard(expert_id)
             if expert_id in self.ram_records and expert_id in self.pool.experts:
                 self.ram_records[expert_id] = self.pool.experts[expert_id]
+                live = self._live_tag(expert_id)
+                if live is not None:
+                    self._staged_tag[expert_id] = live
 
     def forget(self, expert_id: str) -> None:
         """Drop every cached/staged trace of a pruned expert.
@@ -295,8 +456,11 @@ class ExpertPager:
             self._forgotten.add(expert_id)
             self._versions[expert_id] = self._versions.get(expert_id, 0) + 1
             self.ram.pop(expert_id, None)
+            self._ram_tag.pop(expert_id, None)
             self.vram.pop(expert_id, None)
+            self._vram_tag.pop(expert_id, None)
             self.ram_records.pop(expert_id, None)
+            self._staged_tag.pop(expert_id, None)
             fut = self._pending.pop(expert_id, None)
             if fut is not None:
                 try:
@@ -305,16 +469,52 @@ class ExpertPager:
                     pass
             self._prefetched.discard(expert_id)
 
+    def restore(self, expert_id: str) -> None:
+        """Clear the pruned marker so a restored (re-added) id is readable.
+
+        Pruning calls forget(); re-adding the same id without clearing the
+        forgotten-set would leave it permanently unreadable. Restoring drops
+        the marker (caches are already empty from forget) without resetting
+        the monotonic version, so older async results still mismatch.
+        """
+        with self._lock:
+            self._forgotten.discard(expert_id)
+
+    # Alias for callers that think in prune/restore vs forget/remember terms.
+    remember = restore
+
     def _stage(self, expert_id: str):
         """Disk -> RAM staging with LRU bound; evicted records re-read later."""
+        tag_before = self._live_tag(expert_id)
         rec = self._read_disk(expert_id)
         with self._lock:
-            if expert_id not in self._forgotten:
-                self.stats.ram_loads += 1
-                self.ram_records[expert_id] = rec
-                self.ram_records.move_to_end(expert_id)
-                while len(self.ram_records) > self.max_staged:
-                    self.ram_records.popitem(last=False)
+            if self._closed or expert_id in self._forgotten:
+                return
+            if expert_id not in self.pool.experts:
+                return
+            if expert_id in self.ram_records:
+                return  # fresher staged entry already present: keep it
+            cur = self._live_tag(expert_id)
+            live_rec = self.pool.experts.get(expert_id)
+            if cur is not None and (cur != tag_before or
+                    (live_rec is not None and live_rec is not rec and cur[0] != 0)):
+                # Snapshot went stale during the read: stage live instead.
+                if live_rec is not None:
+                    self.ram_records[expert_id] = live_rec
+                    self._staged_tag[expert_id] = cur
+                    self.ram_records.move_to_end(expert_id)
+                    while len(self.ram_records) > self.max_staged:
+                        old, _ = self.ram_records.popitem(last=False)
+                        self._staged_tag.pop(old, None)
+                    return
+            self.stats.ram_loads += 1
+            self.ram_records[expert_id] = rec
+            if cur is not None:
+                self._staged_tag[expert_id] = cur
+            self.ram_records.move_to_end(expert_id)
+            while len(self.ram_records) > self.max_staged:
+                old, _ = self.ram_records.popitem(last=False)
+                self._staged_tag.pop(old, None)
 
     # -- R2VR: RAM -> VRAM (disk only via warm_ram) --
     def warm_ram(self) -> None:
@@ -338,15 +538,40 @@ class ExpertPager:
             for eid in unique_ids:
                 if eid in self._forgotten:
                     continue
-                if eid in self.ram or eid in self.vram:
-                    continue
+                # Tag-validated residency: a stale entry does not suppress a
+                # fresh prefetch.
+                live = self._live_tag(eid)
+                if eid in self.ram:
+                    if live is not None and self._ram_tag.get(eid) == live:
+                        continue
+                if eid in self.vram:
+                    if live is not None and self._vram_tag.get(eid) == live:
+                        continue
                 if eid in self._pending:
                     continue  # already in flight: collapsed!
-                expected_ver = self._get_version(eid)
+                expected = self._live_tag(eid)
                 self.stats.prefetch_submitted += 1
-                self._pending[eid] = self._exec.submit(self._prefetch_one, eid, expected_ver)
+                self._pending[eid] = self._exec.submit(self._prefetch_one, eid, expected)
 
-    def _prefetch_one(self, expert_id: str, expected_version: int) -> None:
+    def _evict_if_stale(self, expert_id: str, expected: tuple[int, int] | None) -> None:
+        """Remove only the stale entry this prefetch wrote; preserve fresh."""
+        if self.mode == "D2R":
+            if self._ram_tag.get(expert_id) == expected:
+                self.ram.pop(expert_id, None)
+                self._ram_tag.pop(expert_id, None)
+        else:
+            if self._vram_tag.get(expert_id) == expected:
+                self.vram.pop(expert_id, None)
+                self._vram_tag.pop(expert_id, None)
+        if self._staged_tag.get(expert_id) == expected:
+            # Only drop the staged snapshot when live has moved on; a fresh
+            # stage inserted after us must survive.
+            live = self._live_tag(expert_id)
+            if live != expected:
+                self.ram_records.pop(expert_id, None)
+                self._staged_tag.pop(expert_id, None)
+
+    def _prefetch_one(self, expert_id: str, expected: tuple[int, int] | None) -> None:
         self._tls.prefetching = True
         try:
             with self._lock:
@@ -361,11 +586,15 @@ class ExpertPager:
                 return
 
             with self._lock:
-                current_ver = self._get_version(expert_id)
-                if self._closed or expert_id in self._forgotten or current_ver != expected_version:
-                    self.ram.pop(expert_id, None)
-                    self.vram.pop(expert_id, None)
-                    self.ram_records.pop(expert_id, None)
+                if self._closed or expert_id in self._forgotten:
+                    self._evict_if_stale(expert_id, expected)
+                    return
+                current = self._live_tag(expert_id)
+                if current != expected:
+                    # An update/replace/prune won the race. The inner provider
+                    # already revalidated, so a fresh entry (if any) must be
+                    # preserved; only the stale write (if still resident) goes.
+                    self._evict_if_stale(expert_id, expected)
                     return
                 self._prefetched.add(expert_id)
             _ = w
@@ -393,10 +622,14 @@ class ExpertPager:
 
     def resident_counts(self) -> dict:
         with self._lock:
-            for d in (self.ram, self.vram, self.ram_records):
+            for d, t in ((self.ram, self._ram_tag),
+                         (self.vram, self._vram_tag),
+                         (self.ram_records, self._staged_tag)):
                 stale = [eid for eid in d if eid in self._forgotten or eid not in self.pool.experts]
                 for eid in stale:
                     d.pop(eid, None)
+                    if t is not None:
+                        t.pop(eid, None)
             return {
                 "ram": len(self.ram),
                 "vram": len(self.vram),
