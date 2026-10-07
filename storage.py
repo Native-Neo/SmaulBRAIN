@@ -433,10 +433,21 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     sched = extra.get("scheduler", {}) or {}
     model._scheduler_snapshot = dict(sched) if isinstance(sched, dict) else {}
     # The pool objects were replaced: cached compute weights and staged
-    # records still point at the pre-load experts and must go.
+    # records still point at the pre-load experts and must go. So do all
+    # concurrency bookkeeping: forgotten/version/pending state refers to
+    # pre-load ids and would poison the fresh pool (e.g. a pruned-then-
+    # restored expert id would stay unreadable).
     model.pager.ram.clear()
     model.pager.vram.clear()
     model.pager.ram_records.clear()
+    for attr in ("_forgotten", "_versions", "_prefetched"):
+        buf = getattr(model.pager, attr, None)
+        if buf is not None:
+            buf.clear()
+    for attr in ("_pending", "_in_flight"):
+        buf = getattr(model.pager, attr, None)
+        if buf is not None:
+            buf.clear()
     if model.cfg.paging_method == "R2VR":
         model.pager.warm_ram()
     model._resume_step = int(step)
