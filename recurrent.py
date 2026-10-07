@@ -26,11 +26,40 @@ from rmsnorm import RMSNorm
 
 @dataclass
 class RecurrentState:
-    """Carried across recurrent applications within one forward pass."""
+    """Carried across recurrent applications within one forward pass.
+
+    Ownership: the block never mutates its inputs; ``forward`` returns new
+    ``(h, attn)`` tensors. Reset starts from ``RecurrentState.zeros(...)``;
+    continue passes the returned state back in. ``reset(indices)`` zeroes
+    selected batch rows for per-sequence reuse.
+    """
 
     h: torch.Tensor  # [B, T, D] hidden vectors (BF16 compute)
     attn: LinearAttnState  # [B, H, Dh, Dh] + [B, H, Dh] accumulators
     steps_taken: int = 0
+
+    @classmethod
+    def zeros(cls, batch: int, seq: int, d_model: int, n_heads: int, device=None,
+              dtype: torch.dtype = torch.float32) -> "RecurrentState":
+        """Fresh stream state: zero hidden + zero attention accumulators."""
+        assert d_model % n_heads == 0
+        return cls(
+            h=torch.zeros(batch, seq, d_model, device=device, dtype=dtype),
+            attn=LinearAttnState.zeros(batch, n_heads, d_model // n_heads, device=device),
+            steps_taken=0,
+        )
+
+    def reset(self, indices=None) -> "RecurrentState":
+        """Zero selected batch rows in place (per-sequence reset)."""
+        if indices is None:
+            self.h.zero_()
+            self.attn.reset()
+        else:
+            idx = torch.as_tensor(indices, dtype=torch.long, device=self.h.device)
+            self.h[idx] = 0.0
+            self.attn.reset(idx)
+        self.steps_taken = 0
+        return self
 
     def clone(self) -> "RecurrentState":
         return RecurrentState(h=self.h.clone(), attn=self.attn.clone(), steps_taken=self.steps_taken)
@@ -67,13 +96,37 @@ class SharedRecurrentBlock(nn.Module):
         attn: LinearAttnState,
         moe_fn: MoeFn,
         chunk_size: int = 256,
+        keep: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, LinearAttnState, torch.Tensor, torch.Tensor]:
         """One recurrent application.
 
         Returns (h_next, attn_next, halt_logit [B, T], aux_loss).
         halt_logit is the raw (pre-sigmoid) per-token halting score.
+
+        Ownership: inputs are never mutated; new tensors are returned.
+        Reset with fresh zeros; continue by feeding back the returned
+        state. ``keep`` (optional bool [B, T]) marks valid vs padded
+        positions and is forwarded to linear attention so pads add
+        nothing to the accumulators. Outputs are chunk-size invariant
+        (chunking only changes summation order within float tolerance).
+        The halt head reads ``h.detach()`` so halting gradients never
+        flow into the trunk (halt learns to predict, not to steer).
         """
+        if h.ndim != 3:
+            raise ValueError(f"h must have shape [B, T, D], got {tuple(h.shape)}")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
         B, T, D = h.shape
+        if D != self.d_model:
+            raise ValueError(f"h width {D} != d_model {self.d_model}")
+        if not attn.matches(B, self.n_heads, self.head_dim):
+            raise ValueError(
+                f"attn state mismatch: S={tuple(attn.S.shape)}/{attn.S.dtype} "
+                f"z={tuple(attn.z.shape)}/{attn.z.dtype}, expected B={B} "
+                f"H={self.n_heads} Dh={self.head_dim} fp32"
+            )
+        if keep is not None and keep.shape != (B, T):
+            raise ValueError(f"keep must have shape [B, T]=[{B}, {T}], got {tuple(keep.shape)}")
         # -- linear attention branch (residual) --
         a = self.n1(h)
         qkv = self.qkv(a).view(B, T, 3, self.n_heads, self.head_dim)
@@ -83,8 +136,12 @@ class SharedRecurrentBlock(nn.Module):
         v = v.transpose(1, 2).contiguous()
         # Chunkwise causal linear attention. The incoming state is visible
         # to every token; within each chunk only earlier-token prefixes are used.
+        # The input state is never mutated (linear_attn_forward clones).
+        keep_mask = None
+        if keep is not None:
+            keep_mask = keep.to(dtype=torch.bool, device=h.device)
         y, attn_next = linear_attn_forward(
-            q, k, v, eps=1e-6, state=attn, chunk_size=chunk_size
+            q, k, v, eps=1e-6, state=attn, chunk_size=chunk_size, keep=keep_mask
         )
         y = y.reshape(B, T, D).to(h.dtype)
         h = h + self.o_proj(self.n_attn(y))
