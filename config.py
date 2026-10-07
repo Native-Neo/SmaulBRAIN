@@ -139,41 +139,89 @@ class SmaulBrainConfig:
     def per_expert_params(self) -> int:
         return expert_param_count(self.d_model, self.expert_hidden)
 
+    def router_params(self) -> int:
+        """Router projection params: [num_experts, d_model] weight + bias."""
+        return self.num_experts * self.d_model + self.num_experts
+
     def shared_params(self) -> int:
-        """Shared trunk params: embeddings + attention + norms + halt + router + head."""
+        """Shared trunk params (router excluded; see router_params).
+
+        embeddings + attention + norms + halt + head. The recurrent block
+        is counted once (unique params); unrolled logical depth reuses it.
+        Matches model.param_counts()["shared_params"] (trunk-only).
+        """
         d, v = self.d_model, self.vocab_size
         # embed(v,d) + qkv+o (4*d*d) + 6 norms (n_init,n1,n_attn,n2,n3,n_final)
-        # + halt (d+1) + router (n_exp*d + n_exp) + out head (v*d)
-        return v * d + 4 * d * d + 6 * d + (d + 1) + (self.num_experts * d + self.num_experts) + v * d
+        # + halt (d+1) + out head (v*d)
+        return v * d + 4 * d * d + 6 * d + (d + 1) + v * d
 
     def total_params(self) -> int:
-        return self.shared_params() + self.num_experts * self.per_expert_params
+        """Logical == unique params: shared + router + all experts."""
+        return self.shared_params() + self.router_params() + self.num_experts * self.per_expert_params
 
     def active_params(self) -> int:
-        return self.shared_params() + self.top_k * self.per_expert_params
+        """Params touched per token: shared + router + top-k experts."""
+        return self.shared_params() + self.router_params() + self.top_k * self.per_expert_params
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "SmaulBrainConfig":
+        """Rebuild from a serialized dict (checkpoint config.json compatible).
+
+        Compatibility contract:
+        - Omitted fields fall back to dataclass defaults (backward compatible).
+        - Explicit nulls are rejected (omitted != null; null is never valid).
+        - Unknown fields (incl. ``schema_version`` stamped by storage.py,
+          whose major is gated there) are tolerated and dropped (forward
+          compatible). Use to_dict() for an exact round-trip.
+        - ``active_experts`` must equal ``top_k`` when both are present;
+          mismatched persisted values raise instead of silently syncing.
+        - Impossible floors (``min_experts < top_k``) raise via __post_init__
+          instead of being silently clamped (no migration path: old
+          checkpoints carrying such floors are corrupt, not loadable).
+        """
+        if not isinstance(d, dict):
+            raise ValueError(f"config payload must be a dict, got {type(d).__name__}")
         known = {f for f in cls.__dataclass_fields__}
         values = {k: v for k, v in d.items() if k in known}
-        # Older checkpoints allowed an impossible pruning floor below top-k.
-        # Clamp it to the minimum viable active expert count when loading.
-        values["min_experts"] = max(
-            int(values.get("min_experts", cls.min_experts)),
-            int(values.get("top_k", cls.top_k)),
-        )
+        nulls = [k for k, v in values.items() if v is None]
+        if nulls:
+            raise ValueError(
+                f"config fields must not be null (omit for defaults): {sorted(nulls)}"
+            )
+        if "active_experts" in values and "top_k" in values:
+            if int(values["active_experts"]) != int(values["top_k"]):
+                raise ValueError(
+                    f"incompatible active_experts={values['active_experts']!r} "
+                    f"!= top_k={values['top_k']!r}; refusing to guess"
+                )
         return cls(**values)
 
     def describe_counts(self) -> dict:
+        """Architecture param breakdown with unambiguous count categories.
+
+        - logical_params == unique_params == total_params here: every expert
+          is distinct and the shared recurrent block is counted once
+          (unrolled depth reuses it, so no depth multiplier).
+        - active_params: shared + router + top-k experts (per-token).
+        - resident (RAM/VRAM dequantized transients) and on-disk
+          (stored_expert_bytes, FP8 reality) need a live model; see
+          model.param_counts(). They are reported as None here to keep the
+          categories distinct instead of conflating them.
+        """
         return {
             "shared_params": self.shared_params(),
-            "router_params": self.num_experts * self.d_model + self.num_experts,
+            "router_params": self.router_params(),
             "per_expert_params": self.per_expert_params,
             "expert_count": self.num_experts,
             "expert_params_total": self.num_experts * self.per_expert_params,
             "total_params": self.total_params(),
+            "logical_params": self.total_params(),
+            "unique_params": self.total_params(),
             "active_params": self.active_params(),
+            "resident_ram_params": None,
+            "resident_vram_params": None,
+            "stored_expert_bytes": None,
         }
