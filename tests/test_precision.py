@@ -5,8 +5,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 from precision import (
-    PRECISION_POLICY, compute_dtype, dequantize_fp8_blockwise,
-    dequantize_fp8_row_block, quantize_fp8_blockwise, update_fp8_row_block,
+    PRECISION_POLICY, compute_dtype, dequantize_fp8_block,
+    dequantize_fp8_blockwise, dequantize_fp8_row_block, quantize_fp8_blockwise,
+    update_fp8_row_block, update_fp8_tile_block,
 )
 from smaulopt import SmaulOpt, SmaulOptHParams, init_state, smaul_update, smaul_update_range
 
@@ -156,4 +157,126 @@ def test_smaul_update_range_updates_only_target_rows():
     assert torch.equal(st["m"][8:], orig_m[8:])
     assert torch.equal(st["v_row"][:4], orig_vr[:4])
     assert torch.equal(st["v_row"][8:], orig_vr[8:])
+
+
+def test_tile_block_slice_matches_full():
+    # Level-3 read: exact vs full-dequant slice, incl. partial tiles + ragged tail.
+    torch.manual_seed(7)
+    w = torch.randn(10, 130) * 0.5
+    t = quantize_fp8_blockwise(w, tile=64)
+    full = dequantize_fp8_blockwise(t)
+    windows = [(0, 10, 0, 130), (2, 5, 0, 64), (2, 5, 64, 128),
+               (0, 3, 10, 100), (4, 10, 100, 130), (7, 8, 63, 65)]
+    for (r0, r1, c0, c1) in windows:
+        part = dequantize_fp8_block(t, r0, r1, c0, c1)
+        assert part.shape == (r1 - r0, c1 - c0)
+        assert torch.equal(part, full[r0:r1, c0:c1])
+
+
+def test_update_fp8_tile_block_preserves_untouched_tiles_bit_for_bit():
+    torch.manual_seed(11)
+    w = torch.randn(12, 128)
+    t = quantize_fp8_blockwise(w, tile=64)
+    orig_codes = t.codes.clone()
+    orig_scales = t.scales.clone()
+
+    new_slice = torch.randn(5, 64) * 0.5
+    update_fp8_tile_block(t, new_slice, 3, 8, 64, 128)  # rows 3:8, 2nd tile
+
+    # Touched tile changed.
+    assert not torch.equal(t.codes[3:8, 64:128], orig_codes[3:8, 64:128])
+
+    # Every untouched region bit-identical (codes AND scales).
+    assert torch.equal(t.codes[:3], orig_codes[:3])
+    assert torch.equal(t.codes[8:], orig_codes[8:])
+    assert torch.equal(t.codes[3:8, :64], orig_codes[3:8, :64])
+    assert torch.equal(t.scales[:3], orig_scales[:3])
+    assert torch.equal(t.scales[8:], orig_scales[8:])
+    assert torch.equal(t.scales[3:8, :1], orig_scales[3:8, :1])
+
+    # Tile read stays consistent with the full dequant after the write.
+    full = dequantize_fp8_blockwise(t)
+    assert torch.equal(dequantize_fp8_block(t, 3, 8, 64, 128), full[3:8, 64:128])
+
+
+def test_tile_block_write_matches_full_row_requant_on_touched_tiles():
+    # Storage equivalence: per-tile requant == full-row requant on touched
+    # tiles (incl. the ragged tail block), while untouched rows are preserved
+    # (a full-row requant path would still rewrite them).
+    torch.manual_seed(21)
+    w = torch.randn(8, 130)
+    t_tile = quantize_fp8_blockwise(w, tile=64)
+    t_full = quantize_fp8_blockwise(w, tile=64)
+    torch.manual_seed(22)
+    new_rows = torch.randn(4, 130)
+    update_fp8_row_block(t_full, new_rows, 2, 6)
+    update_fp8_tile_block(t_tile, new_rows[:, :64], 2, 6, 0, 64)
+    update_fp8_tile_block(t_tile, new_rows[:, 64:128], 2, 6, 64, 128)
+    update_fp8_tile_block(t_tile, new_rows[:, 128:130], 2, 6, 128, 130)
+    assert torch.equal(t_tile.codes, t_full.codes)
+    assert torch.equal(t_tile.scales, t_full.scales)
+
+
+def test_tile_block_rejects_unaligned_and_bad_ranges():
+    import pytest
+    w = torch.randn(8, 128)
+    t = quantize_fp8_blockwise(w, tile=64)
+    with pytest.raises(ValueError):  # partial-tile write would corrupt siblings
+        update_fp8_tile_block(t, torch.randn(2, 10), 0, 2, 60, 70)
+    with pytest.raises(ValueError):  # slice shape must match the window
+        update_fp8_tile_block(t, torch.randn(3, 64), 0, 2, 0, 64)
+    with pytest.raises(ValueError):  # row helper now validates slice shape too
+        update_fp8_row_block(t, torch.randn(2, 128), 0, 3)
+    with pytest.raises(ValueError):  # empty / out-of-bounds windows
+        dequantize_fp8_block(t, 2, 2, 0, 64)
+    with pytest.raises(ValueError):
+        dequantize_fp8_block(t, 0, 2, 0, 129)
+
+
+def test_tile_block_ops_native_fallback_parity(monkeypatch):
+    torch.manual_seed(31)
+    w = torch.randn(9, 130)
+    monkeypatch.setenv("SMAUL_NATIVE", "0")
+    ref = quantize_fp8_blockwise(w, tile=64)
+    monkeypatch.setenv("SMAUL_NATIVE", "1")
+    nat = quantize_fp8_blockwise(w, tile=64)
+    ns = torch.randn(5, 64)
+    update_fp8_tile_block(ref, ns, 2, 7, 0, 64)
+    update_fp8_tile_block(nat, ns.clone(), 2, 7, 0, 64)
+    assert torch.equal(ref.codes, nat.codes)
+    assert torch.equal(ref.scales, nat.scales)
+    ref_read = dequantize_fp8_block(ref, 2, 7, 10, 100)
+    assert torch.equal(dequantize_fp8_block(nat, 2, 7, 10, 100), ref_read)
+
+
+def test_sparse_update_global_clock_semantics_documented():
+    # Pins the documented sparse-update semantics (see precision.py contract):
+    # frozen rows' stored moments are untouched (no zero-grad decay), while the
+    # global step still ticks so bias corrections advance for all rows.
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=False)
+    st = init_state((8, 16), hp)
+    w = torch.zeros(2, 16)
+    g = torch.ones(2, 16)
+    new_w = smaul_update_range(w, g, st, hp, lr=1e-3, row_start=2, row_end=4)
+    assert new_w.shape == (2, 16)
+    assert st["step"] == 1  # global clock ticked though only 2 rows moved
+    assert torch.equal(st["m"][:2], torch.zeros(2, 16))  # frozen: no decay
+    assert torch.equal(st["m"][4:], torch.zeros(4, 16))
+    assert torch.equal(st["v"][:2], torch.zeros(2, 16))
+    assert torch.equal(st["v"][4:], torch.zeros(4, 16))
+    # Touched rows took the standard first step: m_hat=1, v_hat=|g|=1.
+    assert torch.allclose(new_w, torch.full_like(new_w, -0.001), atol=1e-5)
+
+
+def test_sparse_update_factored_v_col_coupling_documented():
+    # With factor_v the shared v_col absorbs the sparse slice's column means:
+    # untouched rows' stored moments stay bit-identical, but their future
+    # trajectory shifts via v_col. Pinned here as documented behavior.
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=True)
+    st = init_state((8, 4), hp)
+    smaul_update_range(torch.zeros(2, 4), torch.ones(2, 4), st, hp,
+                       lr=1e-3, row_start=0, row_end=2)
+    assert torch.equal(st["m"][2:], torch.zeros(6, 4))  # untouched rows frozen
+    assert torch.equal(st["v_row"][2:], torch.zeros(6, 1))
+    assert not torch.equal(st["v_col"], torch.zeros(1, 4))  # shared moment moved
 
