@@ -8,8 +8,15 @@ code only when it is provably safe, and says so out loud otherwise:
     built with baseline x86-64 flags only — never ``-march=native`` — so the
     compiled code cannot execute instructions the build host has but the
     runtime CPU lacks.
-  * Built shared objects are cached by source hash; concurrent first builds
-    race harmlessly (identical bytes, atomic publish).
+   * Built shared objects are cached by source hash; concurrent first builds
+     race harmlessly (identical bytes, atomic publish).
+   * Required ISA is explicit (``REQUIRED_ISA`` = baseline x86-64/SSE2):
+     dispatch checks runtime CPU flags (token-exact ``cpu_flags()``) via
+     ``host_supports_baseline()`` before building, and every built ``.so``
+     is disassembled (objdump, when available) to prove it needs no
+     AVX/AVX2/AVX-512 instructions — an Ivy Bridge CPU can dlopen it
+     safely. ``status()`` exposes mode, CPU label, flags, cache, and
+     counters for observability.
   * Build pins baseline x86-64 flags (``-march=x86-64 -mtune=generic``,
     never ``-march=native``) plus ``-fno-fast-math``; the cache key folds in
     sources, flags, compiler version, Python/torch versions, and machine, so
@@ -46,6 +53,7 @@ import hashlib
 import math
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -59,6 +67,29 @@ BUILD_TIMEOUT_VAR = "SMAUL_NATIVE_BUILD_TIMEOUT"
 BUILD_TIMEOUT_DEFAULT = 300
 SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels_cpp")
 LIBS = ("rmsnorm", "linear_attn", "fp8_quant")
+
+# Required ISA: baseline x86-64 (SSE2) only. The kernels use no AVX/AVX2/
+# AVX-512 intrinsics and are built with ``-march=x86-64``, so they run on any
+# x86-64 CPU including Ivy Bridge. Dispatch checks the host provides at least
+# this baseline before attempting native (defense in depth + observability):
+# ``cpu_flags()`` is the runtime truth (token-exact CPUID flags), kept
+# separate from both the torch build-target label and the compile flags.
+REQUIRED_ISA = "x86-64 (SSE2 baseline)"
+REQUIRED_X86_FLAGS = ("sse2",)
+
+# VEX/EVEX evidence: v-prefixed vector mnemonics and ymm/zmm/opmask
+# registers. Baseline x86-64/SSE code never emits these, so any match means
+# the .so needs more than REQUIRED_ISA (unsafe for e.g. Ivy Bridge).
+_ISA_RE = re.compile(
+    r"(?<![A-Za-z_])v(zeroupper|zeroall|mov[a-z]*|add[a-z]*|sub[a-z]*|mul[a-z]*"
+    r"|div[a-z]*|broadcast[a-z]*|blend[a-z]*|perm[a-z]*|unpck[a-z]*|insert[a-z]*"
+    r"|extract[a-z]*|gather[a-z]*|scatter[a-z]*|fmadd[a-z0-9]*|fmsub[a-z0-9]*"
+    r"|fnmadd[a-z0-9]*|fnmsub[a-z0-9]*|xor[a-z]*|or[a-z]*|and[a-z]*"
+    r"|padd[a-z]*|psub[a-z]*|pmul[a-z]*|pmin[a-z]*|pmax[a-z]*|pshuf[a-z]*"
+    r"|punpck[a-z]*|maskmov[a-z]*|mask[a-z]*|compress[a-z]*|expand[a-z]*)"
+    r"(?![A-Za-z_])|%(ymm|zmm)[0-9]+|%k[0-7]\b",
+    re.IGNORECASE,
+)
 
 COUNTERS: dict[str, int] = {
     "fp8_quant_native": 0, "fp8_quant_fallback": 0,
@@ -79,28 +110,81 @@ def reset_counters() -> None:
     LAST_FALLBACK.clear()
 
 
+_cpu_flags_cache: frozenset[str] | None = None
+
+
+def _parse_cpu_flags(text: str) -> frozenset[str]:
+    """Token-exact flag parse: ``avx`` alone must never read as ``avx2``."""
+    for line in text.splitlines():
+        if line.startswith("flags") and ":" in line:
+            return frozenset(line.split(":", 1)[1].split())
+    return frozenset()
+
+
+def cpu_flags() -> frozenset[str]:
+    """Runtime CPU flag tokens (Linux /proc/cpuinfo); empty set if unknown.
+
+    Cached per process (flags cannot change under us); never raises.
+    """
+    global _cpu_flags_cache
+    if _cpu_flags_cache is not None:
+        return _cpu_flags_cache
+    try:
+        if os.path.exists("/proc/cpuinfo"):
+            with open("/proc/cpuinfo") as f:
+                _cpu_flags_cache = _parse_cpu_flags(f.read(65536))
+                return _cpu_flags_cache
+    except Exception:
+        pass
+    _cpu_flags_cache = frozenset()
+    return _cpu_flags_cache
+
+
 def cpu_capability() -> str:
-    """Best-effort CPU capability label; never raises."""
+    """Best-effort CPU capability label; never raises.
+
+    ``torch.backends.cpu.get_cpu_capability()`` reports the ISA PyTorch was
+    built to target, not necessarily the runtime CPUID, so it is only a
+    label here — never a dispatch gate. The gate is
+    :func:`host_supports_baseline`, which checks runtime flags (token-exact)
+    against :data:`REQUIRED_ISA`.
+    """
     try:
         cap = torch.backends.cpu.get_cpu_capability()
         if cap:
             return str(cap)
     except Exception:
         pass
+    flags = cpu_flags()
+    for want in ("avx512f", "avx2", "avx", "sse4_2", "sse2"):
+        if want in flags:
+            return want.upper()
+    return "BASELINE" if flags else "UNKNOWN"
+
+
+def required_isa() -> str:
+    """ISA every native .so is guaranteed to stay within."""
+    return REQUIRED_ISA
+
+
+def host_supports_baseline() -> bool:
+    """True if the host provably runs baseline x86-64 code; never raises.
+
+    Non-x86 hosts always return True (generic ``-O2`` build, no x86 ISA
+    assumption). On x86-64 the runtime flags must contain SSE2 when they are
+    readable; unreadable flags (non-Linux) also return True — baseline x86-64
+    implies SSE2 by definition, so absence of evidence is not evidence of
+    absence, and the compiled binary stays baseline either way.
+    """
     try:
-        if os.path.exists("/proc/cpuinfo"):
-            with open("/proc/cpuinfo") as f:
-                text = f.read(65536)
-            for line in text.splitlines():
-                if line.startswith("flags") and ":" in line:
-                    flags = line.split(":", 1)[1]
-                    for want in ("avx512f", "avx2", "sse4_2"):
-                        if want in flags:
-                            return want.upper()
-                    return "BASELINE"
+        if platform.machine().lower() not in ("x86_64", "amd64"):
+            return True
+        flags = cpu_flags()
+        if not flags:
+            return True
+        return all(f in flags for f in REQUIRED_X86_FLAGS)
     except Exception:
-        pass
-    return "UNKNOWN"
+        return True
 
 
 def native_mode() -> str:
@@ -156,6 +240,82 @@ def _cache_dir() -> str:
     return d
 
 
+def _verify_baseline_isa(so_path: str) -> bool:
+    """Best-effort proof a built .so needs no AVX+ instructions; never raises.
+
+    Disassembles with objdump (when available) and rejects VEX/EVEX-encoded
+    (``v``-prefixed) mnemonics and ymm/zmm/opmask registers. Missing objdump
+    or any inspection failure returns True (skip): the ``-march=x86-64``
+    build flags are the guarantee, this is the audit net on top.
+    """
+    try:
+        if shutil.which("objdump") is None:
+            return True
+        r = subprocess.run(["objdump", "-d", so_path], capture_output=True,
+                           text=True, timeout=120)
+        if r.returncode != 0 or not r.stdout:
+            return True
+        return _ISA_RE.search(r.stdout) is None
+    except Exception:
+        return True
+
+
+def _compile(name: str, so: str) -> None:
+    """Compile one kernel to ``so`` (atomic publish); raises with reason."""
+    tmp = so + f".{os.getpid()}.tmp"
+    try:
+        # Baseline ISA only: portable to any x86-64 CPU by default.
+        r = subprocess.run(
+            ["g++", *_build_flags(),
+             os.path.join(SRC_DIR, name + ".cpp"), "-o", tmp],
+            capture_output=True, text=True, timeout=_build_timeout(),
+        )
+    except subprocess.TimeoutExpired:
+        _rm(tmp)
+        raise RuntimeError(
+            f"g++ timed out after {_build_timeout()}s for {name}")
+    if r.returncode != 0:
+        _rm(tmp)
+        raise RuntimeError(f"g++ failed for {name}: {r.stderr[:500]}")
+    try:
+        os.replace(tmp, so)
+    except OSError as e:
+        _rm(tmp)
+        raise RuntimeError(f"publish failed for {name}: {e}")
+
+
+def _load_or_build(name: str, so: str) -> None:
+    """Load a cached .so, rebuilding once if missing/corrupt/stale/wrong-ISA.
+
+    Every file is ISA-verified *before* dlopen, so a foreign-ISA .so planted
+    in the cache is never executed — it is rebuilt from our baseline sources
+    and re-verified. Raises with the reason on failure.
+    """
+    if not os.path.exists(so):
+        _compile(name, so)
+    if not _verify_baseline_isa(so):
+        _rm(so)  # wrong ISA for this host: rebuild once from baseline sources
+        _compile(name, so)
+        if not _verify_baseline_isa(so):
+            _rm(so)
+            raise RuntimeError(f"{name}.so failed baseline-ISA verification")
+    try:
+        lib = ctypes.CDLL(so)
+    except OSError as e:  # ABI mismatch / corrupt / stale .so: rebuild once
+        _rm(so)
+        _compile(name, so)  # raises with its own reason (timeout/compile error)
+        if not _verify_baseline_isa(so):
+            _rm(so)
+            raise RuntimeError(f"{name}.so failed baseline-ISA verification")
+        try:
+            lib = ctypes.CDLL(so)
+        except OSError as e2:
+            _rm(so)
+            raise RuntimeError(f"load failed for {name} (ABI?) after rebuild: {e2}")
+    _bind(lib, name)
+    _libs[name] = lib
+
+
 def ensure_native() -> bool:
     """Build (cached) and load all native libraries. False + reason on failure."""
     global _build_failed
@@ -174,41 +334,41 @@ def ensure_native() -> bool:
         try:
             d = _cache_dir()
             for name in LIBS:
-                so = os.path.join(d, name + ".so")
-                if not os.path.exists(so):
-                    tmp = so + f".{os.getpid()}.tmp"
-                    try:
-                        # Baseline ISA only: portable to any x86-64 CPU by default.
-                        r = subprocess.run(
-                            ["g++", *_build_flags(),
-                             os.path.join(SRC_DIR, name + ".cpp"), "-o", tmp],
-                            capture_output=True, text=True, timeout=_build_timeout(),
-                        )
-                    except subprocess.TimeoutExpired:
-                        _rm(tmp)
-                        raise RuntimeError(
-                            f"g++ timed out after {_build_timeout()}s for {name}")
-                    if r.returncode != 0:
-                        _rm(tmp)
-                        raise RuntimeError(f"g++ failed for {name}: {r.stderr[:500]}")
-                    try:
-                        os.replace(tmp, so)
-                    except OSError as e:
-                        _rm(tmp)
-                        raise RuntimeError(f"publish failed for {name}: {e}")
-                try:
-                    lib = ctypes.CDLL(so)
-                except OSError as e:  # ABI mismatch / corrupt .so: rebuild once
-                    _rm(so)
-                    raise RuntimeError(f"load failed for {name} (ABI?): {e}")
-                _bind(lib, name)
-                _libs[name] = lib
+                _load_or_build(name, os.path.join(d, name + ".so"))
             _self_test()  # raises on mismatch; never ships a bad kernel
             return True
         except Exception as e:  # noqa: BLE001 - reason is recorded, not hidden
             _libs.clear()
             _build_failed = f"{type(e).__name__}: {e}"
             return False
+
+
+def status() -> dict[str, object]:
+    """Observable native-runtime summary: mode, CPU, build, and counters."""
+    try:
+        cache = _cache_dir()
+    except Exception:
+        cache = "unknown"
+    return {
+        "mode": native_mode(),
+        "cpu_capability": cpu_capability(),
+        "required_isa": REQUIRED_ISA,
+        "host_ok": host_supports_baseline(),
+        "build_flags": list(_build_flags()),
+        "cache_dir": cache,
+        "build_failed": _build_failed,
+        "loaded": sorted(_libs),
+        "counters": dict(COUNTERS),
+        "last_fallback": dict(LAST_FALLBACK),
+    }
+
+
+def reset_native_state() -> None:
+    """Clear loaded libs, the sticky build failure, and the CPU-flags cache."""
+    global _build_failed, _cpu_flags_cache
+    _libs.clear()
+    _build_failed = None
+    _cpu_flags_cache = None
 
 
 def _rm(path: str) -> None:
@@ -298,6 +458,13 @@ def _want_native(op: str) -> bool:
     mode = native_mode()
     if mode == "off":
         _note(op, False, "disabled by %s=off" % ENV_VAR)
+        return False
+    if not host_supports_baseline():
+        reason = ("host CPU lacks %s (capability=%s)"
+                  % (REQUIRED_ISA, cpu_capability()))
+        if mode == "force":
+            raise RuntimeError(f"native {op} forced but unsupported: {reason}")
+        _note(op, False, reason)
         return False
     if not ensure_native():
         if mode == "force":
