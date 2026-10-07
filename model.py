@@ -149,7 +149,11 @@ class SmaulBrainModel(nn.Module):
         from incomplete states. Adaptivity lives in the per-token halting
         depths (which representation is read out), not in skipped compute.
         ``keep`` (bool [B*T], training only) restricts the MoE balance loss
-        to scored positions so padding cannot dilute it.
+        to scored positions so padding cannot dilute it, and masks padded
+        positions from the linear-attention accumulators so pads add
+        nothing to (S, z). Depth selection uses the same threshold rule in
+        training (diagnostic) and inference (readout): depths respect
+        min_depth/max_depth for every token.
         """
         B, T, _D = h.shape
         hs: list[torch.Tensor] = []
@@ -158,19 +162,23 @@ class SmaulBrainModel(nn.Module):
         depths = torch.full((B, T), self.cfg.max_depth, dtype=torch.long, device=h.device)
         cum = torch.zeros(B, T, device=h.device)
         halted = torch.zeros(B, T, dtype=torch.bool, device=h.device)
+        keep_bt = keep.reshape(B, T).to(dtype=torch.bool) if keep is not None else None
         n_executed = 0
         for depth in range(self.cfg.max_depth):
             h, attn_states[depth], halt_logit, aux = self.block(
                 h, attn_states[depth], self._moe_fn(train, step, keep=keep),
                 chunk_size=self.cfg.attention_chunk_size,
+                keep=keep_bt,
             )
             aux_total = aux_total + aux  # keep router grad graph (training)
             lam = torch.sigmoid(halt_logit.float())  # [B, T]
             hs.append(h)
             lams.append(lam)
             n_executed = depth + 1
-            if train:
-                continue  # training always runs max_depth for ponder weighting
+            # Same halting rule in training and inference: training still
+            # executes max_depth (ponder weighting needs every step), but
+            # the reported depths use the threshold selection so diagnostics
+            # share probability semantics with the inference readout.
             if n_executed >= self.cfg.min_depth:
                 cum = cum + (1.0 - cum) * lam.detach()
                 newly = (~halted) & (cum >= self.cfg.halting_threshold)
@@ -179,7 +187,12 @@ class SmaulBrainModel(nn.Module):
         return hs, lams, aux_total, depths, n_executed
 
     def _ponder(self, lams: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Halting distribution p_n, mean geometric-prior KL, per-position KL."""
+        """Halting distribution p_n, mean geometric-prior KL, per-position KL.
+
+        No halting before min_depth: mass on depths below min_depth is
+        zero so the ponder weights only score representations the
+        threshold readout can actually select (min_depth=1 is a no-op).
+        """
         B, T = lams[0].shape
         dev = lams[0].device
         p_pr = self.cfg.halt_prior
@@ -187,11 +200,12 @@ class SmaulBrainModel(nn.Module):
         remaining = torch.ones(B, T, device=dev)
         kl_pos = torch.zeros(B, T, device=dev)
         for n, lam in enumerate(lams):
+            lam_eff = lam if (n + 1) >= self.cfg.min_depth else torch.zeros_like(lam)
             if n == len(lams) - 1:
                 p = remaining  # force-stop: all remaining mass halts here
             else:
-                p = lam * remaining
-                remaining = remaining * (1.0 - lam)
+                p = lam_eff * remaining
+                remaining = remaining * (1.0 - lam_eff)
             probs.append(p)
             geom = p_pr * ((1.0 - p_pr) ** n)
             kl_pos = kl_pos + p * (torch.log(p.clamp_min(1e-9)) - math.log(max(geom, 1e-12)))
@@ -278,7 +292,11 @@ class SmaulBrainModel(nn.Module):
                 pred = mixed.argmax(-1)
                 acc = ((pred == targets) & valid).float().sum().item() / max(1, n_valid)
                 steps = torch.arange(1, len(hs) + 1, device=P.device).view(-1, 1, 1)
-                mean_depth = float((P * steps).sum().item() / (B * T))
+                # Valid-only ponder expectation: pads contribute neither CE
+                # nor ponder statistics, so the diagnostic shares the loss
+                # mask (pad-free batches reduce to the old B*T mean).
+                depth_pos = (P * steps).sum(dim=0)  # [B, T] expected depth
+                mean_depth = float(depth_pos[valid].sum().item() / max(1, n_valid))
             return {
                 # The model's prediction is the ponder-mixed readout, matching
                 # the loss and the accuracy above (cached: no second head pass).
