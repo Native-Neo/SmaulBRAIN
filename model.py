@@ -411,20 +411,37 @@ class SmaulBrainModel(nn.Module):
         Logical counts size the model; ``stored_expert_bytes`` sizes RAM and
         checkpoints. Resident cache counts are dequantized compute elements
         (transients), not parameters — hence reported separately.
+
+        Accounting contract (audit 039):
+        - shared block counted once (depth recurrence reuses it; no
+          max_depth multiplier). Embed and head are distinct (untied).
+        - total/logical/unique include every pool expert, active or
+          inactive; active counts min(top_k, expert_count) selected
+          experts (upper bound: capacity drops admit fewer).
+        - expert_params_total sums live per-expert counts (heterogeneous
+          safe); per_expert_params is the first expert's count (probe).
+        - padding/pondering/paging/native never change these counts;
+          R2VR staged FP8 records are stored bytes, not dequantized
+          resident transients.
         """
         per_expert = self.pool.experts[self.pool.order[0]].param_count if len(self.pool) else 0
         trunk_n = sum(p.nelement() for _, p in self._trunk_params())
         router_n = sum(p.nelement() for _, p in self._router_params())
         stored = sum(rec.storage_bytes() for rec in self.pool.experts.values())
+        expert_total = sum(rec.param_count for rec in self.pool.experts.values())
+        active_k = min(self.cfg.top_k, len(self.pool))
+        total_n = trunk_n + router_n + expert_total
         return {
             "shared_params": trunk_n,
             "router_params": router_n,
             "per_expert_params": per_expert,
             "expert_count": len(self.pool),
-            "expert_params_total": per_expert * len(self.pool),
+            "expert_params_total": expert_total,
             "stored_expert_bytes": stored,
-            "total_params": trunk_n + router_n + per_expert * len(self.pool),
-            "active_params": trunk_n + router_n + per_expert * self.cfg.top_k,
+            "total_params": total_n,
+            "logical_params": total_n,
+            "unique_params": total_n,
+            "active_params": trunk_n + router_n + per_expert * active_k,
             "resident_ram_params": self._resident_params(self.pager.ram),
             "resident_vram_params": self._resident_params(self.pager.vram),
         }
