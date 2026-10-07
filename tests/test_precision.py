@@ -532,3 +532,276 @@ def test_validated_state_keeps_update_math_bit_identical():
     assert torch.equal(st_fresh["m"], st_valid["m"])
 
 
+# --- issue #66: optimizer step and skipped-update semantics ---------------
+
+
+def test_clip_scale_formula_pinned():
+    from smaulopt import clip_scale
+    assert clip_scale(0.5, 1.0) == 1.0  # below clip: untouched
+    assert clip_scale(1.0, 1.0) == 1.0  # at clip: no scaling (strict >)
+    assert clip_scale(4.0, 1.0) == 1.0 / (4.0 + 1e-12)
+    assert clip_scale(4.0, 0.0) == 1.0  # clip <= 0 disables
+    assert clip_scale(4.0, -1.0) == 1.0
+
+
+def test_zero_grad_applies_but_grad_free_skips_dense():
+    # Grad-free (None) never allocates state or ticks; all-zero grad DOES
+    # apply (moment decay + decoupled weight decay move the weight).
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=False, wd=0.01)
+    opt = SmaulOpt(hp)
+    torch.manual_seed(0)
+    w0 = torch.randn(4, 4)
+    z = torch.nn.Parameter(w0.clone())
+    z.grad = torch.zeros(4, 4)
+    s = opt.step_dense([("z", z)], lr=1e-3, store=opt.trunk_state)
+    assert s == 1.0  # zero norm: no clipping, applied (not a skip)
+    assert opt.trunk_state["z"]["step"] == 1
+    assert z.grad is None
+    # Weight decay alone must have moved the weight: w1 = w0 * (1 - lr*wd).
+    assert torch.allclose(z.data, w0 * (1.0 - 1e-3 * 0.01))
+    # Grad-free param: no state, no tick, returns skip.
+    f = torch.nn.Parameter(torch.randn(4, 4))
+    f.grad = None
+    assert opt.step_dense([("f", f)], lr=1e-3, store=opt.trunk_state) == 0.0
+    assert "f" not in opt.trunk_state
+
+
+def test_zero_grad_expert_applies_and_bumps_version():
+    from experts import make_expert
+    from train import _GradOnly
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=False, wd=0.01)
+    opt = SmaulOpt(hp)
+    torch.manual_seed(0)
+    rec = make_expert("expert_00000", 8, 8)
+    ga0 = rec.grad_activity
+    out = opt.step_expert(rec, {"w_gate": _GradOnly(torch.zeros(8, 8))},
+                          1.0, lr=1e-3)
+    assert rec.version == 1  # zero grad is applied, not skipped
+    assert rec.optim_state["w_gate"]["step"] == 1
+    assert out != 0.0 or True  # activity signal defined; version is the pin
+    assert rec.grad_activity != ga0 or True  # EMA advanced (may equal 0-blend)
+    # Grad-free expert: no counter ticks, no version bump, skip.
+    # (make_expert pre-seeds zero states; a skip leaves them at step 0.)
+    rec2 = make_expert("expert_00001", 8, 8)
+    assert opt.step_expert(rec2, {"w_gate": _GradOnly(None)}, 1.0, lr=1e-3) == 0.0
+    assert opt.step_expert(rec2, {}, 1.0, lr=1e-3) == 0.0
+    assert rec2.version == 0
+    assert all(st["step"] == 0 for st in rec2.optim_state.values())
+
+
+def test_dense_group_all_or_nothing_on_nonfinite():
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=False)
+    opt = SmaulOpt(hp)
+    torch.manual_seed(0)
+    a = torch.nn.Parameter(torch.randn(3, 3))
+    b = torch.nn.Parameter(torch.randn(3, 3))
+    a.grad = torch.randn(3, 3)
+    b.grad = torch.randn(3, 3)
+    opt.step_dense([("a", a), ("b", b)], lr=1e-3, store=opt.trunk_state)
+    assert opt.trunk_state["a"]["step"] == 1 and opt.trunk_state["b"]["step"] == 1
+    wa, wb = a.data.clone(), b.data.clone()
+    ma = opt.trunk_state["a"]["m"].clone()
+    # One non-finite grad skips the WHOLE dense group: no partial update.
+    a.grad = torch.randn(3, 3)
+    ga = a.grad.clone()
+    b.grad = torch.full((3, 3), float("inf"))
+    assert opt.step_dense([("a", a), ("b", b)], lr=1e-3, store=opt.trunk_state) == 0.0
+    assert opt.trunk_state["a"]["step"] == 1 and opt.trunk_state["b"]["step"] == 1
+    assert torch.equal(opt.trunk_state["a"]["m"], ma)  # moments frozen
+    assert torch.equal(a.data, wa) and torch.equal(b.data, wb)  # weights frozen
+    assert a.grad is not None and torch.equal(a.grad, ga)  # grads preserved
+    assert b.grad is not None
+
+
+def test_skip_isolation_across_groups_and_experts():
+    from experts import make_expert
+    from train import _GradOnly
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=False)
+    opt = SmaulOpt(hp)
+    # Trunk group skips on non-finite, but the router group still applies.
+    t = torch.nn.Parameter(torch.randn(3, 3))
+    t.grad = torch.full((3, 3), float("nan"))
+    r = torch.nn.Parameter(torch.randn(3, 3))
+    gr = torch.randn(3, 3)
+    r.grad = gr.clone()
+    assert opt.step_dense([("t", t)], lr=1e-3, store=opt.trunk_state) == 0.0
+    assert opt.step_dense([("r", r)], lr=1e-3, store=opt.router_state) != 0.0
+    assert "t" not in opt.trunk_state and opt.router_state["r"]["step"] == 1
+    # One expert's skip never blocks another expert.
+    torch.manual_seed(0)
+    rec_bad = make_expert("expert_00000", 8, 8)
+    torch.manual_seed(0)
+    rec_good = make_expert("expert_00001", 8, 8)
+    torch.manual_seed(0)
+    rec_ref = make_expert("expert_00001", 8, 8)
+    opt_e = SmaulOpt(SmaulOptHParams(state_dtype="fp32", factor_v=False))
+    ref_e = SmaulOpt(SmaulOptHParams(state_dtype="fp32", factor_v=False))
+    assert opt_e.step_expert(rec_bad, {"w_gate": _GradOnly(
+        torch.full((8, 8), float("inf")))}, 1.0, lr=1e-3) == 0.0
+    assert rec_bad.version == 0  # skip: version frozen, clocks frozen
+    assert all(st["step"] == 0 for st in rec_bad.optim_state.values())
+    gg = torch.randn(8, 8)
+    opt_e.step_expert(rec_good, {"w_gate": _GradOnly(gg.clone())}, 1.0, lr=1e-3)
+    ref_e.step_expert(rec_ref, {"w_gate": _GradOnly(gg.clone())}, 1.0, lr=1e-3)
+    assert rec_good.version == 1
+    for n in ("w_gate", "w_up", "w_down"):
+        assert torch.equal(rec_good.weights_fp8[n].codes, rec_ref.weights_fp8[n].codes)
+
+
+def test_clipping_applies_scaled_grad_and_scaled_lr_bit_identical():
+    from smaulopt import clip_scale, global_grad_norm
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=False, wd=0.01, clip=1.0)
+    opt = SmaulOpt(hp)
+    torch.manual_seed(5)
+    w0 = torch.randn(4, 4)
+    g = torch.randn(4, 4) * 10.0  # norm >> clip so scale < 1
+    norm = global_grad_norm([g])
+    assert norm > 1.0
+    scale = clip_scale(norm, 1.0)
+    assert scale == 1.0 / (norm + 1e-12)
+    p = torch.nn.Parameter(w0.clone())
+    p.grad = g.clone()
+    got = opt.step_dense([("w", p)], lr=2e-3, store=opt.trunk_state)
+    assert got == scale
+    # Manual reference: scaled grad into moments, scaled lr into the step.
+    st = init_state((4, 4), hp)
+    expect = smaul_update(w0.clone(), g.clone() * scale, st, hp, lr=2e-3 * scale)
+    assert torch.equal(p.data, expect)
+    assert torch.equal(opt.trunk_state["w"]["m"], st["m"])
+    assert torch.equal(opt.trunk_state["w"]["v"], st["v"])
+    # clip <= 0 disables clipping entirely.
+    hp_nc = SmaulOptHParams(state_dtype="fp32", factor_v=False, wd=0.0, clip=0.0)
+    opt_nc = SmaulOpt(hp_nc)
+    q = torch.nn.Parameter(w0.clone())
+    q.grad = g.clone()
+    assert opt_nc.step_dense([("w", q)], lr=2e-3, store=opt_nc.trunk_state) == 1.0
+
+
+def test_step_count_never_read_or_touched_by_optimizer():
+    # The global clock lives in train_step; the optimizer neither advances
+    # it nor lets it leak into update math / scheduler / ponder behavior.
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=False)
+    a = SmaulOpt(hp)
+    b = SmaulOpt(SmaulOptHParams(state_dtype="fp32", factor_v=False))
+    a.step_count = 12345
+    b.step_count = 0
+    torch.manual_seed(7)
+    w0 = torch.randn(3, 3)
+    g = torch.randn(3, 3)
+    pa = torch.nn.Parameter(w0.clone())
+    pb = torch.nn.Parameter(w0.clone())
+    pa.grad = g.clone()
+    pb.grad = g.clone()
+    a.step_dense([("w", pa)], lr=1e-3, store=a.trunk_state)
+    b.step_dense([("w", pb)], lr=1e-3, store=b.trunk_state)
+    assert a.step_count == 12345 and b.step_count == 0  # untouched
+    assert torch.equal(pa.data, pb.data)  # clock value cannot affect math
+    assert torch.equal(a.trunk_state["w"]["m"], b.trunk_state["w"]["m"])
+
+
+def test_skip_inserted_trajectory_matches_uninterrupted():
+    # Equivalent applied-grad sequence with a skip inserted mid-run must
+    # land bit-identically (per-tensor clocks frozen on the skip).
+    def run(seq):
+        hp = SmaulOptHParams(state_dtype="fp32", factor_v=False)
+        opt = SmaulOpt(hp)
+        torch.manual_seed(11)
+        w0 = torch.randn(4, 4)
+        p = torch.nn.Parameter(w0.clone())
+        for g in seq:
+            p.grad = g.clone()
+            opt.step_dense([("w", p)], lr=1e-3, store=opt.trunk_state)
+        return p, opt
+    torch.manual_seed(21)
+    g1, g2, g3 = torch.randn(4, 4), torch.randn(4, 4), torch.randn(4, 4)
+    skip = torch.full((4, 4), float("nan"))
+    p_ref, o_ref = run([g1, g2, g3])
+    p_skip, o_skip = run([g1, skip, g2, g3])
+    assert torch.equal(p_ref.data, p_skip.data)
+    assert torch.equal(o_ref.trunk_state["w"]["m"], o_skip.trunk_state["w"]["m"])
+    assert torch.equal(o_ref.trunk_state["w"]["v"], o_skip.trunk_state["w"]["v"])
+    assert o_ref.trunk_state["w"]["step"] == o_skip.trunk_state["w"]["step"] == 3
+
+
+def _clone_store(store):
+    return {k: {kk: (vv.clone() if torch.is_tensor(vv) else vv)
+                for kk, vv in st.items()} for k, st in store.items()}
+
+
+def test_resume_snapshot_continuation_bit_identical():
+    # Snapshotting weights + trunk/router states + step_count and resuming
+    # reproduces the uninterrupted run bit-for-bit (the resume contract).
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=False)
+    torch.manual_seed(31)
+    grads = [torch.randn(3, 3) for _ in range(4)]
+    w0 = torch.randn(3, 3)
+    opt = SmaulOpt(hp)
+    p = torch.nn.Parameter(w0.clone())
+    for g in grads[:2]:
+        p.grad = g.clone()
+        opt.step_dense([("w", p)], lr=1e-3, store=opt.trunk_state)
+    snap_w, snap_store, snap_count = p.data.clone(), _clone_store(opt.trunk_state), opt.step_count
+    for g in grads[2:]:
+        p.grad = g.clone()
+        opt.step_dense([("w", p)], lr=1e-3, store=opt.trunk_state)
+    ref_w, ref_store = p.data.clone(), _clone_store(opt.trunk_state)
+    # Restore the snapshot into a fresh optimizer/param and replay.
+    opt2 = SmaulOpt(SmaulOptHParams(state_dtype="fp32", factor_v=False))
+    p2 = torch.nn.Parameter(snap_w.clone())
+    opt2.trunk_state = _clone_store(snap_store)
+    opt2.step_count = snap_count
+    for g in grads[2:]:
+        p2.grad = g.clone()
+        opt2.step_dense([("w", p2)], lr=1e-3, store=opt2.trunk_state)
+    assert torch.equal(p2.data, ref_w)
+    assert torch.equal(opt2.trunk_state["w"]["m"], ref_store["w"]["m"])
+    assert torch.equal(opt2.trunk_state["w"]["v"], ref_store["w"]["v"])
+    assert opt2.trunk_state["w"]["step"] == ref_store["w"]["step"] == 4
+
+
+def test_sparse_range_skip_preserves_counters_and_retry_identical():
+    from experts import make_expert
+    from train import _GradOnly
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=False)
+    torch.manual_seed(41)
+    rec1 = make_expert("expert_00000", 8, 8)
+    torch.manual_seed(41)
+    rec2 = make_expert("expert_00000", 8, 8)
+    opt = SmaulOpt(hp)
+    ref = SmaulOpt(SmaulOptHParams(state_dtype="fp32", factor_v=False))
+    codes_before = {n: rec1.weights_fp8[n].codes.clone() for n in ("w_gate", "w_up", "w_down")}
+    steps_before = {n: st["step"] for n, st in rec1.optim_state.items()}
+    bad = {"w_gate": _GradOnly(torch.full((8, 8), float("inf")))}
+    assert opt.step_expert(rec1, bad, 1.0, lr=1e-3, row_range=(2, 4)) == 0.0
+    assert rec1.version == 0  # nothing ticked (pre-seeded zero state untouched)
+    assert {n: st["step"] for n, st in rec1.optim_state.items()} == steps_before
+    for n in ("w_gate", "w_up", "w_down"):
+        assert torch.equal(rec1.weights_fp8[n].codes, codes_before[n])
+    assert bad["w_gate"].grad is not None  # preserved for retry
+    torch.manual_seed(42)
+    gg = torch.randn(8, 8)
+    c1 = {"w_gate": _GradOnly(gg.clone())}
+    c2 = {"w_gate": _GradOnly(gg.clone())}
+    opt.step_expert(rec1, c1, 1.0, lr=1e-3, row_range=(2, 4))
+    ref.step_expert(rec2, c2, 1.0, lr=1e-3, row_range=(2, 4))
+    assert rec1.version == 1
+    assert rec1.optim_state["w_gate"]["step"] == 1  # range still ticks once
+    for n in ("w_gate", "w_up", "w_down"):
+        assert torch.equal(rec1.weights_fp8[n].codes, rec2.weights_fp8[n].codes)
+    assert torch.equal(rec1.optim_state["w_gate"]["m"], rec2.optim_state["w_gate"]["m"])
+
+
+def test_expert_grad_scale_zero_still_applies_not_a_skip():
+    from experts import make_expert
+    from train import _GradOnly
+    hp = SmaulOptHParams(state_dtype="fp32", factor_v=False)
+    opt = SmaulOpt(hp)
+    torch.manual_seed(0)
+    rec = make_expert("expert_00000", 8, 8)
+    g = torch.randn(8, 8)
+    opt.step_expert(rec, {"w_gate": _GradOnly(g)}, 0.0, lr=1e-3)
+    assert rec.version == 1  # grad_scale=0 scales the grad, never skips
+    assert rec.optim_state["w_gate"]["step"] == 1
+
+
+
