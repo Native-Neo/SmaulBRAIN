@@ -47,10 +47,19 @@ class ReplayBuffer:
     instance (seeded at construction, state persisted via to_dict/from_dict).
     No global RNG, no hash-order iteration (storage is a deque, sampling uses
     indexed choice, persistence preserves order).
+
+    Capacity boundaries (defined): ``capacity`` must be >= 0; ``0`` means
+    disabled (stores nothing, every sample is ``[]``). Negative capacities
+    raise. Once full, each new item is kept with probability
+    ``capacity / seen`` (classic Algorithm R: ``j = randrange(seen)``,
+    replace ``buf[j]`` iff ``j < capacity``), so every prefix of the stream
+    is uniformly represented.
     """
 
     def __init__(self, capacity: int = 512, seed: int = 0) -> None:
-        self.capacity = capacity
+        if int(capacity) < 0:
+            raise ValueError(f"ReplayBuffer capacity must be >= 0, got {capacity!r}")
+        self.capacity = int(capacity)
         self.buf: deque[list[int]] = deque()
         self.rng = random.Random(seed)
         self.seen = 0
@@ -117,8 +126,12 @@ def batch_from_seqs(seqs: list[list[int]], context: int, pad_id: int = PAD_ID) -
     Padding defaults to PAD_ID (a structural special, never a real byte),
     so padded positions are distinguishable from data and masked from the
     loss. Callers may pass an explicit byte pad only when the pad positions
-    are genuinely meant to score as data.
+    are genuinely meant to score as data. Empty input raises (a batch must
+    hold >= 1 row; undersized replay is clipped by the sampler, never by
+    silently stacking zero rows).
     """
+    if not seqs:
+        raise ValueError("batch_from_seqs needs >= 1 seq (got empty list)")
     rows = []
     for s in seqs:
         s = s[: context + 1]
