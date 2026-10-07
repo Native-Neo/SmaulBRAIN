@@ -352,3 +352,182 @@ def test_status_observable(monkeypatch):
     assert "-march=native" not in " ".join(s["build_flags"])
     assert "-march=x86-64" in s["build_flags"]
     assert set(s["counters"]) == set(native.COUNTERS)
+
+
+# --- Issue 62: dispatch-mode edge semantics, fallback completeness, counters ---
+
+def test_mode_aliases_and_whitespace(monkeypatch):
+    """Issue 62: mode parsing is case/whitespace-tolerant with true/false."""
+    for v in ("1", "force", "FORCE", "  on  ", "true", "TRUE", "yes", "YES",
+              "enable", "enabled"):
+        monkeypatch.setenv("SMAUL_NATIVE", v)
+        assert native.native_mode() == "force", v
+    for v in ("0", "off", "OFF", "  no ", "disable", "disabled",
+              "false", "FALSE"):
+        monkeypatch.setenv("SMAUL_NATIVE", v)
+        assert native.native_mode() == "off", v
+    for v in ("auto", "AUTO", "  ", "", "whatever", "2"):
+        monkeypatch.setenv("SMAUL_NATIVE", v)
+        assert native.native_mode() == "auto", v
+    monkeypatch.delenv("SMAUL_NATIVE", raising=False)
+    assert native.native_mode() == "auto"
+
+
+def test_forced_infra_failure_records_counter(monkeypatch):
+    """Issue 62: forced host/build failures raise AND stay observable."""
+    monkeypatch.setattr(native, "host_supports_baseline", lambda: False)
+    monkeypatch.setenv("SMAUL_NATIVE", "1")
+    native.reset_counters()
+    with pytest.raises(RuntimeError, match="forced but unsupported"):
+        native.call_rmsnorm(torch.randn(2, 4), torch.randn(4), 1e-6)
+    assert native.COUNTERS["rmsnorm_fallback"] == 1
+    assert "lacks" in native.LAST_FALLBACK["rmsnorm"]
+    # Build failure path records too.
+    monkeypatch.setattr(native, "host_supports_baseline", lambda: True)
+    native.reset_native_state()
+    native.reset_counters()
+    native._build_failed = "simulated boom"
+    try:
+        with pytest.raises(RuntimeError, match="forced but unavailable"):
+            native.call_fp8_quant(
+                torch.randn(2, 8),
+                torch.empty(2, 8, dtype=torch.uint8),
+                torch.empty(2, 2, dtype=torch.float32), 2, 8, 4)
+        assert native.COUNTERS["fp8_quant_fallback"] == 1
+        assert "simulated boom" in native.LAST_FALLBACK["fp8_quant"]
+    finally:
+        native.reset_native_state()
+        native.reset_counters()
+
+
+def test_kernel_exception_force_raises_auto_falls_back(monkeypatch):
+    """Issue 62: kernel errors propagate when forced, fall back when auto."""
+    if shutil.which("g++") is None:
+        pytest.skip("no g++")
+    native.reset_native_state()
+    native.reset_counters()
+    assert native.ensure_native()
+    try:
+        def _boom(*_a, **_k):
+            raise RuntimeError("simulated kernel boom")
+        monkeypatch.setattr(native, "_ptr", _boom)
+        monkeypatch.setenv("SMAUL_NATIVE", "1")
+        native.reset_counters()
+        with pytest.raises(RuntimeError, match="simulated kernel boom"):
+            native.call_rmsnorm(torch.randn(2, 4), torch.randn(4), 1e-6)
+        assert native.COUNTERS["rmsnorm_fallback"] == 1
+        assert "simulated kernel boom" in native.LAST_FALLBACK["rmsnorm"]
+        monkeypatch.setenv("SMAUL_NATIVE", "auto")
+        native.reset_counters()
+        assert native.call_rmsnorm(torch.randn(2, 4), torch.randn(4), 1e-6) is None
+        assert native.COUNTERS["rmsnorm_fallback"] == 1
+        assert native.COUNTERS["rmsnorm_native"] == 0
+    finally:
+        native.reset_native_state()
+        native.reset_counters()
+
+
+def test_fallback_reasons_always_recorded(force_native):
+    """Issue 62: every validation fallback leaves a reason and a count."""
+    assert native.call_rmsnorm(torch.randn(2, 4), torch.randn(4), float("nan")) is None
+    assert native.LAST_FALLBACK["rmsnorm"] == "bad eps (NaN/Inf/negative)"
+    Dh = 8
+    S = torch.zeros(Dh, Dh)
+    z = torch.zeros(Dh)
+    q = k = v = torch.randn(Dh)
+    y, scratch = torch.empty(Dh), torch.empty(2 * Dh)
+    assert not native.call_attn_step(S, z, q, k, v, y, scratch, -3, 1e-6)
+    assert native.LAST_FALLBACK["attn_step"] == "empty Dh"
+    w = torch.randn(2, 8)
+    codes = torch.empty(2, 8, dtype=torch.uint8)
+    scales = torch.empty(2, 2, dtype=torch.float32)
+    assert not native.call_fp8_quant(w, codes, scales, 2, 8, 0)
+    assert "zero tile" in native.LAST_FALLBACK["fp8_quant"]
+    out = torch.empty(2, 8, dtype=torch.float32)
+    assert not native.call_fp8_dequant(codes, scales, out, 2, 8, 0)
+    assert "zero tile" in native.LAST_FALLBACK["fp8_dequant"]
+    for op in ("rmsnorm", "attn_step", "fp8_quant", "fp8_dequant"):
+        assert native.COUNTERS[f"{op}_fallback"] >= 1
+        assert native.LAST_FALLBACK[op]  # non-empty, human-readable
+
+
+def test_native_output_contract(force_native):
+    """Issue 62: native outputs are fresh float32 CPU tensors of right shape."""
+    x = torch.randn(3, 8)
+    w = torch.randn(8)
+    y = native.call_rmsnorm(x, w, 1e-6)
+    assert y is not None
+    assert y.dtype == torch.float32 and y.device.type == "cpu"
+    assert tuple(y.shape) == (3, 8)
+    assert y.data_ptr() not in (x.data_ptr(), w.data_ptr())
+    assert not y.requires_grad
+    assert torch.allclose(y, rmsnorm_fn(x, w), atol=1e-6)
+    assert native.COUNTERS["rmsnorm_native"] == 1
+    # FP8 buffers keep dtype/shape; native path bit-matches reference.
+    fw = torch.randn(4, 130) * 0.5
+    t = quantize_fp8_blockwise(fw, tile=64)
+    assert t.codes.dtype == torch.uint8 and t.scales.dtype == torch.float32
+    assert tuple(t.codes.shape) == (4, 130) and t.scales.shape == (4, 3)
+    r = dequantize_fp8_blockwise(t)
+    assert r.dtype == torch.float32 and tuple(r.shape) == (4, 130)
+
+
+def test_status_has_no_build_side_effects(monkeypatch):
+    """Issue 62: import/status never builds — native is used, not just present."""
+    monkeypatch.setenv("SMAUL_NATIVE", "auto")
+    native.reset_native_state()
+    native.reset_counters()
+    try:
+        assert native._libs == {}
+        s = native.status()
+        assert native._libs == {}  # status() observes, never builds/loads
+        assert s["loaded"] == []
+        assert s["build_failed"] is None
+    finally:
+        native.reset_native_state()
+        native.reset_counters()
+
+
+def test_both_paths_exercised_all_ops(monkeypatch):
+    """Issue 62: native and fallback paths are both exercised and counted."""
+    torch.manual_seed(0)
+    # RMSNorm direct call: forced native vs off fallback.
+    monkeypatch.setenv("SMAUL_NATIVE", "1")
+    native.reset_counters()
+    with torch.no_grad():
+        y_nat = native.call_rmsnorm(torch.randn(2, 4), torch.randn(4), 1e-6)
+    assert y_nat is not None and native.COUNTERS["rmsnorm_native"] == 1
+    monkeypatch.setenv("SMAUL_NATIVE", "0")
+    native.reset_counters()
+    assert native.call_rmsnorm(torch.randn(2, 4), torch.randn(4), 1e-6) is None
+    assert native.COUNTERS["rmsnorm_native"] == 0
+    assert native.COUNTERS["rmsnorm_fallback"] == 1
+    assert "disabled" in native.LAST_FALLBACK["rmsnorm"]
+    # Attention step via use_native: forced native vs off fallback.
+    Dh = 8
+    mk = lambda: (torch.zeros(Dh, Dh), torch.zeros(Dh), torch.randn(Dh),
+                  torch.randn(Dh), torch.randn(Dh), torch.empty(Dh),
+                  torch.empty(2 * Dh))
+    monkeypatch.setenv("SMAUL_NATIVE", "1")
+    native.reset_counters()
+    S, z, q, k, v, y, sc = mk()
+    with torch.no_grad():
+        assert native.call_attn_step(S, z, q, k, v, y, sc, Dh, 1e-6)
+    assert native.COUNTERS["attn_step_native"] == 1
+    monkeypatch.setenv("SMAUL_NATIVE", "0")
+    native.reset_counters()
+    S, z, q, k, v, y, sc = mk()
+    with torch.no_grad():
+        assert not native.call_attn_step(S, z, q, k, v, y, sc, Dh, 1e-6)
+    assert native.COUNTERS["attn_step_native"] == 0
+    assert native.COUNTERS["attn_step_fallback"] == 1
+    # FP8 auto-dispatches (bit-exact), off-mode falls back with equal bytes.
+    w = torch.randn(4, 130) * 0.5
+    monkeypatch.setenv("SMAUL_NATIVE", "auto")
+    native.reset_counters()
+    t_nat = quantize_fp8_blockwise(w, tile=64)
+    assert native.COUNTERS["fp8_quant_native"] == 1
+    monkeypatch.setenv("SMAUL_NATIVE", "0")
+    t_ref = quantize_fp8_blockwise(w, tile=64)
+    assert torch.equal(t_nat.codes, t_ref.codes)
+    assert torch.equal(t_nat.scales, t_ref.scales)
