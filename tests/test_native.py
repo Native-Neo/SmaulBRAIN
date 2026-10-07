@@ -173,6 +173,7 @@ def test_fp8_nan_input_falls_back_bit_exact(monkeypatch):
     native.reset_counters()
     w = torch.randn(4, 130)
     w[0, 0] = float("nan")
+    w[1, 1] = float("inf")
     t = quantize_fp8_blockwise(w, tile=64)
     assert native.COUNTERS["fp8_quant_native"] == 0  # NaN stays on reference
     assert native.COUNTERS["fp8_quant_fallback"] == 1
