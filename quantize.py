@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 
 import torch
@@ -47,15 +48,24 @@ def _fsync_dir(dirpath: str) -> None:
 
 
 def _sweep_stale_tmp(directory: str) -> None:
-    """Remove leftover converter sidecars from a prior crash (best-effort)."""
+    """Remove leftover converter sidecars from a prior crash (best-effort).
+
+    Unified with storage: matches ``tmp_quant_``, ``tmp_ckpt_``,
+    ``tmp_json_``, staged generation dirs (``tmp_ckpt_gen_*``), and
+    ``.convert_tmp`` sidecars. Directories are removed recursively.
+    """
     try:
         names = os.listdir(directory)
     except OSError:
         return
     for name in names:
-        if name.startswith("tmp_quant_") or name.endswith(".convert_tmp"):
+        if name.startswith(("tmp_quant_", "tmp_ckpt_", "tmp_json_")) or name.endswith(".convert_tmp"):
+            p = os.path.join(directory, name)
             try:
-                os.remove(os.path.join(directory, name))
+                if os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.remove(p)
             except OSError:
                 pass
 
@@ -176,10 +186,18 @@ def convert_checkpoint(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[d
     Transactional: every input is validated first, converted outputs land
     in sidecar files, and the sidecars replace the originals only after all
     conversions succeed — a failure never leaves a half-converted pool.
-    Precision metadata (manifest + config tile) updates last.
+    Precision metadata (manifest + config tile) updates last (commit point).
+    Holds the checkpoint exclusive lock across staging+publish so a
+    concurrent save/load cannot observe a mixed generation.
     """
     if to not in ("fp8", "bf16"):
         raise ValueError(f"unknown target {to}")
+    import storage as _st
+    with _st._ckpt_locked(ckpt_dir, exclusive=True):
+        return _convert_checkpoint_locked(ckpt_dir, to=to, tile=tile)
+
+
+def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[dict]:
     manifest = load_manifest(ckpt_dir)
     man_path = os.path.join(ckpt_dir, "manifest.json")
     cfg_path = os.path.join(ckpt_dir, "config.json")
@@ -206,6 +224,7 @@ def convert_checkpoint(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[d
                 reports.append(convert_expert_file(p, tmp, to=to, tile=tile))
                 staged.append((tmp, p))
             for tmp, p in staged:
+                _fsync_file(tmp)
                 os.replace(tmp, p)
             _fsync_dir(exp_dir)
         finally:
