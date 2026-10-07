@@ -12,6 +12,12 @@
 extern "C" void smaul_rmsnorm_forward(
     const float* x, const float* w, float* y,
     std::size_t rows, std::size_t cols, float eps) {
+  // Safety: null/empty inputs are no-ops (Python validates first; this keeps
+  // a stray ctypes call from faulting or dividing by zero). No AVX/intrinsics:
+  // baseline x86-64 only, safe on Ivy Bridge and later.
+  if (!x || !w || !y) return;
+  if (rows == 0 || cols == 0) return;
+  if (!(eps >= 0.0f) || !std::isfinite(eps)) return;
   for (std::size_t r = 0; r < rows; ++r) {
     const float* xr = x + r * cols;
     float acc = 0.0f;
