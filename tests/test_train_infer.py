@@ -314,3 +314,108 @@ def test_cli_quantize_and_train_grow_every_schema(tmp_path):
     cfg = config_from_args(build_parser().parse_args(["train"]))
     assert resolve_train_grow_every(build_parser().parse_args(["train"]), cfg) == cfg.grow_every == 200
     assert resolve_train_grow_every(build_parser().parse_args(["train", "--grow-every", "0"]), cfg) == 0
+
+
+# --- issue #56: special-token generation contract (append-only) ---
+
+def _stub_model(plan, vocab_size=260, logits_vocab=None):
+    """Minimal generate() double: scripted argmax ids, no training."""
+    import types
+    lv = logits_vocab if logits_vocab is not None else vocab_size
+    state = {"i": 0}
+
+    def _out_for(x):
+        want = plan[min(state["i"], len(plan) - 1)]
+        state["i"] += 1
+        t = x.shape[1] if x.ndim == 2 else 1
+        l = torch.full((1, t, lv), -10.0)
+        if 0 <= want < lv:
+            l[:, -1, want] = 10.0
+        return {"logits": l, "depths": torch.zeros(1, t)}, []
+
+    m = types.SimpleNamespace()
+    m.training = False
+    m.eval = lambda: setattr(m, "training", False)
+    m.train = lambda: setattr(m, "training", True)
+    m.embed = types.SimpleNamespace(
+        weight=types.SimpleNamespace(device=torch.device("cpu")))
+    m.cfg = types.SimpleNamespace(vocab_size=vocab_size, context_length=24)
+    m.forward_infer_stateful = lambda x, attn_states=None, step=0: _out_for(x)
+    # Step reuses _out_for (shares the script counter).
+    m.forward_infer_step = lambda x, s, step=0: _out_for(x)
+    m.pager = types.SimpleNamespace(
+        stats=types.SimpleNamespace(to_dict=lambda: {}))
+    return m
+
+
+def test_generate_stops_on_eos_by_default():
+    from bytes import EOS_ID, decode_text
+    m = _stub_model([EOS_ID])
+    res = generate(m, [104, 105], max_new=8, temperature=0.0)
+    assert res["ids"][-1] == EOS_ID and len(res["ids"]) == 3
+    assert len(res["depths"]) == 1  # EOS keeps its depth entry
+    assert res["text"] == decode_text(res["ids"][2:]) == ""  # EOS decodes to no text
+
+
+def test_generate_stop_on_eos_false_runs_full_length():
+    from bytes import EOS_ID
+    m = _stub_model([EOS_ID])
+    res = generate(m, [104, 105], max_new=4, temperature=0.0, stop_on_eos=False)
+    assert res["ids"][2:] == [EOS_ID] * 4 and len(res["depths"]) == 4
+
+
+def test_generate_never_samples_pad_or_bos_greedy():
+    from bytes import PAD_ID, BOS_ID
+    for banned in (PAD_ID, BOS_ID):
+        m = _stub_model([banned])  # stub wants the banned id on top
+        res = generate(m, [104, 105], max_new=1, temperature=0.0)
+        assert res["ids"][-1] != banned  # masked before argmax
+        assert 0 <= res["ids"][-1] < 256  # falls back to a real byte
+
+
+def test_sample_next_forbidden_masks_greedy_and_validates_vocab():
+    from infer import sample_next
+    from bytes import PAD_ID, BOS_ID
+    l = torch.full((260,), -10.0)
+    l[PAD_ID] = 100.0
+    l[65] = 10.0
+    assert sample_next(l, temperature=0.0, forbidden_ids=[PAD_ID, BOS_ID]) == 65
+    assert sample_next(l, temperature=0.0) == PAD_ID  # no mask: old path intact
+    with pytest.raises(ValueError):
+        sample_next(torch.zeros(260), temperature=0.0, vocab_size=259)
+    assert sample_next(torch.zeros(4), temperature=0.0, vocab_size=4) == 0
+    with pytest.raises(ValueError):
+        sample_next(torch.zeros(4), temperature=0.0, vocab_size=260)
+    # Out-of-range forbiddens are ignored so tiny logits still work.
+    assert sample_next(torch.zeros(4), temperature=0.0,
+                       forbidden_ids=[99999]) == 0
+
+
+def test_generate_rejects_logits_vocab_mismatch():
+    from bytes import EOS_ID
+    m = _stub_model([65], vocab_size=260, logits_vocab=4)
+    with pytest.raises(ValueError):
+        generate(m, [104, 105], max_new=2, temperature=0.0)
+
+
+def test_generate_byte_zero_is_ordinary_data():
+    m = _stub_model([0])
+    res = generate(m, [0, 65], max_new=1, temperature=0.0)  # NUL prompt ok
+    assert res["ids"][:2] == [0, 65] and res["ids"][-1] == 0  # NUL sampled ok
+    assert res["text"] == "\x00"  # NUL decodes, never treated as pad/terminator
+
+
+def test_generate_continuation_only_decode_skips_specials_and_prompt():
+    from bytes import BOS_ID as _BOS, EOS_ID as _EOS
+    from bytes import SPECIAL_IDS, decode_text
+    _SEP = SPECIAL_IDS["<sep>"]
+    m = _stub_model([65, _SEP, _EOS])
+    res = generate(m, [_BOS, 104, 105], max_new=8, temperature=0.0)
+    assert res["ids"][:3] == [_BOS, 104, 105]  # prompt kept, no auto-BOS added
+    assert res["ids"][3:] == [65, _SEP, _EOS]  # EOS terminates, SEP kept
+    assert res["text"] == decode_text(res["ids"][3:])  # continuation-only
+    assert res["text"] == "A"  # SEP/EOS contribute no text
+    # No-BOS prompt stays BOS-free: generate never auto-prepends BOS.
+    m2 = _stub_model([66])
+    res2 = generate(m2, [104, 105], max_new=1, temperature=0.0)
+    assert res2["ids"] == [104, 105, 66]
