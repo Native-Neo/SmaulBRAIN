@@ -204,3 +204,19 @@ def test_concurrent_duplicate_prefetch_collapses():
     assert pg.stats.prefetch_submitted == 2  # collapsed despite the race
     pg.await_prefetch()
     pg.close()
+
+
+def test_caches_stay_bounded_and_close_is_repeatable():
+    pool = _pool()
+    pg = ExpertPager(pool, mode="R2VR", ram_cache=2, vram_cache=2,
+                     load_from_disk=_counting(pool))
+    for _ in range(3):
+        for eid in pool.order:
+            pg.provider(eid)
+        pg.prefetch(list(pool.order))
+        pg.await_prefetch()
+    counts = pg.resident_counts()
+    assert counts["vram"] <= 2  # LRU caps hold under churn, no leak
+    assert not pg._pending and not pg._prefetched  # nothing left in flight
+    pg.close()
+    pg.close()  # repeatable shutdown
