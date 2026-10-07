@@ -28,6 +28,27 @@ class RoutePlan:
     dropped: torch.Tensor  # [N] bool: token dropped by capacity
     probs: torch.Tensor  # [N, E] full softmax probs (for balance loss)
 
+    def validate(self, num_experts: int, top_k: int) -> None:
+        """Structural contract: shapes, id range, finiteness, device unity."""
+        n = self.top_ids.shape[0]
+        assert self.top_ids.shape == (n, top_k), "top_ids shape"
+        assert self.top_weights.shape == (n, top_k), "top_weights shape"
+        assert self.dropped.shape == (n,), "dropped shape"
+        assert self.probs.shape == (n, num_experts), "probs shape"
+        assert self.top_ids.dtype == torch.long, "top_ids dtype"
+        assert self.dropped.dtype == torch.bool, "dropped dtype"
+        dev = self.top_ids.device
+        for name in ("top_weights", "dropped", "probs"):
+            assert getattr(self, name).device == dev, f"{name} device"
+        if n == 0:
+            return
+        assert bool(((self.top_ids >= 0) & (self.top_ids < num_experts)).all()), \
+            "expert id out of range"
+        assert bool(torch.isfinite(self.top_weights).all()), "nonfinite weight"
+        assert bool(torch.isfinite(self.probs).all()), "nonfinite prob"
+        for row in self.top_ids.tolist():
+            assert len(set(row)) == len(row), "duplicate top-k expert id"
+
 
 class SparseRouter(nn.Module):
     """Top-k router: Linear(d -> n_experts) + softmax + top-k + capacity."""
@@ -66,11 +87,14 @@ class SparseRouter(nn.Module):
         """
         n_tokens = x.shape[0]
         if n_tokens == 0:
-            empty_ids = torch.zeros((0, self.top_k), dtype=torch.long)
-            empty_w = torch.zeros((0, self.top_k))
-            return RoutePlan(top_ids=empty_ids, top_weights=empty_w,
-                             dropped=torch.zeros(0, dtype=torch.bool),
-                             probs=torch.zeros((0, self.num_experts)))
+            dev = x.device
+            empty_ids = torch.zeros((0, self.top_k), dtype=torch.long, device=dev)
+            empty_w = torch.zeros((0, self.top_k), device=dev)
+            plan = RoutePlan(top_ids=empty_ids, top_weights=empty_w,
+                             dropped=torch.zeros(0, dtype=torch.bool, device=dev),
+                             probs=torch.zeros((0, self.num_experts), device=dev))
+            plan.validate(self.num_experts, self.top_k)
+            return plan
         logits = self.proj(x.to(self.proj.weight.dtype)).float()  # [N, E]
         bad = ~torch.isfinite(logits).all(dim=-1)
         if bool(bad.any()):
@@ -83,7 +107,7 @@ class SparseRouter(nn.Module):
         n = top_ids.shape[0]
         if not enforce_capacity:
             admit = torch.ones_like(top_ids, dtype=torch.bool)
-            dropped = torch.zeros(n, dtype=torch.bool)
+            dropped = torch.zeros(n, dtype=torch.bool, device=top_ids.device)
         else:
             admit, dropped = self._admit_slots(top_ids, top_w, n)
             top_w = torch.where(admit, top_w, torch.zeros_like(top_w))
@@ -95,7 +119,9 @@ class SparseRouter(nn.Module):
                 counts = torch.bincount(kept, minlength=self.num_experts)
                 self.usage_counts += counts.to(torch.float64)
                 self.admit_counts += counts.to(torch.float64)
-        return RoutePlan(top_ids=top_ids, top_weights=top_w, dropped=dropped, probs=probs)
+        plan = RoutePlan(top_ids=top_ids, top_weights=top_w, dropped=dropped, probs=probs)
+        plan.validate(self.num_experts, self.top_k)
+        return plan
 
     def _admit_slots(self, top_ids: torch.Tensor, top_w: torch.Tensor,
                      n_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -108,13 +134,19 @@ class SparseRouter(nn.Module):
         admitted slot is dropped to the residual path.
         """
         cap = max(1, int(self.capacity_factor * n_tokens * self.top_k / self.num_experts))
-        order = torch.argsort(top_w.max(dim=-1).values, descending=True)
+        # Stable priority: equal-confidence tokens keep input order, so the
+        # same batch always admits the same slots (deterministic routing).
+        order = torch.argsort(top_w.max(dim=-1).values, descending=True, stable=True)
         assigned = torch.zeros(self.num_experts, dtype=torch.long)
         admit = torch.zeros_like(top_ids, dtype=torch.bool)
-        dropped = torch.zeros(n_tokens, dtype=torch.bool)
+        dropped = torch.zeros(n_tokens, dtype=torch.bool, device=top_ids.device)
+        # One host transfer up front: the loop below is pure Python over
+        # lists (no per-slot device synchronization on the hot path).
+        top_list = top_ids.tolist()
         for idx in order.tolist():
+            row = top_list[idx]
             for slot in range(self.top_k):
-                e = int(top_ids[idx, slot].item())
+                e = row[slot]
                 if assigned[e] < cap:
                     assigned[e] += 1
                     admit[idx, slot] = True
