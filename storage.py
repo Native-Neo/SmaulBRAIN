@@ -19,12 +19,20 @@ Single experts load/save without touching the rest of the model.
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import json
 import os
 import random
+import shutil
 import tempfile
 
 import torch
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    _fcntl = None
 
 from experts import ExpertRecord, init_expert_optim_state
 from precision import FP8BlockTensor
@@ -87,20 +95,77 @@ def _fsync_dir(dirpath: str) -> None:
 def _sweep_stale_tmp(directory: str) -> None:
     """Remove leftover atomic-write sidecars from a prior crash.
 
-    Matches this module's tmp prefixes plus converter sidecars that may
-    share the directory; best-effort so a concurrent writer never fails
-    the sweep.
+    Matches this module's tmp prefixes, the quantizer's ``tmp_quant_``
+    prefix, staged generation dirs (``tmp_ckpt_gen_*``), and converter
+    sidecars that may share the directory; best-effort so a concurrent
+    writer never fails the sweep. Directories are removed recursively.
     """
     try:
         names = os.listdir(directory)
     except OSError:
         return
     for name in names:
-        if name.startswith(("tmp_ckpt_", "tmp_json_")) or name.endswith(".convert_tmp"):
+        if name.startswith(("tmp_ckpt_", "tmp_json_", "tmp_quant_")) or name.endswith(".convert_tmp"):
+            p = os.path.join(directory, name)
             try:
-                os.remove(os.path.join(directory, name))
+                if os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.remove(p)
             except OSError:
                 pass
+
+
+def _ckpt_lock_path(ckpt_dir: str) -> str:
+    return os.path.join(ckpt_dir, ".ckpt.lock")
+
+
+@contextlib.contextmanager
+def _ckpt_locked(ckpt_dir: str, exclusive: bool):
+    """Inter-process checkpoint lock (best-effort flock).
+
+    Writers hold an exclusive lock for the whole stage+publish sequence;
+    readers hold a shared lock for the whole load. On hosts without
+    ``fcntl`` this is a no-op. The lock file itself is never part of the
+    checkpoint format and is ignored by the loader.
+    """
+    if _fcntl is None:
+        yield
+        return
+    try:
+        os.makedirs(ckpt_dir, exist_ok=True)
+        fd = os.open(_ckpt_lock_path(ckpt_dir), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        yield
+        return
+    try:
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_EX if exclusive else _fcntl.LOCK_SH)
+        except OSError:
+            pass
+        yield
+    finally:
+        try:
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
+            except OSError:
+                pass
+        finally:
+            os.close(fd)
+
+
+def _with_ckpt_lock(exclusive: bool):
+    """Decorator: hold the checkpoint lock across save/load calls."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(ckpt_dir: str, *args, **kwargs):
+            with _ckpt_locked(ckpt_dir, exclusive=exclusive):
+                return fn(ckpt_dir, *args, **kwargs)
+        return wrapper
+    return deco
+
+
+_TMP_GEN_PREFIX = "tmp_ckpt_gen_"
 
 
 def _checked_torch_load(path: str):
@@ -219,6 +284,16 @@ def load_expert_file(path: str) -> ExpertRecord:
 def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = None) -> None:
     """Save the full model + optimizer. Manifest is written last (commit point).
 
+    Filesystem transaction: every new file is first fully written and
+    fsynced inside a temporary generation dir
+    (``ckpt_dir/tmp_ckpt_gen_*`` on the same filesystem), then published
+    into place with manifest last. A crash during staging leaves the
+    previous complete generation untouched; only the fast rename phase
+    runs in the live directory, and it holds an exclusive inter-process
+    lock so concurrent readers (shared lock in :func:`load_model`) see
+    either the previous or the new complete generation. Stale generation
+    dirs and tmp sidecars from a prior crash are swept before staging.
+
     Validates before writing anything: a topology that fails validation
     raises without touching the checkpoint directory, so a previous
     complete generation is never clobbered by a partial one.
@@ -248,58 +323,81 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
     os.makedirs(ckpt_dir, exist_ok=True)
     exp_dir = os.path.join(ckpt_dir, "experts")
     os.makedirs(exp_dir, exist_ok=True)
-    # Crash leftovers (tmp_ckpt_*/tmp_json_*/.convert_tmp) must not
-    # accumulate: sweep them now so the next load/save sees a clean dir.
-    _sweep_stale_tmp(ckpt_dir)
-    _sweep_stale_tmp(exp_dir)
-    cfg_dict = model.cfg.to_dict()
-    cfg_dict["num_experts"] = len(model.pool)
-    from config import __version__ as _schema
-    cfg_dict["schema_version"] = _schema
-    # Pruning may reduce the pool below the configured floor; checkpoints
-    # must remain constructible while still respecting top_k.
-    cfg_dict["min_experts"] = min(model.cfg.min_experts, len(model.pool))
-    _atomic_write_json(cfg_dict, os.path.join(ckpt_dir, "config.json"))
-    _atomic_save({k: v.detach().cpu() for k, v in model.state_dict().items()
-                  if not k.startswith("router.") and "usage_" not in k and "admit_" not in k
-                  and k not in ("router.proj.weight", "router.proj.bias")},
-                 os.path.join(ckpt_dir, "trunk.pt"))
-    _atomic_save({"weight": model.router.proj.weight.detach().cpu(),
-                  "bias": model.router.proj.bias.detach().cpu()},
-                 os.path.join(ckpt_dir, "router.pt"))
-    _atomic_save({"trunk": opt.trunk_state, "router": opt.router_state,
-                  "step_count": opt.step_count,
-                  "hparams": dict(opt.hp.__dict__)}, os.path.join(ckpt_dir, "optim.pt"))
-    _atomic_save(get_rng_snapshot(), os.path.join(ckpt_dir, "rng.pt"))
-    for eid in model.pool.order:
-        save_expert_file(model.pool.experts[eid], os.path.join(exp_dir, f"{eid}.pt"))
-    manifest = {
-        "step": step,
-        "expert_ids": list(model.pool.order),
-        "next_id": model.pool._next_id,
-        "paging_method": model.cfg.paging_method,
-        "usage": model.pool.usage_snapshot(),
-        "router_usage": model.router.usage_counts.tolist(),
-        "router_admit": model.router.admit_counts.tolist(),
-        "param_counts": model.param_counts(),
-        "extra": extra_meta or {},
-    }
-    _atomic_write_json(manifest, os.path.join(ckpt_dir, "manifest.json"))
-    # The manifest is the commit point. Once it is safely published, remove
-    # expert files no longer referenced by the new topology.
-    live = {f"{eid}.pt" for eid in model.pool.order}
-    try:
-        names = os.listdir(exp_dir)
-    except FileNotFoundError:
-        names = []
-    for name in names:
-        if name.endswith(".pt") and name not in live:
-            try:
-                os.remove(os.path.join(exp_dir, name))
-            except OSError:
-                pass
-    _fsync_dir(exp_dir)
-    _fsync_dir(ckpt_dir)
+    with _ckpt_locked(ckpt_dir, exclusive=True):
+        # Crash leftovers (tmp_ckpt_*/tmp_json_*/tmp_quant_*/.convert_tmp
+        # plus staged generation dirs) must not accumulate: sweep them now
+        # so the next load/save sees a clean dir.
+        _sweep_stale_tmp(ckpt_dir)
+        _sweep_stale_tmp(exp_dir)
+        cfg_dict = model.cfg.to_dict()
+        cfg_dict["num_experts"] = len(model.pool)
+        from config import __version__ as _schema
+        cfg_dict["schema_version"] = _schema
+        # Pruning may reduce the pool below the configured floor; checkpoints
+        # must remain constructible while still respecting top_k.
+        cfg_dict["min_experts"] = min(model.cfg.min_experts, len(model.pool))
+        manifest = {
+            "step": step,
+            "expert_ids": list(model.pool.order),
+            "next_id": model.pool._next_id,
+            "paging_method": model.cfg.paging_method,
+            "usage": model.pool.usage_snapshot(),
+            "router_usage": model.router.usage_counts.tolist(),
+            "router_admit": model.router.admit_counts.tolist(),
+            "param_counts": model.param_counts(),
+            "extra": extra_meta or {},
+        }
+        # ---- stage: all slow writes happen off to the side ----
+        staging = tempfile.mkdtemp(dir=ckpt_dir, prefix=_TMP_GEN_PREFIX)
+        try:
+            st_exp = os.path.join(staging, "experts")
+            os.makedirs(st_exp, exist_ok=True)
+            _atomic_write_json(cfg_dict, os.path.join(staging, "config.json"))
+            _atomic_save({k: v.detach().cpu() for k, v in model.state_dict().items()
+                          if not k.startswith("router.") and "usage_" not in k and "admit_" not in k
+                          and k not in ("router.proj.weight", "router.proj.bias")},
+                         os.path.join(staging, "trunk.pt"))
+            _atomic_save({"weight": model.router.proj.weight.detach().cpu(),
+                          "bias": model.router.proj.bias.detach().cpu()},
+                         os.path.join(staging, "router.pt"))
+            _atomic_save({"trunk": opt.trunk_state, "router": opt.router_state,
+                          "step_count": opt.step_count,
+                          "hparams": dict(opt.hp.__dict__)}, os.path.join(staging, "optim.pt"))
+            _atomic_save(get_rng_snapshot(), os.path.join(staging, "rng.pt"))
+            for eid in model.pool.order:
+                _atomic_save(expert_to_payload(model.pool.experts[eid]),
+                             os.path.join(st_exp, f"{eid}.pt"))
+            _atomic_write_json(manifest, os.path.join(staging, "manifest.json"))
+            _fsync_dir(st_exp)
+            _fsync_dir(staging)
+            # ---- publish: fast renames only, manifest last (commit point) ----
+            for name in ("config.json", "trunk.pt", "router.pt", "optim.pt", "rng.pt"):
+                os.replace(os.path.join(staging, name), os.path.join(ckpt_dir, name))
+            for eid in model.pool.order:
+                os.replace(os.path.join(st_exp, f"{eid}.pt"),
+                           os.path.join(exp_dir, f"{eid}.pt"))
+            _fsync_dir(exp_dir)
+            _fsync_dir(ckpt_dir)
+            os.replace(os.path.join(staging, "manifest.json"),
+                       os.path.join(ckpt_dir, "manifest.json"))
+            _fsync_dir(ckpt_dir)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        # The manifest is the commit point. Once it is safely published, remove
+        # expert files no longer referenced by the new topology.
+        live = {f"{eid}.pt" for eid in model.pool.order}
+        try:
+            names = os.listdir(exp_dir)
+        except FileNotFoundError:
+            names = []
+        for name in names:
+            if name.endswith(".pt") and name not in live:
+                try:
+                    os.remove(os.path.join(exp_dir, name))
+                except OSError:
+                    pass
+        _fsync_dir(exp_dir)
+        _fsync_dir(ckpt_dir)
 
 
 def load_manifest(ckpt_dir: str) -> dict:
@@ -481,6 +579,7 @@ def _validate_rng_snapshot(snap) -> None:
             _require(isinstance(cuda, (list, tuple)), "rng snapshot bad cuda state")
 
 
+@_with_ckpt_lock(exclusive=False)
 def load_model(ckpt_dir: str, model, opt) -> dict:
     """Load weights/opt/router/experts into an existing model+opt. Returns manifest.
 
@@ -488,6 +587,10 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     live object mutates, and the commit phase only swaps in prebuilt objects.
     A corrupt checkpoint raises with the live model untouched — never a
     partially restored model.
+
+    Holds a shared inter-process lock for the whole read so a concurrent
+    :func:`save_model` (exclusive lock, manifest-last publish) cannot
+    interleave a mixed generation underneath the read.
     """
     from config import SmaulBrainConfig, __version__ as _schema
 
