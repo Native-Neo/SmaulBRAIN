@@ -459,6 +459,16 @@ def call_fp8_quant(
     if tuple(scales.shape) != (rows, nblocks):
         _note("fp8_quant", False, "scales shape mismatch for tile")
         return False
+    # NaN encodes differently per path (native saturates to finite codes,
+    # torch casts NaN->NaN code), so non-finite inputs stay on the reference
+    # path: bit-exactness is preserved and nothing crashes either way.
+    try:
+        if not bool(torch.isfinite(w).all()):
+            _note("fp8_quant", False, "non-finite input (NaN/Inf)")
+            return False
+    except Exception:
+        _note("fp8_quant", False, "finiteness check failed")
+        return False
     if not all(_valid_ptr(t) for t in (w, codes, scales)):
         _note("fp8_quant", False, "null storage")
         return False
