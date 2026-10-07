@@ -328,8 +328,8 @@ def grow_topk_clones(
     try:
         for rec, parent_row in built:
             pool.add(rec)
-            router.add_expert_row(init=parent_row)
             new_ids.append(rec.expert_id)
+            router.add_expert_row(init=parent_row)
         if optim_state is not None and new_ids:
             _pad_state_rows(optim_state, len(new_ids))
     except Exception:
