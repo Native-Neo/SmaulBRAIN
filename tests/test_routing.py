@@ -3,6 +3,7 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import pytest
 import torch
 from routing import SparseRouter
 
@@ -140,3 +141,60 @@ def test_inference_routing_ignores_batch_size():
     split_w = torch.cat([p.top_weights for p in parts], dim=0)
     assert torch.equal(whole.top_ids, split_ids)
     assert torch.allclose(whole.top_weights, split_w)
+
+
+def test_identical_tokens_admit_in_input_order():
+    # All rows tie on confidence: stable priority must admit earlier tokens
+    # first, identically on every run (deterministic tie-breaking).
+    torch.manual_seed(0)
+    r = SparseRouter(8, num_experts=4, top_k=2, capacity_factor=0.5)
+    row = torch.randn(1, 8)
+    x = row.expand(8, 8).contiguous()
+    first = r.route(x)
+    assert first.dropped.tolist() == [False, False] + [True] * 6
+    for _ in range(3):
+        again = r.route(x)
+        assert torch.equal(again.top_ids, first.top_ids)
+        assert torch.equal(again.dropped, first.dropped)
+        assert torch.allclose(again.top_weights, first.top_weights)
+
+
+def test_topk_ids_unique_per_row_across_seeds():
+    for seed in range(5):
+        torch.manual_seed(seed)
+        r = SparseRouter(16, num_experts=6, top_k=3)
+        plan = r.route(torch.randn(32, 16))
+        for row in plan.top_ids.tolist():
+            assert len(set(row)) == 3  # topk never repeats an expert
+
+
+def test_plan_validator_rejects_bad_plans():
+    from routing import RoutePlan
+    good_ids = torch.tensor([[0, 1], [2, 3]])
+    good_w = torch.tensor([[0.5, 0.5], [1.0, 0.0]])
+    RoutePlan(top_ids=good_ids, top_weights=good_w,
+              dropped=torch.tensor([False, False]),
+              probs=torch.zeros(2, 4)).validate(4, 2)
+    dup = RoutePlan(top_ids=torch.tensor([[1, 1], [2, 3]]),
+                    top_weights=good_w,
+                    dropped=torch.tensor([False, False]),
+                    probs=torch.zeros(2, 4))
+    with pytest.raises(AssertionError):
+        dup.validate(4, 2)
+    oob = RoutePlan(top_ids=torch.tensor([[0, 9], [2, 3]]),
+                    top_weights=good_w,
+                    dropped=torch.tensor([False, False]),
+                    probs=torch.zeros(2, 4))
+    with pytest.raises(AssertionError):
+        oob.validate(4, 2)
+
+
+def test_plan_tensors_share_one_device():
+    torch.manual_seed(0)
+    r = SparseRouter(8, num_experts=4, top_k=2)
+    plan = r.route(torch.randn(10, 8))
+    devs = {plan.top_ids.device, plan.top_weights.device,
+            plan.dropped.device, plan.probs.device}
+    assert len(devs) == 1
+    empty = r.route(torch.zeros(0, 8))
+    assert empty.top_ids.device == empty.dropped.device == empty.probs.device
