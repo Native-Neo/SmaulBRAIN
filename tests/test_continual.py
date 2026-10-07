@@ -366,3 +366,152 @@ def test_resume_before_trigger_matches_uninterrupted():
         m2.pager.close()
         m3.pager.close()
     assert resumed_ids == full_ids
+
+
+def test_scheduler_snapshot_pins_rng_cadence_knobs():
+    # RNG stream splits + batch composition must ride along: replay_n pins
+    # the interleaving width, max_new_experts pins the growth salt.
+    m, cfg = _model()
+    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
+    res = run_training(m, opt, cfg, _seqs(), steps=1, batch_size=2,
+                       replay=ReplayBuffer(8, seed=7), replay_n=1,
+                       grow_every=2, grow_loss_below=None, seed=5,
+                       log_fn=lambda s: None)
+    sched = res["scheduler"]
+    assert sched["replay_n"] == 1
+    assert sched["max_new_experts"] == int(cfg.max_new_experts)
+    assert sched["seed"] == 5
+    m.pager.close()
+
+
+def test_global_rng_streams_isolated_and_restored():
+    # Growth uses isolated Generators, replay an owned Random: dirtying the
+    # global torch/python RNG around save/resume must not perturb the
+    # trajectory, while rng.pt itself still restores the global states.
+    import random
+    from storage import save_model, load_model
+    import tempfile
+    seqs = _seqs()
+    kw = dict(batch_size=2, replay_n=1, grow_every=2,
+              grow_loss_below=-1.0, seed=5, log_fn=lambda s: None)
+    m, cfg = _model()
+    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
+    ref = run_training(m, opt, cfg, seqs, steps=4,
+                       replay=ReplayBuffer(capacity=8, seed=7), **kw)
+    ref_losses = [h["loss"] for h in ref["history"]]
+    ref_embed = m.embed.weight.detach().clone()
+    m.pager.close()
+    m1, cfg1 = _model()
+    o1 = SmaulOpt(SmaulOptHParams(lr=cfg1.expert_lr))
+    leg1 = run_training(m1, o1, cfg1, seqs, steps=2,
+                        replay=ReplayBuffer(capacity=8, seed=7), **kw)
+    torch_cpu_before = torch.get_rng_state().clone()
+    python_before = random.getstate()
+    with tempfile.TemporaryDirectory() as d:
+        save_model(d, m1, o1, 1, extra_meta={"scheduler": leg1["scheduler"]})
+        torch.randn(64)  # dirty globals between save and load
+        [random.random() for _ in range(64)]
+        m2, cfg2 = _model()
+        o2 = SmaulOpt(SmaulOptHParams(lr=cfg2.expert_lr))
+        torch.randn(32)
+        load_model(d, m2, o2)
+        # rng.pt restore: global states return to the checkpoint values.
+        assert torch.equal(torch.get_rng_state(), torch_cpu_before)
+        assert random.getstate()[1] == python_before[1]
+        cfg2 = m2.cfg
+        torch.randn(64)  # dirty again after load: training must not notice
+        [random.random() for _ in range(64)]
+        leg2 = run_training(m2, o2, cfg2, seqs, steps=2, batch_size=2,
+                            replay_n=1, grow_every=2, grow_loss_below=-1.0,
+                            seed=5, log_fn=lambda s: None)
+        got = [h["loss"] for h in leg1["history"]] + \
+            [h["loss"] for h in leg2["history"]]
+        assert got == ref_losses
+        assert torch.equal(m2.embed.weight, ref_embed)
+        m1.pager.close()
+        m2.pager.close()
+
+
+def test_loss_edge_resume_matches_uninterrupted():
+    # The falling-edge memory (prev_loss) crosses the checkpoint boundary:
+    # a split run must fire the same loss-triggered growth as straight-through.
+    from storage import save_model, load_model
+    import tempfile
+    seqs = _seqs()
+    m0, cfg0 = _model()
+    o0 = SmaulOpt(SmaulOptHParams(lr=cfg0.expert_lr))
+    probe = run_training(m0, o0, cfg0, seqs, steps=3, batch_size=2,
+                         grow_every=0, grow_loss_below=None,
+                         log_fn=lambda s: None)
+    m0.pager.close()
+    losses = [h["loss"] for h in probe["history"]]
+    thr = (losses[0] + losses[1]) / 2.0  # fires exactly at step 1
+    assert losses[0] >= thr > losses[1]
+    kw = dict(batch_size=2, grow_every=0, grow_loss_below=thr,
+              growths_per_prune=2, seed=0, log_fn=lambda s: None)
+    m1, cfg1 = _model()
+    o1 = SmaulOpt(SmaulOptHParams(lr=cfg1.expert_lr))
+    full = run_training(m1, o1, cfg1, seqs, steps=3, **kw)
+    m1.pager.close()
+    m2, cfg2 = _model()
+    o2 = SmaulOpt(SmaulOptHParams(lr=cfg2.expert_lr))
+    leg1 = run_training(m2, o2, cfg2, seqs, steps=1, **kw)
+    assert leg1["scheduler"]["prev_loss"] == leg1["history"][0]["loss"]
+    with tempfile.TemporaryDirectory() as d:
+        save_model(d, m2, o2, 0, extra_meta={"scheduler": leg1["scheduler"]})
+        m3, cfg3 = _model()
+        o3 = SmaulOpt(SmaulOptHParams(lr=cfg3.expert_lr))
+        load_model(d, m3, o3)
+        cfg3 = m3.cfg
+        leg2 = run_training(m3, o3, cfg3, seqs, steps=2, **kw)
+        resumed_grew = [h["grew"] for h in leg1["history"]] + \
+            [h["grew"] for h in leg2["history"]]
+        resumed_loss = [h["loss"] for h in leg1["history"]] + \
+            [h["loss"] for h in leg2["history"]]
+        assert resumed_grew == [h["grew"] for h in full["history"]]
+        assert resumed_loss == [h["loss"] for h in full["history"]]
+        m2.pager.close()
+        m3.pager.close()
+
+
+def test_resume_replay_rebase_rule():
+    # Cursor re-basing rule: replay=None on resume continues the snapshot
+    # trajectory (bit-equal); an explicit fresh buffer intentionally re-bases
+    # (deterministic but divergent). Both halves of the rule are pinned here.
+    from storage import save_model, load_model
+    import tempfile
+    seqs = _seqs()
+    kw = dict(batch_size=2, replay_n=1, grow_every=0,
+              grow_loss_below=-1.0, seed=5, log_fn=lambda s: None)
+    m, cfg = _model()
+    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
+    ref = run_training(m, opt, cfg, seqs, steps=4,
+                       replay=ReplayBuffer(capacity=8, seed=7), **kw)
+    ref_losses = [h["loss"] for h in ref["history"]]
+    m.pager.close()
+    m1, cfg1 = _model()
+    o1 = SmaulOpt(SmaulOptHParams(lr=cfg1.expert_lr))
+    leg1 = run_training(m1, o1, cfg1, seqs, steps=2,
+                        replay=ReplayBuffer(capacity=8, seed=7), **kw)
+    with tempfile.TemporaryDirectory() as d:
+        save_model(d, m1, o1, 1, extra_meta={"scheduler": leg1["scheduler"]})
+        # Snapshot path: replay=None -> exact continuation.
+        m2, cfg2 = _model()
+        o2 = SmaulOpt(SmaulOptHParams(lr=cfg2.expert_lr))
+        load_model(d, m2, o2)
+        leg2 = run_training(m2, o2, m2.cfg, seqs, steps=2, **kw)
+        got = [h["loss"] for h in leg1["history"]] + \
+            [h["loss"] for h in leg2["history"]]
+        assert got == ref_losses
+        m2.pager.close()
+        # Re-base path: explicit fresh buffer restarts the sampler.
+        m3, cfg3 = _model()
+        o3 = SmaulOpt(SmaulOptHParams(lr=cfg3.expert_lr))
+        load_model(d, m3, o3)
+        leg3 = run_training(m3, o3, m3.cfg, seqs, steps=2,
+                            replay=ReplayBuffer(capacity=8, seed=7), **kw)
+        rebased = [h["loss"] for h in leg1["history"]] + \
+            [h["loss"] for h in leg3["history"]]
+        assert rebased != ref_losses  # intentional re-base, never silent equal
+        m3.pager.close()
+        m1.pager.close()
