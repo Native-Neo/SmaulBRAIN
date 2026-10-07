@@ -381,3 +381,123 @@ def test_step_expert_row_range_preserves_untouched_fp8_bit_for_bit():
     assert torch.equal(rec.weights_fp8["w_down"].codes, orig_codes["w_down"])
     assert torch.equal(rec.weights_fp8["w_down"].scales, orig_scales["w_down"])
 
+
+def test_grow_topk_build_failure_restores_id_cursor():
+    """Growth rollback: phase-1 build failure consumes no IDs."""
+    pool, r = _synced(n=3)
+    pool.experts["expert_00000"].weights_fp8["w_gate"] = None  # poison build
+    next_before = pool._next_id
+    order = list(pool.order)
+    w_before = r.proj.weight.detach().clone()
+    with pytest.raises(Exception):
+        grow_topk_clones(pool, r, 16, 32, step=1, seed=0, k=3)
+    assert pool.order == order and r.num_experts == 3
+    assert pool._next_id == next_before  # no consumed IDs
+    assert pool.fresh_id() == "expert_00003"  # cursor reusable
+    assert torch.equal(r.proj.weight, w_before)
+
+
+def test_grow_expert_commit_failure_restores_exact_topology(monkeypatch):
+    """Growth rollback: router-append failure undoes pool add + ID cursor."""
+    pool, r = _synced(n=3)
+    next_before = pool._next_id
+    order = list(pool.order)
+    w_before = r.proj.weight.detach().clone()
+    b_before = r.proj.bias.detach().clone()
+
+    def boom(init=None):
+        raise RuntimeError("router on fire")
+    monkeypatch.setattr(r, "add_expert_row", boom)
+    with pytest.raises(RuntimeError):
+        grow_expert(pool, r, 16, 32, step=1, seed=0)
+    assert pool.order == order and len(pool) == 3 and r.num_experts == 3
+    assert pool._next_id == next_before  # ID restored
+    assert torch.equal(r.proj.weight, w_before)
+    assert torch.equal(r.proj.bias, b_before)
+
+
+def test_grow_topk_commit_failure_rolls_back_prefix_exactly(monkeypatch):
+    """Growth rollback: mid-commit failure removes prefix, restores cursor."""
+    pool, r = _synced(n=3)
+    next_before = pool._next_id
+    order = list(pool.order)
+    w_before = r.proj.weight.detach().clone()
+    from smaulopt import SmaulOpt, SmaulOptHParams
+    opt = SmaulOpt(SmaulOptHParams())
+    d = r.proj.weight.shape[1]
+    m = torch.stack([torch.full((d,), 100.0 + i) for i in range(3)])
+    opt.router_state["w"] = {"m": m.clone(), "step": 5,
+                             "v_row": torch.zeros(3, 1),
+                             "v_col": torch.zeros(1, d)}
+    real_add = r.add_expert_row
+    calls = {"n": 0}
+
+    def flaky(init=None):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("router on fire mid-sweep")
+        return real_add(init=init)
+    monkeypatch.setattr(r, "add_expert_row", flaky)
+    with pytest.raises(RuntimeError):
+        grow_topk_clones(pool, r, 16, 32, step=1, seed=0, k=3,
+                         optim_state=opt.router_state)
+    # Exact prior topology: no prefix left behind, cursor restored.
+    assert pool.order == order and len(pool) == 3 and r.num_experts == 3
+    assert pool._next_id == next_before
+    assert torch.equal(r.proj.weight, w_before)
+    m_after = opt.router_state["w"]["m"]
+    assert m_after.shape == (3, d)  # optim untouched (pad is last)
+    for i in range(3):
+        assert torch.equal(m_after[i], torch.full((d,), 100.0 + i))
+
+
+def test_growth_rejects_mismatched_optim_width_without_mutating():
+    """Validate-first: stale momentum widths refuse before any growth."""
+    pool, r = _synced(n=3)
+    from smaulopt import SmaulOpt, SmaulOptHParams
+    opt = SmaulOpt(SmaulOptHParams())
+    d = r.proj.weight.shape[1]
+    opt.router_state["w"] = {"m": torch.zeros(2, d), "step": 1,
+                             "v_row": torch.zeros(2, 1),
+                             "v_col": torch.zeros(1, d)}
+    order = list(pool.order)
+    next_before = pool._next_id
+    with pytest.raises(ValueError):
+        grow_expert(pool, r, 16, 32, step=1, seed=0,
+                    optim_state=opt.router_state)
+    assert pool.order == order and r.num_experts == 3
+    assert pool._next_id == next_before
+    with pytest.raises(ValueError):
+        grow_topk_clones(pool, r, 16, 32, step=1, seed=0, k=2,
+                         optim_state=opt.router_state)
+    assert pool.order == order and r.num_experts == 3
+    assert pool._next_id == next_before
+
+
+def test_grow_pad_failure_rolls_back_topology(monkeypatch):
+    """Growth rollback: momentum-pad failure undoes pool + router + IDs."""
+    import growth as growth_mod
+    pool, r = _synced(n=3)
+    from smaulopt import SmaulOpt, SmaulOptHParams
+    opt = SmaulOpt(SmaulOptHParams())
+    d = r.proj.weight.shape[1]
+    m = torch.stack([torch.full((d,), 100.0 + i) for i in range(3)])
+    opt.router_state["w"] = {"m": m.clone(), "step": 5,
+                             "v_row": torch.zeros(3, 1),
+                             "v_col": torch.zeros(1, d)}
+    m_before = opt.router_state["w"]["m"].clone()
+    next_before = pool._next_id
+    order = list(pool.order)
+    w_before = r.proj.weight.detach().clone()
+
+    def boom(state, n_new):
+        raise RuntimeError("pad on fire")
+    monkeypatch.setattr(growth_mod, "_pad_state_rows", boom)
+    with pytest.raises(RuntimeError):
+        grow_expert(pool, r, 16, 32, step=1, seed=0,
+                    optim_state=opt.router_state)
+    assert pool.order == order and r.num_experts == 3
+    assert pool._next_id == next_before
+    assert torch.equal(r.proj.weight, w_before)
+    assert torch.equal(opt.router_state["w"]["m"], m_before)
+
