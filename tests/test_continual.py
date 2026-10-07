@@ -515,3 +515,60 @@ def test_resume_replay_rebase_rule():
         assert rebased != ref_losses  # intentional re-base, never silent equal
         m3.pager.close()
         m1.pager.close()
+
+
+def test_scheduler_snapshot_pins_prune_cooldown_knobs():
+    # #68 (cooldowns): prune grace/hysteresis/floor knobs ride in the
+    # scheduler snapshot so a resumer can reuse them exactly; diverging
+    # them intentionally re-bases prune decisions (config.json stays
+    # checkpoint-authoritative via storage.py, verified read-only).
+    m, cfg = _model()
+    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
+    res = run_training(m, opt, cfg, _seqs(), steps=1, batch_size=2,
+                       log_fn=lambda s: None)
+    sched = res["scheduler"]
+    assert sched["prune_survival_steps"] == int(cfg.prune_survival_steps)
+    assert sched["prune_min_usage"] == float(cfg.prune_min_usage)
+    assert sched["min_experts"] == int(cfg.min_experts)
+    assert sched["max_experts"] == int(cfg.max_experts)
+    m.pager.close()
+
+
+def test_resume_before_cadence_prune_matches_uninterrupted():
+    # #68 (pending triggers / no duplicate-or-skip): split run preserves
+    # growth_events and per-step prune decisions, not just grow ids.
+    from storage import save_model, load_model
+    import tempfile
+    seqs = _seqs()
+    kw = dict(batch_size=2, grow_every=2, grow_loss_below=None,
+              growths_per_prune=2, prune_every=2, seed=0,
+              log_fn=lambda s: None)
+    m1, cfg1 = _model()
+    o1 = SmaulOpt(SmaulOptHParams(lr=cfg1.expert_lr))
+    full = run_training(m1, o1, cfg1, seqs, steps=4, **kw)
+    full_grow = [list(h["new_experts"]) for h in full["history"]]
+    full_prune = [list(h["pruned_experts"]) for h in full["history"]]
+    full_events = full["growth_events"]
+    m1.pager.close()
+    m2, cfg2 = _model()
+    o2 = SmaulOpt(SmaulOptHParams(lr=cfg2.expert_lr))
+    leg1 = run_training(m2, o2, cfg2, seqs, steps=1, **kw)
+    with tempfile.TemporaryDirectory() as d:
+        save_model(d, m2, o2, 0, extra_meta={"scheduler": leg1["scheduler"]})
+        m3, cfg3 = _model()
+        o3 = SmaulOpt(SmaulOptHParams(lr=cfg3.expert_lr))
+        load_model(d, m3, o3)
+        leg2 = run_training(m3, o3, m3.cfg, seqs, steps=3, **kw)
+        got_grow = [list(h["new_experts"]) for h in leg1["history"]] + \
+            [list(h["new_experts"]) for h in leg2["history"]]
+        got_prune = [list(h["pruned_experts"]) for h in leg1["history"]] + \
+            [list(h["pruned_experts"]) for h in leg2["history"]]
+        assert got_grow == full_grow
+        assert got_prune == full_prune
+        # Exact counter continuity: leg2 carries leg1's counter forward,
+        # so the resumed tail counter equals the uninterrupted total.
+        assert leg2["growth_events"] == full_events
+        assert leg1["scheduler"]["growth_events"] == leg1["growth_events"]
+        assert leg2["scheduler"]["growth_events"] == full_events
+        m2.pager.close()
+        m3.pager.close()
