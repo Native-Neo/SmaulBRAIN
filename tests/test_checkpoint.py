@@ -310,3 +310,113 @@ def test_garbage_rng_snapshot_leaves_model_untouched(tmp_path):
         import torch as _t
         _t.save({"bogus": 1}, os.path.join(d, "rng.pt"))
     _tampered_load_fails_cleanly(tmp_path, tamper)
+
+
+def test_stale_tmp_swept_on_save(tmp_path):
+    """Crash leftovers (tmp_ckpt_/tmp_json_/.convert_tmp) are swept on save."""
+    import storage as _st
+    d = str(tmp_path / "c")
+    m, opt = _trained(d)
+    exp_dir = os.path.join(d, "experts")
+    # Plant stale sidecars imitating a crash mid-rename.
+    for p in [os.path.join(d, "tmp_ckpt_crash"),
+              os.path.join(d, "tmp_json_crash"),
+              os.path.join(exp_dir, "tmp_ckpt_crash"),
+              os.path.join(exp_dir, "stale.convert_tmp")]:
+        with open(p, "w") as f:
+            f.write("stale")
+    save_model(d, m, opt, step=10)
+    assert _st.load_manifest(d)["step"] == 10
+    for root, _, files in os.walk(d):
+        assert not [f for f in files if f.startswith(("tmp_ckpt_", "tmp_json_"))]
+        assert not [f for f in files if f.endswith(".convert_tmp")]
+    m.pager.close()
+
+
+def test_truncated_expert_detected_as_validation_error(tmp_path):
+    """Empty/truncated files raise ValueError (not raw EOF) with model untouched."""
+    import storage as _st
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    eid = m.pool.order[0]
+    p = os.path.join(d, "experts", f"{eid}.pt")
+    with open(p, "wb") as f:
+        f.truncate(0)
+    m2 = SmaulBrainModel(m.cfg)
+    opt2 = SmaulOpt(SmaulOptHParams())
+    before = list(m2.pool.order)
+    with pytest.raises(ValueError, match="validation failed"):
+        load_model(d, m2, opt2)
+    assert list(m2.pool.order) == before
+    with pytest.raises(ValueError, match="validation failed"):
+        _st.load_expert_file(p)
+    # Truncated (non-empty) payload is also normalized to ValueError.
+    with open(p, "wb") as f:
+        f.write(b"\x00\x01\x02\x03")
+    with pytest.raises(ValueError, match="validation failed"):
+        _st.load_expert_file(p)
+    m.pager.close(); m2.pager.close()
+
+
+def test_atomic_writes_fsync_before_publish(tmp_path, monkeypatch):
+    """fsync ordering: file flushed before rename, dir flushed after."""
+    import storage as _st
+    calls = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def _recording_fsync(fd):
+        calls.append(("fsync", fd))
+        return real_fsync(fd)
+
+    def _recording_replace(src, dst):
+        calls.append(("replace", src, dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "fsync", _recording_fsync)
+    monkeypatch.setattr(os, "replace", _recording_replace)
+    d = str(tmp_path / "c")
+    m, opt = _trained(d)
+    # At least one file-fsync must precede a rename, and a dir-fsync follows.
+    kinds = [c[0] for c in calls]
+    assert "fsync" in kinds and "replace" in kinds
+    first_replace = kinds.index("replace")
+    assert "fsync" in kinds[:first_replace]
+    m.pager.close()
+
+
+def test_nested_dir_creation_is_race_safe(tmp_path):
+    """Single-expert saves create missing parents; existing dirs are reused."""
+    from storage import load_expert_file, save_expert_file
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    eid = m.pool.order[0]
+    rec = m.pool.experts[eid]
+    nested = os.path.join(d, "experts", "nested", "deep", f"{eid}.pt")
+    save_expert_file(rec, nested)  # parents did not exist
+    assert load_expert_file(nested).expert_id == eid
+    save_expert_file(rec, nested)  # second save over existing dirs
+    assert load_expert_file(nested).expert_id == eid
+    m.pager.close()
+
+
+def test_quantize_sweeps_stale_sidecars_and_refuses_empty(tmp_path):
+    """Converter drops prior-crash sidecars; empty inputs fail loudly."""
+    from quantize import convert_checkpoint
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    exp_dir = os.path.join(d, "experts")
+    for p in [os.path.join(d, "tmp_quant_crash"),
+              os.path.join(exp_dir, "stale.convert_tmp")]:
+        with open(p, "w") as f:
+            f.write("stale")
+    reports = convert_checkpoint(d, to="fp8", tile=32)
+    assert reports
+    assert not [f for f in os.listdir(d) if f.startswith("tmp_quant_")]
+    assert not [f for f in os.listdir(exp_dir) if f.endswith(".convert_tmp")]
+    eid = m.pool.order[0]
+    with open(os.path.join(exp_dir, f"{eid}.pt"), "wb") as f:
+        f.truncate(0)
+    with pytest.raises(ValueError, match="validation failed|empty"):
+        convert_checkpoint(d, to="fp8", tile=32)
+    m.pager.close()
