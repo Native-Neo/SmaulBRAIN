@@ -181,3 +181,188 @@ def test_stepped_experts_follow_pool_order():
         stepped = h["stepped_experts"]
         assert stepped == sorted(stepped, key=lambda e: (rank.get(e, 1 << 30), e))
     m.pager.close()
+
+
+def _seqs(n=8):
+    return [[(i * 3 + j) % 256 for j in range(30)] for i in range(n)]
+
+
+def test_scheduler_global_step_trigger_boundaries():
+    # Exact semantics: scheduled growth fires when (global_step+1) % grow_every == 0.
+    m, cfg = _model()
+    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
+    res = run_training(m, opt, cfg, _seqs(), steps=4, batch_size=2,
+                       grow_every=2, grow_loss_below=None,
+                       log_fn=lambda s: None)
+    fired = [h["step"] for h in res["history"] if h["grew"]]
+    assert fired == [1, 3]  # global steps 1 and 3, not local 0..3 pattern shift
+    m.pager.close()
+
+
+def test_scheduler_snapshot_persists_cadence_and_seed():
+    m, cfg = _model()
+    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
+    res = run_training(m, opt, cfg, _seqs(), steps=2, batch_size=2,
+                       grow_every=3, prune_every=5, grow_loss_below=0.5,
+                       growths_per_prune=4, seed=11, log_fn=lambda s: None)
+    sched = res["scheduler"]
+    assert sched["growths_per_prune"] == 4
+    assert sched["grow_every"] == 3 and sched["prune_every"] == 5
+    assert sched["grow_loss_below"] == 0.5 and sched["seed"] == 11
+    assert sched["growth_events"] == res["growth_events"]
+    m.pager.close()
+
+
+def test_loss_edge_first_step_never_spurious():
+    # Fresh run: prev_loss is None so the first step cannot loss-fire,
+    # even with an enormous threshold.
+    m, cfg = _model()
+    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
+    res = run_training(m, opt, cfg, _seqs(), steps=1, batch_size=2,
+                       grow_every=0, grow_loss_below=1e9,
+                       log_fn=lambda s: None)
+    assert res["history"][0]["grew"] is False
+    assert res["history"][0]["new_experts"] == []
+    # Snapshot carries the edge memory for resume (no spurious re-fire).
+    assert res["scheduler"]["prev_loss"] == res["history"][0]["loss"]
+    m.pager.close()
+
+
+def test_trigger_rng_streams_deterministic():
+    import torch
+    from precision import dequantize_fp8_blockwise
+
+    def _run(seed):
+        from config import SmaulBrainConfig
+        from model import SmaulBrainModel
+        torch.manual_seed(0)
+        cfg = SmaulBrainConfig(d_model=32, n_heads=4, num_experts=4, top_k=2,
+                               expert_hidden=64, max_depth=2, context_length=24)
+        m = SmaulBrainModel(cfg)
+        opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
+        res = run_training(m, opt, cfg, _seqs(), steps=1, batch_size=2,
+                           grow_every=1, grow_loss_below=None, seed=seed,
+                           log_fn=lambda s: None)
+        ids = list(res["history"][0]["new_experts"])
+        sums = [float(dequantize_fp8_blockwise(
+            m.pool.experts[e].weights_fp8["w_gate"]).sum().item()) for e in ids]
+        parents = [tuple(m.pool.experts[e].parents) for e in ids]
+        m.pager.close()
+        return ids, parents, sums
+    ids_a, par_a, sums_a = _run(9)
+    ids_b, par_b, sums_b = _run(9)
+    ids_c, par_c, sums_c = _run(10)
+    assert ids_a == ids_b and par_a == par_b and sums_a == sums_b
+    # Ids/parents derive from deterministic contribution ranking (seed-free);
+    # the seeded stream controls mutation/noise, so weights must re-base.
+    assert par_a == par_c and sums_a != sums_c
+
+
+def test_prune_triggers_coalesce_to_one_eval_per_step():
+    import train as train_mod
+    m, cfg = _model()
+    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
+    calls = []
+    orig = train_mod.pruning_mod.find_victims
+
+    def counting(*a, **k):
+        calls.append(1)
+        return []
+    train_mod.pruning_mod.find_victims = counting
+    try:
+        run_training(m, opt, cfg, _seqs(), steps=3, batch_size=2,
+                     grow_every=1, grow_loss_below=None,
+                     growths_per_prune=1, prune_every=1, seed=0,
+                     log_fn=lambda s: None)
+    finally:
+        train_mod.pruning_mod.find_victims = orig
+    # Cadence (every growth) + schedule (every step) coincide: still 1/step.
+    assert len(calls) == 3
+    m.pager.close()
+
+
+def test_trigger_while_at_cap_does_not_advance_cadence():
+    m, cfg = _model()
+    cfg.max_experts = len(m.pool)  # at cap before step 0
+    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
+    res = run_training(m, opt, cfg, _seqs(), steps=2, batch_size=2,
+                       grow_every=1, grow_loss_below=None,
+                       growths_per_prune=1, seed=0, log_fn=lambda s: None)
+    assert res["scheduler"]["growth_events"] == 0
+    assert res["growth_events"] == 0
+    assert all(h["grew"] is False and h["new_experts"] == [] for h in res["history"])
+    assert len(m.pool) == cfg.max_experts
+    m.pager.close()
+
+
+def test_machine_readable_growth_prune_ledger():
+    m, cfg = _model()
+    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
+    res = run_training(m, opt, cfg, _seqs(), steps=3, batch_size=2,
+                       grow_every=1, grow_loss_below=None, seed=0,
+                       log_fn=lambda s: None)
+    for h in res["history"]:
+        assert isinstance(h["grew"], bool)
+        assert isinstance(h["new_experts"], list) and isinstance(h["pruned_experts"], list)
+        assert h["grew"] == bool(h["new_experts"])
+    evts = res["growth_prune_events"]
+    assert all(set(e) == {"step", "type", "ids"} for e in evts)
+    assert all(e["type"] in ("grow", "prune") for e in evts)
+    # Same-step ordering: grow entries precede prune entries.
+    for step in {e["step"] for e in evts}:
+        kinds = [e["type"] for e in evts if e["step"] == step]
+        assert kinds == sorted(kinds, key=lambda t: 0 if t == "grow" else 1)
+    # Ledger matches per-step history.
+    flat_grow = [eid for h in res["history"] for eid in h["new_experts"]]
+    assert flat_grow == [eid for e in evts if e["type"] == "grow" for eid in e["ids"]]
+    m.pager.close()
+
+
+def test_parent_victim_selection_deterministic():
+    from growth import select_parents
+    from pruning import find_victims
+    m, cfg = _model()
+    try:
+        assert select_parents(m.pool, k=2) == select_parents(m.pool, k=2)
+        v1 = find_victims(m.pool, step=10_000, survival_steps=1,
+                          min_experts=cfg.min_experts)
+        v2 = find_victims(m.pool, step=10_000, survival_steps=1,
+                          min_experts=cfg.min_experts)
+        assert v1 == v2
+        # min_experts floor: never proposes more than len - floor.
+        assert len(v1) <= max(0, len(m.pool) - cfg.min_experts)
+    finally:
+        m.pager.close()
+
+
+def test_resume_before_trigger_matches_uninterrupted():
+    # Resuming immediately before a scheduled trigger must make the same
+    # topology decision as running straight through (global-step cadence).
+    from storage import save_model, load_model
+    import tempfile
+    seqs = _seqs()
+    kw = dict(batch_size=2, grow_every=2, grow_loss_below=None,
+              growths_per_prune=2, seed=0, log_fn=lambda s: None)
+    m1, cfg1 = _model()
+    o1 = SmaulOpt(SmaulOptHParams(lr=cfg1.expert_lr))
+    full = run_training(m1, o1, cfg1, seqs, steps=4, **kw)
+    full_ids = [list(h["new_experts"]) for h in full["history"]]
+    m1.pager.close()
+    # Split run: 1 step, checkpoint, resume for 3 more.
+    m2, cfg2 = _model()
+    o2 = SmaulOpt(SmaulOptHParams(lr=cfg2.expert_lr))
+    part1 = run_training(m2, o2, cfg2, seqs, steps=1, **kw)
+    assert [h["step"] for h in part1["history"]] == [0]
+    with tempfile.TemporaryDirectory() as d:
+        save_model(d, m2, o2, 0, extra_meta={"scheduler": part1["scheduler"]})
+        m3, cfg3 = _model()
+        o3 = SmaulOpt(SmaulOptHParams(lr=cfg3.expert_lr))
+        load_model(d, m3, o3)
+        cfg3 = m3.cfg
+        part2 = run_training(m3, o3, cfg3, seqs, steps=3, **kw)
+        resumed_ids = [list(h["new_experts"]) for h in part1["history"]] + \
+            [list(h["new_experts"]) for h in part2["history"]]
+        assert [h["step"] for h in part2["history"]] == [1, 2, 3]
+        m2.pager.close()
+        m3.pager.close()
+    assert resumed_ids == full_ids
