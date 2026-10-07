@@ -223,3 +223,94 @@ def test_generate_seeded_deterministic_and_text_matches_ids():
     z = generate(m, [104, 105], max_new=0, temperature=0.0)
     assert z["ids"] == [104, 105] and z["text"] == "" and z["depths"] == []
     m.pager.close()
+
+
+def test_cli_maps_every_config_field():
+    from cli import build_parser, config_from_args
+    from config import SmaulBrainConfig
+    import dataclasses
+    fields = {f.name for f in dataclasses.fields(SmaulBrainConfig)} - {"active_experts"}
+    args = build_parser().parse_args(["train"])
+    cfg = config_from_args(args)
+    for name in sorted(fields):
+        assert hasattr(cfg, name), name
+    # Ponder / balance / optimizer / precision / norm / vocab / growth knobs.
+    args = build_parser().parse_args([
+        "--halt-prior", "0.2", "--ponder-beta", "0.03",
+        "--moe-balance-weight", "0.05", "--router-lr-mult", "0.5",
+        "--weight-decay", "0.02", "--grad-clip", "0.5",
+        "--beta-m", "0.8", "--beta-v", "0.99", "--epsilon", "1e-7",
+        "--fp8-tile", "32", "--state-dtype", "fp32",
+        "--rmsnorm-eps", "1e-5", "--vocab-size", "260",
+        "--prune-survival-steps", "10", "--prune-min-usage", "0.01",
+        "--max-new-experts", "3", "--grow-every-default", "50",
+        "train"])
+    cfg = config_from_args(args)
+    assert (cfg.halt_prior, cfg.ponder_beta, cfg.moe_balance_weight) == (0.2, 0.03, 0.05)
+    assert (cfg.router_lr_mult, cfg.weight_decay, cfg.grad_clip) == (0.5, 0.02, 0.5)
+    assert (cfg.beta_m, cfg.beta_v, cfg.epsilon) == (0.8, 0.99, 1e-7)
+    assert (cfg.fp8_tile, cfg.state_dtype, cfg.rmsnorm_eps) == (32, "fp32", 1e-5)
+    assert (cfg.prune_survival_steps, cfg.prune_min_usage, cfg.max_new_experts) == (10, 0.01, 3)
+    assert cfg.grow_every == 50 and cfg.vocab_size == 260
+
+
+def test_cli_shape_mismatch_aborts_before_build(tmp_path):
+    ckpt = str(tmp_path / "ckpt")
+    base = ["--d-model", "32", "--n-heads", "4", "--experts", "2",
+            "--expert-size", "64", "--active-experts", "1",
+            "--max-depth", "1", "--context-length", "24",
+            "--ckpt", ckpt]
+    r = subprocess.run([sys.executable, "cli.py", *base, "train",
+                        "--steps", "2", "--batch", "2"],
+                       capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    bad = [b if b != "32" else "48" for b in base]
+    r = subprocess.run([sys.executable, "cli.py", *bad, "train", "--steps", "1"],
+                       capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 2
+    assert "topology mismatch" in r.stderr and "d_model" in r.stderr
+
+
+def test_cli_runtime_mismatch_warns_and_checkpoint_wins(tmp_path):
+    ckpt = str(tmp_path / "ckpt")
+    base = ["--d-model", "32", "--n-heads", "4", "--experts", "2",
+            "--expert-size", "64", "--active-experts", "1",
+            "--max-depth", "1", "--context-length", "24",
+            "--ckpt", ckpt]
+    r = subprocess.run([sys.executable, "cli.py", *base, "train",
+                        "--steps", "2", "--batch", "2"],
+                       capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    r = subprocess.run([sys.executable, "cli.py", *base, "--ram-cache", "999",
+                        "--ckpt", ckpt, "report"],
+                       capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    assert "ignoring --ram-cache" in r.stderr
+    body = json.loads(r.stdout)
+    assert body["logical_params"] == body["total_params"]
+    assert body["unique_params"] == body["total_params"]
+    assert set(("paging", "resident")) <= set(body)
+
+
+def test_cli_quantize_and_train_grow_every_schema(tmp_path):
+    from cli import build_parser, config_from_args, resolve_train_grow_every
+    ckpt = str(tmp_path / "ckpt")
+    base = ["--d-model", "32", "--n-heads", "4", "--experts", "2",
+            "--expert-size", "64", "--active-experts", "1",
+            "--max-depth", "1", "--context-length", "24",
+            "--ckpt", ckpt]
+    r = subprocess.run([sys.executable, "cli.py", *base, "train",
+                        "--steps", "2", "--batch", "2"],
+                       capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    r = subprocess.run([sys.executable, "cli.py", "--ckpt", ckpt,
+                        "quantize", "--to", "fp8"],
+                       capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    body = json.loads(r.stdout)
+    assert body["to"] == "fp8" and body["converted_experts"] == 2
+    assert body["bytes_before"] > 0 and body["bytes_after"] > 0
+    # Train schedule falls back to config.grow_every when omitted.
+    cfg = config_from_args(build_parser().parse_args(["train"]))
+    assert resolve_train_grow_every(build_parser().parse_args(["train"]), cfg) == cfg.grow_every == 200
+    assert resolve_train_grow_every(build_parser().parse_args(["train", "--grow-every", "0"]), cfg) == 0
