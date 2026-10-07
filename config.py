@@ -160,8 +160,14 @@ class SmaulBrainConfig:
         return self.shared_params() + self.router_params() + self.num_experts * self.per_expert_params
 
     def active_params(self) -> int:
-        """Params touched per token: shared + router + top-k experts."""
-        return self.shared_params() + self.router_params() + self.top_k * self.per_expert_params
+        """Params touched per token: shared + router + selected experts.
+
+        Selected experts are min(top_k, num_experts): a pruned pool below
+        top_k cannot touch more experts than exist (active <= total).
+        Admitted (capacity) experts are <= selected; padding/pondering/
+        paging/native never change this count.
+        """
+        return self.shared_params() + self.router_params() + min(self.top_k, self.num_experts) * self.per_expert_params
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -205,7 +211,11 @@ class SmaulBrainConfig:
         - logical_params == unique_params == total_params here: every expert
           is distinct and the shared recurrent block is counted once
           (unrolled depth reuses it, so no depth multiplier).
-        - active_params: shared + router + top-k experts (per-token).
+        - active_params: shared + router + min(top_k, expert_count)
+          selected experts per token (upper bound; capacity-admitted <=
+          selected). Throughput timing (bytes/s) is not derived here;
+          countable throughput facts are 1 token == 1 byte (byte vocab)
+          and valid-byte (non-PAD) normalization — see train/bench.
         - resident (RAM/VRAM dequantized transients) and on-disk
           (stored_expert_bytes, FP8 reality) need a live model; see
           model.param_counts(). They are reported as None here to keep the
