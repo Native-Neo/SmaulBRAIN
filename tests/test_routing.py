@@ -198,3 +198,149 @@ def test_plan_tensors_share_one_device():
     assert len(devs) == 1
     empty = r.route(torch.zeros(0, 8))
     assert empty.top_ids.device == empty.dropped.device == empty.probs.device
+
+
+def test_audit027_empty_batch_leaves_stats_finite():
+    # Empty batches: well-formed plan, stats untouched, zero loss, finite share.
+    torch.manual_seed(0)
+    r = SparseRouter(8, num_experts=4, top_k=2)
+    r.route(torch.randn(10, 8))
+    u_before = r.usage_counts.clone()
+    a_before = r.admit_counts.clone()
+    plan = r.route(torch.zeros(0, 8))
+    assert plan.top_ids.shape == (0, 2)
+    assert plan.top_weights.shape == (0, 2)
+    assert plan.dropped.shape == (0,)
+    assert plan.probs.shape == (0, 4)
+    assert torch.equal(r.usage_counts, u_before)
+    assert torch.equal(r.admit_counts, a_before)
+    b = r.balance_loss(plan.probs)
+    assert float(b) == 0.0 and bool(torch.isfinite(b))
+    assert b.device == plan.probs.device
+    share = r.usage_share()
+    assert bool(torch.isfinite(share).all())
+    # Fresh router with no traffic: share is all zeros but finite.
+    fresh = SparseRouter(8, num_experts=4, top_k=2)
+    s0 = fresh.usage_share()
+    assert bool(torch.isfinite(s0).all())
+    assert float(s0.sum()) == 0.0
+
+
+def test_audit027_all_dropped_counts_admitted_and_stays_finite():
+    # All-dropped assignments: stats count admitted slots only (< attempted
+    # N*K), dropped rows sum to 0, balance/share stay finite.
+    torch.manual_seed(0)
+    r = SparseRouter(8, num_experts=2, top_k=2, capacity_factor=0.0)
+    n = 16
+    plan = r.route(torch.randn(n, 8))
+    assert plan.dropped.sum().item() > 0
+    # Admitted slots via positive weight (non-admitted slots read 0).
+    admitted = plan.top_ids[plan.top_weights > 0]
+    expected = torch.bincount(admitted, minlength=2).to(torch.float64) if admitted.numel() else torch.zeros(2, dtype=torch.float64)
+    assert torch.equal(r.usage_counts, expected)
+    assert torch.equal(r.admit_counts, expected)
+    # Intentional duplicate: both counters track admitted traffic (see below).
+    assert torch.equal(r.usage_counts, r.admit_counts)
+    assert int(r.usage_counts.sum().item()) <= n * 2
+    if plan.dropped.sum().item() > 0:
+        assert int(r.usage_counts.sum().item()) < n * 2
+        assert (plan.top_weights[plan.dropped].sum(-1) == 0).all()
+    assert bool(torch.isfinite(r.balance_loss(plan.probs)))
+    assert bool(torch.isfinite(r.usage_share()).all())
+
+
+def test_audit027_inactive_expert_share_zero_finite():
+    # Inactive experts: never-selected expert keeps 0 count/share, finite loss.
+    torch.manual_seed(0)
+    r = SparseRouter(8, num_experts=4, top_k=1)
+    with torch.no_grad():
+        r.proj.weight[3].zero_()
+        r.proj.bias[3] = -1e9
+    plan = r.route(torch.randn(32, 8))
+    assert 3 not in set(plan.top_ids.reshape(-1).tolist())
+    assert float(r.usage_counts[3]) == 0.0
+    share = r.usage_share()
+    assert float(share[3]) == 0.0
+    assert bool(torch.isfinite(share).all())
+    assert bool(torch.isfinite(r.balance_loss(plan.probs)))
+
+
+def test_audit027_zero_denominators_never_nan():
+    # Zero denominators: live rows renormalize to 1, dropped rows to 0,
+    # share clamps at zero total; nothing becomes NaN/Inf.
+    torch.manual_seed(0)
+    r = SparseRouter(8, num_experts=4, top_k=2, capacity_factor=0.5)
+    plan = r.route(torch.randn(16, 8))
+    live = ~plan.dropped
+    if int(live.sum()) > 0:
+        assert torch.allclose(plan.top_weights[live].sum(-1),
+                              torch.ones(int(live.sum())), atol=1e-5)
+    if int(plan.dropped.sum()) > 0:
+        assert (plan.top_weights[plan.dropped].sum(-1) == 0).all()
+    assert bool(torch.isfinite(plan.top_weights).all())
+    assert bool(torch.isfinite(plan.probs).all())
+    fresh = SparseRouter(8, num_experts=4, top_k=2)
+    assert bool(torch.isfinite(fresh.usage_share()).all())
+    # keep=None vs keep=all-excluded both yield finite (0 for empty selection).
+    b_all_out = r.balance_loss(plan.probs, keep=torch.zeros(plan.probs.shape[0], dtype=torch.bool))
+    assert float(b_all_out) == 0.0 and bool(torch.isfinite(b_all_out))
+    assert b_all_out.device == plan.probs.device
+
+
+def test_audit027_nonfinite_triple_sanitized_and_counted():
+    # NaN/Inf router inputs: NaN, +Inf, -Inf rows sanitized, counted, finite.
+    torch.manual_seed(0)
+    r = SparseRouter(8, num_experts=3, top_k=2)
+    x = torch.randn(6, 8)
+    x[0, :] = float("nan")
+    x[1, 0] = float("inf")
+    x[2, 0] = float("-inf")
+    plan = r.route(x)
+    assert float(r.sanitized_counts) == 3.0
+    assert ((plan.top_ids >= 0) & (plan.top_ids < 3)).all()
+    assert bool(torch.isfinite(plan.top_weights).all())
+    assert bool(torch.isfinite(plan.probs).all())
+    assert bool(torch.isfinite(r.balance_loss(plan.probs)))
+    for row in plan.top_ids.tolist():
+        assert len(set(row)) == len(row)
+
+
+def test_audit027_variable_batch_counts_stable():
+    # Variable batch/token counts: N=1..33 route without error, stats track
+    # admitted slots, single-token batches never drop (cap >= 1).
+    torch.manual_seed(0)
+    for n in (1, 2, 7, 33):
+        r = SparseRouter(8, num_experts=4, top_k=2)
+        plan = r.route(torch.randn(n, 8))
+        assert plan.top_ids.shape == (n, 2)
+        assert plan.top_weights.shape == (n, 2)
+        assert plan.dropped.shape == (n,)
+        assert plan.probs.shape == (n, 4)
+        assert bool(torch.isfinite(plan.top_weights).all())
+        admitted = plan.top_ids[plan.top_weights > 0]
+        assert int(r.usage_counts.sum().item()) == int(admitted.numel())
+    torch.manual_seed(0)
+    r1 = SparseRouter(8, num_experts=4, top_k=2)
+    p1 = r1.route(torch.randn(1, 8))
+    assert not p1.dropped.any()
+
+
+def test_audit027_stats_represent_admitted_not_attempted():
+    # Statistics must represent admitted traffic, not attempted top-k touches.
+    # With forced dropping, admitted slots < N*K; both counters equal the
+    # admitted bincount (kept identical for checkpoint compat).
+    torch.manual_seed(0)
+    r = SparseRouter(8, num_experts=2, top_k=2, capacity_factor=0.05)
+    n = 32
+    plan = r.route(torch.randn(n, 8))
+    assert plan.dropped.sum().item() > 0
+    attempted_total = n * 2
+    admitted = plan.top_ids[plan.top_weights > 0]
+    assert int(admitted.numel()) < attempted_total
+    assert int(r.usage_counts.sum().item()) == int(admitted.numel())
+    assert int(r.admit_counts.sum().item()) == int(admitted.numel())
+    # usage_share is over admitted traffic, hence finite and sums to 1
+    # once any slot was admitted.
+    share = r.usage_share()
+    assert bool(torch.isfinite(share).all())
+    assert abs(float(share.sum()) - 1.0) < 1e-6
