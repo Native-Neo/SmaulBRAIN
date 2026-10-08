@@ -522,7 +522,7 @@ def test_clones_differ_from_parent_by_one_to_ten_percent():
                               / a.abs().mean().clamp_min(1e-12)))
         rel = sum(rels) / len(rels)
         assert 0.005 <= rel <= 0.15, (eid, rel)  # ~1-10% + FP8 epsilon
-        key = tuple(rec.weights_fp8[n].codes.flatten().tolist() for n in names)
+        key = tuple(tuple(rec.weights_fp8[n].codes.flatten().tolist()) for n in names)
         assert key not in seen  # distinct clones
         seen.add(key)
     for eid, rec in pool.experts.items():
