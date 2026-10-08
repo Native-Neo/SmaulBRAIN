@@ -11,8 +11,10 @@ selects which parameter groups move:
 
 Each step: forward (ponder-weighted loss) -> backward -> SmaulOpt updates
 (trunk at trunk_lr, router at router_lr, experts at expert_lr) -> pager
-invalidation for rewritten experts. Replay interleaving, growth/pruning
-schedule, retention eval, and checkpointing are all driven here.
+invalidation for rewritten experts. Replay interleaving, growth schedule,
+retention eval, and checkpointing are all driven here. Pruning never happens
+during training: pool shrinkage is a manual offline operation
+(``python pruning.py --rm-worst N``).
 """
 
 from __future__ import annotations
@@ -24,7 +26,6 @@ from collections import deque
 import torch
 
 import growth as growth_mod
-import pruning as pruning_mod
 from bytes import PAD_ID
 
 
@@ -276,9 +277,7 @@ def run_training(
     replay_n: int = 0,
     old_seqs: list[list[int]] | None = None,
     grow_every: int = 20000,
-    prune_every: int = 10000,
     grow_loss_below: float | None = 1.0,
-    growths_per_prune: int = 2,
     seed: int = 0,
     log_fn=print,
 ) -> dict:
@@ -302,20 +301,14 @@ def run_training(
 
     Growth fires on schedule (``grow_every``, default every 20000 steps)
     and whenever the step loss newly dips below ``grow_loss_below``
-    (default 1.0; falling edge; negative disables).
-    Pruning removes the 4 worst experts on schedule (``prune_every``,
-    default every 10000 steps). Growth-triggered pruning strips the worst
-    16, but ONLY when more than 2 growths fired in the trailing 10000
-    steps (checked together with the ``growths_per_prune`` cadence).
-    The expert floor is 64: pruning never takes the pool below 64. When
-    the floor blocks a prune that would otherwise fire, the prune is
-    skipped and a compensatory top-4 mutated growth fires instead (free,
-    needs no trigger).
+    (default 1.0; falling edge; negative disables). Training never prunes:
+    the pool only grows here; shrinking is a manual offline operation
+    (``python pruning.py --rm-worst N``), which respects the floor stored
+    in the checkpoint's ``resume_config.json``.
 
     Exact trigger semantics (global steps, 0-indexed):
       * scheduled growth fires when ``(global_step + 1) % grow_every == 0``
-        (``grow_every <= 0`` disables); scheduled prune uses the same rule
-        with ``prune_every``. Both are evaluated on the global step so a
+        (``grow_every <= 0`` disables). Evaluated on the global step so a
         resume continues the cadence (no repeat/skip).
       * loss-edge growth fires when ``prev_loss >= grow_loss_below >
         loss_now`` (strict falling edge). ``prev_loss`` is the previous
@@ -323,18 +316,7 @@ def run_training(
         previous loss). ``grow_loss_below is None`` or negative disables
         the edge (callers pass a negative value to disable).
       * only successful growths (new experts actually added; at-cap
-        attempts return no ids) increment ``growth_events`` and enter the
-        trailing 10K-step window. The cadence prune fires when the
-        post-increment counter satisfies
-        ``growth_events % growths_per_prune == 0`` AND more than 2 growths
-        sit in the trailing 10000-step window; it strips the worst 16.
-        Scheduled prunes (``prune_every``) strip the worst 4.
-      * the floor is 64 experts: a prune that would take the pool below
-        64 is skipped, and a compensatory top-4 mutated growth fires
-        instead (logged, counted, needs no trigger).
-      * ordering per step is grow-then-prune; at most one prune evaluation
-        runs per step (cadence and schedule triggers coalesce), so a step
-        can never prune twice ``max_victims``.
+        attempts return no ids) increment ``growth_events``.
       * trigger RNG is deterministic: scheduled growth seeds
         ``seed + step * max(1, max_new_experts)``, loss-edge growth adds a
         +7919 salt offset. Same ``(seed, step, max_new_experts)`` reproduces
@@ -344,7 +326,7 @@ def run_training(
         isolated ``torch.Generator`` per event and the replay sampler uses
         an owned ``random.Random``: dirtying the global torch/python RNG
         between save and resume never perturbs the trajectory, while
-        ``rng.pt`` still restores the global RNG state itself.
+        the RNG snapshot still restores the global RNG state itself.
     Returns history + optional retention report (old_seqs evaluated before
     and after) so continual-learning retention is measured, not claimed.
     """
@@ -356,8 +338,6 @@ def run_training(
         raise ValueError(f"batch_size must be >= 1, got {batch_size!r}")
     if replay_n < 0:
         raise ValueError(f"replay_n must be >= 0, got {replay_n!r}")
-    if growths_per_prune < 1:
-        raise ValueError(f"growths_per_prune must be >= 1, got {growths_per_prune!r}")
     from storage import save_model
 
     old_before = None
@@ -367,7 +347,7 @@ def run_training(
     n = max(1, len(train_seqs))
     start_step = int(getattr(model, "_resume_step", -1)) + 1
     # Resume scheduler state stashed by storage.load_model (loss edge,
-    # growth/prune counters, replay buffer). Fresh runs start clean.
+    # growth counter, replay buffer). Fresh runs start clean.
     _snap = getattr(model, "_scheduler_snapshot", {}) or {}
     if not isinstance(_snap, dict):
         _snap = {}
@@ -385,43 +365,30 @@ def run_training(
         # ReplayBuffer intentionally re-bases the sampler (fresh trajectory);
         # bit-equality with an uninterrupted run requires the None path.
         replay = ReplayBuffer.from_dict(_snap["replay"])
-    try:
-        growth_steps = deque(int(s) for s in _snap.get("growth_steps", []))
-    except (TypeError, ValueError):
-        growth_steps = deque()
 
     def scheduler_snapshot() -> dict:
         # Dataset/batch cursor for exact resume: manifest step carries the
         # global step; batch_size/dataset_len/next_step pin the batch formula
         # (resuming with different values intentionally re-bases the cursor).
         # Scheduler knobs ride along so a resumer can reuse them exactly:
-        # growths_per_prune/grow_every/prune_every/grow_loss_below/seed/
-        # replay_n/max_new_experts/prune_survival_steps/prune_min_usage/
+        # grow_every/grow_loss_below/seed/replay_n/max_new_experts/
         # min_experts/max_experts otherwise silently re-base trigger
         # cadences, batch composition, and RNG streams. max_new_experts pins
         # the growth salt (seed + step*max(1,max_new_experts)); replay_n pins
         # the interleaving width (batch_size + min(replay_n, len(buf))).
-        # prune_survival_steps/prune_min_usage/min_experts pin the prune
-        # cooldown (grace period), hysteresis floor, and capacity floor:
-        # resuming with different values intentionally re-bases prune
-        # decisions (config.json stays checkpoint-authoritative via storage).
+        # (config.json stays checkpoint-authoritative via storage.)
         return {
             "prev_loss": prev_loss,
             "growth_events": growth_events,
-            "growth_steps": [int(s) for s in growth_steps],
             "replay": replay.to_dict() if replay is not None else None,
             "batch_size": batch_size,
             "dataset_len": n,
             "next_step": start_step + len(hist),
-            "growths_per_prune": growths_per_prune,
             "grow_every": grow_every,
-            "prune_every": prune_every,
             "grow_loss_below": grow_loss_below,
             "seed": seed,
             "replay_n": replay_n,
             "max_new_experts": int(cfg.max_new_experts),
-            "prune_survival_steps": int(cfg.prune_survival_steps),
-            "prune_min_usage": float(cfg.prune_min_usage),
             "min_experts": int(cfg.min_experts),
             "max_experts": int(cfg.max_experts),
         }
@@ -431,7 +398,7 @@ def run_training(
 
         Returns the new expert ids (empty when at cap): callers use the
         non-emptiness as the success signal so failed at-cap attempts never
-        advance the growths_per_prune cadence.
+        advance the growth counter.
         """
         count = min(cfg.max_new_experts, cfg.max_experts - len(model.pool))
         if count <= 0:
@@ -447,55 +414,9 @@ def run_training(
         model.cfg.num_experts = len(model.pool)
         return list(new_ids)
 
-    def prune_eval(step: int, max_victims: int = 4) -> tuple[list[str], list[str]]:
-        """Prune victims, or compensatory-grow when the 64-floor blocks.
-
-        Returns (pruned_ids, compensatory_ids): at most one is non-empty.
-        The floor is 64 whenever the pool holds 64+ experts (below that the
-        configured ``min_experts`` governs, preserving tiny-model behavior).
-        """
-        floor = 64 if len(model.pool) >= 64 else cfg.min_experts
-        victims = pruning_mod.find_victims(model.pool, step,
-                                           survival_steps=cfg.prune_survival_steps,
-                                           min_experts=floor,
-                                           usage_threshold=cfg.prune_min_usage,
-                                           max_victims=max_victims)
-        if not victims and len(model.pool) >= 64:
-            raw = pruning_mod.find_victims(model.pool, step,
-                                           survival_steps=cfg.prune_survival_steps,
-                                           min_experts=1,
-                                           usage_threshold=cfg.prune_min_usage,
-                                           max_victims=max_victims)
-            if raw:
-                # Floor blocked a live prune: skip removal, grow a free
-                # compensatory top-4 (all mutated) instead. At cap this is
-                # a no-op (callee returns []).
-                comp_ids = growth_mod.grow_topk_clones(
-                    model.pool, model.router, cfg.d_model, cfg.expert_hidden, step,
-                    seed=seed + step * max(1, cfg.max_new_experts) + 52525, k=4,
-                    fp8_tile=cfg.fp8_tile, max_experts=cfg.max_experts,
-                    optim_state=opt.router_state,
-                )
-                if comp_ids:
-                    for eid in comp_ids:
-                        log_fn(f"[compensate] step={step} new={eid} pool={len(model.pool)}")
-                    model.cfg.num_experts = len(model.pool)
-                    return [], list(comp_ids)
-                log_fn(f"[compensate] step={step} at cap, pool={len(model.pool)}")
-                return [], []
-        if victims:
-            # Pager traces are forgotten inside prune_experts (atomic with
-            # removal); no separate caller loop to skip on partial failure.
-            pruned = pruning_mod.prune_experts(model.pool, model.router, victims,
-                                               pager=model.pager,
-                                               optim_state=opt.router_state)
-            model.cfg.num_experts = len(model.pool)
-            log_fn(f"[prune] step={step} removed={pruned} pool={len(model.pool)}")
-            return list(pruned), []
-        return [], []
     run_started = time.perf_counter()
     bytes_processed = 0
-    events: list[dict] = []  # machine-readable growth/pruning ledger
+    events: list[dict] = []  # machine-readable growth ledger
     for local_step in range(steps):
         step_started = time.perf_counter()
         step = start_step + local_step
@@ -519,9 +440,8 @@ def run_training(
         step_bytes = int((b[:, : cfg.context_length] != PAD_ID).sum().item())
         bytes_processed += step_bytes
         hist.append(stats)
-        # Grow-then-prune ordering per step. At most one prune evaluation
-        # runs per step: cadence (growths_per_prune) and schedule
-        # (prune_every) triggers coalesce into a single prune_eval call.
+        # Growth only: training never prunes (pool shrinkage is the manual
+        # offline pruner). Successful growths increment the counter.
         new_ids: list[str] = []
         if grow_every and (step + 1) % grow_every == 0:
             new_ids += grow_batch(step, step * max(1, cfg.max_new_experts))
@@ -537,37 +457,10 @@ def run_training(
             events.append({"step": step, "type": "grow", "ids": list(new_ids)})
         if grew:
             growth_events += 1
-            growth_steps.append(step)
-        # Trailing 10K-step growth window: only growths strictly newer than
-        # step-10000 count toward the strip-16 gate.
-        while growth_steps and growth_steps[0] <= step - 10000:
-            growth_steps.popleft()
-        prune_due = False
-        prune_cap = 4
-        if grew and growth_events % growths_per_prune == 0 and len(growth_steps) > 2:
-            # Hot window: strip the worst 16 (only here, never otherwise).
-            prune_due = True
-            prune_cap = 16
-        if prune_every and (step + 1) % prune_every == 0:
-            # Scheduled prune strips the worst 4.
-            prune_due = True
-        pruned_ids: list[str] = []
-        if prune_due:
-            pruned_ids, comp_ids = prune_eval(step, max_victims=prune_cap)
-            if comp_ids:
-                # Floor-blocked prune converted to free growth: ledger it
-                # as growth (counted, needs no trigger).
-                new_ids += comp_ids
-                events.append({"step": step, "type": "grow", "ids": list(comp_ids)})
-                growth_events += 1
-                growth_steps.append(step)
-                grew = True
-        if pruned_ids:
-            events.append({"step": step, "type": "prune", "ids": list(pruned_ids)})
         # Machine-readable per-step ledger (history entries stay JSON-safe).
         stats["grew"] = grew
         stats["new_experts"] = list(new_ids)
-        stats["pruned_experts"] = list(pruned_ids)
+        stats["pruned_experts"] = []
         if ckpt_dir and save_every and (step + 1) % save_every == 0:
             save_model(ckpt_dir, model, opt, step,
                        extra_meta={"scheduler": scheduler_snapshot()})
@@ -609,8 +502,8 @@ def run_training(
         # Scheduler snapshot for exact resume: whoever saves the final
         # checkpoint passes this as extra_meta (see cli train command).
         "scheduler": scheduler_snapshot(),
-        # Machine-readable growth/pruning ledger: one entry per event in
-        # execution order (grow entries precede same-step prune entries).
+        # Machine-readable growth ledger: one entry per growth event in
+        # execution order.
         "growth_prune_events": [dict(e) for e in events],
         "growth_events": growth_events,
     }
