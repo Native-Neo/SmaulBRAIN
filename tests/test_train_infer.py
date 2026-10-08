@@ -312,7 +312,7 @@ def test_cli_quantize_and_train_grow_every_schema(tmp_path):
     assert body["bytes_before"] > 0 and body["bytes_after"] > 0
     # Train schedule falls back to config.grow_every when omitted.
     cfg = config_from_args(build_parser().parse_args(["train"]))
-    assert resolve_train_grow_every(build_parser().parse_args(["train"]), cfg) == cfg.grow_every == 200
+    assert resolve_train_grow_every(build_parser().parse_args(["train"]), cfg) == cfg.grow_every == 20000
     assert resolve_train_grow_every(build_parser().parse_args(["train", "--grow-every", "0"]), cfg) == 0
 
 
