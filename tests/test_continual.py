@@ -22,6 +22,30 @@ def _model(seed=0):
     return m, cfg
 
 
+def _dying_pool_model(n_experts, seed=0, **cfg_kw):
+    """Model whose experts are all prune-eligible (old, idle, zero signal)."""
+    torch.manual_seed(seed)
+    base = dict(d_model=16, n_heads=2, num_experts=n_experts, top_k=1,
+                expert_hidden=32, max_depth=1, context_length=12,
+                expert_lr=3e-2, max_experts=400, prune_survival_steps=1)
+    base.update(cfg_kw)
+    cfg = SmaulBrainConfig(**base)
+    m = SmaulBrainModel(cfg)
+    for rec in m.pool.experts.values():
+        rec.birth_step = -5
+        rec.last_used_step = -5
+        rec.tokens_routed = 0
+        rec.grad_activity = 0.0
+        rec.contribution = 0.0
+    return m, cfg
+
+
+def _seqs(n_seqs=8, seed=3):
+    import random
+    rng = random.Random(seed)
+    return [[rng.randrange(256) for _ in range(16)] for _ in range(n_seqs)]
+
+
 def test_replay_buffer_reservoir_and_sample():
     buf = ReplayBuffer(capacity=8, seed=0)
     for i in range(20):
@@ -634,3 +658,41 @@ def test_reservoir_long_run_uniform_and_resume_equal():
     snap = a.to_dict()
     b = ReplayBuffer.from_dict(snap)
     assert [b.sample(3) for _ in range(5)] == [a.sample(3) for _ in range(5)]
+
+
+def test_floor_blocks_prune_and_grows_compensatory_top4():
+    # Pool exactly at the 64 floor with live dying experts: floored
+    # victims are empty (keep = 0) while raw victims exist -> no prune,
+    # free compensatory top-4 instead.
+    m, cfg = _dying_pool_model(64)
+    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
+    res = run_training(m, opt, cfg, _seqs(), steps=1, batch_size=2,
+                       grow_every=0, grow_loss_below=None, prune_every=1,
+                       log_fn=lambda s: None)
+    assert len(m.pool) == 68
+    ledger = res["growth_prune_events"]
+    assert not [e for e in ledger if e["type"] == "prune"]
+    grows = [e for e in ledger if e["type"] == "grow"]
+    assert len(grows) == 1 and len(grows[0]["ids"]) == 4
+    assert all(m.pool.experts[e].source == "clone-mutated" for e in grows[0]["ids"])
+    assert res["growth_events"] == 1  # compensatory growth is counted
+    m.pager.close()
+
+
+def test_hot_window_strips_sixteen_not_four():
+    m, cfg = _dying_pool_model(80)
+    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
+    res = run_training(m, opt, cfg, _seqs(), steps=4, batch_size=2,
+                       grow_every=1, grow_loss_below=None,
+                       growths_per_prune=1, prune_every=0,
+                       log_fn=lambda s: None)
+    by_step = {}
+    for e in res["growth_prune_events"]:
+        if e["type"] == "prune":
+            by_step.setdefault(e["step"], []).extend(e["ids"])
+    assert 0 not in by_step and 1 not in by_step  # cold window: no strip
+    assert 2 in by_step and 3 in by_step  # hot window (>2 in 10K): strips
+    for step, ids in by_step.items():
+        assert 4 < len(ids) <= 16, (step, len(ids))  # 16-cap, not the 4-cap
+    assert len(m.pool) >= 64  # floor never breached
+    m.pager.close()
