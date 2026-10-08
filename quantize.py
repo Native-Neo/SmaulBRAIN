@@ -201,7 +201,8 @@ def convert_checkpoint(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[d
 
 
 def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[dict]:
-    manifest = load_manifest(ckpt_dir)
+    import storage as _st
+    manifest = _st.load_manifest(ckpt_dir)
     man_path = os.path.join(ckpt_dir, "manifest.json")
     cfg_path = os.path.join(ckpt_dir, "config.json")
     exp_dir = os.path.join(ckpt_dir, "experts")
@@ -222,9 +223,13 @@ def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -
                 f"checkpoint validation failed: empty expert files {empty}"
             )
         staged: list[tuple[str, str]] = []
+        # Stage inside a dedicated subdir: save_expert_file sweeps *.convert_tmp
+        # in its target dir, so staging next to the live files would nuke
+        # previously converted experts.
+        stage_dir = tempfile.mkdtemp(dir=exp_dir, prefix="tmp_quant_stage_")
         try:
             for eid, p in paths:
-                tmp = p + ".convert_tmp"
+                tmp = os.path.join(stage_dir, f"{eid}.safetensors.convert_tmp")
                 reports.append(convert_expert_file(p, tmp, to=to, tile=tile))
                 staged.append((tmp, p))
             for tmp, p in staged:
@@ -241,6 +246,10 @@ def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -
                             os.remove(side)
                         except OSError:
                             pass
+            try:
+                os.rmdir(stage_dir)
+            except OSError:
+                pass
         try:
             with open(cfg_path) as f:
                 cfg_dict = json.load(f)
