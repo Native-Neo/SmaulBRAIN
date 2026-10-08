@@ -66,6 +66,20 @@ class SparseRouter(nn.Module):
         self.top_k = top_k
         self.capacity_factor = capacity_factor
         self.proj = nn.Linear(d_model, num_experts)
+        # Runtime-only new-expert steering (never checkpointed: plain Python
+        # attributes, not parameters/buffers, so state_dict is untouched).
+        # At rest both are cleared (0.0/()) so inference (forward_infer,
+        # generate, evaluate_loss -- all dispatch through route()) is NEVER
+        # implicitly steered. train_step sets them immediately around the
+        # mode-`new` training forward only (try/finally, cleared right
+        # after, including the exception path) and forces them cleared for
+        # every other mode, so training never depends on stale values. To
+        # explicitly steer inference, set both attrs manually before
+        # calling generate/forward_infer.
+        # Honored by route() only (training forward, forward_infer, and
+        # streaming inference all dispatch through route()).
+        self.new_routing_bias: float = 0.0
+        self.new_expert_idx: tuple = ()
         # High-precision routing statistics (buffers, not parameters).
         self.register_buffer("usage_counts", torch.zeros(num_experts, dtype=torch.float64))
         self.register_buffer("admit_counts", torch.zeros(num_experts, dtype=torch.float64))
@@ -101,6 +115,16 @@ class SparseRouter(nn.Module):
             with torch.no_grad():
                 self.sanitized_counts += float(bad.sum().item())
             logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+        # New-expert steering: additive logit bonus on the runtime-selected
+        # rows only. Skipped entirely when the bias is 0.0 (the default), so
+        # the off path is bit-identical to unsteered routing. Only routing
+        # weights/choice change; expert and trunk weights are untouched.
+        _bias = float(getattr(self, "new_routing_bias", 0.0) or 0.0)
+        if _bias != 0.0:
+            _idx = [int(i) for i in (getattr(self, "new_expert_idx", ()) or ())
+                    if 0 <= int(i) < self.num_experts]
+            if _idx:
+                logits[:, _idx] = logits[:, _idx] + _bias
         probs = F.softmax(logits, dim=-1)
         top_w, top_ids = torch.topk(probs, k=self.top_k, dim=-1)
         top_w = top_w / top_w.sum(dim=-1, keepdim=True).clamp_min(1e-9)

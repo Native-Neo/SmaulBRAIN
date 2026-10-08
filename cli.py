@@ -73,6 +73,7 @@ ARG_TO_CONFIG = {
     "trunk_lr_mult": "trunk_lr_mult",
     "router_lr_mult": "router_lr_mult",
     "router_lr_mult_new": "router_lr_mult_new",
+    "new_routing_bias": "new_routing_bias",
     "weight_decay": "weight_decay",
     "grad_clip": "grad_clip",
     "beta_m": "beta_m",
@@ -149,6 +150,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Router LR multiplier (default: 1.0).")
     p.add_argument("--router-lr-mult-new", type=float, default=None, dest="router_lr_mult_new",
                    help="Old-expert router-row LR multiplier in --mode new only (default: 0.005).")
+    p.add_argument("--new-routing-bias", type=float, default=None, dest="new_routing_bias",
+                   help="Additive router-logit bonus for new experts in --mode new "
+                        "(default: 0.0 = off).")
     p.add_argument("--weight-decay", type=float, default=None, dest="weight_decay",
                    help="Decoupled weight decay (default: 0.01).")
     p.add_argument("--grad-clip", type=float, default=None, dest="grad_clip",
@@ -257,6 +261,7 @@ def config_from_args(args: argparse.Namespace) -> SmaulBrainConfig:
         trunk_lr_mult=pick_cfg(getattr(args, "trunk_lr_mult", None), "trunk_lr_mult"),
         router_lr_mult=pick_cfg(getattr(args, "router_lr_mult", None), "router_lr_mult"),
         router_lr_mult_new=pick_cfg(getattr(args, "router_lr_mult_new", None), "router_lr_mult_new"),
+        new_routing_bias=pick_cfg(getattr(args, "new_routing_bias", None), "new_routing_bias"),
         weight_decay=pick_cfg(getattr(args, "weight_decay", None), "weight_decay"),
         grad_clip=pick_cfg(getattr(args, "grad_clip", None), "grad_clip"),
         beta_m=pick_cfg(getattr(args, "beta_m", None), "beta_m"),

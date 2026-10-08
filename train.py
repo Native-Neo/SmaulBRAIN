@@ -228,8 +228,40 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
         raise ValueError(f"empty batch {tuple(x.shape)} carries no gradient signal")
     model.train()
     model.zero_grad(set_to_none=True)
+    # New-expert routing steering (runtime-only): in mode `new`, add
+    # cfg.new_routing_bias to the router logits of experts born at/after
+    # new_since_step so new-domain tokens reach new experts more often.
+    # Plain router attributes only -- never checkpointed, manifested, or
+    # snapshotted. Scoped strictly to the training forward below: set
+    # immediately before, cleared in a finally immediately after, so at
+    # rest (inference: forward_infer/generate/evaluate_loss, save/load)
+    # the router is always unsteered (0.0/()). The try/finally also
+    # covers the exception path, so a failed forward leaves no stale
+    # steering behind. Steering changes routing weights/choice only; the
+    # trunk/expert freeze below is untouched (old-expert weights cannot
+    # move).
     try:
-        out = model(x, y, step=step)
+        _router = getattr(model, "router", None)
+        if _router is not None:
+            if mode == "new":
+                _bias = float(getattr(cfg, "new_routing_bias", 0.0) or 0.0)
+                _pool = getattr(model, "pool", None)
+                _order = list(getattr(_pool, "order", None) or [])
+                _experts = getattr(_pool, "experts", {}) or {}
+                _router.new_routing_bias = _bias
+                _router.new_expert_idx = tuple(
+                    i for i, eid in enumerate(_order)
+                    if eid in _experts
+                    and _experts[eid].birth_step >= new_since_step)
+            else:
+                _router.new_routing_bias = 0.0
+                _router.new_expert_idx = ()
+        try:
+            out = model(x, y, step=step)
+        finally:
+            if _router is not None:
+                _router.new_routing_bias = 0.0
+                _router.new_expert_idx = ()
         loss = out["loss"]
         loss.backward()
         stepped: list[str] = []

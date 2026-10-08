@@ -8,6 +8,7 @@ a serialized copy of this config so topology changes stay checkpoint-safe.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 
 from bytes import total_vocab
 
@@ -74,6 +75,12 @@ class SmaulBrainConfig:
     # applied old-row deltas for experts with birth_step < new_since_step
     # are rescaled by this factor post-step, newborn rows train at full LR.
     router_lr_mult_new: float = 0.005
+    # Additive router-logit bonus for NEW experts (birth_step >= the run's
+    # new_since_step cutoff), applied only while a runtime routing attribute
+    # is set (mode `new` training wires it per train_step; see routing.py).
+    # 0.0 = off (bit-exact no-op). Steering only changes routing
+    # weights/choice, never old-expert weights.
+    new_routing_bias: float = 0.0
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     beta_m: float = 0.9
@@ -122,6 +129,8 @@ class SmaulBrainConfig:
         assert self.trunk_lr_mult > 0, "trunk LR multiplier must be positive"
         assert self.router_lr_mult > 0, "router LR multiplier must be positive"
         assert self.router_lr_mult_new >= 0, "router new-mode LR multiplier must be non-negative"
+        assert math.isfinite(self.new_routing_bias) and self.new_routing_bias >= 0, \
+            "new routing bias must be a finite value >= 0"
         assert self.weight_decay >= 0, "weight decay must be non-negative"
         # Clipping semantics: grad_clip > 0 caps the global grad norm;
         # 0 (or negative) disables clipping entirely.
