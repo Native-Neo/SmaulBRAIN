@@ -10,6 +10,29 @@ The main idea is simple:
 
 SmaulBRAIN combines ideas from SmaulNative and [mini-AGI](https://github.com/volotat/mini-AGI), along with its own changes.
 
+> **License note:** SmaulBRAIN is under the **PolyForm Noncommercial
+> License 1.0.0** — free for research, learning, and noncommercial use,
+> but commercial use needs a separate license. That deliberately limits
+> adoption: if you want to use this commercially or contribute with
+> downstream commercial use in mind, talk to the maintainer first (see
+> [License](#license)).
+
+## Requirements and quickstart
+
+* Python 3.10+ and `pip install -r requirements.txt`
+  (`torch>=2.2`, `numpy`, `pytest`, `safetensors`). Developed and measured
+  with Python 3.14 + torch 2.14 (CPU); CUDA works wherever torch does.
+* No tokenizer files, no downloads, no build step — clone and run.
+
+```bash
+pip install -r requirements.txt
+python cli.py --ckpt ckpt/demo train --steps 20 --batch 2   # tiny 246K config
+python cli.py --ckpt ckpt/demo infer --prompt "hello" --max-new 32
+python cli.py --ckpt ckpt/demo report                        # param counts
+python pruning.py --ckpt ckpt/demo --rm-worst 0 --dry-run    # pool + floor preview
+python -m pytest tests/ -q                                   # 379 tests
+```
+
 ## What does SmaulBRAIN do?
 
 ### Byte-level input and output
@@ -208,9 +231,11 @@ It is an experimental architecture.
 
 ## Status
 
-**Experimental / Research — implemented and measured (2026-10-04)**
+**Experimental / Research**
 
-79 tests pass (`python -m pytest tests/ -q`). Measured on CPU (torch 2.14,
+### Measured
+
+379 tests pass (`python -m pytest tests/ -q`). Measured on CPU (torch 2.14,
 4-core, 7.6 GB RAM) with tiny configs unless noted:
 
 * 16K context forward: +61 MB delta RSS, ~6 s (d=32, 4 experts, top-1,
@@ -227,7 +252,9 @@ It is an experimental architecture.
 * Expert size is explicit (`--expert-size`); at d=512/h=3328 one expert is
   5,111,808 params (~5.12M).
 
-Reference audit: SmaulNative's SmaulOpt (update equations, factored `v`,
+### Verified against reference
+
+SmaulNative's SmaulOpt (update equations, factored `v`,
 BF16 state/FP32 math) and linear attention (ELU+1, S/z recurrence) were
 verified in source and ported; its static MoE has no growth/pruning/paging
 and its LR is constant. mini-AGI's depth recurrence, PonderNet halting,
@@ -237,7 +264,18 @@ quadratic SDPA (replaced here with linear attention) and it has no FP8 and
 no tests. Nothing was copied blindly; nothing was invented where the
 reference could not be verified.
 
-Breaking changes are still expected.
+### Known open
+
+* Breaking changes are still expected — checkpoint schema, CLI flags, and
+  the growth/pruning policy have all changed before and may change again.
+* Checkpoints are safetensors (no pickle), but there is **no GGUF
+  converter yet** — tensors are extractable, the conversion script is not
+  written.
+* Numbers above are tiny-config CPU measurements; the `--full` preset
+  (328M params) has no published throughput/quality numbers yet.
+* The offline pruner refuses below the 64-expert floor rather than
+  compensating — pools parked exactly at the floor can only grow, never
+  shrink, until the policy says otherwise.
 
 Tests, measurements, memory usage, and actual training results are more important than keeping the current design unchanged.
 
@@ -275,7 +313,7 @@ The command-line interface. Every flag maps onto `SmaulBrainConfig`, and the
 `train` / `infer` / `report` / `quantize` subcommands share one model build
 path and one checkpoint format. Training flags cover architecture (`--d-model`,
 `--experts`, `--expert-size`, `--active-experts`, `--max/min-experts`,
-`--max/min-depth`, `--halting-threshold`), paging (`--pagingmthd`,
+`--max/min-depth`, `--halting-threshold`), paging (`--paging-method`,
 `--ram-cache`, `--vram-cache`), optimization (`--expert-lr`,
 `--trunk-lr-mult`), and runtime (`--context-length`, `--threads`, `--dtype`,
 `--seed`, `--ckpt`).
