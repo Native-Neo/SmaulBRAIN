@@ -66,7 +66,7 @@ ARG_TO_CONFIG = {
     "moe_balance_weight": "moe_balance_weight",
     "context_length": "context_length",
     "attention_chunk_size": "attention_chunk_size",
-    "paging_method": "pagingmthd",
+    "paging_method": "paging_method",
     "ram_cache": "ram_cache",
     "vram_cache": "vram_cache",
     "expert_lr": "expert_lr",
@@ -133,8 +133,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ponder-beta", type=float, default=None, dest="ponder_beta",
                    help="Weight of ponder KL regularizer (default: 0.01).")
     # --- paging ---
-    p.add_argument("--pagingmthd", "--paging-method", type=str, default=None,
-                   dest="pagingmthd",
+    p.add_argument("--paging-method", "--pagingmthd", type=str, default=None,
+                   dest="paging_method",
                    choices=["D2R", "R2VR", "D2VR", "d2r", "r2vr", "d2vr"],
                    help="D2R=disk->RAM, R2VR=RAM->VRAM (staged), D2VR=disk->VRAM direct "
                         "(case-insensitive; default: D2R). Checkpoint wins on resume.")
@@ -229,7 +229,7 @@ def config_from_args(args: argparse.Namespace) -> SmaulBrainConfig:
     expert_hidden = getattr(args, "expert_size", None)
     if expert_hidden is None:
         expert_hidden = preset["expert_hidden"]
-    paging = getattr(args, "pagingmthd", None)
+    paging = getattr(args, "paging_method", None)
     paging = paging.upper() if paging is not None else _cfg_default("paging_method")
     return SmaulBrainConfig(
         vocab_size=pick_cfg(getattr(args, "vocab_size", None), "vocab_size"),
@@ -279,7 +279,7 @@ def explicit_config_fields(args: argparse.Namespace) -> dict:
             continue  # schedule lives on train --grow-every; see resolve_train_grow_every
         val = getattr(args, dest, None)
         if val is not None:
-            if dest == "pagingmthd":
+            if dest == "paging_method":
                 val = str(val).upper()
             out[field] = val
     # expert_hidden alias: dest is expert_size
