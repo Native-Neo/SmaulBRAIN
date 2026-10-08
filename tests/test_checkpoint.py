@@ -41,6 +41,14 @@ def _trained(tmp, seed=0):
     return m, opt
 
 
+def _sf_rw(path, mutate):
+    """Load a safetensors file, mutate the (cloned) tensors, save back."""
+    from safetensors.torch import load_file, save_file
+    obj = {k: v.clone() for k, v in load_file(path).items()}
+    mutate(obj)
+    save_file(obj, path)
+
+
 def test_save_load_roundtrip_bit_identical(tmp_path):
     d = str(tmp_path / "c")
     m, _ = _trained(d)
@@ -72,7 +80,7 @@ def test_optimizer_state_restored_by_expert_id(tmp_path):
 def test_single_expert_file_without_full_model(tmp_path):
     d = str(tmp_path / "c")
     m, _ = _trained(d)
-    rec = load_expert_file(os.path.join(d, "experts", "expert_00002.pt"))
+    rec = load_expert_file(os.path.join(d, "experts", "expert_00002.safetensors"))
     assert rec.expert_id == "expert_00002"
     assert rec.param_count == m.pool.experts["expert_00002"].param_count
     m.pager.close()
@@ -259,39 +267,36 @@ def _tampered_load_fails_cleanly(tmp_path, tamper):
 
 def test_corrupt_expert_file_leaves_model_untouched(tmp_path):
     def tamper(d):
-        import torch as _t
-        p = os.path.join(d, "experts", "expert_00000.pt")
-        payload = _t.load(p, map_location="cpu", weights_only=False)
-        payload["weights"]["w_gate"]["codes"] = payload["weights"]["w_gate"]["codes"][:-1]
-        _t.save(payload, p)
+        p = os.path.join(d, "experts", "expert_00000.safetensors")
+        _sf_rw(p, lambda obj: obj.__setitem__(
+            "w_gate.codes", obj["w_gate.codes"][:-1]))
     _tampered_load_fails_cleanly(tmp_path, tamper)
 
 
 def test_missing_expert_file_leaves_model_untouched(tmp_path):
     def tamper(d):
-        os.remove(os.path.join(d, "experts", "expert_00001.pt"))
+        os.remove(os.path.join(d, "experts", "expert_00001.safetensors"))
     _tampered_load_fails_cleanly(tmp_path, tamper)
 
 
 def test_router_width_mismatch_leaves_model_untouched(tmp_path):
     def tamper(d):
-        import torch as _t
-        p = os.path.join(d, "router.pt")
-        obj = _t.load(p, map_location="cpu", weights_only=False)
-        obj["weight"] = obj["weight"][:2]
-        obj["bias"] = obj["bias"][:2]
-        _t.save(obj, p)
+        p = os.path.join(d, "router.safetensors")
+        def cut(obj):
+            obj["weight"] = obj["weight"][:2]
+            obj["bias"] = obj["bias"][:2]
+        _sf_rw(p, cut)
     _tampered_load_fails_cleanly(tmp_path, tamper)
 
 
 def test_trunk_shape_mismatch_leaves_model_untouched(tmp_path):
     def tamper(d):
         import torch as _t
-        p = os.path.join(d, "trunk.pt")
-        obj = _t.load(p, map_location="cpu", weights_only=False)
-        k = next(k for k in obj if isinstance(obj[k], _t.Tensor) and obj[k].ndim == 2)
-        obj[k] = obj[k][:, :-1]
-        _t.save(obj, p)
+        p = os.path.join(d, "trunk.safetensors")
+        def cut(obj):
+            k = next(k for k in obj if isinstance(obj[k], _t.Tensor) and obj[k].ndim == 2)
+            obj[k] = obj[k][:, :-1]
+        _sf_rw(p, cut)
     _tampered_load_fails_cleanly(tmp_path, tamper)
 
 
@@ -307,8 +312,8 @@ def test_duplicate_manifest_ids_leaves_model_untouched(tmp_path):
 
 def test_garbage_rng_snapshot_leaves_model_untouched(tmp_path):
     def tamper(d):
-        import torch as _t
-        _t.save({"bogus": 1}, os.path.join(d, "rng.pt"))
+        with open(os.path.join(d, "rng.safetensors"), "wb") as f:
+            f.write(b"\x00" * 16)  # not a safetensors payload
     _tampered_load_fails_cleanly(tmp_path, tamper)
 
 
@@ -339,7 +344,7 @@ def test_truncated_expert_detected_as_validation_error(tmp_path):
     d = str(tmp_path / "c")
     m, _ = _trained(d)
     eid = m.pool.order[0]
-    p = os.path.join(d, "experts", f"{eid}.pt")
+    p = os.path.join(d, "experts", f"{eid}.safetensors")
     with open(p, "wb") as f:
         f.truncate(0)
     m2 = SmaulBrainModel(m.cfg)
@@ -392,7 +397,7 @@ def test_nested_dir_creation_is_race_safe(tmp_path):
     m, _ = _trained(d)
     eid = m.pool.order[0]
     rec = m.pool.experts[eid]
-    nested = os.path.join(d, "experts", "nested", "deep", f"{eid}.pt")
+    nested = os.path.join(d, "experts", "nested", "deep", f"{eid}.safetensors")
     save_expert_file(rec, nested)  # parents did not exist
     assert load_expert_file(nested).expert_id == eid
     save_expert_file(rec, nested)  # second save over existing dirs
@@ -415,7 +420,7 @@ def test_quantize_sweeps_stale_sidecars_and_refuses_empty(tmp_path):
     assert not [f for f in os.listdir(d) if f.startswith("tmp_quant_")]
     assert not [f for f in os.listdir(exp_dir) if f.endswith(".convert_tmp")]
     eid = m.pool.order[0]
-    with open(os.path.join(exp_dir, f"{eid}.pt"), "wb") as f:
+    with open(os.path.join(exp_dir, f"{eid}.safetensors"), "wb") as f:
         f.truncate(0)
     with pytest.raises(ValueError, match="validation failed|empty"):
         convert_checkpoint(d, to="fp8", tile=32)
@@ -463,8 +468,10 @@ def test_extra_expert_file_rejected_untouched(tmp_path):
     import shutil
     d = str(tmp_path / "c")
     m, _ = _trained(d)
-    src = os.path.join(d, "experts", m.pool.order[0] + ".pt")
-    shutil.copy(src, os.path.join(d, "experts", "expert_99999.pt"))
+    src = os.path.join(d, "experts", m.pool.order[0] + ".safetensors")
+    shutil.copy(src, os.path.join(d, "experts", "expert_99999.safetensors"))
+    shutil.copy(src[: -len(".safetensors")] + ".json",
+                os.path.join(d, "experts", "expert_99999.json"))
     m2 = SmaulBrainModel(m.cfg)
     opt2 = SmaulOpt(SmaulOptHParams())
     snap = _snapshot_live(m2, opt2)
@@ -530,12 +537,13 @@ def test_incompatible_topology_rejected_untouched(tmp_path):
 
 def test_trunk_missing_entry_rejected_untouched(tmp_path):
     """Trunk missing one key must fail (no silent strict=False partial)."""
+    from safetensors.torch import load_file, save_file
     d = str(tmp_path / "c")
     m, _ = _trained(d)
-    p = os.path.join(d, "trunk.pt")
-    obj = torch.load(p, map_location="cpu", weights_only=False)
+    p = os.path.join(d, "trunk.safetensors")
+    obj = {k: v.clone() for k, v in load_file(p).items()}
     obj.pop(next(iter(obj)))
-    torch.save(obj, p)
+    save_file(obj, p)
     m2 = SmaulBrainModel(m.cfg)
     opt2 = SmaulOpt(SmaulOptHParams())
     snap = _snapshot_live(m2, opt2)
@@ -546,14 +554,15 @@ def test_trunk_missing_entry_rejected_untouched(tmp_path):
 
 
 def test_corrupt_optimizer_state_rejected_untouched(tmp_path):
-    """Non-tensor optimizer moment fails deep validation; opt untouched."""
+    """Wrong-shape optimizer moment fails deep validation; opt untouched."""
+    from safetensors.torch import load_file, save_file
     d = str(tmp_path / "c")
     m, _ = _trained(d)
-    p = os.path.join(d, "optim.pt")
-    obj = torch.load(p, map_location="cpu", weights_only=False)
-    k = next(iter(obj["trunk"]))
-    obj["trunk"][k]["m"] = "corrupted"
-    torch.save(obj, p)
+    p = os.path.join(d, "optim.safetensors")
+    obj = {k: v.clone() for k, v in load_file(p).items()}
+    k = next(k for k in obj if k.startswith("trunk.") and k.endswith(".m"))
+    obj[k] = torch.zeros(2, 2, dtype=torch.bfloat16)
+    save_file(obj, p)
     m2 = SmaulBrainModel(m.cfg)
     opt2 = SmaulOpt(SmaulOptHParams())
     snap = _snapshot_live(m2, opt2)
@@ -565,13 +574,14 @@ def test_corrupt_optimizer_state_rejected_untouched(tmp_path):
 
 def test_corrupt_expert_optim_shape_rejected_untouched(tmp_path):
     """Expert-local moment with wrong shape fails; pool/pager/opt untouched."""
+    from safetensors.torch import load_file, save_file
     d = str(tmp_path / "c")
     m, _ = _trained(d)
     eid = m.pool.order[0]
-    p = os.path.join(d, "experts", f"{eid}.pt")
-    obj = torch.load(p, map_location="cpu", weights_only=False)
-    obj["optim_state"]["w_gate"]["m"] = torch.zeros(2, 2, dtype=torch.bfloat16)
-    torch.save(obj, p)
+    p = os.path.join(d, "experts", f"{eid}.safetensors")
+    obj = {k: v.clone() for k, v in load_file(p).items()}
+    obj["optim.w_gate.m"] = torch.zeros(2, 2, dtype=torch.bfloat16)
+    save_file(obj, p)
     m2 = SmaulBrainModel(m.cfg)
     opt2 = SmaulOpt(SmaulOptHParams())
     snap = _snapshot_live(m2, opt2)
@@ -583,13 +593,14 @@ def test_corrupt_expert_optim_shape_rejected_untouched(tmp_path):
 
 def test_corrupt_expert_meta_type_rejected_untouched(tmp_path):
     """Non-numeric expert meta normalizes to ValueError; nothing mutates."""
+    import json as _j
     d = str(tmp_path / "c")
     m, _ = _trained(d)
     eid = m.pool.order[0]
-    p = os.path.join(d, "experts", f"{eid}.pt")
-    obj = torch.load(p, map_location="cpu", weights_only=False)
-    obj["meta"]["tokens_routed"] = {"x": 1}
-    torch.save(obj, p)
+    p = os.path.join(d, "experts", f"{eid}.json")
+    meta = _j.load(open(p))
+    meta["meta"]["tokens_routed"] = {"x": 1}
+    _j.dump(meta, open(p, "w"))
     m2 = SmaulBrainModel(m.cfg)
     opt2 = SmaulOpt(SmaulOptHParams())
     snap = _snapshot_live(m2, opt2)
@@ -628,24 +639,24 @@ def test_crash_during_staging_leaves_previous_intact(tmp_path, monkeypatch):
     d = str(tmp_path / "c")
     m, opt = _trained(d)
     assert _st.load_manifest(d)["step"] == 3
-    trunk_before = open(os.path.join(d, "trunk.pt"), "rb").read()
+    trunk_before = open(os.path.join(d, "trunk.safetensors"), "rb").read()
 
-    real_atomic = _st._atomic_save
+    real_atomic = _st._atomic_save_tensors
 
-    def _boom_once(obj, path):
+    def _boom_once(tensors, path):
         _boom_once.calls += 1
         if _boom_once.calls == 1:
             raise RuntimeError("simulated crash mid-staging")
-        return real_atomic(obj, path)
+        return real_atomic(tensors, path)
     _boom_once.calls = 0
-    monkeypatch.setattr(_st, "_atomic_save", _boom_once)
+    monkeypatch.setattr(_st, "_atomic_save_tensors", _boom_once)
     with torch.no_grad():
         m.embed.weight.add_(1.0)
     with pytest.raises(RuntimeError, match="simulated crash"):
         save_model(d, m, opt, step=99)
     # Previous generation untouched and loadable.
     assert _st.load_manifest(d)["step"] == 3
-    assert open(os.path.join(d, "trunk.pt"), "rb").read() == trunk_before
+    assert open(os.path.join(d, "trunk.safetensors"), "rb").read() == trunk_before
     m2 = SmaulBrainModel(m.cfg)
     assert load_model(d, m2, SmaulOpt(SmaulOptHParams()))["step"] == 3
     # Next save sweeps any staging leftovers and succeeds.
@@ -664,7 +675,7 @@ def test_stale_generations_and_cross_tmp_swept_on_save(tmp_path):
     exp_dir = os.path.join(d, "experts")
     stale_gen = os.path.join(d, "tmp_ckpt_gen_stale")
     os.makedirs(os.path.join(stale_gen, "experts"), exist_ok=True)
-    with open(os.path.join(stale_gen, "trunk.pt"), "w") as f:
+    with open(os.path.join(stale_gen, "trunk.safetensors"), "w") as f:
         f.write("stale")
     for p in [os.path.join(d, "tmp_quant_crash"),
               os.path.join(d, "tmp_json_crash"),
@@ -689,18 +700,16 @@ def test_quantize_failure_leaves_pool_intact_no_sidecars(tmp_path):
     m, _ = _trained(d)
     exp_dir = os.path.join(d, "experts")
     before = {f: open(os.path.join(exp_dir, f), "rb").read()
-              for f in os.listdir(exp_dir) if f.endswith(".pt")}
-    # Corrupt one expert payload so conversion of that file raises.
+              for f in os.listdir(exp_dir) if f.endswith(".safetensors")}
+    # Corrupt one expert sidecar so conversion of that file raises.
     eid = m.pool.order[0]
-    p = os.path.join(exp_dir, f"{eid}.pt")
-    obj = torch.load(p, map_location="cpu", weights_only=False)
-    obj["weights"]["w_gate"]["codes"] = "corrupted"
-    torch.save(obj, p)
+    with open(os.path.join(exp_dir, f"{eid}.json"), "wb") as f:
+        f.write(b"\x00\x01\x02not-json")
     with pytest.raises((ValueError, RuntimeError, AttributeError, TypeError)):
         convert_checkpoint(d, to="fp8", tile=32)
     # Uncorrupted experts are bit-identical; no sidecars remain.
     for f, blob in before.items():
-        if f != f"{eid}.pt":
+        if f != f"{eid}.safetensors":
             assert open(os.path.join(exp_dir, f), "rb").read() == blob
     assert not [f for f in os.listdir(exp_dir) if f.endswith(".convert_tmp")]
     assert not [f for f in os.listdir(exp_dir) if f.startswith("tmp_quant_")]
@@ -738,4 +747,17 @@ def test_concurrent_readers_see_old_or_new_never_mixed(tmp_path):
     assert not errors
     assert seen_steps and all(s in (3, 4, 5) for s in seen_steps)
     assert _st.load_manifest(d)["step"] == 5
+    m.pager.close()
+
+
+def test_resume_config_written_with_floor_and_scheduler(tmp_path):
+    """Every save writes resume_config.json: floor, topology, scheduler."""
+    import storage as _st
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    rc = _st.load_resume_config(d)
+    assert rc["min_experts"] == m.cfg.min_experts
+    assert rc["num_experts"] == len(m.pool)
+    assert rc["topology"]["d_model"] == m.cfg.d_model
+    assert isinstance(rc.get("scheduler", {}), dict)
     m.pager.close()
