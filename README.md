@@ -297,8 +297,9 @@ python cli.py --ckpt ckpt/demo quantize --to fp8 # requantize experts
 ```
 
 Fine-tuning selectors: `--mode trunk|experts|selected|new`, with
-`--selected expert_00001,expert_00002` or `--new-since <step>`, plus
-`--grow-every N` / `--prune-every N` schedules.
+`--selected expert_00001,expert_00002` or `--new-since <step>`, plus the
+`--grow-every N` schedule. Training never prunes; shrink the pool offline
+with `python pruning.py --ckpt <dir> --rm-worst N`.
 
 ### What is `config.py`
 
@@ -308,7 +309,8 @@ The single source of truth: `SmaulBrainConfig` holds topology (`d_model`,
 (`num/top_k/max/min_experts`, explicit `expert_hidden`), paging
 (`paging_method`, `ram/vram_cache`), learning rates (`expert_lr`,
 `trunk/router_lr_mult`), precision (`dtype`, `fp8_tile`, `state_dtype`), and
-growth/pruning knobs. `__post_init__` validates every field, and derived
+growth knobs plus the offline pruner's grace/dying thresholds.
+`__post_init__` validates every field, and derived
 helpers (`trunk_lr`, `per_expert_params`, `total/active_params`,
 `to_dict`/`from_dict`, `describe_counts`) keep checkpoints and reports
 consistent. `expert_hidden_for_target` sizes one expert to ~5.12M params.
@@ -548,30 +550,26 @@ print(compute_dtype("activations"))   # torch.bfloat16 per PRECISION_POLICY
 
 ### What is `pruning.py`
 
-Hysteresis pruning with grace periods. An expert dies only when old enough,
-long idle, AND below threshold on every vitality signal (usage share,
-gradient activity, contribution) — one strong signal saves it. A redundancy
-pass additionally retires near-duplicate gate weights, but only below a
-looser usage bar, so load-bearing twins survive. `prune_experts` removes
-weights, optimizer state, router row, and metadata together, highest index
-first, keeping checkpoints index-consistent. The pool never prunes below
-64 experts: when the floor blocks a live prune, no removal happens and a
-free compensatory top-4 mutated growth fires instead.
+The offline expert pruner — a standalone script, not a library (training
+never prunes; nothing imports this file). Run it explicitly:
 
-### How to use `pruning.py`
-
-```python
-from pruning import find_victims, prune_experts
-
-victims = find_victims(pool, step=1000, survival_steps=500,
-                       min_experts=64, usage_threshold=1e-4)
-if victims:
-    print(prune_experts(pool, router, victims))  # weights+state+row+meta gone
+```bash
+python pruning.py --ckpt ckpt/run1 --rm-worst 4          # remove 4 worst
+python pruning.py --ckpt ckpt/run1 --rm-worst 4 --dry-run  # rank only
 ```
 
-In training, schedule it with `run_training(..., prune_every=10000)` or the
-CLI `--prune-every 10000`: scheduled prunes strip the worst 4, and a hot
-window (more than 2 growths in the trailing 10K steps) strips the worst 16.
+Selection is hysteresis with grace periods. An expert dies only when old
+enough, long idle, AND below threshold on every vitality signal (usage
+share, gradient activity, contribution) — one strong signal saves it. A
+redundancy pass additionally retires near-duplicate gate weights, but only
+below a looser usage bar, so load-bearing twins survive. The floor comes
+from the checkpoint's `resume_config.json` (`min_experts`, default 64):
+removal never takes the pool below it — asking for more than
+`len(pool) - floor` refuses with exit 2 and changes nothing.
+`prune_experts` removes weights, optimizer state, router row, and metadata
+together, highest index first, keeping checkpoints index-consistent; the
+checkpoint is re-saved in place, still resumable (scheduler snapshot and
+RNG state preserved, so training continues on the next global step).
 
 ### What is `quantize.py`
 
@@ -643,7 +641,7 @@ y = rmsnorm_fn(x, n.weight)
 The sparse top-k router. Each token scores every expert, keeps the top-k
 (renormalized to sum to 1), and per-expert capacity drops overflow tokens to
 the residual path. A Switch-style balance loss keeps traffic spread, FP64
-usage/admission counters feed growth and pruning, and `add/remove_expert_row`
+usage/admission counters feed growth and offline pruning, and `add/remove_expert_row`
 keep router rows aligned with pool ids (preserving dtype) as the topology
 changes.
 
@@ -668,7 +666,7 @@ Two-D weights use factored row/col second moments (full matrix never
 materialized); state stores BF16 with FP32 math; global FP64 grad clipping
 with a non-finite skip. `SmaulOpt` splits LR groups (`step_trunk`,
 `step_router`, `step_expert`), and expert states live on the records so they
-follow experts across paging and die on pruning.
+follow experts across paging and die with pruned experts.
 
 ### How to use `smaulopt.py`
 
@@ -686,13 +684,17 @@ requantizes only that expert's blocks.
 
 ### What is `storage.py`
 
-Atomic, per-expert checkpointing. Layout: `config.json`, `trunk.pt`,
-`router.pt`, single `optim.pt`, `rng.pt`, one `experts/<id>.pt` per expert
-(FP8 codes + scales, expert-local optimizer state, metadata), and
-`manifest.json` written last as the commit point — a crash mid-save leaves
-the previous checkpoint intact. Loading resizes the router both ways,
-restores usage stats and RNG, clears stale pager caches, and rebuilds the
-pool in manifest order. `make_disk_loader` reads single experts without
+Atomic, multi-file safetensors checkpointing — no pickle anywhere, so every
+tensor is cleanly extractable (e.g. for GGUF converters). Layout:
+`config.json`, `manifest.json` (written last as the commit point),
+`resume_config.json` (prune floor, topology, scheduler snapshot),
+`meta.json` (optimizer hparams, RNG state), `trunk.safetensors`,
+`router.safetensors`, `optim.safetensors`, `rng.safetensors`, and one
+`experts/<id>.safetensors` + `experts/<id>.json` sidecar per expert (FP8
+codes + scales, expert-local optimizer moments, metadata). A crash mid-save
+leaves the previous checkpoint intact. Loading resizes the router both
+ways, restores usage stats and RNG, clears stale pager caches, and rebuilds
+the pool in manifest order. `make_disk_loader` reads single experts without
 loading the model.
 
 ### How to use `storage.py`
@@ -702,7 +704,7 @@ from storage import save_model, load_model, load_expert_file, make_disk_loader
 
 save_model("ckpt/run1", model, opt, step=100)
 manifest = load_model("ckpt/run1", fresh_model, fresh_opt)  # returns manifest
-rec = load_expert_file("ckpt/run1/experts/expert_00002.pt")  # no full load
+rec = load_expert_file("ckpt/run1/experts/expert_00002.safetensors")  # no full load
 loader = make_disk_loader("ckpt/run1")                       # pager wiring
 ```
 
@@ -712,7 +714,8 @@ One training loop for training and fine-tuning (a mode, not a separate
 model). `train_step` runs forward → backward → mode-gated SmaulOpt updates:
 `entire` moves everything, `trunk` freezes experts, `experts` freezes the
 trunk, `selected` steps listed ids, `new` steps experts born after a cutoff.
-`run_training` adds replay interleaving, growth/pruning schedules,
+`run_training` adds replay interleaving, the growth schedule (training
+never prunes — pool shrinkage is the offline `pruning.py` script),
 periodic checkpointing, and before/after retention measurement.
 
 ### How to use `train.py`
@@ -726,7 +729,7 @@ print(stats["loss"], stats["mean_depth"], stats["stepped_experts"])
 res = run_training(model, opt, cfg, train_seqs, steps=20, batch_size=2,
                    mode="selected", selected=["expert_00001"],
                    replay=ReplayBuffer(512), replay_n=2,
-                   old_seqs=old_data, grow_every=20000, prune_every=10000,
+                   old_seqs=old_data, grow_every=20000,
                    ckpt_dir="ckpt/run1", save_every=50)
 print(res["final_loss"], res["retention"])  # retention measured, not claimed
 ```
