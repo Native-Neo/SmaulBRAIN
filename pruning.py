@@ -200,6 +200,7 @@ def prune_experts(
             _drop_state_row(optim_state, idx)
         if pager is not None:
             pager.forget(eid)
+        pruned.append(eid)
     return sorted(pruned, key=lambda eid: eid)
 
 
@@ -280,7 +281,6 @@ def main(argv: list[str] | None = None) -> int:
         extra = manifest.get("extra", {})
         save_model(ckpt, model, opt, step,
                    extra_meta=extra if isinstance(extra, dict) else {})
-        result["removed"] = removed
     result["pool_after"] = len(model.pool)
     model.pager.close()
     print(json.dumps(result, indent=2))
