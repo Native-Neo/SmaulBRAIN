@@ -180,6 +180,42 @@ def retention_report(before: dict, after: dict) -> dict:
     }
 
 
+def _new_cap_factor(old_delta: torch.Tensor, new_delta: torch.Tensor, cap: float) -> float:
+    """Safety-ceiling factor for old-router-row deltas (pure, deterministic).
+
+    Returns ``f in [0, 1]`` such that scaling ``old_delta`` by ``f`` keeps
+    every aggregate old/new movement ratio (Frobenius, mean per-row L2,
+    mean abs) at or below ``cap``. All three ratios are linear in the old
+    block's scale, so a single factor fixes them together. Returns 1.0 when
+    no cap is needed, and also when the new block did not move (ratio
+    undefined -- exact-mult semantics are kept instead of freezing).
+    """
+    f = 1.0
+    o_fro = float(old_delta.float().pow(2).sum().sqrt().item())
+    n_fro = float(new_delta.float().pow(2).sum().sqrt().item())
+    if o_fro > 0.0:
+        if n_fro < 1e-12:
+            return 1.0
+        f = min(f, cap * n_fro / o_fro)
+    if old_delta.ndim == 1:
+        o_mean = float(old_delta.float().abs().mean().item())
+        n_mean = float(new_delta.float().abs().mean().item())
+    else:
+        o_mean = float(old_delta.float().pow(2).sum(dim=1).sqrt().mean().item())
+        n_mean = float(new_delta.float().pow(2).sum(dim=1).sqrt().mean().item())
+    if o_mean > 0.0:
+        if n_mean < 1e-12:
+            return 1.0
+        f = min(f, cap * n_mean / o_mean)
+    o_l1 = float(old_delta.float().abs().mean().item())
+    n_l1 = float(new_delta.float().abs().mean().item())
+    if o_l1 > 0.0:
+        if n_l1 < 1e-12:
+            return 1.0
+        f = min(f, cap * n_l1 / o_l1)
+    return max(0.0, min(1.0, f))
+
+
 def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
                mode: str = "entire", selected: list[str] | None = None,
                new_since_step: int = 0) -> dict:
@@ -205,7 +241,70 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
             for _, p in model._trunk_params():
                 p.grad = None
         if train_router:
+            # Mode `new` only: old experts' router rows learn at
+            # router_lr_mult_new while newborn rows (birth_step >= cutoff,
+            # incl. rows appended by mid-run growth) train at full LR.
+            # Post-step-only delta rescale: the optimizer steps on UNSCALED
+            # grads (bit-identical clip norm, factored v_row/v_col moments
+            # and new-row deltas to a full-LR run), then old rows' applied
+            # delta is rescaled by mult. Grad pre-scaling is deliberately
+            # avoided: SmaulOpt's u = m_hat/(v_hat+eps) is ~invariant to
+            # uniform grad rescaling, and proj.weight's factored v_col is
+            # shared across old+new rows while the global grad-norm clip
+            # spans scaled grads -- so grad-scale + delta-rescale overshoots
+            # mult by ~2x. Post-step-only is exact by construction:
+            # delta_final = mult x full-delta on every touched old row.
+            # Safety ceiling: after the mult rescale, old rows are further
+            # capped so old/new movement stays <= _NEW_CAP (0.015, under the
+            # 0.02 bar with headroom for bf16 storage rounding) on every
+            # step. This handles shrinking-new-row inflation: as newborn
+            # rows converge their updates shrink while slowed old rows keep
+            # larger full-memory grads, so a fixed mult alone would let
+            # old/new drift past the bar over steps. The cap binds only
+            # when needed (fresh steps sit at ~mult << cap, so the
+            # counterfactual own-full-step ratio stays ~= mult); when there
+            # are no new rows (or they did not move) the ratio is undefined
+            # and the cap is skipped, keeping exact-mult semantics.
+            _NEW_CAP = 0.015
+            _held: list[tuple] = []
+            _held_mult = 1.0
+            if mode == "new":
+                mult = float(getattr(cfg, "router_lr_mult_new", 0.005))
+                if mult != 1.0:
+                    pool = getattr(model, "pool", None)
+                    order = list(getattr(pool, "order", None) or [])
+                    experts = getattr(pool, "experts", {}) or {}
+                    old_idx = [i for i, eid in enumerate(order)
+                               if eid in experts and experts[eid].birth_step < new_since_step]
+                    if old_idx:
+                        _held_mult = mult
+                        with torch.no_grad():
+                            for rname, rp in model._router_params():
+                                is_row = (("proj.weight" in rname
+                                           and rp.data.ndim == 2)
+                                          or ("proj.bias" in rname
+                                              and rp.data.ndim == 1))
+                                if not is_row:
+                                    continue
+                                idx = [i for i in old_idx if i < rp.data.shape[0]]
+                                if not idx:
+                                    continue
+                                iset = set(idx)
+                                nidx = [i for i in range(rp.data.shape[0]) if i not in iset]
+                                _held.append((rp, rp.data[idx].clone(), list(idx),
+                                              rp.data[nidx].clone() if nidx else None, nidx))
             opt.step_router(model._router_params(), cfg.router_lr)
+            if _held:
+                with torch.no_grad():
+                    for rp, snap_old, idx, snap_new, nidx in _held:
+                        snap32 = snap_old.float()
+                        total = (rp.data[idx].float() - snap32) * _held_mult
+                        if snap_new is not None and nidx:
+                            new_delta = rp.data[nidx].float() - snap_new.float()
+                            f = _new_cap_factor(total, new_delta, _NEW_CAP)
+                            if f != 1.0:
+                                total = total * f
+                        rp.data[idx] = (snap32 + total).to(rp.data.dtype)
         else:
             for _, p in model._router_params():
                 p.grad = None
