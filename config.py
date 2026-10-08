@@ -69,7 +69,11 @@ class SmaulBrainConfig:
     # --- optimization ---
     expert_lr: float = 2e-4
     trunk_lr_mult: float = 0.1  # shared trunk LR = expert_lr * trunk_lr_mult
-    router_lr_mult: float = 1.0
+    router_lr_mult: float = 1.0  # router LR = expert_lr * router_lr_mult
+    # Old-expert router-row LR scale applied ONLY in training mode `new`:
+    # applied old-row deltas for experts with birth_step < new_since_step
+    # are rescaled by this factor post-step, newborn rows train at full LR.
+    router_lr_mult_new: float = 0.005
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     beta_m: float = 0.9
@@ -117,6 +121,7 @@ class SmaulBrainConfig:
         assert self.expert_lr > 0, "expert LR must be positive"
         assert self.trunk_lr_mult > 0, "trunk LR multiplier must be positive"
         assert self.router_lr_mult > 0, "router LR multiplier must be positive"
+        assert self.router_lr_mult_new >= 0, "router new-mode LR multiplier must be non-negative"
         assert self.weight_decay >= 0, "weight decay must be non-negative"
         # Clipping semantics: grad_clip > 0 caps the global grad norm;
         # 0 (or negative) disables clipping entirely.
