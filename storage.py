@@ -1,20 +1,33 @@
-"""Checkpoint storage: per-expert files, FP8 bytes, atomic writes.
+"""Checkpoint storage: multi-file safetensors, atomic writes.
 
 Layout (``ckpt_dir/``)::
 
     config.json          architecture + precision + paging configuration
-    manifest.json        step, expert ids, usage/growth metadata, RNG cursor
-    trunk.pt             embeddings, block, norms, head (dense BF16/FP32)
-    router.pt            router projection (dense)
-    optim.pt             SmaulOpt trunk + router state (name-keyed, BF16 storage)
-    rng.pt               torch RNG state
-    experts/<id>.pt      one file per expert: FP8 codes + FP32 scales,
-                         expert-local optimizer state, metadata
+    manifest.json        step, expert ids, usage/growth metadata (commit point)
+    resume_config.json   floor (min_experts), topology, scheduler snapshot —
+                         the standalone pruner reads its floor from here
+    meta.json            optimizer hparams + step count, RNG python state
+    trunk.safetensors    embeddings, block, norms, head (dense BF16/FP32)
+    router.safetensors   router projection (dense)
+    optim.safetensors    SmaulOpt trunk + router moments (BF16/FP32 storage)
+    rng.safetensors      torch RNG state (CPU + CUDA byte tensors)
+    experts/<id>.safetensors   one file per expert: FP8 codes + FP32 scales,
+                               expert-local optimizer moments
+    experts/<id>.json          per-expert sidecar: dims, tiles, shapes,
+                               optimizer structure/steps, metadata
+
+No pickle anywhere: every tensor blob is safetensors, every non-tensor is
+JSON, so checkpoints are cleanly extractable (e.g. for GGUF converters).
 
 A crash during checkpointing cannot corrupt the model: every file is written
-to ``<name>.tmp`` and atomically renamed; the manifest (written last, also
-atomic) is the commit point — a loader only trusts experts listed there.
-Single experts load/save without touching the rest of the model.
+to a ``tmp_`` sidecar and atomically renamed; the manifest (written last,
+also atomic) is the commit point — a loader only trusts experts listed
+there. Single experts load/save without touching the rest of the model.
+
+Per-expert sidecar rule: ``save_expert_file(rec, path)`` writes tensors to
+``path`` and JSON meta to the sidecar derived from it — ``path`` with a
+``.safetensors`` suffix swapped for ``.json``, otherwise ``path + ".json"``.
+``load_expert_file`` resolves the sidecar the same way.
 """
 
 from __future__ import annotations
@@ -28,6 +41,8 @@ import shutil
 import tempfile
 
 import torch
+from safetensors.torch import load_file as _sf_load
+from safetensors.torch import save_file as _sf_save
 
 try:
     import fcntl as _fcntl
@@ -38,6 +53,9 @@ from experts import ExpertRecord, init_expert_optim_state
 from precision import FP8BlockTensor
 
 EXPERT_NAMES = ("w_gate", "w_up", "w_down")
+SF_SUFFIX = ".safetensors"
+
+RESUME_SCHEMA = "1"
 
 
 def get_rng_snapshot() -> dict:
@@ -168,8 +186,8 @@ def _with_ckpt_lock(exclusive: bool):
 _TMP_GEN_PREFIX = "tmp_ckpt_gen_"
 
 
-def _checked_torch_load(path: str):
-    """torch.load with truncated-file detection normalized to ValueError."""
+def _checked_sf_load(path: str) -> dict:
+    """safetensors load with truncated-file detection normalized to ValueError."""
     try:
         st = os.stat(path)
     except FileNotFoundError:
@@ -177,7 +195,7 @@ def _checked_torch_load(path: str):
     if st.st_size == 0:
         raise ValueError(f"checkpoint validation failed: empty file {path}")
     try:
-        return torch.load(path, map_location="cpu", weights_only=False)
+        return _sf_load(path)
     except ValueError:
         raise
     except Exception as e:
@@ -186,12 +204,32 @@ def _checked_torch_load(path: str):
         ) from e
 
 
-def _atomic_save(obj, path: str) -> None:
+def _detached_cpu_map(tensors: dict) -> dict:
+    """Detach + CPU + contiguous copy map; clones storage-sharing tensors.
+
+    safetensors refuses tensors that share memory (it would duplicate them
+    on disk and reload them divergent), so any tensor whose storage was
+    already emitted is cloned. Returns fresh tensors; inputs untouched.
+    """
+    out: dict = {}
+    seen: set[int] = set()
+    for k, t in tensors.items():
+        c = t.detach().cpu().contiguous()
+        ptr = c.untyped_storage().data_ptr()
+        if ptr in seen:
+            c = c.clone()
+            ptr = c.untyped_storage().data_ptr()
+        seen.add(ptr)
+        out[k] = c
+    return out
+
+
+def _atomic_save_tensors(tensors: dict, path: str) -> None:
     tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path) or ".",
                                         prefix="tmp_ckpt_")
     os.close(tmp_fd)
     try:
-        torch.save(obj, tmp_path)
+        _sf_save(_detached_cpu_map(tensors), tmp_path)
         _fsync_file(tmp_path)
         os.replace(tmp_path, path)
         _fsync_dir(os.path.dirname(path) or ".")
@@ -219,23 +257,44 @@ def _atomic_write_json(payload: dict, path: str) -> None:
             os.remove(tmp_path)
 
 
-def _fp8_to_dict(t: FP8BlockTensor) -> dict:
-    return {"codes": t.codes.cpu(), "scales": t.scales.cpu(),
-            "shape": list(t.shape), "tile": t.tile}
+def _opt_kind(st: dict) -> str:
+    if "v" in st:
+        return "full"
+    return "factored"
 
 
-def _fp8_from_dict(d: dict) -> FP8BlockTensor:
-    return FP8BlockTensor(codes=d["codes"], scales=d["scales"],
-                          shape=tuple(d["shape"]), tile=int(d["tile"]))
+def expert_tensors(rec: ExpertRecord) -> dict:
+    """All of one expert's tensors: FP8 weights + local optimizer moments."""
+    out: dict = {}
+    for n in EXPERT_NAMES:
+        t = rec.weights_fp8[n]
+        out[f"{n}.codes"] = t.codes
+        out[f"{n}.scales"] = t.scales
+    for n, st in (rec.optim_state or {}).items():
+        out[f"optim.{n}.m"] = st["m"]
+        if _opt_kind(st) == "full":
+            out[f"optim.{n}.v"] = st["v"]
+        else:
+            out[f"optim.{n}.v_row"] = st["v_row"]
+            out[f"optim.{n}.v_col"] = st["v_col"]
+    return out
 
 
-def expert_to_payload(rec: ExpertRecord) -> dict:
+def expert_meta(rec: ExpertRecord) -> dict:
+    """All of one expert's non-tensor state (JSON-serializable)."""
     return {
         "expert_id": rec.expert_id,
         "d_model": rec.d_model,
         "expert_hidden": rec.expert_hidden,
-        "weights": {n: _fp8_to_dict(rec.weights_fp8[n]) for n in EXPERT_NAMES},
-        "optim_state": rec.optim_state,
+        "weights": {
+            n: {"shape": list(rec.weights_fp8[n].shape),
+                "tile": rec.weights_fp8[n].tile}
+            for n in EXPERT_NAMES
+        },
+        "optim": {
+            n: {"kind": _opt_kind(st), "step": int(st.get("step", 0))}
+            for n, st in (rec.optim_state or {}).items()
+        },
         "meta": {
             "birth_step": rec.birth_step,
             "parents": list(rec.parents),
@@ -248,37 +307,114 @@ def expert_to_payload(rec: ExpertRecord) -> dict:
     }
 
 
-def expert_from_payload(p: dict) -> ExpertRecord:
+def expert_from_parts(tensors: dict, meta: dict) -> ExpertRecord:
+    """Rebuild an ExpertRecord from safetensors tensors + JSON meta."""
+    weights = {}
+    for n in EXPERT_NAMES:
+        wm = meta["weights"][n]
+        weights[n] = FP8BlockTensor(codes=tensors[f"{n}.codes"],
+                                    scales=tensors[f"{n}.scales"],
+                                    shape=tuple(wm["shape"]),
+                                    tile=int(wm["tile"]))
     rec = ExpertRecord(
-        expert_id=p["expert_id"],
-        d_model=int(p["d_model"]),
-        expert_hidden=int(p["expert_hidden"]),
-        weights_fp8={n: _fp8_from_dict(p["weights"][n]) for n in EXPERT_NAMES},
-        birth_step=int(p["meta"].get("birth_step", 0)),
-        parents=list(p["meta"].get("parents", [])),
-        source=str(p["meta"].get("source", "init")),
+        expert_id=meta["expert_id"],
+        d_model=int(meta["d_model"]),
+        expert_hidden=int(meta["expert_hidden"]),
+        weights_fp8=weights,
+        birth_step=int(meta["meta"].get("birth_step", 0)),
+        parents=list(meta["meta"].get("parents", [])),
+        source=str(meta["meta"].get("source", "init")),
     )
-    rec.tokens_routed = int(p["meta"].get("tokens_routed", 0))
-    rec.last_used_step = int(p["meta"].get("last_used_step", 0))
-    rec.grad_activity = float(p["meta"].get("grad_activity", 0.0))
-    rec.contribution = float(p["meta"].get("contribution", 0.0))
-    rec.optim_state = p.get("optim_state", {}) or {}
-    if not rec.optim_state:
-        rec.optim_state = init_expert_optim_state(rec)
+    rec.tokens_routed = int(meta["meta"].get("tokens_routed", 0))
+    rec.last_used_step = int(meta["meta"].get("last_used_step", 0))
+    rec.grad_activity = float(meta["meta"].get("grad_activity", 0.0))
+    rec.contribution = float(meta["meta"].get("contribution", 0.0))
+    ost: dict = {}
+    for n, om in meta.get("optim", {}).items():
+        st: dict = {"m": tensors[f"optim.{n}.m"],
+                    "step": int(om.get("step", 0))}
+        if om.get("kind", "full") == "full":
+            st["v"] = tensors[f"optim.{n}.v"]
+        else:
+            st["v_row"] = tensors[f"optim.{n}.v_row"]
+            st["v_col"] = tensors[f"optim.{n}.v_col"]
+        ost[n] = st
+    rec.optim_state = ost or init_expert_optim_state(rec)
     return rec
 
 
+def _expert_sidecar(path: str) -> str:
+    if path.endswith(SF_SUFFIX):
+        return path[: -len(SF_SUFFIX)] + ".json"
+    return path + ".json"
+
+
 def save_expert_file(rec: ExpertRecord, path: str) -> None:
+    """Atomically save one expert (tensors + JSON sidecar)."""
     parent = os.path.dirname(path) or "."
     os.makedirs(parent, exist_ok=True)
     _sweep_stale_tmp(parent)
-    _atomic_save(expert_to_payload(rec), path)
+    sidecar = _expert_sidecar(path)
+    tmp_fd, tmp_tensors = tempfile.mkstemp(dir=parent, prefix="tmp_ckpt_")
+    os.close(tmp_fd)
+    try:
+        _sf_save(_detached_cpu_map(expert_tensors(rec)), tmp_tensors)
+        _fsync_file(tmp_tensors)
+        os.replace(tmp_tensors, path)
+        _atomic_write_json(expert_meta(rec), sidecar)
+        _fsync_dir(parent)
+    finally:
+        if os.path.exists(tmp_tensors):
+            os.remove(tmp_tensors)
 
 
 def load_expert_file(path: str) -> ExpertRecord:
+    """Load one expert written by :func:`save_expert_file`."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"missing expert file {path}")
-    return expert_from_payload(_checked_torch_load(path))
+    sidecar = _expert_sidecar(path)
+    if not os.path.exists(sidecar):
+        raise FileNotFoundError(f"missing expert sidecar {sidecar}")
+    tensors = _checked_sf_load(path)
+    try:
+        with open(sidecar) as f:
+            meta = json.load(f)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(
+            f"checkpoint validation failed: unreadable sidecar {sidecar}: {e}"
+        ) from e
+    return expert_from_parts(tensors, meta)
+
+
+def _flatten_opt_store(store: dict, prefix: str) -> tuple[dict, dict]:
+    """Flatten a SmaulOpt state store to safetensors keys + structure map."""
+    tensors: dict = {}
+    struct: dict = {}
+    for k, st in store.items():
+        tensors[f"{prefix}.{k}.m"] = st["m"]
+        if _opt_kind(st) == "full":
+            tensors[f"{prefix}.{k}.v"] = st["v"]
+        else:
+            tensors[f"{prefix}.{k}.v_row"] = st["v_row"]
+            tensors[f"{prefix}.{k}.v_col"] = st["v_col"]
+        struct[k] = {"kind": _opt_kind(st), "step": int(st.get("step", 0))}
+    return tensors, struct
+
+
+def _unflatten_opt_store(tensors: dict, struct: dict, prefix: str) -> dict:
+    store: dict = {}
+    for k, sm in struct.items():
+        st: dict = {"m": tensors[f"{prefix}.{k}.m"],
+                    "step": int(sm.get("step", 0))}
+        if sm.get("kind", "full") == "full":
+            st["v"] = tensors[f"{prefix}.{k}.v"]
+        else:
+            st["v_row"] = tensors[f"{prefix}.{k}.v_row"]
+            st["v_col"] = tensors[f"{prefix}.{k}.v_col"]
+        store[k] = st
+    return store
 
 
 def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = None) -> None:
@@ -336,6 +472,7 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
         # Pruning may reduce the pool below the configured floor; checkpoints
         # must remain constructible while still respecting top_k.
         cfg_dict["min_experts"] = min(model.cfg.min_experts, len(model.pool))
+        extra = extra_meta or {}
         manifest = {
             "step": step,
             "expert_ids": list(model.pool.order),
@@ -345,37 +482,78 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
             "router_usage": model.router.usage_counts.tolist(),
             "router_admit": model.router.admit_counts.tolist(),
             "param_counts": model.param_counts(),
-            "extra": extra_meta or {},
+            "extra": extra,
         }
+        resume_cfg = {
+            "resume_schema": RESUME_SCHEMA,
+            "step": step,
+            "min_experts": model.cfg.min_experts,
+            "max_experts": model.cfg.max_experts,
+            "num_experts": len(model.pool),
+            "next_id": model.pool._next_id,
+            "topology": {
+                "d_model": model.cfg.d_model,
+                "n_heads": model.cfg.n_heads,
+                "vocab_size": model.cfg.vocab_size,
+                "expert_hidden": model.cfg.expert_hidden,
+                "top_k": model.cfg.top_k,
+                "dtype": model.cfg.dtype,
+                "fp8_tile": model.cfg.fp8_tile,
+                "paging_method": model.cfg.paging_method,
+            },
+            "scheduler": extra.get("scheduler", {}),
+        }
+        snap = get_rng_snapshot()
+        trunk_tensors = {k: v for k, v in model.state_dict().items()
+                         if not k.startswith("router.") and "usage_" not in k and "admit_" not in k
+                         and k not in ("router.proj.weight", "router.proj.bias")}
+        router_tensors = {"weight": model.router.proj.weight,
+                          "bias": model.router.proj.bias}
+        optim_trunk_t, optim_trunk_s = _flatten_opt_store(opt.trunk_state, "trunk")
+        optim_router_t, optim_router_s = _flatten_opt_store(opt.router_state, "router")
+        optim_tensors = {**optim_trunk_t, **optim_router_t}
+        meta = {
+            "optim_hparams": dict(opt.hp.__dict__),
+            "optim_step_count": int(opt.step_count),
+            "optim_structure": {"trunk": optim_trunk_s, "router": optim_router_s},
+            "rng_python": [snap["python"][0], list(snap["python"][1]),
+                           snap["python"][2]],
+        }
+        rng_tensors = {"torch_cpu": snap["torch_cpu"]}
+        if "cuda" in snap:
+            for i, t in enumerate(snap["cuda"]):
+                rng_tensors[f"cuda.{i}"] = t
         # ---- stage: all slow writes happen off to the side ----
         staging = tempfile.mkdtemp(dir=ckpt_dir, prefix=_TMP_GEN_PREFIX)
         try:
             st_exp = os.path.join(staging, "experts")
             os.makedirs(st_exp, exist_ok=True)
             _atomic_write_json(cfg_dict, os.path.join(staging, "config.json"))
-            _atomic_save({k: v.detach().cpu() for k, v in model.state_dict().items()
-                          if not k.startswith("router.") and "usage_" not in k and "admit_" not in k
-                          and k not in ("router.proj.weight", "router.proj.bias")},
-                         os.path.join(staging, "trunk.pt"))
-            _atomic_save({"weight": model.router.proj.weight.detach().cpu(),
-                          "bias": model.router.proj.bias.detach().cpu()},
-                         os.path.join(staging, "router.pt"))
-            _atomic_save({"trunk": opt.trunk_state, "router": opt.router_state,
-                          "step_count": opt.step_count,
-                          "hparams": dict(opt.hp.__dict__)}, os.path.join(staging, "optim.pt"))
-            _atomic_save(get_rng_snapshot(), os.path.join(staging, "rng.pt"))
+            _atomic_save_tensors(trunk_tensors, os.path.join(staging, "trunk.safetensors"))
+            _atomic_save_tensors(router_tensors, os.path.join(staging, "router.safetensors"))
+            _atomic_save_tensors(optim_tensors, os.path.join(staging, "optim.safetensors"))
+            _atomic_save_tensors(rng_tensors, os.path.join(staging, "rng.safetensors"))
+            _atomic_write_json(meta, os.path.join(staging, "meta.json"))
+            _atomic_write_json(resume_cfg, os.path.join(staging, "resume_config.json"))
             for eid in model.pool.order:
-                _atomic_save(expert_to_payload(model.pool.experts[eid]),
-                             os.path.join(st_exp, f"{eid}.pt"))
+                rec = model.pool.experts[eid]
+                _atomic_save_tensors(expert_tensors(rec),
+                                     os.path.join(st_exp, f"{eid}.safetensors"))
+                _atomic_write_json(expert_meta(rec),
+                                   os.path.join(st_exp, f"{eid}.json"))
             _atomic_write_json(manifest, os.path.join(staging, "manifest.json"))
             _fsync_dir(st_exp)
             _fsync_dir(staging)
             # ---- publish: fast renames only, manifest last (commit point) ----
-            for name in ("config.json", "trunk.pt", "router.pt", "optim.pt", "rng.pt"):
+            for name in ("config.json", "trunk.safetensors", "router.safetensors",
+                         "optim.safetensors", "rng.safetensors", "meta.json",
+                         "resume_config.json"):
                 os.replace(os.path.join(staging, name), os.path.join(ckpt_dir, name))
             for eid in model.pool.order:
-                os.replace(os.path.join(st_exp, f"{eid}.pt"),
-                           os.path.join(exp_dir, f"{eid}.pt"))
+                os.replace(os.path.join(st_exp, f"{eid}.safetensors"),
+                           os.path.join(exp_dir, f"{eid}.safetensors"))
+                os.replace(os.path.join(st_exp, f"{eid}.json"),
+                           os.path.join(exp_dir, f"{eid}.json"))
             _fsync_dir(exp_dir)
             _fsync_dir(ckpt_dir)
             os.replace(os.path.join(staging, "manifest.json"),
@@ -385,13 +563,14 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
             shutil.rmtree(staging, ignore_errors=True)
         # The manifest is the commit point. Once it is safely published, remove
         # expert files no longer referenced by the new topology.
-        live = {f"{eid}.pt" for eid in model.pool.order}
+        live = {f"{eid}.safetensors" for eid in model.pool.order}
+        live |= {f"{eid}.json" for eid in model.pool.order}
         try:
             names = os.listdir(exp_dir)
         except FileNotFoundError:
             names = []
         for name in names:
-            if name.endswith(".pt") and name not in live:
+            if (name.endswith(".safetensors") or name.endswith(".json")) and name not in live:
                 try:
                     os.remove(os.path.join(exp_dir, name))
                 except OSError:
@@ -419,10 +598,32 @@ def load_manifest(ckpt_dir: str) -> dict:
         ) from e
 
 
+def load_resume_config(ckpt_dir: str) -> dict:
+    """Read the pruner/resume floor + topology snapshot (resume_config.json)."""
+    path = os.path.join(ckpt_dir, "resume_config.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"missing checkpoint file {path}")
+    try:
+        if os.stat(path).st_size == 0:
+            raise ValueError(
+                f"checkpoint validation failed: empty file {path}"
+            )
+        with open(path) as f:
+            cfg = json.load(f)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(
+            f"checkpoint validation failed: unreadable/truncated file {path}: {e}"
+        ) from e
+    _require(isinstance(cfg, dict), "resume_config.json is not a dict")
+    return cfg
+
+
 def make_disk_loader(ckpt_dir: str):
     """Pager loader reading single expert files (no full-model load)."""
     def load(expert_id: str) -> ExpertRecord:
-        return load_expert_file(os.path.join(ckpt_dir, "experts", f"{expert_id}.pt"))
+        return load_expert_file(os.path.join(ckpt_dir, "experts", f"{expert_id}.safetensors"))
     return load
 
 
@@ -435,13 +636,13 @@ def _is_num(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool)
 
 
-def _validate_expert_payload(p: dict, eid: str, saved_cfg) -> None:
-    """Type/shape validation for one raw expert payload (pre-mutation)."""
-    _require(isinstance(p, dict), f"{eid}: payload is not a dict")
-    _require(p.get("expert_id") == eid, f"{eid}: id mismatch {p.get('expert_id')!r}")
+def _validate_expert_parts(tensors: dict, meta: dict, eid: str, saved_cfg) -> None:
+    """Type/shape validation for one raw expert (tensors + JSON meta)."""
+    _require(isinstance(meta, dict), f"{eid}: meta is not a dict")
+    _require(meta.get("expert_id") == eid, f"{eid}: id mismatch {meta.get('expert_id')!r}")
     try:
-        d_model = int(p.get("d_model", -1))
-        expert_hidden = int(p.get("expert_hidden", -1))
+        d_model = int(meta.get("d_model", -1))
+        expert_hidden = int(meta.get("expert_hidden", -1))
     except (TypeError, ValueError):
         raise ValueError(
             f"checkpoint validation failed: {eid}: bad d_model/expert_hidden"
@@ -454,49 +655,65 @@ def _validate_expert_payload(p: dict, eid: str, saved_cfg) -> None:
         "w_up": (saved_cfg.expert_hidden, saved_cfg.d_model),
         "w_down": (saved_cfg.d_model, saved_cfg.expert_hidden),
     }
-    w = p.get("weights")
-    _require(isinstance(w, dict), f"{eid}: weights is not a dict")
+    wmeta = meta.get("weights")
+    _require(isinstance(wmeta, dict), f"{eid}: weights meta is not a dict")
     for n in EXPERT_NAMES:
-        t = w.get(n)
-        _require(isinstance(t, dict), f"{eid}: {n} is not a dict")
-        codes, scales = t.get("codes"), t.get("scales")
-        _require(torch.is_tensor(codes) and codes.dtype == torch.uint8,
-                 f"{eid}: {n} codes must be uint8")
-        _require(torch.is_tensor(scales) and scales.dtype == torch.float32,
-                 f"{eid}: {n} scales must be float32")
-        _require(tuple(t.get("shape", ())) == want[n], f"{eid}: {n} bad shape")
-        _require(tuple(codes.shape) == want[n], f"{eid}: {n} bad code shape")
+        wm = wmeta.get(n)
+        _require(isinstance(wm, dict), f"{eid}: {n} meta is not a dict")
+        _require(tuple(wm.get("shape", ())) == want[n], f"{eid}: {n} bad shape")
         try:
-            tile = int(t.get("tile", 0))
+            tile = int(wm.get("tile", 0))
         except (TypeError, ValueError):
             raise ValueError(
                 f"checkpoint validation failed: {eid}: {n} bad tile"
             ) from None
         _require(tile >= 1, f"{eid}: {n} bad tile")
+        codes, scales = tensors.get(f"{n}.codes"), tensors.get(f"{n}.scales")
+        _require(torch.is_tensor(codes) and codes.dtype == torch.uint8,
+                 f"{eid}: {n} codes must be uint8")
+        _require(torch.is_tensor(scales) and scales.dtype == torch.float32,
+                 f"{eid}: {n} scales must be float32")
+        _require(tuple(codes.shape) == want[n], f"{eid}: {n} bad code shape")
         n_blocks = (want[n][1] + tile - 1) // tile
         _require(tuple(scales.shape) == (want[n][0], n_blocks),
                  f"{eid}: {n} bad scale shape")
-    _validate_expert_optim_state(p.get("optim_state", {}), eid, want)
-    meta = p.get("meta", {})
-    _require(isinstance(meta, dict), f"{eid}: bad meta")
+    ost = meta.get("optim", {})
+    _require(isinstance(ost, dict), f"{eid}: bad optim meta")
+    for n, om in ost.items():
+        _require(n in EXPERT_NAMES, f"{eid}: unknown optim entry {n!r}")
+        _require(om.get("kind") in ("full", "factored"),
+                 f"{eid}: optim {n} bad kind")
+        try:
+            s = int(om.get("step", -1))
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"checkpoint validation failed: {eid}: optim {n} bad step"
+            ) from None
+        _require(s >= 0, f"{eid}: optim {n} bad step")
+        fields = ("m", "v") if om.get("kind") == "full" else ("m", "v_row", "v_col")
+        st = {f: tensors.get(f"optim.{n}.{f}") for f in fields}
+        st["step"] = s
+        _validate_opt_entry(st, want[n], f"{eid}: optim {n}")
+    m = meta.get("meta", {})
+    _require(isinstance(m, dict), f"{eid}: bad meta")
     for k in ("birth_step", "last_used_step", "tokens_routed"):
         try:
-            int(meta.get(k, 0))
+            int(m.get(k, 0))
         except (TypeError, ValueError):
             raise ValueError(
                 f"checkpoint validation failed: {eid}: bad meta {k}"
             ) from None
     for k in ("grad_activity", "contribution"):
         try:
-            float(meta.get(k, 0.0))
+            float(m.get(k, 0.0))
         except (TypeError, ValueError):
             raise ValueError(
                 f"checkpoint validation failed: {eid}: bad meta {k}"
             ) from None
-    parents = meta.get("parents", [])
+    parents = m.get("parents", [])
     _require(isinstance(parents, list) and all(isinstance(x, str) for x in parents),
              f"{eid}: parents must be a list of str")
-    _require(isinstance(meta.get("source", "init"), str), f"{eid}: bad source")
+    _require(isinstance(m.get("source", "init"), str), f"{eid}: bad source")
 
 
 def _validate_opt_entry(st: dict, want_shape: tuple | None, label: str) -> None:
@@ -534,14 +751,6 @@ def _validate_opt_entry(st: dict, want_shape: tuple | None, label: str) -> None:
                  f"{label} bad v_col shape")
 
 
-def _validate_expert_optim_state(ost: dict, eid: str, want: dict) -> None:
-    """Deep validation for one expert's local optimizer state (pre-mutation)."""
-    _require(isinstance(ost, dict), f"{eid}: bad optim_state")
-    for n, st in ost.items():
-        _require(n in EXPERT_NAMES, f"{eid}: unknown optim_state entry {n!r}")
-        _validate_opt_entry(st, want[n], f"{eid}: optim_state {n}")
-
-
 def _validate_optim_store(store: dict, expected: dict, label: str) -> None:
     """Deep validation for a dense (trunk/router) optimizer store (pre-mutation)."""
     _require(isinstance(store, dict), f"{label} bad state dict")
@@ -553,30 +762,28 @@ def _validate_optim_store(store: dict, expected: dict, label: str) -> None:
 
 
 def _validate_opt_hparams(saved_hp: dict) -> None:
-    _require(isinstance(saved_hp, dict), "optim.pt bad hparams")
+    _require(isinstance(saved_hp, dict), "meta.json bad hparams")
     for k in ("lr", "beta_m", "beta_v", "eps", "wd", "clip", "update_clip"):
         if k in saved_hp:
-            _require(_is_num(saved_hp[k]), f"optim.pt bad hparam {k}")
+            _require(_is_num(saved_hp[k]), f"meta.json bad hparam {k}")
     if "state_dtype" in saved_hp:
         _require(saved_hp["state_dtype"] in ("bf16", "fp32"),
-                 "optim.pt bad hparam state_dtype")
+                 "meta.json bad hparam state_dtype")
     if "factor_v" in saved_hp:
         _require(isinstance(saved_hp["factor_v"], bool),
-                 "optim.pt bad hparam factor_v")
+                 "meta.json bad hparam factor_v")
 
 
-def _validate_rng_snapshot(snap) -> None:
-    _require(isinstance(snap, (torch.Tensor, dict)), "rng snapshot bad type")
-    if isinstance(snap, dict):
-        cpu = snap.get("torch_cpu")
-        _require(torch.is_tensor(cpu), "rng snapshot missing torch_cpu state")
-        py = snap.get("python")
-        if py is not None:
-            _require(isinstance(py, (list, tuple)) and len(py) == 3,
-                     "rng snapshot bad python state")
-        cuda = snap.get("cuda")
-        if cuda is not None:
-            _require(isinstance(cuda, (list, tuple)), "rng snapshot bad cuda state")
+def _validate_rng_parts(tensors: dict, py_state) -> None:
+    cpu = tensors.get("torch_cpu")
+    _require(torch.is_tensor(cpu) and cpu.dtype == torch.uint8,
+             "rng snapshot missing torch_cpu state")
+    for k, t in tensors.items():
+        _require(torch.is_tensor(t) and t.dtype == torch.uint8,
+                 f"rng snapshot bad entry {k}")
+    if py_state is not None:
+        _require(isinstance(py_state, (list, tuple)) and len(py_state) == 3,
+                 "rng snapshot bad python state")
 
 
 @_with_ckpt_lock(exclusive=False)
@@ -653,13 +860,12 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     saved_cfg.num_experts = len(eids)
 
     # ---- phase 1b: tensors (read + validate, no live mutation) ----
-    trunk = _checked_torch_load(_path("trunk.pt"))
-    _require(isinstance(trunk, dict), "trunk.pt is not a dict")
+    trunk = _checked_sf_load(_path("trunk.safetensors"))
     model_sd = model.state_dict()
     expected_trunk = {k for k in model_sd
                       if not (k.startswith("router.") or "usage_" in k or "admit_" in k)}
     for k in expected_trunk:
-        _require(k in trunk, f"trunk.pt missing entry {k}")
+        _require(k in trunk, f"trunk.safetensors missing entry {k}")
     for k, v in trunk.items():
         _require(torch.is_tensor(v), f"trunk entry {k} is not a tensor")
         if k in model_sd:
@@ -668,58 +874,79 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         else:
             _require(k.startswith("router.") or "usage_" in k or "admit_" in k,
                      f"trunk entry {k} matches nothing in the model")
-    router = _checked_torch_load(_path("router.pt"))
-    _require(isinstance(router, dict), "router.pt is not a dict")
+    router = _checked_sf_load(_path("router.safetensors"))
     rw, rb = router.get("weight"), router.get("bias")
     _require(torch.is_tensor(rw) and torch.is_floating_point(rw)
              and tuple(rw.shape) == (len(eids), saved_cfg.d_model),
-             "router.pt weight must be [n_experts, d_model]")
+             "router.safetensors weight must be [n_experts, d_model]")
     _require(torch.is_tensor(rb) and tuple(rb.shape) == (len(eids),),
-             "router.pt bias must be [n_experts]")
-    optim = _checked_torch_load(_path("optim.pt"))
-    _require(isinstance(optim, dict), "optim.pt is not a dict")
-    _require(isinstance(optim.get("trunk"), dict)
-             and isinstance(optim.get("router"), dict), "optim.pt bad state dicts")
+             "router.safetensors bias must be [n_experts]")
+    optim_t = _checked_sf_load(_path("optim.safetensors"))
     try:
-        step_count = int(optim.get("step_count", 0))
+        with open(_path("meta.json")) as f:
+            meta = json.load(f)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(
+            f"checkpoint validation failed: unreadable/truncated meta.json: {e}"
+        ) from e
+    _require(isinstance(meta, dict), "meta.json is not a dict")
+    saved_hp = meta.get("optim_hparams", {})
+    _validate_opt_hparams(saved_hp)
+    try:
+        step_count = int(meta.get("optim_step_count", 0))
     except (TypeError, ValueError):
         raise ValueError("checkpoint validation failed: bad optim step_count")
     _require(step_count >= 0, "bad optim step_count")
-    saved_hp = optim.get("hparams", {})
-    _validate_opt_hparams(saved_hp)
+    ostruct = meta.get("optim_structure", {})
+    _require(isinstance(ostruct, dict)
+             and isinstance(ostruct.get("trunk"), dict)
+             and isinstance(ostruct.get("router"), dict),
+             "meta.json bad optim structure")
+    trunk_opt = _unflatten_opt_store(optim_t, ostruct["trunk"], "trunk")
+    router_opt = _unflatten_opt_store(optim_t, ostruct["router"], "router")
     _trunk_shapes = {n: tuple(p.shape) for n, p in model._trunk_params()}
-    _validate_optim_store(optim["trunk"], _trunk_shapes, "optim.pt trunk")
+    _validate_optim_store(trunk_opt, _trunk_shapes, "optim trunk")
     # Router width is checkpoint-authoritative (growth may widen the pool
     # beyond a fresh live model): validate against saved topology, not live.
     _router_shapes = {"router.proj.weight": (len(eids), saved_cfg.d_model),
                       "router.proj.bias": (len(eids),)}
-    _validate_optim_store(optim["router"], _router_shapes, "optim.pt router")
-    rng_path = os.path.join(ckpt_dir, "rng.pt")
-    rng_snap = None
-    if os.path.exists(rng_path):
-        rng_snap = _checked_torch_load(rng_path)
-        _validate_rng_snapshot(rng_snap)
-    payloads = []
+    _validate_optim_store(router_opt, _router_shapes, "optim router")
+    rng_t = _checked_sf_load(_path("rng.safetensors"))
+    _validate_rng_parts(rng_t, meta.get("rng_python"))
+    parts = []
     for eid in eids:
-        p = _checked_torch_load(_path("experts", f"{eid}.pt"))
-        _validate_expert_payload(p, eid, saved_cfg)
-        payloads.append(p)
+        t = _checked_sf_load(_path("experts", f"{eid}.safetensors"))
+        sidecar = os.path.join(ckpt_dir, "experts", f"{eid}.json")
+        _require(os.path.exists(sidecar), f"missing checkpoint file {sidecar}")
+        try:
+            with open(sidecar) as f:
+                m = json.load(f)
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(
+                f"checkpoint validation failed: unreadable sidecar {sidecar}: {e}"
+            ) from e
+        _validate_expert_parts(t, m, eid, saved_cfg)
+        parts.append((t, m))
     try:
         on_disk = {n for n in os.listdir(os.path.join(ckpt_dir, "experts"))
-                   if n.endswith(".pt")}
+                   if n.endswith(".safetensors")}
     except OSError as e:
         raise ValueError(
             f"checkpoint validation failed: unreadable experts dir: {e}"
         ) from e
-    _require(on_disk == {f"{eid}.pt" for eid in eids},
+    _require(on_disk == {f"{eid}.safetensors" for eid in eids},
              f"experts dir mismatch: disk {sorted(on_disk)} vs manifest {eids}")
 
     # ---- phase 1c: build replacement objects (still no live mutation) ----
     import torch.nn as nn
     new_experts: dict = {}
     new_order: list[str] = []
-    for p in payloads:
-        rec = expert_from_payload(p)
+    for t, m in parts:
+        rec = expert_from_parts(t, m)
         new_experts[rec.expert_id] = rec
         new_order.append(rec.expert_id)
     dev, dt = model.router.proj.weight.device, model.router.proj.weight.dtype
@@ -748,8 +975,8 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     model.pager.compute_dtype = (
         torch.bfloat16 if saved_cfg.dtype == "bf16" else torch.float32
     )
-    opt.trunk_state = optim["trunk"]
-    opt.router_state = optim["router"]
+    opt.trunk_state = trunk_opt
+    opt.router_state = router_opt
     opt.step_count = step_count
     # Optimizer hyperparameters are checkpoint-authoritative: resuming with
     # different betas/eps/clip/weight-decay would silently change the math.
@@ -757,10 +984,15 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         for k, v in saved_hp.items():
             if hasattr(opt.hp, k):
                 setattr(opt.hp, k, v)
-    if rng_snap is not None:
-        set_rng_snapshot(rng_snap)
-    # Scheduler snapshot (loss edge, growth/prune counters, replay buffer)
-    # travels in manifest extras; run_training picks it up for exact resume.
+    _rng_snap: dict = {"torch_cpu": rng_t["torch_cpu"]}
+    if meta.get("rng_python"):
+        _rng_snap["python"] = tuple(meta["rng_python"])
+    _cuda_keys = sorted(k for k in rng_t if k.startswith("cuda."))
+    if _cuda_keys:
+        _rng_snap["cuda"] = [rng_t[k] for k in _cuda_keys]
+    set_rng_snapshot(_rng_snap)
+    # Scheduler snapshot (loss edge, growth counters, replay buffer) travels
+    # in manifest extras; run_training picks it up for exact resume.
     sched = extra.get("scheduler", {}) or {}
     model._scheduler_snapshot = dict(sched) if isinstance(sched, dict) else {}
     # The pool objects were replaced: cached compute weights and staged
