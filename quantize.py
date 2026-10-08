@@ -6,8 +6,8 @@ converted one file at a time (streamed through a row-block window), so a
 tensor shapes, FP8 scaling metadata, optimizer state, and manifest metadata
 are preserved; only the targeted tensors change dtype/format.
 
-Trunk conversion (``convert_trunk``) rewrites trunk.pt/router.pt in place
-within the checkpoint directory.
+Trunk conversion (``convert_trunk``) rewrites trunk.safetensors/router.safetensors
+in place within the checkpoint directory.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import tempfile
 
 import torch
 
-from storage import EXPERT_NAMES, expert_from_payload, expert_to_payload, load_manifest
+from storage import EXPERT_NAMES, load_expert_file, save_expert_file
 
 
 def _fsync_file(path: str) -> None:
@@ -85,7 +85,8 @@ def _checked_torch_load(path: str):
             f"checkpoint validation failed: unreadable file {path}: {e}"
         ) from e
     try:
-        return torch.load(path, map_location="cpu", weights_only=False)
+        import storage as _st
+        return _st._checked_sf_load(path)
     except ValueError:
         raise
     except Exception as e:
@@ -112,6 +113,12 @@ def _atomic_write_json(payload: dict, path: str) -> None:
             os.remove(tmp)
 
 
+def _sidecar(path: str) -> str:
+    if path.endswith(".safetensors"):
+        return path[: -len(".safetensors")] + ".json"
+    return path + ".json"
+
+
 def convert_expert_file(src: str, dst: str, to: str = "fp8", tile: int = 64) -> dict:
     """Convert one expert file independently. Returns a small conversion report."""
     from precision import (
@@ -120,7 +127,7 @@ def convert_expert_file(src: str, dst: str, to: str = "fp8", tile: int = 64) -> 
 
     if not os.path.exists(src):
         raise FileNotFoundError(f"missing expert file (refusing): {src}")
-    rec = expert_from_payload(_checked_torch_load(src))
+    rec = load_expert_file(src)
     before = {n: rec.weights_fp8[n].nbytes() for n in EXPERT_NAMES}
     if to == "fp8":
         # Any source precision -> canonical FP8 block storage (also re-tiles).
@@ -158,16 +165,12 @@ def convert_expert_file(src: str, dst: str, to: str = "fp8", tile: int = 64) -> 
     else:
         raise ValueError(f"unknown target {to}")
     os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dst) or ".", prefix="tmp_quant_")
-    os.close(fd)
-    try:
-        torch.save(expert_to_payload(rec), tmp)
-        _fsync_file(tmp)
-        os.replace(tmp, dst)
-        _fsync_dir(os.path.dirname(dst) or ".")
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+    # Stage under a sidecar name, then publish tensors + JSON sidecar together.
+    # (save_expert_file derives the JSON sidecar from dst, so dst must not
+    # collide with a live expert path.)
+    save_expert_file(rec, dst)
+    _fsync_file(dst)
+    _fsync_dir(os.path.dirname(dst) or ".")
     after = {n: rec.weights_fp8[n].nbytes() for n in EXPERT_NAMES}
     report = {"expert_id": rec.expert_id, "to": to,
               "bytes_before": sum(before.values()), "bytes_after": sum(after.values())}
@@ -181,7 +184,7 @@ def convert_checkpoint(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[d
 
     ``to="fp8"`` requantizes/retile every expert file independently (the trunk
     is untouched — FP8 trunk storage is refused per the precision policy).
-    ``to="bf16"`` casts trunk.pt/router.pt to BF16 (experts stay FP8).
+    ``to="bf16"`` casts trunk.safetensors/router.safetensors to BF16 (experts stay FP8).
 
     Transactional: every input is validated first, converted outputs land
     in sidecar files, and the sidecars replace the originals only after all
@@ -207,9 +210,10 @@ def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -
     _sweep_stale_tmp(exp_dir)
     reports = []
     if to == "fp8":
-        paths = [(eid, os.path.join(ckpt_dir, "experts", f"{eid}.pt"))
+        paths = [(eid, os.path.join(ckpt_dir, "experts", f"{eid}.safetensors"))
                  for eid in manifest["expert_ids"]]
-        missing = [eid for eid, p in paths if not os.path.exists(p)]
+        missing = [eid for eid, p in paths
+                   if not (os.path.exists(p) and os.path.exists(_sidecar(p)))]
         if missing:
             raise FileNotFoundError(f"missing expert files (refusing): {missing}")
         empty = [eid for eid, p in paths if os.stat(p).st_size == 0]
@@ -225,12 +229,18 @@ def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -
                 staged.append((tmp, p))
             for tmp, p in staged:
                 _fsync_file(tmp)
+                _fsync_file(tmp + ".json")
                 os.replace(tmp, p)
+                os.replace(tmp + ".json", _sidecar(p))
             _fsync_dir(exp_dir)
         finally:
             for tmp, _ in staged:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
+                for side in (tmp, tmp + ".json"):
+                    if os.path.exists(side):
+                        try:
+                            os.remove(side)
+                        except OSError:
+                            pass
         try:
             with open(cfg_path) as f:
                 cfg_dict = json.load(f)
@@ -242,7 +252,8 @@ def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -
         _atomic_write_json(cfg_dict, cfg_path)
     # to == "bf16": experts intentionally stay FP8; only the trunk converts.
     if to == "bf16":
-        for name in ("trunk.pt", "router.pt"):
+        import storage as _st2
+        for name in ("trunk.safetensors", "router.safetensors"):
             p = os.path.join(ckpt_dir, name)
             if not os.path.exists(p):
                 continue
@@ -251,19 +262,10 @@ def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -
                     f"checkpoint validation failed: empty file {p}"
                 )
             obj = _checked_torch_load(p)
-            if isinstance(obj, dict):
-                obj = {k: (v.to(torch.bfloat16) if torch.is_tensor(v) and v.is_floating_point() else v)
-                       for k, v in obj.items()}
-                fd, tmp = tempfile.mkstemp(dir=ckpt_dir, prefix="tmp_quant_")
-                os.close(fd)
-                try:
-                    torch.save(obj, tmp)
-                    _fsync_file(tmp)
-                    os.replace(tmp, p)
-                    _fsync_dir(ckpt_dir)
-                finally:
-                    if os.path.exists(tmp):
-                        os.remove(tmp)
+            obj = {k: (v.to(torch.bfloat16) if torch.is_tensor(v) and v.is_floating_point() else v)
+                   for k, v in obj.items()}
+            _st2._atomic_save_tensors(obj, p)
+            _fsync_dir(ckpt_dir)
     manifest["precision"] = {"format": to, "fp8_tile": tile}
     _atomic_write_json(manifest, man_path)
     return reports
