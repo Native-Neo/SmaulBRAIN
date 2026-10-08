@@ -126,7 +126,7 @@ def test_growth_prune_save_load_keeps_topology_consistent(tmp_path):
         # Grow two clones; pool and router move in lockstep.
         new_ids = growth_mod.grow_topk_clones(
             m.pool, m.router, cfg.d_model, cfg.expert_hidden,
-            step=1, seed=7, k=2, n_mutated=1,
+            step=1, seed=7, k=2,
             fp8_tile=cfg.fp8_tile, max_experts=8,
             optim_state=opt.router_state)
         assert len(new_ids) == 2
