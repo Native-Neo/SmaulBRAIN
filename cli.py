@@ -205,6 +205,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Text file for training bytes (default: synthetic demo).")
     t.add_argument("--save-every", type=int, default=0, help="Checkpoint every N steps (0=off).")
     t.add_argument("--grow-every", type=int, default=None, help="Growth eval every N steps (0=off; omitted: config grow_every=20000).")
+    t.add_argument("--grow-experts", type=int, default=0,
+                   help="Grow N experts once at run start (before training) for a new skill; "
+                        "birth step equals the run's start global step so --mode new "
+                        "--new-since <same step> selects exactly these (0=off).")
     t.add_argument("--grow-loss-below", type=float, default=1.0,
                    help="Grow whenever step loss newly dips below this (default 1.0; negative disables).")
     # infer
@@ -424,6 +428,47 @@ def main(argv: list[str] | None = None) -> int:
             seqs = _demo_seqs()
         grow_every = resolve_train_grow_every(args, cfg)
         cfg.grow_every = grow_every
+        grow_n = int(getattr(args, "grow_experts", 0) or 0)
+        if grow_n > 0:
+            import growth as _growth_mod
+            start_step = int(getattr(model, "_resume_step", -1)) + 1
+            if start_step == 0:
+                print("note: staged new-skill growth is a resume-flow operation "
+                      "(train base, then --grow-experts on the checkpoint where "
+                      "start >= 1 isolates cleanly); --new-since 0 will also "
+                      "select init experts",
+                      file=sys.stderr)
+            room = int(cfg.max_experts) - len(model.pool)
+            if room <= 0:
+                print(f"warning: --grow-experts {grow_n} requested but pool at cap "
+                      f"({len(model.pool)}/{cfg.max_experts}); adding 0",
+                      file=sys.stderr)
+            else:
+                want = min(grow_n, room)
+                grown: list[str] = []
+                base_seed = int(cfg.seed)
+                it = 0
+                while len(grown) < want:
+                    room_now = int(cfg.max_experts) - len(model.pool)
+                    if room_now <= 0:
+                        break
+                    need = want - len(grown)
+                    new_ids = _growth_mod.grow_topk_clones(
+                        model.pool, model.router, cfg.d_model, cfg.expert_hidden,
+                        start_step, seed=base_seed + it, k=need,
+                        fp8_tile=cfg.fp8_tile, max_experts=cfg.max_experts,
+                        optim_state=opt.router_state)
+                    if not new_ids:
+                        break
+                    grown.extend(new_ids)
+                    it += 1
+                model.cfg.num_experts = len(model.pool)
+                cfg.num_experts = len(model.pool)
+                for eid in grown:
+                    print(f"[grow] step={start_step} new={eid} pool={len(model.pool)}",
+                          file=sys.stderr)
+                print(f"[grow] requested={grow_n} added={len(grown)} pool={len(model.pool)}",
+                      file=sys.stderr)
         res = run_training(model, opt, cfg, seqs, steps=args.steps,
                            batch_size=args.batch, mode=args.mode,
                            selected=args.selected.split(",") if args.selected else None,
