@@ -22,30 +22,6 @@ def _model(seed=0):
     return m, cfg
 
 
-def _dying_pool_model(n_experts, seed=0, **cfg_kw):
-    """Model whose experts are all prune-eligible (old, idle, zero signal)."""
-    torch.manual_seed(seed)
-    base = dict(d_model=16, n_heads=2, num_experts=n_experts, top_k=1,
-                expert_hidden=32, max_depth=1, context_length=12,
-                expert_lr=3e-2, max_experts=400, prune_survival_steps=1)
-    base.update(cfg_kw)
-    cfg = SmaulBrainConfig(**base)
-    m = SmaulBrainModel(cfg)
-    for rec in m.pool.experts.values():
-        rec.birth_step = -5
-        rec.last_used_step = -5
-        rec.tokens_routed = 0
-        rec.grad_activity = 0.0
-        rec.contribution = 0.0
-    return m, cfg
-
-
-def _seqs(n_seqs=8, seed=3):
-    import random
-    rng = random.Random(seed)
-    return [[rng.randrange(256) for _ in range(16)] for _ in range(n_seqs)]
-
-
 def test_replay_buffer_reservoir_and_sample():
     buf = ReplayBuffer(capacity=8, seed=0)
     for i in range(20):
@@ -227,11 +203,10 @@ def test_scheduler_snapshot_persists_cadence_and_seed():
     m, cfg = _model()
     opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
     res = run_training(m, opt, cfg, _seqs(), steps=2, batch_size=2,
-                       grow_every=3, prune_every=5, grow_loss_below=0.5,
-                       growths_per_prune=4, seed=11, log_fn=lambda s: None)
+                       grow_every=3, grow_loss_below=0.5,
+                       seed=11, log_fn=lambda s: None)
     sched = res["scheduler"]
-    assert sched["growths_per_prune"] == 4
-    assert sched["grow_every"] == 3 and sched["prune_every"] == 5
+    assert sched["grow_every"] == 3
     assert sched["grow_loss_below"] == 0.5 and sched["seed"] == 11
     assert sched["growth_events"] == res["growth_events"]
     m.pager.close()
@@ -282,36 +257,13 @@ def test_trigger_rng_streams_deterministic():
     assert par_a == par_c and sums_a != sums_c
 
 
-def test_prune_triggers_coalesce_to_one_eval_per_step():
-    import train as train_mod
-    m, cfg = _model()
-    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
-    calls = []
-    orig = train_mod.pruning_mod.find_victims
-
-    def counting(*a, **k):
-        calls.append(1)
-        return []
-    train_mod.pruning_mod.find_victims = counting
-    try:
-        run_training(m, opt, cfg, _seqs(), steps=3, batch_size=2,
-                     grow_every=1, grow_loss_below=None,
-                     growths_per_prune=1, prune_every=1, seed=0,
-                     log_fn=lambda s: None)
-    finally:
-        train_mod.pruning_mod.find_victims = orig
-    # Cadence (every growth) + schedule (every step) coincide: still 1/step.
-    assert len(calls) == 3
-    m.pager.close()
-
-
 def test_trigger_while_at_cap_does_not_advance_cadence():
     m, cfg = _model()
     cfg.max_experts = len(m.pool)  # at cap before step 0
     opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
     res = run_training(m, opt, cfg, _seqs(), steps=2, batch_size=2,
                        grow_every=1, grow_loss_below=None,
-                       growths_per_prune=1, seed=0, log_fn=lambda s: None)
+                       seed=0, log_fn=lambda s: None)
     assert res["scheduler"]["growth_events"] == 0
     assert res["growth_events"] == 0
     assert all(h["grew"] is False and h["new_experts"] == [] for h in res["history"])
@@ -331,30 +283,20 @@ def test_machine_readable_growth_prune_ledger():
         assert h["grew"] == bool(h["new_experts"])
     evts = res["growth_prune_events"]
     assert all(set(e) == {"step", "type", "ids"} for e in evts)
-    assert all(e["type"] in ("grow", "prune") for e in evts)
-    # Same-step ordering: grow entries precede prune entries.
-    for step in {e["step"] for e in evts}:
-        kinds = [e["type"] for e in evts if e["step"] == step]
-        assert kinds == sorted(kinds, key=lambda t: 0 if t == "grow" else 1)
+    # Training never prunes: the ledger carries growth only.
+    assert all(e["type"] == "grow" for e in evts)
+    assert all(h["pruned_experts"] == [] for h in res["history"])
     # Ledger matches per-step history.
     flat_grow = [eid for h in res["history"] for eid in h["new_experts"]]
-    assert flat_grow == [eid for e in evts if e["type"] == "grow" for eid in e["ids"]]
+    assert flat_grow == [eid for e in evts for eid in e["ids"]]
     m.pager.close()
 
 
-def test_parent_victim_selection_deterministic():
+def test_parent_selection_deterministic():
     from growth import select_parents
-    from pruning import find_victims
     m, cfg = _model()
     try:
         assert select_parents(m.pool, k=2) == select_parents(m.pool, k=2)
-        v1 = find_victims(m.pool, step=10_000, survival_steps=1,
-                          min_experts=cfg.min_experts)
-        v2 = find_victims(m.pool, step=10_000, survival_steps=1,
-                          min_experts=cfg.min_experts)
-        assert v1 == v2
-        # min_experts floor: never proposes more than len - floor.
-        assert len(v1) <= max(0, len(m.pool) - cfg.min_experts)
     finally:
         m.pager.close()
 
@@ -366,7 +308,7 @@ def test_resume_before_trigger_matches_uninterrupted():
     import tempfile
     seqs = _seqs()
     kw = dict(batch_size=2, grow_every=2, grow_loss_below=None,
-              growths_per_prune=2, seed=0, log_fn=lambda s: None)
+              seed=0, log_fn=lambda s: None)
     m1, cfg1 = _model()
     o1 = SmaulOpt(SmaulOptHParams(lr=cfg1.expert_lr))
     full = run_training(m1, o1, cfg1, seqs, steps=4, **kw)
@@ -390,6 +332,9 @@ def test_resume_before_trigger_matches_uninterrupted():
         m2.pager.close()
         m3.pager.close()
     assert resumed_ids == full_ids
+    # Exact counter continuity: part2 carries part1's counter forward.
+    assert part1["scheduler"]["growth_events"] == part1["growth_events"]
+    assert part2["growth_events"] == full["growth_events"]
 
 
 def test_scheduler_snapshot_pins_rng_cadence_knobs():
@@ -411,7 +356,7 @@ def test_scheduler_snapshot_pins_rng_cadence_knobs():
 def test_global_rng_streams_isolated_and_restored():
     # Growth uses isolated Generators, replay an owned Random: dirtying the
     # global torch/python RNG around save/resume must not perturb the
-    # trajectory, while rng.pt itself still restores the global states.
+    # trajectory, while the rng snapshot itself still restores the global states.
     import random
     from storage import save_model, load_model
     import tempfile
@@ -439,7 +384,7 @@ def test_global_rng_streams_isolated_and_restored():
         o2 = SmaulOpt(SmaulOptHParams(lr=cfg2.expert_lr))
         torch.randn(32)
         load_model(d, m2, o2)
-        # rng.pt restore: global states return to the checkpoint values.
+        # rng snapshot restore: global states return to the checkpoint values.
         assert torch.equal(torch.get_rng_state(), torch_cpu_before)
         assert random.getstate()[1] == python_before[1]
         cfg2 = m2.cfg
@@ -472,7 +417,7 @@ def test_loss_edge_resume_matches_uninterrupted():
     thr = (losses[0] + losses[1]) / 2.0  # fires exactly at step 1
     assert losses[0] >= thr > losses[1]
     kw = dict(batch_size=2, grow_every=0, grow_loss_below=thr,
-              growths_per_prune=2, seed=0, log_fn=lambda s: None)
+              seed=0, log_fn=lambda s: None)
     m1, cfg1 = _model()
     o1 = SmaulOpt(SmaulOptHParams(lr=cfg1.expert_lr))
     full = run_training(m1, o1, cfg1, seqs, steps=3, **kw)
@@ -541,63 +486,6 @@ def test_resume_replay_rebase_rule():
         m1.pager.close()
 
 
-def test_scheduler_snapshot_pins_prune_cooldown_knobs():
-    # #68 (cooldowns): prune grace/hysteresis/floor knobs ride in the
-    # scheduler snapshot so a resumer can reuse them exactly; diverging
-    # them intentionally re-bases prune decisions (config.json stays
-    # checkpoint-authoritative via storage.py, verified read-only).
-    m, cfg = _model()
-    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
-    res = run_training(m, opt, cfg, _seqs(), steps=1, batch_size=2,
-                       log_fn=lambda s: None)
-    sched = res["scheduler"]
-    assert sched["prune_survival_steps"] == int(cfg.prune_survival_steps)
-    assert sched["prune_min_usage"] == float(cfg.prune_min_usage)
-    assert sched["min_experts"] == int(cfg.min_experts)
-    assert sched["max_experts"] == int(cfg.max_experts)
-    m.pager.close()
-
-
-def test_resume_before_cadence_prune_matches_uninterrupted():
-    # #68 (pending triggers / no duplicate-or-skip): split run preserves
-    # growth_events and per-step prune decisions, not just grow ids.
-    from storage import save_model, load_model
-    import tempfile
-    seqs = _seqs()
-    kw = dict(batch_size=2, grow_every=2, grow_loss_below=None,
-              growths_per_prune=2, prune_every=2, seed=0,
-              log_fn=lambda s: None)
-    m1, cfg1 = _model()
-    o1 = SmaulOpt(SmaulOptHParams(lr=cfg1.expert_lr))
-    full = run_training(m1, o1, cfg1, seqs, steps=4, **kw)
-    full_grow = [list(h["new_experts"]) for h in full["history"]]
-    full_prune = [list(h["pruned_experts"]) for h in full["history"]]
-    full_events = full["growth_events"]
-    m1.pager.close()
-    m2, cfg2 = _model()
-    o2 = SmaulOpt(SmaulOptHParams(lr=cfg2.expert_lr))
-    leg1 = run_training(m2, o2, cfg2, seqs, steps=1, **kw)
-    with tempfile.TemporaryDirectory() as d:
-        save_model(d, m2, o2, 0, extra_meta={"scheduler": leg1["scheduler"]})
-        m3, cfg3 = _model()
-        o3 = SmaulOpt(SmaulOptHParams(lr=cfg3.expert_lr))
-        load_model(d, m3, o3)
-        leg2 = run_training(m3, o3, m3.cfg, seqs, steps=3, **kw)
-        got_grow = [list(h["new_experts"]) for h in leg1["history"]] + \
-            [list(h["new_experts"]) for h in leg2["history"]]
-        got_prune = [list(h["pruned_experts"]) for h in leg1["history"]] + \
-            [list(h["pruned_experts"]) for h in leg2["history"]]
-        assert got_grow == full_grow
-        assert got_prune == full_prune
-        # Exact counter continuity: leg2 carries leg1's counter forward,
-        # so the resumed tail counter equals the uninterrupted total.
-        assert leg2["growth_events"] == full_events
-        assert leg1["scheduler"]["growth_events"] == leg1["growth_events"]
-        assert leg2["scheduler"]["growth_events"] == full_events
-        m2.pager.close()
-        m3.pager.close()
-
-
 def test_replay_capacity_bounds_defined():
     # #69 (capacity boundaries): negative raises, 0 is defined-disabled.
     import pytest
@@ -658,41 +546,3 @@ def test_reservoir_long_run_uniform_and_resume_equal():
     snap = a.to_dict()
     b = ReplayBuffer.from_dict(snap)
     assert [b.sample(3) for _ in range(5)] == [a.sample(3) for _ in range(5)]
-
-
-def test_floor_blocks_prune_and_grows_compensatory_top4():
-    # Pool exactly at the 64 floor with live dying experts: floored
-    # victims are empty (keep = 0) while raw victims exist -> no prune,
-    # free compensatory top-4 instead.
-    m, cfg = _dying_pool_model(64)
-    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
-    res = run_training(m, opt, cfg, _seqs(), steps=1, batch_size=2,
-                       grow_every=0, grow_loss_below=None, prune_every=1,
-                       log_fn=lambda s: None)
-    assert len(m.pool) == 68
-    ledger = res["growth_prune_events"]
-    assert not [e for e in ledger if e["type"] == "prune"]
-    grows = [e for e in ledger if e["type"] == "grow"]
-    assert len(grows) == 1 and len(grows[0]["ids"]) == 4
-    assert all(m.pool.experts[e].source == "clone-mutated" for e in grows[0]["ids"])
-    assert res["growth_events"] == 1  # compensatory growth is counted
-    m.pager.close()
-
-
-def test_hot_window_strips_sixteen_not_four():
-    m, cfg = _dying_pool_model(80)
-    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr))
-    res = run_training(m, opt, cfg, _seqs(), steps=4, batch_size=2,
-                       grow_every=1, grow_loss_below=None,
-                       growths_per_prune=1, prune_every=0,
-                       log_fn=lambda s: None)
-    by_step = {}
-    for e in res["growth_prune_events"]:
-        if e["type"] == "prune":
-            by_step.setdefault(e["step"], []).extend(e["ids"])
-    assert 0 not in by_step and 1 not in by_step  # cold window: no strip
-    assert 2 in by_step and 3 in by_step  # hot window (>2 in 10K): strips
-    for step, ids in by_step.items():
-        assert 4 < len(ids) <= 16, (step, len(ids))  # 16-cap, not the 4-cap
-    assert len(m.pool) >= 64  # floor never breached
-    m.pager.close()
