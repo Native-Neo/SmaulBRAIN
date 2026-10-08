@@ -350,10 +350,14 @@ def _expert_sidecar(path: str) -> str:
 
 
 def save_expert_file(rec: ExpertRecord, path: str) -> None:
-    """Atomically save one expert (tensors + JSON sidecar)."""
+    """Atomically save one expert (tensors + JSON sidecar).
+
+    Does not sweep the target directory: callers (save_model, the
+    quantizer) sweep explicitly, and sweeping here would delete staged
+    ``*.convert_tmp`` sidecars sharing the directory.
+    """
     parent = os.path.dirname(path) or "."
     os.makedirs(parent, exist_ok=True)
-    _sweep_stale_tmp(parent)
     sidecar = _expert_sidecar(path)
     tmp_fd, tmp_tensors = tempfile.mkstemp(dir=parent, prefix="tmp_ckpt_")
     os.close(tmp_fd)
