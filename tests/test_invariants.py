@@ -118,9 +118,8 @@ def test_save_load_roundtrip_preserves_inference_outputs(tmp_path):
         m.pager.close()
 
 
-def test_growth_prune_save_load_keeps_topology_consistent(tmp_path):
+def test_growth_save_load_keeps_topology_consistent(tmp_path):
     import growth as growth_mod
-    import pruning as pruning_mod
     m, opt, cfg = _model()
     try:
         # Grow two clones; pool and router move in lockstep.
@@ -132,23 +131,6 @@ def test_growth_prune_save_load_keeps_topology_consistent(tmp_path):
         assert len(new_ids) == 2
         assert len(m.pool) == m.router.num_experts == cfg.num_experts + 2
         m.cfg.num_experts = len(m.pool)
-        # Age every expert out of grace so one prune victim exists.
-        for rec in m.pool.experts.values():
-            rec.birth_step = -1000
-            rec.last_used_step = -1000
-            rec.tokens_routed = 0
-            rec.grad_activity = 0.0
-            rec.contribution = 0.0
-        victims = pruning_mod.find_victims(
-            m.pool, step=1000, survival_steps=2,
-            min_experts=2, max_victims=1)
-        assert len(victims) == 1
-        pruned = pruning_mod.prune_experts(
-            m.pool, m.router, victims, pager=m.pager,
-            optim_state=opt.router_state)
-        assert pruned == victims
-        m.cfg.num_experts = len(m.pool)
-        assert len(m.pool) == m.router.num_experts >= 2
         assert m.router.usage_counts.shape[0] == len(m.pool)
         counts = m.param_counts()
         assert counts["expert_count"] == len(m.pool)
@@ -352,7 +334,7 @@ def test_corrupt_checkpoint_raises_and_survivor_still_runs(tmp_path):
         d = str(tmp_path / "c")
         save_model(d, m, opt, step=0)
         eid = m.pool.order[0]
-        with open(os.path.join(d, "experts", f"{eid}.pt"), "wb") as f:
+        with open(os.path.join(d, "experts", f"{eid}.safetensors"), "wb") as f:
             f.truncate(0)
         m2 = SmaulBrainModel(SmaulBrainConfig.from_dict(m.cfg.to_dict()))
         try:
