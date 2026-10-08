@@ -501,3 +501,32 @@ def test_grow_pad_failure_rolls_back_topology(monkeypatch):
     assert torch.equal(r.proj.weight, w_before)
     assert torch.equal(opt.router_state["w"]["m"], m_before)
 
+
+def test_clones_differ_from_parent_by_one_to_ten_percent():
+    pool, r = _synced(n=4)
+    names = ("w_gate", "w_up", "w_down")
+    before = {eid: {n: rec.weights_fp8[n].codes.clone() for n in names}
+              for eid, rec in pool.experts.items()}
+    ids = grow_topk_clones(pool, r, 16, 32, step=1, seed=0, k=4)
+    assert len(ids) == 4
+    seen = set()
+    for eid in ids:
+        rec = pool.experts[eid]
+        assert rec.source == "clone-mutated"  # every clone mutated, none exact
+        par = rec.parents[0]
+        rels = []
+        for n in names:
+            a = dequantize_fp8_blockwise(pool.experts[par].weights_fp8[n]).float()
+            b = dequantize_fp8_blockwise(rec.weights_fp8[n]).float()
+            rels.append(float((b - a).abs().mean()
+                              / a.abs().mean().clamp_min(1e-12)))
+        rel = sum(rels) / len(rels)
+        assert 0.005 <= rel <= 0.15, (eid, rel)  # ~1-10% + FP8 epsilon
+        key = tuple(rec.weights_fp8[n].codes.flatten().tolist() for n in names)
+        assert key not in seen  # distinct clones
+        seen.add(key)
+    for eid, rec in pool.experts.items():
+        if eid not in ids:  # parents never touched
+            for n in names:
+                assert torch.equal(rec.weights_fp8[n].codes, before[eid][n])
+
