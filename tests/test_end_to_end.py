@@ -1,8 +1,8 @@
 """End-to-end regression suite (issue #51): full lifecycle smoke test.
 
-Covers through public APIs only (config/cli/train/infer/storage/growth/
-pruning + quantize/native/paging/precision/model):
-  training with growth+prune schedule -> checkpoint save -> reload into fresh
+Covers through public APIs only (config/cli/train/infer/storage/growth
++ quantize/native/paging/precision/model, plus the offline pruner script):
+  training with growth schedule -> checkpoint save -> reload into fresh
   objects -> resume determinism -> inference from resumed model ->
   quantize/retile roundtrip -> corrupted-checkpoint refusal.
 
@@ -82,18 +82,15 @@ def _expert_bytes(model):
 
 
 def test_e2e_train_growth_save_resume_determinism(tmp_path):
-    """Tiny train with growth+prune schedule; checkpoint/resume is bit-identical."""
+    """Tiny train with growth schedule; checkpoint/resume is bit-identical."""
     import growth as growth_mod
-    import pruning as pruning_mod
 
     seqs = _demo_seqs()
     kw = dict(
         batch_size=2,
         replay_n=1,
         grow_every=2,
-        prune_every=2,
         grow_loss_below=-1.0,
-        growths_per_prune=2,
         seed=5,
         log_fn=lambda s: None,
     )
@@ -111,14 +108,9 @@ def test_e2e_train_growth_save_resume_determinism(tmp_path):
     ref_experts = _expert_bytes(m)
     assert ref["growth_events"] >= 1  # scheduled growth fired
     assert all("grew" in h and "pruned_experts" in h for h in ref["history"])
-    # Public growth/pruning APIs are exercised on the live pool.
+    assert all(h["pruned_experts"] == [] for h in ref["history"])  # never prunes
+    # Public growth API is exercised on the live pool.
     assert growth_mod.select_parents(m.pool, k=2)
-    assert isinstance(
-        pruning_mod.find_victims(m.pool, step=10, survival_steps=2, min_experts=1),
-        list,
-    )
-    assert pruning_mod.dying_score(0, 100, 0.0, 0.0) is True
-    assert pruning_mod.dying_score(50, 100, 1e-3, 1.0) is False
     infer_before = m.forward_infer(torch.randint(0, 256, (1, 8)))["logits"].clone()
 
     # Two-leg run with a mid-run checkpoint.
@@ -131,7 +123,7 @@ def test_e2e_train_growth_save_resume_determinism(tmp_path):
     )
     assert leg1["steps_completed"] == 2
     assert os.path.exists(os.path.join(d, "manifest.json"))
-    assert os.path.exists(os.path.join(d, "rng.pt"))
+    assert os.path.exists(os.path.join(d, "rng.safetensors"))
     m1.pager.close()
 
     # Reload into fresh objects; topology/params/optimizer/RNG must restore.
@@ -145,8 +137,8 @@ def test_e2e_train_growth_save_resume_determinism(tmp_path):
     cfg2 = m2.cfg  # checkpoint is authoritative
     leg2 = run_training(
         m2, opt2, cfg2, seqs, steps=2, batch_size=2,
-        replay_n=1, grow_every=2, prune_every=2,
-        grow_loss_below=-1.0, growths_per_prune=2,
+        replay_n=1, grow_every=2,
+        grow_loss_below=-1.0,
         seed=5, log_fn=lambda s: None,
     )
 
@@ -246,10 +238,9 @@ def test_e2e_cli_config_and_schedule():
     assert resolve_train_grow_every(build_parser().parse_args(["train", "--grow-every", "0"]), cfg) == 0
 
 
-def test_e2e_growth_pruning_direct_apis():
-    """Direct growth clone + prune removal roundtrip on a tiny pool."""
+def test_e2e_growth_clone_direct_api():
+    """Direct growth clone roundtrip on a tiny pool (pruning is the CLI script)."""
     import growth as growth_mod
-    import pruning as pruning_mod
     from experts import ExpertPool, make_expert
     from routing import SparseRouter
 
@@ -261,17 +252,6 @@ def test_e2e_growth_pruning_direct_apis():
     new_ids = growth_mod.grow_topk_clones(
         pool, router, 16, 32, step=4, seed=0, k=2, max_experts=8)
     assert len(new_ids) == 2 and len(pool) == 5 and router.num_experts == 5
-    # Age the pool and keep one expert useful; the rest are pruneable.
-    keep = pool.order[0]
-    rec = pool.experts[keep]
-    rec.tokens_routed = 500
-    rec.grad_activity = 1e-3
-    rec.contribution = 0.5
-    rec.last_used_step = 600
-    victims = pruning_mod.find_victims(pool, step=600, survival_steps=500, min_experts=1)
-    assert keep not in victims and len(victims) >= 1
-    pruned = pruning_mod.prune_experts(pool, router, victims[:1])
-    assert len(pruned) == 1 and len(pool) == 4 and router.num_experts == 4
 
 
 def test_e2e_quantize_retile_roundtrip(tmp_path):
@@ -318,10 +298,11 @@ def test_e2e_corrupted_checkpoint_refusal(tmp_path):
         assert m2.forward_infer(ids)["logits"].shape == (1, 8, m2.cfg.vocab_size)
 
     # Corrupt expert bytes.
-    p = os.path.join(d, "experts", m.pool.order[0] + ".pt")
-    payload = torch.load(p, map_location="cpu", weights_only=False)
-    payload["weights"]["w_gate"]["codes"] = payload["weights"]["w_gate"]["codes"][:-1]
-    torch.save(payload, p)
+    from safetensors.torch import load_file, save_file
+    p = os.path.join(d, "experts", m.pool.order[0] + ".safetensors")
+    payload = {k: v.clone() for k, v in load_file(p).items()}
+    payload["w_gate.codes"] = payload["w_gate.codes"][:-1]
+    save_file(payload, p)
     m2, opt2, _ = _tiny_model()
     order_before = list(m2.pool.order)
     embed_before = m2.embed.weight.detach().clone()
