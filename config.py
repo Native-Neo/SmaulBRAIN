@@ -55,7 +55,7 @@ class SmaulBrainConfig:
     top_k: int = 2
     active_experts: int = 2  # alias enforced == top_k at runtime
     max_experts: int = 64
-    min_experts: int = 2
+    min_experts: int = 64  # hard floor: pruning never takes 64+ pools below it
     expert_hidden: int = 128  # explicit knob; full preset uses 3328 for ~5.12M
     moe_balance_weight: float = 0.01
     capacity_factor: float = 1.5
@@ -84,7 +84,10 @@ class SmaulBrainConfig:
     seed: int = 0
     rmsnorm_eps: float = 1e-6
     # --- growth / pruning ---
-    grow_every: int = 200  # optimizer steps between growth evaluations
+    # Defaults encode the standing policy: grow every 20K steps or on
+    # sub-1.0 loss, prune 4 worst every 10K steps (16 when hot), and never
+    # prune the pool below 64 experts (tiny pools below 64 use min_experts).
+    grow_every: int = 20000  # optimizer steps between growth evaluations
     prune_survival_steps: int = 500  # grace period before an expert may die
     prune_min_usage: float = 1e-4  # usage share below which expert is dying
     max_new_experts: int = 8  # cap per growth event (clone-top-8 strategy)
@@ -96,7 +99,11 @@ class SmaulBrainConfig:
         assert 0.0 < self.halt_prior < 1.0, "halt prior in (0,1)"
         assert 1 <= self.top_k <= self.num_experts, "need 1 <= top_k <= experts"
         assert self.num_experts >= 1 and self.max_experts >= self.num_experts
-        assert self.min_experts >= self.top_k and self.min_experts <= self.num_experts
+        assert self.min_experts >= self.top_k, "need min_experts >= top_k"
+        # Note: min_experts may exceed num_experts (e.g. the default 64 floor
+        # on a tiny 8-expert pool). Small pools simply never prune: victim
+        # selection caps at len(pool) - floor <= 0. The floor binds once a
+        # pool grows to 64+.
         assert self.paging_method in ("D2R", "R2VR", "D2VR"), "bad paging method"
         assert self.ram_cache >= 1 and self.vram_cache >= 1, "caches need >= 1 slot"
         assert self.dtype in ("bf16", "fp32"), "compute dtype bf16|fp32"
