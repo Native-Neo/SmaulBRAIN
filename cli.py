@@ -30,7 +30,7 @@ from config import SmaulBrainConfig
 # Tiny defaults are the parser defaults (fast CPU smoke runs: 246K params).
 TINY_DEFAULTS = {
     "d_model": 64, "n_heads": 4, "num_experts": 8, "top_k": 2,
-    "expert_hidden": 128, "max_experts": 64, "min_experts": 2,
+    "expert_hidden": 128, "max_experts": 64, "min_experts": 64,
     "max_depth": 3, "min_depth": 1, "context_length": 128,
     "halting_threshold": 0.9, "ram_cache": 8, "vram_cache": 4,
 }
@@ -38,7 +38,7 @@ TINY_DEFAULTS = {
 FULL_DEFAULTS = {
     **TINY_DEFAULTS,
     "d_model": 512, "num_experts": 64, "top_k": 8, "expert_hidden": 3328,
-    "max_experts": 128, "min_experts": 8, "context_length": 1024,
+    "max_experts": 128, "min_experts": 64, "context_length": 1024,
     "ram_cache": 32, "vram_cache": 16,
 }
 
@@ -120,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--active-experts", type=int, default=None, dest="top_k",
                    help="Top-k routed experts per token (default: tiny=2, full=8). Shape-checked.")
     p.add_argument("--max-experts", type=int, default=None, help="Expert pool ceiling (default: tiny=64, full=128). Checkpoint wins on resume.")
-    p.add_argument("--min-experts", type=int, default=None, help="Expert pool floor (default: tiny=2, full=8). Checkpoint wins on resume.")
+    p.add_argument("--min-experts", type=int, default=None, help="Expert pool floor (default: 64; hard floor for 64+ pools). Checkpoint wins on resume.")
     p.add_argument("--capacity-factor", type=float, default=None, dest="capacity_factor",
                    help="Per-expert routing capacity multiple (default: 1.5).")
     p.add_argument("--moe-balance-weight", type=float, default=None, dest="moe_balance_weight",
@@ -178,7 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="RMSNorm epsilon (default: 1e-6).")
     # --- growth / pruning (config; schedule flags live on train) ---
     p.add_argument("--grow-every-default", type=int, default=None, dest="config_grow_every",
-                   help="Config growth interval (default: 200). Train --grow-every "
+                   help="Config growth interval (default: 20000). Train --grow-every "
                         "overrides per-run; omitted train flag falls back to this config value.")
     p.add_argument("--prune-survival-steps", type=int, default=None, dest="prune_survival_steps",
                    help="Grace period before an expert may die (default: 500).")
@@ -203,12 +203,12 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--data", type=str, default=None,
                    help="Text file for training bytes (default: synthetic demo).")
     t.add_argument("--save-every", type=int, default=0, help="Checkpoint every N steps (0=off).")
-    t.add_argument("--grow-every", type=int, default=None, help="Growth eval every N steps (0=off; omitted: config grow_every=200).")
-    t.add_argument("--grow-loss-below", type=float, default=0.75,
-                   help="Grow whenever step loss newly dips below this (negative disables).")
+    t.add_argument("--grow-every", type=int, default=None, help="Growth eval every N steps (0=off; omitted: config grow_every=20000).")
+    t.add_argument("--grow-loss-below", type=float, default=1.0,
+                   help="Grow whenever step loss newly dips below this (default 1.0; negative disables).")
     t.add_argument("--growths-per-prune", type=int, default=2,
                    help="One prune evaluation every N growth events.")
-    t.add_argument("--prune-every", type=int, default=0, help="Prune eval every N steps (0=off).")
+    t.add_argument("--prune-every", type=int, default=10000, help="Prune eval every N steps (0=off; default 10000, worst 4).")
     # infer
     i = sub.add_parser("infer", help="Generate bytes from a prompt.")
     i.add_argument("--prompt", type=str, default="hello", help="Prompt text.")
