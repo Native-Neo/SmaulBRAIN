@@ -8,7 +8,6 @@ import torch
 from config import SmaulBrainConfig
 from growth import grow_expert
 from model import SmaulBrainModel
-from pruning import find_victims, prune_experts
 
 
 def _model(n_exp=4):
@@ -28,21 +27,13 @@ def test_counts_split_and_total_consistent():
     m.pager.close()
 
 
-def test_total_changes_with_growth_and_pruning():
+def test_total_changes_with_growth():
     m = _model()
     before = m.param_counts()["total_params"]
     grow_expert(m.pool, m.router, 32, 64, step=1, seed=0)
     after_grow = m.param_counts()["total_params"]
     # One expert (6144) plus its router row (d_model + 1 = 33).
     assert after_grow == before + m.param_counts()["per_expert_params"] + 33
-    for eid in list(m.pool.order[1:]):
-        r = m.pool.experts[eid]
-        r.tokens_routed = 0; r.grad_activity = 0.0; r.contribution = 0.0
-        r.last_used_step = 0; r.birth_step = 0
-    victims = find_victims(m.pool, step=1000, survival_steps=10, min_experts=1)
-    prune_experts(m.pool, m.router, victims)
-    after_prune = m.param_counts()["total_params"]
-    assert after_prune < after_grow
     m.pager.close()
 
 
@@ -141,14 +132,11 @@ def test_config_counts_match_live_model():
 
 
 def test_audit039_active_clamped_when_pool_below_topk():
-    # Pruning below top_k must not report active > total (old code did).
-    m = _model()
-    for eid in list(m.pool.order[1:]):
-        r = m.pool.experts[eid]
-        r.tokens_routed = 0; r.grad_activity = 0.0; r.contribution = 0.0
-        r.last_used_step = 0; r.birth_step = 0
-    victims = find_victims(m.pool, step=1000, survival_steps=10, min_experts=1)
-    prune_experts(m.pool, m.router, victims)
+    # A single-expert pool must not report active > total (old code did).
+    torch.manual_seed(0)
+    cfg = SmaulBrainConfig(d_model=32, n_heads=4, num_experts=1, top_k=1,
+                           expert_hidden=64, max_depth=1)
+    m = SmaulBrainModel(cfg)
     c = m.param_counts()
     assert c["expert_count"] == 1
     assert c["active_params"] <= c["total_params"]
