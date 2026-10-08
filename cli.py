@@ -84,8 +84,6 @@ ARG_TO_CONFIG = {
     "seed": "seed",
     "rmsnorm_eps": "rmsnorm_eps",
     "vocab_size": "vocab_size",
-    "prune_survival_steps": "prune_survival_steps",
-    "prune_min_usage": "prune_min_usage",
     "max_new_experts": "max_new_experts",
     "grow_every": "config_grow_every",
 }
@@ -108,8 +106,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--d-model", type=int, default=None, help="Shared trunk width (default: tiny=64, full=512).")
     p.add_argument("--n-heads", type=int, default=None, help="Linear-attention heads (default: tiny=4).")
     p.add_argument("--experts", type=int, default=None, dest="num_experts",
-                   help="Initial dynamic expert count (default: tiny=8, full=64). "
-                        "Dynamic after growth/pruning; checkpoint count wins on resume.")
+                    help="Initial dynamic expert count (default: tiny=8, full=64). "
+                         "Dynamic after growth/manual pruning; checkpoint count wins on resume.")
     p.add_argument("--expert-size", type=int, default=None, dest="expert_size",
                    help="Expert hidden dim. Omitted: 128, or 3328 with --full "
                         "(~=5.12M params/expert at d-model 512). Shape-checked before build.")
@@ -176,14 +174,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=None, help="RNG seed (default: 0). Explicit wins on resume.")
     p.add_argument("--rmsnorm-eps", type=float, default=None, dest="rmsnorm_eps",
                    help="RMSNorm epsilon (default: 1e-6).")
-    # --- growth / pruning (config; schedule flags live on train) ---
+    # --- growth (config; schedule flag lives on train) ---
     p.add_argument("--grow-every-default", type=int, default=None, dest="config_grow_every",
                    help="Config growth interval (default: 20000). Train --grow-every "
                         "overrides per-run; omitted train flag falls back to this config value.")
-    p.add_argument("--prune-survival-steps", type=int, default=None, dest="prune_survival_steps",
-                   help="Grace period before an expert may die (default: 500).")
-    p.add_argument("--prune-min-usage", type=float, default=None, dest="prune_min_usage",
-                   help="Usage share below which expert is dying (default: 1e-4).")
     p.add_argument("--max-new-experts", type=int, default=None, dest="max_new_experts",
                    help="Cap per growth event (default: 8).")
     p.add_argument("--ckpt", type=str, default="checkpoints/smaulbrain",
@@ -206,9 +200,6 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--grow-every", type=int, default=None, help="Growth eval every N steps (0=off; omitted: config grow_every=20000).")
     t.add_argument("--grow-loss-below", type=float, default=1.0,
                    help="Grow whenever step loss newly dips below this (default 1.0; negative disables).")
-    t.add_argument("--growths-per-prune", type=int, default=2,
-                   help="One prune evaluation every N growth events.")
-    t.add_argument("--prune-every", type=int, default=10000, help="Prune eval every N steps (0=off; default 10000, worst 4).")
     # infer
     i = sub.add_parser("infer", help="Generate bytes from a prompt.")
     i.add_argument("--prompt", type=str, default="hello", help="Prompt text.")
@@ -276,8 +267,6 @@ def config_from_args(args: argparse.Namespace) -> SmaulBrainConfig:
         context_length=pick(getattr(args, "context_length", None), "context_length"),
         attention_chunk_size=pick_cfg(getattr(args, "attention_chunk_size", None), "attention_chunk_size"),
         grow_every=pick_cfg(getattr(args, "config_grow_every", None), "grow_every"),
-        prune_survival_steps=pick_cfg(getattr(args, "prune_survival_steps", None), "prune_survival_steps"),
-        prune_min_usage=pick_cfg(getattr(args, "prune_min_usage", None), "prune_min_usage"),
         max_new_experts=pick_cfg(getattr(args, "max_new_experts", None), "max_new_experts"),
     )
 
@@ -434,9 +423,7 @@ def main(argv: list[str] | None = None) -> int:
                            save_every=args.save_every,
                            grow_every=grow_every,
                            grow_loss_below=args.grow_loss_below,
-                           growths_per_prune=args.growths_per_prune,
-                           prune_every=args.prune_every,
-                           # Progress/grow/prune lines go to stderr: stdout
+                           # Progress/grow lines go to stderr: stdout
                            # stays pure JSON for scripting.
                            log_fn=lambda s: print(s, file=sys.stderr))
         print(json.dumps({"final_loss": res["final_loss"],
