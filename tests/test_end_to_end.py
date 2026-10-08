@@ -242,7 +242,7 @@ def test_e2e_cli_config_and_schedule():
     aliased = config_from_args(build_parser().parse_args(
         ["--paging-method", "r2vr", "--attention-chunk-size", "64", "train"]))
     assert aliased.paging_method == "R2VR" and aliased.attention_chunk_size == 64
-    assert resolve_train_grow_every(build_parser().parse_args(["train"]), cfg) == cfg.grow_every == 200
+    assert resolve_train_grow_every(build_parser().parse_args(["train"]), cfg) == cfg.grow_every == 20000
     assert resolve_train_grow_every(build_parser().parse_args(["train", "--grow-every", "0"]), cfg) == 0
 
 
@@ -259,7 +259,7 @@ def test_e2e_growth_pruning_direct_apis():
         pool.add(make_expert(pool.fresh_id(), 16, 32, birth_step=0))
     router = SparseRouter(16, 3, 1)
     new_ids = growth_mod.grow_topk_clones(
-        pool, router, 16, 32, step=4, seed=0, k=2, n_mutated=1, max_experts=8)
+        pool, router, 16, 32, step=4, seed=0, k=2, max_experts=8)
     assert len(new_ids) == 2 and len(pool) == 5 and router.num_experts == 5
     # Age the pool and keep one expert useful; the rest are pruneable.
     keep = pool.order[0]
