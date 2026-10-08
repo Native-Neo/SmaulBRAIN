@@ -1,26 +1,38 @@
-"""Expert pruning with grace periods and hysteresis.
+"""Offline expert pruner: standalone CLI, not a library.
 
-An expert is pruned only when it is simultaneously:
-  * old enough (age >= survival_steps — grace period against churn),
-  * unused recently (steps since last use >= survival_steps),
-  * low-signal on every channel (usage share, gradient activity,
-    contribution all below thresholds — hysteresis, not a single counter),
-  * not load-bearing for capacity (pool stays >= min_experts).
+Training never prunes; pool shrinkage happens here, explicitly::
 
-Only the worst ``max_victims`` go per evaluation (worst-first ranking), so
-one bad cycle can never wipe out the pool. Pruning removes weights,
-optimizer state, router row, and metadata together; the pool order compacts
-so checkpoint loading stays index-consistent.
-Redundancy (near-duplicate of a sibling) is an additional trigger, measured
-by cosine similarity of dequantized gate weights.
+    python pruning.py --ckpt checkpoints/smaulbrain --rm-worst 4
+
+The floor comes from the checkpoint's ``resume_config.json``
+(``min_experts``); removal never takes the pool below it. Selection is the
+standing hysteresis policy: an expert dies only when old enough, long idle,
+AND below threshold on every vitality signal (usage share, gradient
+activity, contribution), plus a redundancy pass that retires near-duplicate
+gate weights below a looser usage bar. Removal is atomic (weights +
+optimizer state + router row + pager traces, highest index first) and the
+checkpoint is re-saved in place, still resumable (scheduler snapshot and
+RNG state preserved).
+
+This file is a script, not an importable module: nothing in the training
+path imports it.
 """
 
 from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 import torch.nn.functional as F
 
 from precision import dequantize_fp8_blockwise
+
+FLOOR_DEFAULT = 64
 
 
 def _check_optim_width(optim_state: dict | None, expect: int) -> None:
@@ -188,5 +200,92 @@ def prune_experts(
             _drop_state_row(optim_state, idx)
         if pager is not None:
             pager.forget(eid)
-        pruned.append(eid)
     return sorted(pruned, key=lambda eid: eid)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    from config import SmaulBrainConfig
+    p = argparse.ArgumentParser(prog="pruning",
+                                description="Remove the N worst experts from a checkpoint (offline; training never prunes).")
+    p.add_argument("--ckpt", type=str, default="checkpoints/smaulbrain",
+                   help="Checkpoint directory.")
+    p.add_argument("--rm-worst", type=int, required=True,
+                   help="How many of the worst experts to remove (capped by the resume_config floor).")
+    p.add_argument("--survival-steps", type=int, default=None,
+                   help=f"Grace period before an expert may die (default: {SmaulBrainConfig.prune_survival_steps}).")
+    p.add_argument("--min-usage", type=float, default=None,
+                   help=f"Usage share below which an expert is dying (default: {SmaulBrainConfig.prune_min_usage}).")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Rank and report victims without modifying the checkpoint.")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    from config import SmaulBrainConfig
+    from model import SmaulBrainModel
+    from smaulopt import SmaulOpt
+    from storage import load_manifest, load_model, load_resume_config, save_model
+
+    args = build_parser().parse_args(argv)
+    if args.rm_worst < 0:
+        print(json.dumps({"error": "--rm-worst must be >= 0"}), file=sys.stderr)
+        return 2
+    ckpt = args.ckpt
+    try:
+        resume_cfg = load_resume_config(ckpt)
+        floor = int(resume_cfg.get("min_experts", FLOOR_DEFAULT))
+    except FileNotFoundError:
+        print(f"warning: no resume_config.json in {ckpt}; using default floor {FLOOR_DEFAULT}",
+              file=sys.stderr)
+        floor = FLOOR_DEFAULT
+    except (ValueError, TypeError) as e:
+        print(json.dumps({"error": f"bad resume_config.json: {e}"}), file=sys.stderr)
+        return 2
+    cfg_path = os.path.join(ckpt, "config.json")
+    if not os.path.exists(cfg_path):
+        print(json.dumps({"error": f"no checkpoint at {ckpt}; train first"}), file=sys.stderr)
+        return 2
+    with open(cfg_path) as f:
+        cfg = SmaulBrainConfig.from_dict(json.load(f))
+    survival = args.survival_steps if args.survival_steps is not None else cfg.prune_survival_steps
+    usage = args.min_usage if args.min_usage is not None else cfg.prune_min_usage
+    model = SmaulBrainModel(cfg)
+    opt = SmaulOpt()
+    try:
+        manifest = load_model(ckpt, model, opt)
+    except (ValueError, FileNotFoundError) as e:
+        print(json.dumps({"error": f"cannot load checkpoint: {e}"}), file=sys.stderr)
+        return 2
+    step = int(manifest.get("step", 0))
+    total_tokens = sum(r.tokens_routed for r in model.pool.experts.values())
+    if total_tokens == 0:
+        print("warning: checkpoint has zero routed tokens; every old expert "
+              "looks dying (grace periods still apply)", file=sys.stderr)
+    removable = max(0, len(model.pool) - floor)
+    if args.rm_worst > removable:
+        print(json.dumps({"error": f"requested {args.rm_worst} but only {removable} removable "
+                                   f"(pool={len(model.pool)}, floor={floor}); nothing changed"}),
+              file=sys.stderr)
+        return 2
+    victims = find_victims(model.pool, step, survival_steps=survival,
+                           min_experts=floor, usage_threshold=usage,
+                           max_victims=args.rm_worst)
+    result = {"requested": args.rm_worst, "floor": floor,
+              "pool_before": len(model.pool),
+              "victims": victims, "removed": [], "dry_run": bool(args.dry_run)}
+    if not args.dry_run:
+        result["removed"] = prune_experts(model.pool, model.router, victims,
+                                          pager=model.pager, optim_state=opt.router_state)
+        model.cfg.num_experts = len(model.pool)
+        extra = manifest.get("extra", {})
+        save_model(ckpt, model, opt, step,
+                   extra_meta=extra if isinstance(extra, dict) else {})
+        result["removed"] = removed
+    result["pool_after"] = len(model.pool)
+    model.pager.close()
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
