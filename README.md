@@ -382,10 +382,12 @@ print(pool.usage_snapshot())            # per-expert tokens/activity/parents
 
 ### What is `growth.py`
 
-Controlled expert growth — never pure noise without a documented reason.
+Controlled expert growth — every clone mutated, never the parent.
 `select_parents` ranks experts deterministically by contribution (then usage,
-then id); `recombine_weights` builds a convex parent-mean plus small seeded
-perturbation; `grow_expert` assigns the next stable id, derives the new
+then id); `grow_topk_clones` clones the top-k, each with its own relative
+perturbation uniform in [1%, 10%] (per-weight random signs, multiplicative,
+seeded), so every clone differs from its parent by 1–10% while the parent
+stays bit-identical; `grow_expert` assigns the next stable id, derives the new
 router row from the parent-mean row, initializes optimizer state, records
 parents/birth step, and stays reproducible from the caller seed. An empty
 pool falls back to a fresh random expert.
@@ -401,8 +403,9 @@ eid = grow_expert(pool, router, d_model=128, expert_hidden=256,
 # Same seed + same pool -> byte-identical child (verified in tests).
 ```
 
-In training, schedule it with `run_training(..., grow_every=200)` or the
-CLI `--grow-every 200` (capped by `max_experts`).
+In training, schedule it with `run_training(..., grow_every=20000)` or the
+CLI `--grow-every 20000` (capped by `max_experts`), or let it fire whenever
+the step loss newly dips below 1.0 (`grow_loss_below`).
 
 ### What is `infer.py`
 
@@ -551,7 +554,9 @@ gradient activity, contribution) — one strong signal saves it. A redundancy
 pass additionally retires near-duplicate gate weights, but only below a
 looser usage bar, so load-bearing twins survive. `prune_experts` removes
 weights, optimizer state, router row, and metadata together, highest index
-first, keeping checkpoints index-consistent.
+first, keeping checkpoints index-consistent. The pool never prunes below
+64 experts: when the floor blocks a live prune, no removal happens and a
+free compensatory top-4 mutated growth fires instead.
 
 ### How to use `pruning.py`
 
@@ -559,13 +564,14 @@ first, keeping checkpoints index-consistent.
 from pruning import find_victims, prune_experts
 
 victims = find_victims(pool, step=1000, survival_steps=500,
-                       min_experts=2, usage_threshold=1e-4)
+                       min_experts=64, usage_threshold=1e-4)
 if victims:
     print(prune_experts(pool, router, victims))  # weights+state+row+meta gone
 ```
 
-In training, schedule it with `run_training(..., prune_every=500)` or the
-CLI `--prune-every 500` (never below `min_experts`).
+In training, schedule it with `run_training(..., prune_every=10000)` or the
+CLI `--prune-every 10000`: scheduled prunes strip the worst 4, and a hot
+window (more than 2 growths in the trailing 10K steps) strips the worst 16.
 
 ### What is `quantize.py`
 
@@ -720,7 +726,7 @@ print(stats["loss"], stats["mean_depth"], stats["stepped_experts"])
 res = run_training(model, opt, cfg, train_seqs, steps=20, batch_size=2,
                    mode="selected", selected=["expert_00001"],
                    replay=ReplayBuffer(512), replay_n=2,
-                   old_seqs=old_data, grow_every=200, prune_every=500,
+                   old_seqs=old_data, grow_every=20000, prune_every=10000,
                    ckpt_dir="ckpt/run1", save_every=50)
 print(res["final_loss"], res["retention"])  # retention measured, not claimed
 ```
