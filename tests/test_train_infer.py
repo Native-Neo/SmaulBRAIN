@@ -242,7 +242,6 @@ def test_cli_maps_every_config_field():
         "--beta-m", "0.8", "--beta-v", "0.99", "--epsilon", "1e-7",
         "--fp8-tile", "32", "--state-dtype", "fp32",
         "--rmsnorm-eps", "1e-5", "--vocab-size", "260",
-        "--prune-survival-steps", "10", "--prune-min-usage", "0.01",
         "--max-new-experts", "3", "--grow-every-default", "50",
         "train"])
     cfg = config_from_args(args)
@@ -250,7 +249,9 @@ def test_cli_maps_every_config_field():
     assert (cfg.router_lr_mult, cfg.weight_decay, cfg.grad_clip) == (0.5, 0.02, 0.5)
     assert (cfg.beta_m, cfg.beta_v, cfg.epsilon) == (0.8, 0.99, 1e-7)
     assert (cfg.fp8_tile, cfg.state_dtype, cfg.rmsnorm_eps) == (32, "fp32", 1e-5)
-    assert (cfg.prune_survival_steps, cfg.prune_min_usage, cfg.max_new_experts) == (10, 0.01, 3)
+    # Prune knobs are config-only now (offline pruner reads them); CLI
+    # carries no prune flags, defaults still flow through.
+    assert (cfg.prune_survival_steps, cfg.prune_min_usage, cfg.max_new_experts) == (500, 1e-4, 3)
     assert cfg.grow_every == 50 and cfg.vocab_size == 260
 
 
