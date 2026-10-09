@@ -78,14 +78,26 @@ class LinearAttnState:
         self.z[idx] = 0.0
         return self
 
-    def matches(self, batch: int, heads: int, head_dim: int) -> bool:
-        """The one state contract: fp32 accumulators of exact expected shape."""
-        return (
+    def matches(self, batch: int, heads: int, head_dim: int,
+                  device: torch.device | None = None) -> bool:
+        """The one state contract: fp32 accumulators of exact expected shape.
+
+        ``device`` (when given) must equal the accumulators' device: a
+        pooled state from another device must be rejected loudly here,
+        not as a raw device-mismatch RuntimeError deep in the math.
+        """
+        if not (
             self.S.shape == (batch, heads, head_dim, head_dim)
             and self.z.shape == (batch, heads, head_dim)
             and self.S.dtype == torch.float32
             and self.z.dtype == torch.float32
-        )
+        ):
+            return False
+        if device is not None:
+            dev = torch.device(device)
+            if self.S.device != dev or self.z.device != dev:
+                return False
+        return True
 
     def nbytes(self) -> int:
         return self.S.nelement() * 4 + self.z.nelement() * 4
@@ -123,11 +135,11 @@ def linear_attn_forward(
     B, H, T, Dh = q.shape
     if state is None:
         state = LinearAttnState.zeros(B, H, Dh, device=q.device)
-    if not state.matches(B, H, Dh):
+    if not state.matches(B, H, Dh, q.device):
         raise ValueError(
-            f"state shape/dtype mismatch: S={tuple(state.S.shape)}/{state.S.dtype} "
-            f"z={tuple(state.z.shape)}/{state.z.dtype}, "
-            f"expected ([{B}, {H}, {Dh}, {Dh}]/fp32, [{B}, {H}, {Dh}]/fp32)"
+            f"state shape/dtype/device mismatch: S={tuple(state.S.shape)}/{state.S.dtype}/{state.S.device} "
+            f"z={tuple(state.z.shape)}/{state.z.dtype}/{state.z.device}, "
+            f"expected ([{B}, {H}, {Dh}, {Dh}]/fp32/{q.device}, [{B}, {H}, {Dh}]/fp32/{q.device})"
         )
     if keep is not None:
         if keep.shape != (B, T):
@@ -193,11 +205,11 @@ def linear_attn_step(
     if q.ndim != 3 or k.shape != q.shape or v.shape != q.shape:
         raise ValueError("q, k, and v must all have shape [B, H, Dh]")
     B, H, Dh = q.shape
-    if not state.matches(B, H, Dh):
+    if not state.matches(B, H, Dh, q.device):
         raise ValueError(
-            f"state shape/dtype mismatch: S={tuple(state.S.shape)}/{state.S.dtype} "
-            f"z={tuple(state.z.shape)}/{state.z.dtype}, "
-            f"expected ([{B}, {H}, {Dh}, {Dh}]/fp32, [{B}, {H}, {Dh}]/fp32)"
+            f"state shape/dtype/device mismatch: S={tuple(state.S.shape)}/{state.S.dtype}/{state.S.device} "
+            f"z={tuple(state.z.shape)}/{state.z.dtype}/{state.z.device}, "
+            f"expected ([{B}, {H}, {Dh}, {Dh}]/fp32/{q.device}, [{B}, {H}, {Dh}]/fp32/{q.device})"
         )
     keep_mask: torch.Tensor | None = None
     if keep is not None:
