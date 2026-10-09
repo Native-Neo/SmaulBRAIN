@@ -104,11 +104,12 @@ class SmaulBrainConfig:
     prune_survival_steps: int = 500  # grace period before an expert may die
     prune_min_usage: float = 1e-4  # usage share below which expert is dying
     max_new_experts: int = 8  # cap per growth event (clone-top-8 strategy)
-    # --- BPB ports (all default-off; enabling changes training math) ---
+    # --- BPB ports (conv default-on; lookahead/boundary/cosine default-off;
+    # enabling any of them changes training math) ---
     # use_byte_conv: causal depthwise conv over byte embeddings in the trunk.
     # lookahead_weight/boundary_weight: auxiliary t+2 CE + UTF-8-boundary BCE.
     # cosine_decay_steps: cosine LR decay horizon (0 = constant LR).
-    use_byte_conv: bool = False
+    use_byte_conv: bool = True
     lookahead_weight: float = 0.0
     boundary_weight: float = 0.0
     cosine_decay_steps: int = 0
@@ -180,14 +181,24 @@ class SmaulBrainConfig:
     def shared_params(self) -> int:
         """Shared trunk params (router excluded; see router_params).
 
-        embeddings + attention + norms + halt + head. The recurrent block
+        embeddings + attention + norms + halt + head, plus any enabled
+        BPB-port modules (all trunk-resident). The recurrent block
         is counted once (unique params); unrolled logical depth reuses it.
         Matches model.param_counts()["shared_params"] (trunk-only).
         """
         d, v = self.d_model, self.vocab_size
         # embed(v,d) + qkv+o (4*d*d) + 6 norms (n_init,n1,n_attn,n2,n3,n_final)
         # + halt (d+1) + out head (v*d)
-        return v * d + 4 * d * d + 6 * d + (d + 1) + v * d
+        total = v * d + 4 * d * d + 6 * d + (d + 1) + v * d
+        # BPB ports are trunk modules (see model._trunk_params): count them
+        # exactly when the model builds them (same enable conditions).
+        if self.use_byte_conv:
+            total += 5 * d  # depthwise Conv1d(d, d, kernel=4): 4d weights + d bias
+        if self.lookahead_weight > 0:
+            total += v * d  # Linear(d, V, bias=False)
+        if self.boundary_weight > 0:
+            total += d + 1  # Linear(d, 1): d weights + 1 bias
+        return total
 
     def total_params(self) -> int:
         """Logical == unique params: shared + router + all experts."""
