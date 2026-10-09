@@ -11,6 +11,7 @@ parameters.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 
 import torch
@@ -65,7 +66,15 @@ class SparseRouter(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.capacity_factor = capacity_factor
-        self.proj = nn.Linear(d_model, num_experts)
+        # Zero-expert pools are transient (growth starts from empty): plain
+        # nn.Linear(., 0) construction warns on zero-element init, so build
+        # it quietly. Non-empty pools keep the standard noisy-on-failure init.
+        if num_experts == 0:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                self.proj = nn.Linear(d_model, num_experts)
+        else:
+            self.proj = nn.Linear(d_model, num_experts)
         # Runtime-only new-expert steering (never checkpointed: plain Python
         # attributes, not parameters/buffers, so state_dict is untouched).
         # At rest both are cleared (0.0/()) so inference (forward_infer,
@@ -156,26 +165,32 @@ class SparseRouter(nn.Module):
         slots read weight 0 so downstream dispatch (which multiplies
         mask x weight) cannot serve what capacity refused. A token with no
         admitted slot is dropped to the residual path.
+
+        Vectorized greedy: tokens are stably priority-ordered (same key as
+        the old sequential loop, so results are identical), then each
+        expert's queue position is a cumsum rank over the flattened
+        (token-major, slot-minor) order — exactly the order the sequential
+        loop visited. Rank < cap admits. No Python token loop, no host
+        transfers on the hot path.
         """
         cap = max(1, int(self.capacity_factor * n_tokens * self.top_k / self.num_experts))
         # Stable priority: equal-confidence tokens keep input order, so the
         # same batch always admits the same slots (deterministic routing).
         order = torch.argsort(top_w.max(dim=-1).values, descending=True, stable=True)
-        assigned = torch.zeros(self.num_experts, dtype=torch.long)
-        admit = torch.zeros_like(top_ids, dtype=torch.bool)
-        dropped = torch.zeros(n_tokens, dtype=torch.bool, device=top_ids.device)
-        # One host transfer up front: the loop below is pure Python over
-        # lists (no per-slot device synchronization on the hot path).
-        top_list = top_ids.tolist()
-        for idx in order.tolist():
-            row = top_list[idx]
-            for slot in range(self.top_k):
-                e = row[slot]
-                if assigned[e] < cap:
-                    assigned[e] += 1
-                    admit[idx, slot] = True
-            if not admit[idx].any():
-                dropped[idx] = True
+        sorted_ids = top_ids[order]  # [N, K] priority order
+        flat = sorted_ids.reshape(-1)  # token-major, slot-minor: loop order
+        admit_flat = torch.zeros(flat.shape[0], dtype=torch.bool, device=top_ids.device)
+        for e in range(self.num_experts):
+            is_e = flat == e
+            # Queue rank among this expert's slots in visit order; slots
+            # beyond capacity are refused. (All-False columns yield rank -1
+            # but stay masked out by is_e, so no empty-check sync is needed.)
+            rank = is_e.to(torch.int64).cumsum(0) - 1
+            admit_flat |= is_e & (rank < cap)
+        admit_sorted = admit_flat.reshape(sorted_ids.shape)
+        admit = torch.empty_like(admit_sorted)
+        admit[order] = admit_sorted
+        dropped = ~admit.any(dim=-1)
         return admit, dropped
 
     def balance_loss(self, probs: torch.Tensor, keep: torch.Tensor | None = None) -> torch.Tensor:
@@ -209,6 +224,11 @@ class SparseRouter(nn.Module):
     # -- dynamic topology: router rows follow expert ids --
     def _proj_like(self, out_features: int) -> nn.Linear:
         """Fresh Linear on the router's device/dtype (topology must follow)."""
+        if out_features == 0:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                return nn.Linear(self.d_model, out_features).to(
+                    device=self.proj.weight.device, dtype=self.proj.weight.dtype)
         return nn.Linear(self.d_model, out_features).to(
             device=self.proj.weight.device, dtype=self.proj.weight.dtype)
 
