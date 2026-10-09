@@ -191,9 +191,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "overrides per-run; omitted train flag falls back to this config value.")
     p.add_argument("--max-new-experts", type=int, default=None, dest="max_new_experts",
                    help="Cap per growth event (default: 8).")
-    # --- BPB ports (all default-off; enabling changes training math) ---
+    # --- BPB ports (conv default-on; lookahead/boundary/cosine default-off;
+    # enabling any of them changes training math) ---
     p.add_argument("--use-byte-conv", action="store_true", default=None,
-                   help="Causal byte-n-gram conv in the trunk (default: off).")
+                   help="Causal byte-n-gram conv in the trunk (default: on).")
+    p.add_argument("--no-byte-conv", action="store_false", dest="use_byte_conv",
+                   default=None,
+                   help="Disable the byte-n-gram conv (default: on; this flag turns it off).")
     p.add_argument("--lookahead-weight", type=float, default=None, dest="lookahead_weight",
                    help="Auxiliary t+2 prediction loss weight (default: 0.0 = off).")
     p.add_argument("--boundary-weight", type=float, default=None, dest="boundary_weight",
