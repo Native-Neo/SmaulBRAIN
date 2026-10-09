@@ -241,3 +241,17 @@ def test_audit039_throughput_countable_bytes_are_tokens_valid_only():
     valid_bytes = int((b != PAD_ID).sum().item())
     assert valid_bytes == 3  # valid-only normalization train.py uses for bytes_processed
     # Bench identity train_bytes_per_s == train_tokens_per_s holds by byte vocab.
+
+
+def test_config_counts_match_live_model_with_ports_on():
+    # BPB-port modules are trunk params: config math must match live counts
+    # exactly when every port is enabled (old formula silently omitted them).
+    torch.manual_seed(0)
+    cfg = SmaulBrainConfig(d_model=16, n_heads=4, num_experts=4, top_k=2,
+                           expert_hidden=32, max_depth=2, use_byte_conv=True,
+                           lookahead_weight=0.2, boundary_weight=0.1)
+    m = SmaulBrainModel(cfg)
+    c = m.param_counts()
+    assert cfg.shared_params() == c["shared_params"]
+    assert c["total_params"] == c["shared_params"] + c["router_params"] + c["expert_params_total"]
+    m.pager.close()
