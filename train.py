@@ -19,6 +19,7 @@ during training: pool shrinkage is a manual offline operation
 
 from __future__ import annotations
 
+import math
 import random
 import time
 from collections import deque
@@ -27,6 +28,18 @@ import torch
 
 import growth as growth_mod
 from bytes import PAD_ID
+
+
+def cosine_scale(step: int, horizon: int) -> float:
+    """Cosine LR multiplier: 1.0 at step 0 decaying to ~0.0 at horizon.
+
+    ``horizon <= 0`` disables (constant 1.0). Steps past the horizon pin
+    at ~0.0 (never negative, never NaN).
+    """
+    if horizon <= 0:
+        return 1.0
+    t = min(max(int(step), 0), horizon) / horizon
+    return 0.5 * (1.0 + math.cos(math.pi * t))
 
 
 class _GradOnly:
@@ -267,8 +280,10 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
         stepped: list[str] = []
         train_trunk = mode in ("entire", "trunk")
         train_router = mode in ("entire", "trunk", "experts", "selected", "new")
+        # Cosine decay (default-off): scale all three LRs by the schedule.
+        lr_scale = cosine_scale(step, cfg.cosine_decay_steps)
         if train_trunk:
-            opt.step_trunk(model._trunk_params(), cfg.trunk_lr)
+            opt.step_trunk(model._trunk_params(), cfg.trunk_lr * lr_scale)
         else:
             for _, p in model._trunk_params():
                 p.grad = None
@@ -325,7 +340,7 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
                                 nidx = [i for i in range(rp.data.shape[0]) if i not in iset]
                                 _held.append((rp, rp.data[idx].clone(), list(idx),
                                               rp.data[nidx].clone() if nidx else None, nidx))
-            opt.step_router(model._router_params(), cfg.router_lr)
+            opt.step_router(model._router_params(), cfg.router_lr * lr_scale)
             if _held:
                 with torch.no_grad():
                     for rp, snap_old, idx, snap_new, nidx in _held:
@@ -371,7 +386,7 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
             # grad_scale stays 1.0: routing weights, ponder mass, and repeated
             # depth applications already scale these grads through autograd;
             # any manual factor here would double-count them.
-            opt.step_expert(rec, compute, 1.0, cfg.expert_lr)
+            opt.step_expert(rec, compute, 1.0, cfg.expert_lr * lr_scale)
             model.pager.invalidate(eid)
             stepped.append(eid)
         # Global optimizer steps: exactly one per train_step call, including
@@ -385,6 +400,7 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
     return {
         "loss": float(loss.item()),
         "nll": float(out["nll"].item()),
+        "bpb": float(loss.item()) / math.log(2),
         "ponder_kl": float(out["ponder_kl"].item()),
         "acc": float(out["acc"]),
         "mean_depth": float(out["mean_depth"]),
@@ -608,6 +624,7 @@ def run_training(
         log_fn(
             f"[train] step {completed}/{steps} (global={step}) "
             f"loss={stats['loss']:.4f} nll={stats['nll']:.4f} "
+            f"bpb={stats['bpb']:.4f} "
             f"acc={stats['acc']:.2%} depth={stats['mean_depth']:.2f} "
             f"time={elapsed:.2f}s bytes/s={step_bps:.1f} "
             f"avg_bytes/s={avg_bps:.1f} ETA={eta:.1f}s "
