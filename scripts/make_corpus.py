@@ -160,8 +160,8 @@ def run(out: str, target_bytes: int, shard_bytes: int, start: int,
             try:
                 _, path = download_shard(i, tmp_dir)
             except Exception as e:
-                log(f"[{i:05d}] download failed, stopping: {e}")
-                break
+                log(f"[{i:05d}] download failed, skipping: {e}")
+                continue
             batch: list[str] = []
             for raw in iter_shard_docs(path):
                 stats["seen"] += 1
