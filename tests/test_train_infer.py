@@ -420,3 +420,31 @@ def test_generate_continuation_only_decode_skips_specials_and_prompt():
     m2 = _stub_model([66])
     res2 = generate(m2, [104, 105], max_new=1, temperature=0.0)
     assert res2["ids"] == [104, 105, 66]
+
+
+def test_sample_next_rejects_batched_logits():
+    from infer import sample_next
+    with pytest.raises(ValueError):
+        sample_next(torch.zeros(2, 260), temperature=0.0)
+
+
+def test_generate_rejects_negative_max_new():
+    m, _, _ = _model()
+    with pytest.raises(ValueError):
+        generate(m, [10, 20], max_new=-1)
+    m.pager.close()
+
+
+def test_unscored_forward_leaves_no_leaves_and_matches_infer_depths():
+    # targets=None takes the inference path: detached logits, no expert
+    # leaves, repeat-safe, and depth selection identical to forward_infer.
+    m, _, _ = _model()
+    m.train()
+    x = torch.randint(0, 256, (2, 8))
+    a = m(x)
+    assert not a["logits"].requires_grad and len(m._leaves) == 0
+    b = m(x)
+    assert torch.equal(a["logits"], b["logits"])
+    m.eval()
+    assert torch.equal(a["depths"], m.forward_infer(x)["depths"])
+    m.pager.close()
