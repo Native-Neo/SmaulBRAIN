@@ -209,6 +209,9 @@ class SmaulBrainModel(nn.Module):
         No halting before min_depth: mass on depths below min_depth is
         zero so the ponder weights only score representations the
         threshold readout can actually select (min_depth=1 is a no-op).
+        The prior is the truncated geometric: p*(1-p)^n for steps before
+        the last, and the full tail mass (1-p)^(D-1) on the force-stop
+        step, so the prior sums to 1 and the KL is a proper divergence.
         """
         B, T = lams[0].shape
         dev = lams[0].device
@@ -216,15 +219,17 @@ class SmaulBrainModel(nn.Module):
         probs: list[torch.Tensor] = []
         remaining = torch.ones(B, T, device=dev)
         kl_pos = torch.zeros(B, T, device=dev)
+        last = len(lams) - 1
         for n, lam in enumerate(lams):
             lam_eff = lam if (n + 1) >= self.cfg.min_depth else torch.zeros_like(lam)
-            if n == len(lams) - 1:
+            if n == last:
                 p = remaining  # force-stop: all remaining mass halts here
+                geom = (1.0 - p_pr) ** n  # tail mass: prior also sums to 1
             else:
                 p = lam_eff * remaining
                 remaining = remaining * (1.0 - lam_eff)
+                geom = p_pr * ((1.0 - p_pr) ** n)
             probs.append(p)
-            geom = p_pr * ((1.0 - p_pr) ** n)
             kl_pos = kl_pos + p * (torch.log(p.clamp_min(1e-9)) - math.log(max(geom, 1e-12)))
         P = torch.stack(probs, dim=0)  # [D, B, T]
         return P, kl_pos.mean(), kl_pos
@@ -273,15 +278,24 @@ class SmaulBrainModel(nn.Module):
             for _ in range(self.cfg.max_depth)
         ]
         try:
+            # Unscored readout (targets=None) takes the inference path
+            # (train=False): no expert leaves, no grad graph, capacity off,
+            # so repeated calls never accumulate stale leaves and the depth
+            # selection matches forward_infer exactly. The readout itself
+            # stays ponder-mixed (like the scored path), not threshold-
+            # selected: logits need not equal forward_infer's, depths do.
             hs, lams, aux, depths, n_executed = self._depth_loop(
-                h, attn_states, train=True, step=step,
+                h, attn_states, train=(targets is not None), step=step,
                 keep=valid.reshape(-1) if targets is not None else None,
             )
             P, _kl_mean, kl_pos = self._ponder([l.float() for l in lams])
             if targets is None:
                 # Same ponder-mixed readout as the scored path (no targets to
-                # mask; P sums to 1 per position regardless).
-                mixed = sum(P[n].unsqueeze(-1).detach() * self.head(self.n_final(hs[n])).float()
+                # mask; P sums to 1 per position regardless). Fully detached:
+                # an unscored readout carries no loss, so holding a graph to
+                # the trunk would only leak memory across calls.
+                mixed = sum(P[n].unsqueeze(-1).detach()
+                            * self.head(self.n_final(hs[n])).float().detach()
                             for n in range(len(hs)))
                 return {"logits": mixed, "depths": depths, "n_executed": n_executed}
             # Ponder-weighted CE: each step's logits score against halting mass.
@@ -453,11 +467,11 @@ class SmaulBrainModel(nn.Module):
         if len(attn_states) != self.cfg.max_depth:
             raise ValueError("attention state depth does not match model max_depth")
         for st in attn_states:
-            if not st.matches(B, self.cfg.n_heads, self.cfg.d_model // self.cfg.n_heads):
+            if not st.matches(B, self.cfg.n_heads, self.cfg.d_model // self.cfg.n_heads, h.device):
                 raise ValueError(
                     "attention state width does not match model "
                     f"(expected B={B} H={self.cfg.n_heads} "
-                    f"Dh={self.cfg.d_model // self.cfg.n_heads})"
+                    f"Dh={self.cfg.d_model // self.cfg.n_heads} on {h.device})"
                 )
         hs, lams, _aux, depths, n_executed = self._depth_loop(
             h, attn_states, train=False, step=step
