@@ -25,7 +25,7 @@ from bytes import PAD_ID
 from experts import ExpertPool, make_expert
 from linear_attention import LinearAttnState
 from paging import ExpertPager
-from recurrent import SharedRecurrentBlock
+from recurrent import CausalByteConv, SharedRecurrentBlock
 from rmsnorm import RMSNorm
 from routing import SparseRouter
 
@@ -44,6 +44,16 @@ class SmaulBrainModel(nn.Module):
         self.head = nn.Linear(d, config.vocab_size, bias=False)
         self.router = SparseRouter(d, config.num_experts, config.top_k,
                                    config.capacity_factor)
+        # BPB ports (all default-off; absent modules keep state_dict and
+        # behavior bit-identical to a model without them).
+        self.byte_conv = CausalByteConv(d) if config.use_byte_conv else None
+        self.head_lookahead = (nn.Linear(d, config.vocab_size, bias=False)
+                               if config.lookahead_weight > 0 else None)
+        self.head_boundary = (nn.Linear(d, 1)
+                              if config.boundary_weight > 0 else None)
+        # Streaming conv history: last (k-1) embeddings feeding single-step
+        # inference (plain attr, never in state_dict). Reset per stream.
+        self._conv_hist: torch.Tensor | None = None
         self.pool = ExpertPool()
         for _ in range(config.num_experts):
             self.pool.add(make_expert(self.pool.fresh_id(), d, config.expert_hidden,
@@ -59,8 +69,15 @@ class SmaulBrainModel(nn.Module):
         # Trunk linears/embeddings run in the compute dtype (precision policy:
         # BF16 activations; RMSNorm weights intentionally stay FP32).
         if config.dtype == "bf16":
-            for mod in (self.embed, self.block.qkv, self.block.o_proj,
-                        self.block.halt, self.head, self.router.proj):
+            trunk_mods = [self.embed, self.block.qkv, self.block.o_proj,
+                          self.block.halt, self.head, self.router.proj]
+            if self.byte_conv is not None:
+                trunk_mods.append(self.byte_conv.conv)
+            if self.head_lookahead is not None:
+                trunk_mods.append(self.head_lookahead)
+            if self.head_boundary is not None:
+                trunk_mods.append(self.head_boundary)
+            for mod in trunk_mods:
                 mod.to(torch.bfloat16)
         # Active expert leaves (training): eid -> list of leaf weight dicts
         # (one entry per depth-step activation; grads are summed at opt time).
@@ -242,7 +259,12 @@ class SmaulBrainModel(nn.Module):
         # Scored positions: padding is not data and is excluded from the MoE
         # balance loss as well as the CE/KL/accuracy below.
         valid = (targets != PAD_ID) if targets is not None else None
-        h = self.n_init(self.embed(ids).to(compute))
+        emb = self.embed(ids)
+        if self.byte_conv is not None:
+            # Causal n-gram features over the embeddings (output[t] sees
+            # only inputs[..t]); the depth loop below is unchanged.
+            emb = self.byte_conv(emb)
+        h = self.n_init(emb.to(compute))
         attn_states = [
             LinearAttnState.zeros(
                 B, self.cfg.n_heads, self.cfg.d_model // self.cfg.n_heads,
@@ -285,6 +307,32 @@ class SmaulBrainModel(nn.Module):
             kl_valid = kl_pos[valid].sum() / max(1, n_valid)
             balance = aux / n_executed
             loss = nll + self.cfg.ponder_beta * kl_valid + self.cfg.moe_balance_weight * balance
+            # BPB ports (default-off): auxiliary t+2 lookahead CE +
+            # UTF-8-boundary BCE on the last-depth features. Vocab comes
+            # from cfg (never hardcoded); masks mirror the main loss
+            # (valid-only, pad-free normalization).
+            lookahead = loss.new_zeros(())
+            boundary = loss.new_zeros(())
+            if self.head_lookahead is not None and T >= 3:
+                la_logits = self.head_lookahead(self.n_final(hs[-1])).float()
+                tgt_la = targets[:, 2:]
+                log_la = la_logits[:, :-2]
+                m_la = valid[:, :-2] & valid[:, 2:] & (tgt_la != PAD_ID)
+                n_la = int(m_la.sum().item())
+                if n_la:
+                    ce_la = F.cross_entropy(
+                        log_la.reshape(-1, self.cfg.vocab_size),
+                        tgt_la.reshape(-1), reduction="none",
+                        ignore_index=PAD_ID).reshape(B, T - 2)
+                    lookahead = ce_la[m_la].sum() / n_la
+                    loss = loss + self.cfg.lookahead_weight * lookahead
+            if self.head_boundary is not None:
+                bd_logits = self.head_boundary(self.n_final(hs[-1])).float().squeeze(-1)
+                is_bnd = ((targets & 0xC0) != 0x80).float()
+                bce = F.binary_cross_entropy_with_logits(bd_logits, is_bnd,
+                                                         reduction="none")
+                boundary = (bce[valid].sum() / max(1, n_valid))
+                loss = loss + self.cfg.boundary_weight * boundary
             with torch.no_grad():
                 # Accuracy uses the ponder-mixed readout (same predictor the
                 # loss scores), not the max-depth representation inference
@@ -303,6 +351,7 @@ class SmaulBrainModel(nn.Module):
                 "logits": mixed,
                 "loss": loss, "nll": nll.detach(), "ponder_kl": kl_valid.detach(),
                 "balance": balance.detach() if torch.is_tensor(balance) else balance,
+                "lookahead": lookahead.detach(), "boundary": boundary.detach(),
                 "acc": acc, "depths": depths, "mean_depth": mean_depth,
                 "n_executed": n_executed,
             }
@@ -317,7 +366,11 @@ class SmaulBrainModel(nn.Module):
         self._check_ids(ids, "ids")
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
-        h = self.n_init(self.embed(ids).to(compute))
+        emb = self.embed(ids)
+        if self.byte_conv is not None:
+            emb = self.byte_conv(emb)
+            self._conv_hist = None  # single-shot: leave no stream trace
+        h = self.n_init(emb.to(compute))
         attn_states = [
             LinearAttnState.zeros(
                 B, self.cfg.n_heads, self.cfg.d_model // self.cfg.n_heads,
@@ -347,6 +400,7 @@ class SmaulBrainModel(nn.Module):
     def new_infer_state(self, batch: int = 1) -> list[LinearAttnState]:
         """Create the fixed-size per-depth attention state for streaming."""
         dev = self.embed.weight.device
+        self._conv_hist = None  # fresh stream: no conv carryover
         return [
             LinearAttnState.zeros(
                 batch, self.cfg.n_heads, self.cfg.d_model // self.cfg.n_heads,
@@ -354,6 +408,30 @@ class SmaulBrainModel(nn.Module):
             )
             for _ in range(self.cfg.max_depth)
         ]
+
+    def _conv_embed(self, emb: torch.Tensor) -> torch.Tensor:
+        """Apply byte_conv with streaming history (no-op when disabled).
+
+        Full chunks convolve causally in one go; single-step calls prepend
+        the cached tail so output[t] always sees inputs[..t]. History is
+        updated from the raw chunk tail for the next call.
+        """
+        assert self.byte_conv is not None
+        k = self.byte_conv.kernel_size
+        B = emb.shape[0]
+        hist = self._conv_hist
+        if hist is None or tuple(hist.shape) != (B, max(0, k - 1), emb.shape[2]):
+            hist = emb.new_zeros((B, max(0, k - 1), emb.shape[2]))
+        if k > 1:
+            full = torch.cat([hist.to(emb.device, emb.dtype), emb], dim=1)
+            out = self.byte_conv(full)[:, -emb.shape[1]:, :]
+            # Accumulate: keep the last (k-1) raw embeddings across calls.
+            keep = torch.cat([hist.to(emb.device, emb.dtype), emb], dim=1)
+            self._conv_hist = keep[:, -(k - 1):, :].detach().clone()
+        else:
+            out = self.byte_conv(emb)
+            self._conv_hist = None
+        return out
 
     @torch.no_grad()
     def forward_infer_stateful(
@@ -366,7 +444,10 @@ class SmaulBrainModel(nn.Module):
         self._check_ids(ids, "ids")
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, _T = ids.shape
-        h = self.n_init(self.embed(ids).to(compute))
+        emb = self.embed(ids)
+        if self.byte_conv is not None:
+            emb = self._conv_embed(emb)
+        h = self.n_init(emb.to(compute))
         if attn_states is None:
             attn_states = self.new_infer_state(B)
         if len(attn_states) != self.cfg.max_depth:
@@ -452,9 +533,16 @@ class SmaulBrainModel(nn.Module):
 
     def _trunk_params(self) -> list[tuple[str, torch.Tensor]]:
         out = []
-        for mod, prefix in ((self.embed, "embed"), (self.block, "block"),
-                            (self.n_init, "n_init"), (self.n_final, "n_final"),
-                            (self.head, "head")):
+        mods: list[tuple] = [(self.embed, "embed"), (self.block, "block"),
+                             (self.n_init, "n_init"), (self.n_final, "n_final"),
+                             (self.head, "head")]
+        if self.byte_conv is not None:
+            mods.append((self.byte_conv, "byte_conv"))
+        if self.head_lookahead is not None:
+            mods.append((self.head_lookahead, "head_lookahead"))
+        if self.head_boundary is not None:
+            mods.append((self.head_boundary, "head_boundary"))
+        for mod, prefix in mods:
             for n, p in mod.named_parameters():
                 out.append((f"{prefix}.{n}", p))
         return out
