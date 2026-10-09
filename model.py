@@ -44,7 +44,7 @@ class SmaulBrainModel(nn.Module):
         self.head = nn.Linear(d, config.vocab_size, bias=False)
         self.router = SparseRouter(d, config.num_experts, config.top_k,
                                    config.capacity_factor)
-        # BPB ports (all default-off; absent modules keep state_dict and
+        # BPB ports (conv default-on; absent modules keep state_dict and
         # behavior bit-identical to a model without them).
         self.byte_conv = CausalByteConv(d) if config.use_byte_conv else None
         self.head_lookahead = (nn.Linear(d, config.vocab_size, bias=False)
@@ -321,7 +321,8 @@ class SmaulBrainModel(nn.Module):
             kl_valid = kl_pos[valid].sum() / max(1, n_valid)
             balance = aux / n_executed
             loss = nll + self.cfg.ponder_beta * kl_valid + self.cfg.moe_balance_weight * balance
-            # BPB ports (default-off): auxiliary t+2 lookahead CE +
+            # BPB ports (conv default-on; lookahead/boundary default-off):
+            # auxiliary t+2 lookahead CE +
             # UTF-8-boundary BCE on the last-depth features. Vocab comes
             # from cfg (never hardcoded); masks mirror the main loss
             # (valid-only, pad-free normalization).
