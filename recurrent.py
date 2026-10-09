@@ -50,15 +50,21 @@ class RecurrentState:
         )
 
     def reset(self, indices=None) -> "RecurrentState":
-        """Zero selected batch rows in place (per-sequence reset)."""
+        """Zero selected batch rows in place (per-sequence reset).
+
+        ``indices=None`` resets the whole stream including ``steps_taken``.
+        A partial reset zeroes only the selected rows' tensors and leaves
+        the shared ``steps_taken`` counter untouched (it is stream-global,
+        not per-row: zeroing it would lie about the surviving rows).
+        """
         if indices is None:
             self.h.zero_()
             self.attn.reset()
+            self.steps_taken = 0
         else:
             idx = torch.as_tensor(indices, dtype=torch.long, device=self.h.device)
             self.h[idx] = 0.0
             self.attn.reset(idx)
-        self.steps_taken = 0
         return self
 
     def clone(self) -> "RecurrentState":
@@ -88,13 +94,18 @@ class CausalByteConv(nn.Module):
                               groups=d_model, padding=0, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x [B, T, D] -> same shape; output[t] depends only on x[..t]."""
+        """x [B, T, D] -> same shape and dtype; output[t] depends only on x[..t]."""
         if x.shape[1] < 1:
             raise ValueError(f"need T >= 1, got {tuple(x.shape)}")
         if x.shape[2] != self.d_model:
             raise ValueError(f"width {x.shape[2]} != d_model {self.d_model}")
-        padded = F.pad(x.transpose(1, 2), (self.kernel_size - 1, 0))
-        return self.conv(padded).transpose(1, 2)
+        dtype = x.dtype
+        # Conv weights follow the model dtype in-model (bf16 trunk), but a
+        # standalone module stays fp32: run in the weight dtype so a bf16
+        # input never hits a bf16-input/fp32-bias kernel error, then cast
+        # back. Same-dtype calls are no-ops (bit-identical).
+        padded = F.pad(x.to(self.conv.weight.dtype).transpose(1, 2), (self.kernel_size - 1, 0))
+        return self.conv(padded).transpose(1, 2).to(dtype)
 
 
 class SharedRecurrentBlock(nn.Module):
@@ -147,11 +158,11 @@ class SharedRecurrentBlock(nn.Module):
         B, T, D = h.shape
         if D != self.d_model:
             raise ValueError(f"h width {D} != d_model {self.d_model}")
-        if not attn.matches(B, self.n_heads, self.head_dim):
+        if not attn.matches(B, self.n_heads, self.head_dim, h.device):
             raise ValueError(
-                f"attn state mismatch: S={tuple(attn.S.shape)}/{attn.S.dtype} "
-                f"z={tuple(attn.z.shape)}/{attn.z.dtype}, expected B={B} "
-                f"H={self.n_heads} Dh={self.head_dim} fp32"
+                f"attn state mismatch: S={tuple(attn.S.shape)}/{attn.S.dtype}/{attn.S.device} "
+                f"z={tuple(attn.z.shape)}/{attn.z.dtype}/{attn.z.device}, expected B={B} "
+                f"H={self.n_heads} Dh={self.head_dim} fp32 on {h.device}"
             )
         if keep is not None and keep.shape != (B, T):
             raise ValueError(f"keep must have shape [B, T]=[{B}, {T}], got {tuple(keep.shape)}")
