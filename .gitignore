@@ -6,3 +6,4 @@ checkpoints/
 weights/
 *.pt.tmp
 *.json.tmp
+data/corpus/
