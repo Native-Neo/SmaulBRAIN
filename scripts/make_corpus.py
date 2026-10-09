@@ -32,6 +32,8 @@ import os
 import sqlite3
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 
 REPO = "allenai/c4"
 CONFIG = "en"
@@ -119,16 +121,34 @@ def iter_shard_docs(path: str):
                 continue
 
 
-def download_shard(i: int, tmp_dir: str, part_dir: str | None = None):
-    """Fetch one C4 shard, resumable, without the hub client.
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
-    Rationale: huggingface_hub stalled at 0 bytes on this link (metadata /
-    redirect hangs) while raw ranged HTTPS moves. Direct resolve URL +
-    Range-resume into a .part file (kept in ``part_dir`` so restarts
-    resume mid-file), 8 MiB chunks, 60 s socket timeout, 5 tries.
-    Falls back to hf_hub_download only if direct fails throughout.
+
+def _resolve_cdn(url: str) -> str:
+    """Follow one redirect manually to the signed CDN URL (fast lane)."""
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        opener.open(urllib.request.Request(url, method="HEAD"), timeout=60)
+        return url  # no redirect
+    except urllib.error.HTTPError as e:
+        if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location"):
+            return e.headers["Location"]
+        raise
+
+
+def download_shard(i: int, tmp_dir: str, part_dir: str | None = None):
+    """Fetch one C4 shard, resumable, via the signed CDN URL.
+
+    Rationale: the /resolve/ endpoint plus the hub client stall on this
+    link, while the redirected Xet CDN host moves ~10x faster. Resolve
+    once, then ranged-GET the CDN URL with resume into a .part file
+    (kept in ``part_dir`` so restarts resume mid-file). Falls back to
+    hf_hub_download only if direct fails throughout.
     """
     import time
+    import urllib.error
     import urllib.request
     name = FILE_TEMPLATE.format(i=i)
     url = f"https://huggingface.co/datasets/{REPO}/resolve/main/{name}"
@@ -138,14 +158,18 @@ def download_shard(i: int, tmp_dir: str, part_dir: str | None = None):
     part = os.path.join(pdir, name + ".part")
     if os.path.exists(dest):
         return name, dest
+    try:
+        url = _resolve_cdn(url)
+    except Exception:
+        pass  # fall through: try the original URL directly
     have = os.path.getsize(part) if os.path.exists(part) else 0
     last_err: Exception | None = None
-    for attempt in range(5):
+    for attempt in range(12):
         try:
             req = urllib.request.Request(url)
             if have:
                 req.add_header("Range", f"bytes={have}-")
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(req, timeout=30) as r:
                 if have and r.status not in (200, 206):
                     raise IOError(f"unexpected status {r.status}")
                 if r.status == 200 and have:
