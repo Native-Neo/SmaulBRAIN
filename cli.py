@@ -74,6 +74,10 @@ ARG_TO_CONFIG = {
     "router_lr_mult": "router_lr_mult",
     "router_lr_mult_new": "router_lr_mult_new",
     "new_routing_bias": "new_routing_bias",
+    "use_byte_conv": "use_byte_conv",
+    "lookahead_weight": "lookahead_weight",
+    "boundary_weight": "boundary_weight",
+    "cosine_decay_steps": "cosine_decay_steps",
     "weight_decay": "weight_decay",
     "grad_clip": "grad_clip",
     "beta_m": "beta_m",
@@ -187,6 +191,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "overrides per-run; omitted train flag falls back to this config value.")
     p.add_argument("--max-new-experts", type=int, default=None, dest="max_new_experts",
                    help="Cap per growth event (default: 8).")
+    # --- BPB ports (all default-off; enabling changes training math) ---
+    p.add_argument("--use-byte-conv", action="store_true", default=None,
+                   help="Causal byte-n-gram conv in the trunk (default: off).")
+    p.add_argument("--lookahead-weight", type=float, default=None, dest="lookahead_weight",
+                   help="Auxiliary t+2 prediction loss weight (default: 0.0 = off).")
+    p.add_argument("--boundary-weight", type=float, default=None, dest="boundary_weight",
+                   help="Auxiliary UTF-8-boundary loss weight (default: 0.0 = off).")
+    p.add_argument("--cosine-decay-steps", type=int, default=None, dest="cosine_decay_steps",
+                   help="Cosine LR decay horizon in steps (default: 0 = constant LR).")
     p.add_argument("--ckpt", type=str, default="checkpoints/smaulbrain",
                    help="Checkpoint directory.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -266,6 +279,10 @@ def config_from_args(args: argparse.Namespace) -> SmaulBrainConfig:
         router_lr_mult=pick_cfg(getattr(args, "router_lr_mult", None), "router_lr_mult"),
         router_lr_mult_new=pick_cfg(getattr(args, "router_lr_mult_new", None), "router_lr_mult_new"),
         new_routing_bias=pick_cfg(getattr(args, "new_routing_bias", None), "new_routing_bias"),
+        use_byte_conv=pick_cfg(getattr(args, "use_byte_conv", None), "use_byte_conv"),
+        lookahead_weight=pick_cfg(getattr(args, "lookahead_weight", None), "lookahead_weight"),
+        boundary_weight=pick_cfg(getattr(args, "boundary_weight", None), "boundary_weight"),
+        cosine_decay_steps=pick_cfg(getattr(args, "cosine_decay_steps", None), "cosine_decay_steps"),
         weight_decay=pick_cfg(getattr(args, "weight_decay", None), "weight_decay"),
         grad_clip=pick_cfg(getattr(args, "grad_clip", None), "grad_clip"),
         beta_m=pick_cfg(getattr(args, "beta_m", None), "beta_m"),
