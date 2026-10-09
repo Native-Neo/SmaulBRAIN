@@ -112,7 +112,8 @@ def recombine_weights(
     generator: torch.Generator | None = None,
 ) -> dict[str, torch.Tensor]:
     """Convex combination of dequantized parent weights + seeded noise."""
-    assert parents, "need at least one parent (empty pool uses make_expert fallback)"
+    if not parents:
+        raise ValueError("need at least one parent (empty pool uses make_expert fallback)")
     missing = [eid for eid in parents if eid not in pool.experts]
     if missing:
         raise ValueError(f"unknown parents (refusing to recombine): {missing}")
@@ -122,7 +123,9 @@ def recombine_weights(
         raise ValueError(
             f"{len(weights)} weights for {len(parents)} parents (zip would truncate)"
         )
-    assert abs(sum(weights) - 1.0) < 1e-6 and all(w >= 0 for w in weights)
+    # ValueError, not assert: corrupt weights must not slip through under -O.
+    if not (abs(sum(weights) - 1.0) < 1e-6 and all(w >= 0 for w in weights)):
+        raise ValueError(f"recombine weights must be non-negative and sum to 1, got {weights}")
     out: dict[str, torch.Tensor] | None = None
     for eid, w in zip(parents, weights):
         dec = {n: dequantize_fp8_blockwise(pool.experts[eid].weights_fp8[n], torch.float32)
@@ -295,8 +298,8 @@ def grow_topk_clones(
             # Per-clone relative perturbation, uniform in [min_pct, max_pct]
             # with per-weight random signs (seeded): the parent is never
             # touched, and every clone differs from it by exactly u.
-            # (torch.empty has no generator kwarg on this build; draw via
-            # uniform_ like the signs below.)
+            # (torch.empty carries uninitialized memory and offers no
+            # generator kwarg, so values are drawn via uniform_ below.)
             u_draw = torch.empty(())
             u_draw.uniform_(0.0, 1.0, generator=gen)
             u = min_pct + (max_pct - min_pct) * u_draw.item()
