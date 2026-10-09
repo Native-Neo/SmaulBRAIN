@@ -90,11 +90,14 @@ def quantize_fp8_blockwise(w: torch.Tensor, tile: int = 64) -> FP8BlockTensor:
     # Native path is bit-exact (proven by tests/test_cpp_parity.py), so it
     # may auto-dispatch even with gradients enabled: stored bytes are
     # identical either way. It needs no padding: the kernel loops exact cols.
-    scales = torch.empty(rows, n_blocks, dtype=torch.float32)
-    codes_flat = torch.empty(rows, n_cols, dtype=torch.uint8)
-    if native.call_fp8_quant(flat, codes_flat, scales, rows, n_cols, tile):
-        codes_u8 = codes_flat.reshape(orig).clone()
-        return FP8BlockTensor(codes=codes_u8, scales=scales, shape=orig, tile=tile)
+    # Output buffers are allocated lazily: the kernel needs CPU tensors, so
+    # non-CPU inputs skip native without pointlessly allocating CPU outputs.
+    if flat.device.type == "cpu":
+        scales = torch.empty(rows, n_blocks, dtype=torch.float32)
+        codes_flat = torch.empty(rows, n_cols, dtype=torch.uint8)
+        if native.call_fp8_quant(flat, codes_flat, scales, rows, n_cols, tile):
+            codes_u8 = codes_flat.reshape(orig).clone()
+            return FP8BlockTensor(codes=codes_u8, scales=scales, shape=orig, tile=tile)
     pad = n_blocks * tile - n_cols
     if pad:
         flat = torch.cat([flat, torch.zeros(flat.shape[0], pad)], dim=1)
@@ -113,11 +116,14 @@ def dequantize_fp8_blockwise(t: FP8BlockTensor, dtype: torch.dtype = torch.float
     n_cols = t.shape[-1]
     n_blocks = t.scales.shape[-1]
     rows = t.codes.reshape(-1, n_cols).shape[0]
-    out = torch.empty(rows, n_cols, dtype=torch.float32)
     codes_2d = t.codes.reshape(-1, n_cols)
     scales_2d = t.scales.reshape(-1, n_blocks)
-    if native.call_fp8_dequant(codes_2d, scales_2d, out, rows, n_cols, t.tile):
-        return out.reshape(t.shape).to(dtype)
+    # Lazily allocated on the codes device: non-CPU storage skips the
+    # CPU-only kernel without a wasted output allocation.
+    if codes_2d.device.type == "cpu" and scales_2d.device.type == "cpu":
+        out = torch.empty(rows, n_cols, dtype=torch.float32, device=codes_2d.device)
+        if native.call_fp8_dequant(codes_2d, scales_2d, out, rows, n_cols, t.tile):
+            return out.reshape(t.shape).to(dtype)
     # Reference fallback (also used when native is disabled/unavailable).
     codes_f8 = codes_2d.contiguous().view(FP8_DTYPE)
     flat = codes_f8.to(torch.float32)
