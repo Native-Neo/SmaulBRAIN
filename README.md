@@ -339,8 +339,10 @@ Fine-tuning selectors: `--mode trunk|experts|selected|new`, with
 `--grow-every N` schedule. Training never prunes; shrink the pool offline
 with `python pruning.py --ckpt <dir> --rm-worst N`.
 
-BPB ports (all default-off; enabling changes training math):
-`--use-byte-conv` (causal depthwise n-gram conv over byte embeddings),
+BPB ports (byte-conv default-on; lookahead/boundary/cosine default-off;
+enabling any of them changes training math):
+`--use-byte-conv` / `--no-byte-conv` (causal depthwise n-gram conv over
+byte embeddings),
 `--lookahead-weight` / `--boundary-weight` (auxiliary t+2 prediction +
 UTF-8-boundary losses), `--cosine-decay-steps` (cosine LR decay horizon,
 0 = constant). Every step logs `bpb` (NLL nats/ln2 — pure compression;
