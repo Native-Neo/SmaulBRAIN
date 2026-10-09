@@ -161,6 +161,10 @@ def evaluate_loss(model, batch: torch.Tensor, context: int) -> dict:
 
     Padding (PAD_ID) is excluded from both metrics; means normalize over
     valid targets only so pad length cannot dilute the measurement.
+    Scores the inference readout (threshold-selected depth), not the
+    ponder-mixed predictor training optimizes — deliberately: retention
+    compares deployed behavior before vs. after, and both sides use this
+    same readout so the delta is apples-to-apples.
     """
     was_training = model.training
     model.eval()
@@ -400,7 +404,10 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
     return {
         "loss": float(loss.item()),
         "nll": float(out["nll"].item()),
-        "bpb": float(loss.item()) / math.log(2),
+        # True bits-per-byte: NLL (nats) / ln 2. Regularizers (ponder KL,
+        # MoE balance, lookahead, boundary) shape training but are not
+        # compression, so the optimized total loss must never pose as BPB.
+        "bpb": float(out["nll"].item()) / math.log(2),
         "ponder_kl": float(out["ponder_kl"].item()),
         "acc": float(out["acc"]),
         "mean_depth": float(out["mean_depth"]),
