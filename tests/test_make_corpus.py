@@ -66,7 +66,7 @@ def test_run_dedupes_filters_and_resumes(tmp_path, monkeypatch):
     fake = _fake_shard(tmp_path, docs)
     calls = {"n": 0}
 
-    def fake_dl(i, tmp):
+    def fake_dl(i, tmp, part_dir=None):
         calls["n"] += 1
         assert i >= 100
         return f"f{i}", fake
@@ -88,7 +88,7 @@ def test_run_dedupes_filters_and_resumes(tmp_path, monkeypatch):
 def test_run_stops_at_target_bytes(tmp_path, monkeypatch):
     import scripts.make_corpus as mc
     fake = _fake_shard(tmp_path, ["A completely ordinary english sentence with many words in it"])
-    monkeypatch.setattr(mc, "download_shard", lambda i, t: ("f", fake))
+    monkeypatch.setattr(mc, "download_shard", lambda i, t, part_dir=None: ("f", fake))
     monkeypatch.setattr(mc, "N_SHARDS", 5)
     out = str(tmp_path / "c")
     stats = run(out, 10, 10**6, start=0, min_chars=5)
