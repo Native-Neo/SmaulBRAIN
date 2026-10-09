@@ -343,7 +343,8 @@ BPB ports (all default-off; enabling changes training math):
 `--use-byte-conv` (causal depthwise n-gram conv over byte embeddings),
 `--lookahead-weight` / `--boundary-weight` (auxiliary t+2 prediction +
 UTF-8-boundary losses), `--cosine-decay-steps` (cosine LR decay horizon,
-0 = constant). Every step logs `bpb` (nats/ln2) alongside loss.
+0 = constant). Every step logs `bpb` (NLL nats/ln2 — pure compression;
+ponder/balance/aux regularizers shape training but are excluded) alongside loss.
 
 ### What is `config.py`
 
