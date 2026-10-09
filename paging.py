@@ -61,7 +61,8 @@ class ExpertPager:
         load_from_disk=None,  # (expert_id) -> ExpertRecord (real file IO)
         max_staged: int = 128,  # R2VR RAM-staging ceiling (LRU; misses re-read)
     ) -> None:
-        assert mode in ("D2R", "R2VR", "D2VR"), f"unknown paging mode {mode}"
+        if mode not in ("D2R", "R2VR", "D2VR"):
+            raise ValueError(f"unknown paging mode {mode}")
         self.pool = pool
         self.mode = mode
         self.ram_cache = ram_cache
@@ -244,7 +245,10 @@ class ExpertPager:
             old, _ = self.ram.popitem(last=False)
             self._ram_tag.pop(old, None)
             self.stats.ram_evictions += 1
-        assert len(self.vram) == 0, "D2R path must never populate VRAM"
+        # Structural invariant (ValueError, not assert: must hold under -O
+        # too): the D2R path never populates VRAM.
+        if len(self.vram) != 0:
+            raise ValueError("D2R path must never populate VRAM")
         return w
 
     def _insert_vram_locked(self, expert_id: str, w: dict, tag: tuple[int, int]) -> dict:
