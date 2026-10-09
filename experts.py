@@ -144,7 +144,8 @@ class ExpertPool:
         return eid
 
     def add(self, rec: ExpertRecord) -> int:
-        assert rec.expert_id not in self.experts, f"duplicate {rec.expert_id}"
+        if rec.expert_id in self.experts:
+            raise ValueError(f"duplicate {rec.expert_id} (refusing to overwrite)")
         self.experts[rec.expert_id] = rec
         self.order.append(rec.expert_id)
         try:
@@ -188,12 +189,26 @@ class ExpertPool:
         out = torch.zeros_like(x)
         live = ~dropped
         admitted = live.unsqueeze(-1) & (top_weights > 0)  # [N, K] actual dispatch
-        for rid in range(len(self.order)):
+        if top_ids.numel() == 0:
+            return out
+        # Only experts actually addressed by this batch dispatch: O(active),
+        # not O(pool). Router ids are pool indices (order[rid]).
+        for rid in torch.unique(top_ids).tolist():
+            if not 0 <= rid < len(self.order):
+                raise ValueError(
+                    f"router id {rid} out of range for pool of {len(self.order)} "
+                    "(pool/router out of sync; refusing to mis-dispatch)"
+                )
             mask_slot = (top_ids == rid) & admitted  # [N, K]
             if not mask_slot.any():
                 continue
             eid = self.order[rid]
             w = provider(eid)
+            # The pager caches on its own device (CPU RAM / simulated VRAM);
+            # the trunk may live elsewhere (e.g. CUDA). Follow the
+            # activations with a copy, never by mutating the cache entry.
+            if w["w_gate"].device != x.device:
+                w = {k: v.to(x.device) for k, v in w.items()}
             dtype = w["w_gate"].dtype
             rows = mask_slot.any(dim=-1)  # tokens touching this expert
             xs = x[rows].to(dtype)  # [M, D]
