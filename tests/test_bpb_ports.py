@@ -1,7 +1,8 @@
 """BPB ports (PR #72 rework): byte-conv, lookahead/boundary loss, cosine decay, BPB.
 
-All ports are default-off: with defaults the model is bit-identical to not
-having them (covered by asserting absent modules + unchanged key sets).
+Byte-conv is default-on; lookahead/boundary/cosine stay default-off: with
+those defaults the model is bit-identical to not having them (covered by
+asserting absent modules + unchanged key sets).
 """
 
 import math
@@ -63,17 +64,20 @@ def test_config_validation_and_old_checkpoint_compat():
         del d[k]  # old checkpoint without the keys
     cfg = SmaulBrainConfig.from_dict(d)
     assert (cfg.use_byte_conv, cfg.lookahead_weight,
-            cfg.boundary_weight, cfg.cosine_decay_steps) == (False, 0.0, 0.0, 0)
+            cfg.boundary_weight, cfg.cosine_decay_steps) == (True, 0.0, 0.0, 0)
 
 
-def test_default_off_absent_modules_and_keyset():
+def test_default_conv_on_and_explicit_off_keyset():
     torch.manual_seed(0)
     m = SmaulBrainModel(_cfg())
-    assert m.byte_conv is None and m.head_lookahead is None and m.head_boundary is None
+    assert m.byte_conv is not None and m.head_lookahead is None and m.head_boundary is None
     torch.manual_seed(0)
     m0 = SmaulBrainModel(_cfg(use_byte_conv=False, lookahead_weight=0.0,
                               boundary_weight=0.0, cosine_decay_steps=0))
-    assert set(m.state_dict()) == set(m0.state_dict())
+    assert m0.byte_conv is None
+    # Only the conv keys differ; every other trunk key is shared.
+    assert (set(m.state_dict()) - set(m0.state_dict())
+            == {"byte_conv.conv.weight", "byte_conv.conv.bias"})
     m.pager.close(); m0.pager.close()
 
 
@@ -108,14 +112,18 @@ def test_cosine_decay_changes_trajectory():
     assert _run(0) != _run(4)  # schedule on vs off diverges
 
 
-def test_bpb_key_equals_loss_over_ln2():
+def test_bpb_key_equals_nll_over_ln2():
     torch.manual_seed(4)
-    m = SmaulBrainModel(_cfg())
+    # Aux ports on: proves BPB is pure compression (NLL/ln2), not the
+    # regularized total loss (ponder KL + balance + lookahead + boundary
+    # shape training but are not bits per byte).
+    m = SmaulBrainModel(_cfg(lookahead_weight=0.15, boundary_weight=0.05))
     opt = SmaulOpt(SmaulOptHParams(lr=3e-2))
     xb = torch.randint(0, 256, (2, 24))
     yb = torch.randint(0, 256, (2, 24))
     st = train_step(m, opt, m.cfg, xb, yb, step=0, mode="entire")
-    assert abs(st["bpb"] - st["loss"] / math.log(2)) < 1e-9
+    assert abs(st["bpb"] - st["nll"] / math.log(2)) < 1e-9
+    assert st["loss"] > st["nll"]  # regularizers active: loss/ln2 would lie
     m.pager.close()
 
 
@@ -145,4 +153,6 @@ def test_cli_bpb_flags_map():
             cfg.cosine_decay_steps) == (0.15, 0.05, 100)
     cfg0 = config_from_args(build_parser().parse_args(["train"]))
     assert (cfg0.use_byte_conv, cfg0.lookahead_weight,
-            cfg0.boundary_weight, cfg0.cosine_decay_steps) == (False, 0.0, 0.0, 0)
+            cfg0.boundary_weight, cfg0.cosine_decay_steps) == (True, 0.0, 0.0, 0)
+    cfg_off = config_from_args(build_parser().parse_args(["--no-byte-conv", "train"]))
+    assert cfg_off.use_byte_conv is False
