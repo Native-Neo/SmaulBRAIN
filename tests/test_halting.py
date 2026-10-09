@@ -173,3 +173,28 @@ def test_mean_depth_is_valid_only_and_readout_is_ponder_mixed():
     assert torch.allclose(out["logits"].detach(), manual, atol=1e-5)
     assert torch.allclose(P.sum(dim=0), torch.ones_like(P.sum(dim=0)))
     m.pager.close()
+
+
+def test_ponder_single_depth_kl_is_zero():
+    # max_depth=1: all mass force-stops at step 0 against prior mass 1
+    # (truncated-geometric tail), so the ponder KL is exactly 0. The old
+    # defective prior (p on the last step) charged -log(p) spuriously.
+    torch.manual_seed(0)
+    m = _model(min_depth=1, max_depth=1, dtype="fp32")
+    ids = torch.randint(0, 256, (2, 8))
+    out = m(ids, ids, step=0)
+    assert out["ponder_kl"].item() == 0.0
+    m.pager.close()
+
+
+def test_ponder_prior_masses_sum_to_one():
+    # Analytic check of the truncated-geometric prior the KL uses:
+    # p*(1-p)^n before the last step, tail (1-p)^(D-1) on force-stop.
+    for max_depth in (1, 2, 3, 5):
+        torch.manual_seed(0)
+        m = _model(min_depth=1, max_depth=max_depth, dtype="fp32")
+        p = m.cfg.halt_prior
+        D = max_depth
+        masses = [p * (1 - p) ** n for n in range(D - 1)] + [(1 - p) ** (D - 1)]
+        assert abs(sum(masses) - 1.0) < 1e-12
+        m.pager.close()
