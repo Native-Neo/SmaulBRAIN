@@ -6,8 +6,10 @@ converted one file at a time (streamed through a row-block window), so a
 tensor shapes, FP8 scaling metadata, optimizer state, and manifest metadata
 are preserved; only the targeted tensors change dtype/format.
 
-Trunk conversion (``convert_trunk``) rewrites trunk.safetensors/router.safetensors
-in place within the checkpoint directory.
+Trunk conversion (``convert_checkpoint(..., to="bf16")``) rewrites
+trunk.safetensors/router.safetensors via staged sidecars with a joint
+publish (both swap only after both convert), then refreshes the manifest's
+per-file hashes so the loader's consistency check accepts the result.
 """
 
 from __future__ import annotations
@@ -186,10 +188,12 @@ def convert_checkpoint(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[d
     is untouched — FP8 trunk storage is refused per the precision policy).
     ``to="bf16"`` casts trunk.safetensors/router.safetensors to BF16 (experts stay FP8).
 
-    Transactional: every input is validated first, converted outputs land
-    in sidecar files, and the sidecars replace the originals only after all
-    conversions succeed — a failure never leaves a half-converted pool.
-    Precision metadata (manifest + config tile) updates last (commit point).
+    Transactional per path: ``to="fp8"`` validates every input first,
+    converts into a staging dir, and publishes only after all conversions
+    succeed; ``to="bf16"`` converts both dense files before either swaps
+    into place. Precision metadata (manifest + config tile) and the
+    manifest's per-file hashes update last (commit point), so a crash
+    never leaves a half-converted pool behind silently.
     Holds the checkpoint exclusive lock across staging+publish so a
     concurrent save/load cannot observe a mixed generation.
     """
@@ -262,6 +266,9 @@ def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -
     # to == "bf16": experts intentionally stay FP8; only the trunk converts.
     if to == "bf16":
         import storage as _st2
+        # Phase 1 (pure build): convert + validate every file before any
+        # publish, so a bad input cannot commit a half-converted pair.
+        converted: dict[str, dict] = {}
         for name in ("trunk.safetensors", "router.safetensors"):
             p = os.path.join(ckpt_dir, name)
             if not os.path.exists(p):
@@ -271,10 +278,34 @@ def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -
                     f"checkpoint validation failed: empty file {p}"
                 )
             obj = _checked_torch_load(p)
-            obj = {k: (v.to(torch.bfloat16) if torch.is_tensor(v) and v.is_floating_point() else v)
-                   for k, v in obj.items()}
-            _st2._atomic_save_tensors(obj, p)
+            converted[name] = {k: (v.to(torch.bfloat16) if torch.is_tensor(v) and v.is_floating_point() else v)
+                               for k, v in obj.items()}
+        # Phase 2 (joint publish): stage to sidecars, then swap both into
+        # place. A crash between the swaps can never silently yield
+        # trunk-bf16 + router-fp32: the manifest hashes refreshed below
+        # make the next load refuse the mixed pair loudly.
+        staged: list[tuple[str, str]] = []
+        try:
+            for name, obj in converted.items():
+                tmp = os.path.join(ckpt_dir, name + ".convert_tmp")
+                _st2._atomic_save_tensors(obj, tmp)
+                staged.append((tmp, os.path.join(ckpt_dir, name)))
+            for tmp, p in staged:
+                _fsync_file(tmp)
+                os.replace(tmp, p)
             _fsync_dir(ckpt_dir)
+        finally:
+            for tmp, _ in staged:
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
     manifest["precision"] = {"format": to, "fp8_tile": tile}
     _atomic_write_json(manifest, man_path)
+    # Re-hash every payload (both paths rewrite files in place): without
+    # this the loader's cross-file consistency check would refuse our own
+    # conversion on the next load.
+    import storage as _st3
+    _st3.refresh_manifest_hashes(ckpt_dir)
     return reports
