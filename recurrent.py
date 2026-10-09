@@ -69,6 +69,34 @@ class RecurrentState:
 MoeFn = Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
 
 
+class CausalByteConv(nn.Module):
+    """Causal depthwise 1D conv over byte embeddings (optional trunk stage).
+
+    Extracts local byte n-gram context (e.g. multi-byte UTF-8 prefixes)
+    before the recurrent block. Strictly causal: output[t] sees only
+    inputs[..t] (left padding, no peeking). Used only when
+    ``config.use_byte_conv`` is set; otherwise the model is bit-identical
+    to not having it. Not part of the recurrent state.
+    """
+
+    def __init__(self, d_model: int, kernel_size: int = 4):
+        super().__init__()
+        assert kernel_size >= 1, "conv kernel must be >= 1"
+        self.d_model = d_model
+        self.kernel_size = kernel_size
+        self.conv = nn.Conv1d(d_model, d_model, kernel_size,
+                              groups=d_model, padding=0, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x [B, T, D] -> same shape; output[t] depends only on x[..t]."""
+        if x.shape[1] < 1:
+            raise ValueError(f"need T >= 1, got {tuple(x.shape)}")
+        if x.shape[2] != self.d_model:
+            raise ValueError(f"width {x.shape[2]} != d_model {self.d_model}")
+        padded = F.pad(x.transpose(1, 2), (self.kernel_size - 1, 0))
+        return self.conv(padded).transpose(1, 2)
+
+
 class SharedRecurrentBlock(nn.Module):
     """The single shared block applied repeatedly by the depth loop."""
 
