@@ -119,11 +119,56 @@ def iter_shard_docs(path: str):
                 continue
 
 
-def download_shard(i: int, tmp_dir: str):
-    from huggingface_hub import hf_hub_download
+def download_shard(i: int, tmp_dir: str, part_dir: str | None = None):
+    """Fetch one C4 shard, resumable, without the hub client.
+
+    Rationale: huggingface_hub stalled at 0 bytes on this link (metadata /
+    redirect hangs) while raw ranged HTTPS moves. Direct resolve URL +
+    Range-resume into a .part file (kept in ``part_dir`` so restarts
+    resume mid-file), 8 MiB chunks, 60 s socket timeout, 5 tries.
+    Falls back to hf_hub_download only if direct fails throughout.
+    """
+    import time
+    import urllib.request
     name = FILE_TEMPLATE.format(i=i)
-    return name, hf_hub_download(REPO, filename=name, repo_type="dataset",
-                                 local_dir=tmp_dir)
+    url = f"https://huggingface.co/datasets/{REPO}/resolve/main/{name}"
+    pdir = part_dir or tmp_dir
+    os.makedirs(pdir, exist_ok=True)
+    dest = os.path.join(tmp_dir, name)
+    part = os.path.join(pdir, name + ".part")
+    if os.path.exists(dest):
+        return name, dest
+    have = os.path.getsize(part) if os.path.exists(part) else 0
+    last_err: Exception | None = None
+    for attempt in range(5):
+        try:
+            req = urllib.request.Request(url)
+            if have:
+                req.add_header("Range", f"bytes={have}-")
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if have and r.status not in (200, 206):
+                    raise IOError(f"unexpected status {r.status}")
+                if r.status == 200 and have:
+                    have = 0  # server ignored Range: restart
+                mode = "ab" if have else "wb"
+                with open(part, mode) as f:
+                    while True:
+                        chunk = r.read(1 << 23)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+            os.replace(part, dest)
+            return name, dest
+        except Exception as e:  # noqa: BLE001 - retry then fallback
+            last_err = e
+            have = os.path.getsize(part) if os.path.exists(part) else 0
+            time.sleep(2 ** attempt)
+    try:
+        from huggingface_hub import hf_hub_download
+        return name, hf_hub_download(REPO, filename=name, repo_type="dataset",
+                                     local_dir=tmp_dir)
+    except Exception:
+        raise RuntimeError(f"direct + hub download failed for {name}: {last_err}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -158,7 +203,7 @@ def run(out: str, target_bytes: int, shard_bytes: int, start: int,
                 continue
             log(f"[{i:05d}] downloading {name} ...")
             try:
-                _, path = download_shard(i, tmp_dir)
+                _, path = download_shard(i, tmp_dir, part_dir=out)
             except Exception as e:
                 log(f"[{i:05d}] download failed, skipping: {e}")
                 continue
