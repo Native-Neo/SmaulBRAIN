@@ -45,7 +45,9 @@ class SparseTopKHead(nn.Module):
                 "move the head (or input) first"
             )
         gathered = x[..., self.cols]  # [..., V, K]
-        return (gathered * self.values).sum(dim=-1)
+        # values are fp32 parameters: cast back so output dtype follows the
+        # input (dense nn.Linear parity), never silently upcasts bf16.
+        return ((gathered * self.values).sum(dim=-1)).to(x.dtype)
 
     def param_count(self) -> int:
         return self.values.nelement()
