@@ -345,26 +345,37 @@ def smaul_update(
             v = state["v"].float() * bv + ag * (1.0 - bv)
             state["v"] = v.to(_store_dtype(hparams.state_dtype))
             v_hat = v / bc2
-        else:
-            vr = state["v_row"].float() * bv + ag.mean(dim=1, keepdim=True) * (1.0 - bv)
-            vc = state["v_col"].float() * bv + ag.mean(dim=0, keepdim=True) * (1.0 - bv)
-            state["v_row"] = vr.to(_store_dtype(hparams.state_dtype))
-            state["v_col"] = vc.to(_store_dtype(hparams.state_dtype))
-            vr_hat = vr / bc2
-            vc_hat = vc / bc2
-            # Reconstruct per row-block to bound transient memory (block=256).
-            v_hat = torch.empty_like(ag)
-            for o in range(0, ag.shape[0], 256):
-                rb = vr_hat[o : o + 256]
-                denom = rb.mean().clamp_min(1e-12)
-                v_hat[o : o + 256] = (rb * vc_hat) / denom
+            state["m"] = m.to(_store_dtype(hparams.state_dtype))
+            m_hat = m / bc1
+            u = m_hat / (v_hat + hparams.eps)
+            if hparams.state_dtype != "fp32":
+                u = u.clamp(-hparams.update_clip, hparams.update_clip)
+            decay = lr * hparams.wd
+            return (w32 * (1.0 - decay) - lr * u).detach()
+        vr = state["v_row"].float() * bv + ag.mean(dim=1, keepdim=True) * (1.0 - bv)
+        vc = state["v_col"].float() * bv + ag.mean(dim=0, keepdim=True) * (1.0 - bv)
+        state["v_row"] = vr.to(_store_dtype(hparams.state_dtype))
+        state["v_col"] = vc.to(_store_dtype(hparams.state_dtype))
         state["m"] = m.to(_store_dtype(hparams.state_dtype))
+        vr_hat = vr / bc2
+        vc_hat = vc / bc2
         m_hat = m / bc1
-        u = m_hat / (v_hat + hparams.eps)
-        if hparams.state_dtype != "fp32":
-            u = u.clamp(-hparams.update_clip, hparams.update_clip)
         decay = lr * hparams.wd
-        return (w32 * (1.0 - decay) - lr * u).detach()
+        # Fused per-row-block update (block=256): u is elementwise in the
+        # reconstructed moment, so blocking over rows only partitions work —
+        # the full [R, C] moment matrix is never materialized and each
+        # element sees the identical op sequence as the unfused form.
+        new_w = torch.empty_like(w32)
+        for o in range(0, ag.shape[0], 256):
+            sl = slice(o, o + 256)
+            rb = vr_hat[sl]
+            denom = rb.mean().clamp_min(1e-12)
+            v_blk = (rb * vc_hat) / denom
+            u_blk = m_hat[sl] / (v_blk + hparams.eps)
+            if hparams.state_dtype != "fp32":
+                u_blk = u_blk.clamp(-hparams.update_clip, hparams.update_clip)
+            new_w[sl] = w32[sl] * (1.0 - decay) - lr * u_blk
+        return new_w.detach()
 
     total_rows = state["m"].shape[0] if "m" in state else w.shape[0]
     r0 = 0 if row_start is None else int(row_start)
@@ -392,24 +403,31 @@ def smaul_update(
         v_slice = state["v"][r0:r1].float() * bv + ag * (1.0 - bv)
         state["v"][r0:r1] = v_slice.to(_store_dtype(hparams.state_dtype))
         v_hat = v_slice / bc2
-    else:
-        vr_slice = state["v_row"][r0:r1].float() * bv + ag.mean(dim=1, keepdim=True) * (1.0 - bv)
-        state["v_row"][r0:r1] = vr_slice.to(_store_dtype(hparams.state_dtype))
-        vc = state["v_col"].float() * bv + ag.mean(dim=0, keepdim=True) * (1.0 - bv)
-        state["v_col"] = vc.to(_store_dtype(hparams.state_dtype))
-        vr_hat = vr_slice / bc2
-        vc_hat = vc / bc2
-        v_hat = torch.empty_like(ag)
-        for o in range(0, ag.shape[0], 256):
-            rb = vr_hat[o : o + 256]
-            denom = rb.mean().clamp_min(1e-12)
-            v_hat[o : o + 256] = (rb * vc_hat) / denom
-
-    u = m_hat / (v_hat + hparams.eps)
-    if hparams.state_dtype != "fp32":
-        u = u.clamp(-hparams.update_clip, hparams.update_clip)
+        u = m_hat / (v_hat + hparams.eps)
+        if hparams.state_dtype != "fp32":
+            u = u.clamp(-hparams.update_clip, hparams.update_clip)
+        decay = lr * hparams.wd
+        return (w32 * (1.0 - decay) - lr * u).detach()
+    vr_slice = state["v_row"][r0:r1].float() * bv + ag.mean(dim=1, keepdim=True) * (1.0 - bv)
+    state["v_row"][r0:r1] = vr_slice.to(_store_dtype(hparams.state_dtype))
+    vc = state["v_col"].float() * bv + ag.mean(dim=0, keepdim=True) * (1.0 - bv)
+    state["v_col"] = vc.to(_store_dtype(hparams.state_dtype))
+    vr_hat = vr_slice / bc2
+    vc_hat = vc / bc2
     decay = lr * hparams.wd
-    return (w32 * (1.0 - decay) - lr * u).detach()
+    # Fused per-row-block update (same elementwise math as the unfused form;
+    # no full-slice moment matrix is materialized).
+    new_slice = torch.empty_like(w32)
+    for o in range(0, ag.shape[0], 256):
+        sl = slice(o, o + 256)
+        rb = vr_hat[sl]
+        denom = rb.mean().clamp_min(1e-12)
+        v_blk = (rb * vc_hat) / denom
+        u_blk = m_hat[sl] / (v_blk + hparams.eps)
+        if hparams.state_dtype != "fp32":
+            u_blk = u_blk.clamp(-hparams.update_clip, hparams.update_clip)
+        new_slice[sl] = w32[sl] * (1.0 - decay) - lr * u_blk
+    return new_slice.detach()
 
 
 def smaul_update_range(
