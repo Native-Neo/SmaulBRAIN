@@ -104,6 +104,14 @@ class SmaulBrainConfig:
     prune_survival_steps: int = 500  # grace period before an expert may die
     prune_min_usage: float = 1e-4  # usage share below which expert is dying
     max_new_experts: int = 8  # cap per growth event (clone-top-8 strategy)
+    # --- BPB ports (all default-off; enabling changes training math) ---
+    # use_byte_conv: causal depthwise conv over byte embeddings in the trunk.
+    # lookahead_weight/boundary_weight: auxiliary t+2 CE + UTF-8-boundary BCE.
+    # cosine_decay_steps: cosine LR decay horizon (0 = constant LR).
+    use_byte_conv: bool = False
+    lookahead_weight: float = 0.0
+    boundary_weight: float = 0.0
+    cosine_decay_steps: int = 0
 
     def __post_init__(self) -> None:
         assert self.d_model % self.n_heads == 0, "d_model must split over heads"
@@ -146,6 +154,9 @@ class SmaulBrainConfig:
         assert self.prune_survival_steps >= 1, "need a positive prune grace period"
         assert self.prune_min_usage >= 0, "prune usage threshold must be non-negative"
         assert self.max_new_experts >= 1, "need at least 1 new expert per growth"
+        assert self.lookahead_weight >= 0, "lookahead weight must be non-negative"
+        assert self.boundary_weight >= 0, "boundary weight must be non-negative"
+        assert self.cosine_decay_steps >= 0, "cosine horizon must be non-negative (0 disables)"
         # active_experts is a user-facing alias for top_k; keep them in sync.
         object.__setattr__(self, "active_experts", self.top_k)
 
