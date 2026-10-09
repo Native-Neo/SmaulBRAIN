@@ -90,7 +90,7 @@ def sample_next(logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0,
                 top_p: float = 1.0, generator: torch.Generator | None = None,
                 forbidden_ids: object = None,
                 vocab_size: int | None = None) -> int:
-    """Sample one id from last-position logits [V].
+    """Sample one id from last-position logits [V] (strictly 1-D).
 
     ``forbidden_ids`` masks ids to -inf before argmax/sampling (used by
     ``generate`` to prevent PAD/BOS emission). Out-of-range entries
@@ -98,8 +98,15 @@ def sample_next(logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0,
     in-range ids can never be returned, including via greedy argmax.
     When ``vocab_size`` is given, the logits last dim must equal it
     (configured-vocabulary check, never a hard-coded 256).
+    Higher-dim inputs raise instead of guessing per-row semantics (the
+    return type is a single int; batch callers loop explicitly).
     """
     _check_sampler(temperature, top_k, top_p)
+    if logits.ndim != 1:
+        raise ValueError(
+            f"logits must be 1-D [V], got shape {tuple(logits.shape)}; "
+            "sample each row in an explicit loop"
+        )
     if vocab_size is not None:
         _check_logits(logits, int(vocab_size))
     # Clone: masking must never mutate the caller's logits tensor.
@@ -109,21 +116,14 @@ def sample_next(logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0,
             banned = list(forbidden_ids)  # type: ignore[arg-type]
         except TypeError:
             raise ValueError(f"forbidden_ids must be an iterable of ints, got {forbidden_ids!r}")
-        v = int(l.numel()) if l.ndim == 1 else int(l.shape[-1])
-        # 1-D fast path (the documented [V] shape); N-D falls back to
-        # last-dim indexing so broadcast logits still mask correctly.
-        flat = l.reshape(-1, v) if l.ndim > 1 else None
+        v = int(l.numel())
         for b in banned:
             if isinstance(b, bool) or not isinstance(b, int):
                 raise ValueError(f"forbidden id must be an int, got {b!r}")
             if 0 <= b < v:
-                if flat is None:
-                    l[b] = float("-inf")
-                else:
-                    flat[:, b] = float("-inf")
+                l[b] = float("-inf")
         # All-masked guard: sampling/argmax over all -inf is undefined.
-        check = flat if flat is not None else l.unsqueeze(0)
-        if bool((check[0] == float("-inf")).all().item()) if check.numel() else False:
+        if l.numel() and bool((l == float("-inf")).all().item()):
             raise ValueError("all logits masked by forbidden_ids; nothing left to sample")
     if temperature <= 0:
         return int(l.argmax().item())
@@ -186,6 +186,10 @@ def generate(
         raise ValueError(f"context must be positive, got {context!r}")
     if isinstance(stop_on_eos, bool) is False:
         raise ValueError(f"stop_on_eos must be a bool, got {stop_on_eos!r}")
+    if isinstance(max_new, bool) or not isinstance(max_new, int):
+        raise ValueError(f"max_new must be an int >= 0, got {max_new!r}")
+    if max_new < 0:
+        raise ValueError(f"max_new must be >= 0, got {max_new!r}")
     _check_sampler(temperature, top_k, top_p)
     vocab = int(model.cfg.vocab_size)
     if vocab < BYTE_VOCAB:
