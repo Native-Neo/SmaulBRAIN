@@ -761,3 +761,46 @@ def test_resume_config_written_with_floor_and_scheduler(tmp_path):
     assert rc["topology"]["d_model"] == m.cfg.d_model
     assert isinstance(rc.get("scheduler", {}), dict)
     m.pager.close()
+
+
+def test_hash_mismatch_refuses_silently_mixed_generation(tmp_path):
+    # Same-size single-byte flip inside trunk tensor data: header and all
+    # shapes stay valid, so only the manifest SHA-256 map can catch the
+    # mixed generation (old code loaded it silently).
+    import struct
+    d = str(tmp_path / "hash")
+    m, _ = _trained(d)
+    p = os.path.join(d, "trunk.safetensors")
+    with open(p, "r+b") as f:
+        (hlen,) = struct.unpack("<Q", f.read(8))
+        f.seek(8 + hlen + 100)
+        b = f.read(1)
+        f.seek(8 + hlen + 100)
+        f.write(bytes([b[0] ^ 0xFF]))
+    m2 = SmaulBrainModel(m.cfg)
+    with pytest.raises(ValueError):
+        load_model(d, m2, SmaulOpt(SmaulOptHParams()))
+    m.pager.close(); m2.pager.close()
+
+
+def test_load_drops_conv_for_pre_conv_checkpoint(tmp_path):
+    # New-default (conv on) model loading a conv-off checkpoint: the module
+    # must go, since strict=False silently skips the missing keys and would
+    # otherwise leave random conv weights live in forward.
+    torch.manual_seed(0)
+    cfg_off = SmaulBrainConfig(d_model=32, n_heads=4, num_experts=4, top_k=2,
+                               expert_hidden=64, max_depth=2, context_length=12,
+                               use_byte_conv=False)
+    m = SmaulBrainModel(cfg_off)
+    d = str(tmp_path / "noconv")
+    save_model(d, m, SmaulOpt(SmaulOptHParams()), step=0)
+    torch.manual_seed(1)
+    m2 = SmaulBrainModel(SmaulBrainConfig(
+        d_model=32, n_heads=4, num_experts=4, top_k=2, expert_hidden=64,
+        max_depth=2, context_length=12))
+    assert m2.byte_conv is not None
+    load_model(d, m2, SmaulOpt(SmaulOptHParams()))
+    assert m2.byte_conv is None and m2.cfg.use_byte_conv is False
+    ids = torch.randint(0, 256, (1, 8))
+    assert m2.forward_infer(ids)["logits"].shape == (1, 8, m2.cfg.vocab_size)
+    m.pager.close(); m2.pager.close()
