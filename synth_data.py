@@ -238,6 +238,15 @@ def generate_domain(label: str, topics: list[str], style: str, model: str,
     if overlap:
         log(f"dropping {len(overlap)} train/held overlapping lines")
         held = [l for l in held if l not in set(train)]
+    # Loud shortfall: a manifest certifying fewer lines than requested is a
+    # lie downstream (train/held sizes are experimental controls). Duplicate-
+    # only delivery previously broke out of the top-up loop silently.
+    if len(train) < n_train or len(held) < n_held:
+        raise RuntimeError(
+            f"generator under-delivered for {label!r}: "
+            f"train {len(train)}/{n_train}, held {len(held)}/{n_held} "
+            f"(deduplicated; retry with more topics or a higher per_call)"
+        )
     return train, held
 
 
