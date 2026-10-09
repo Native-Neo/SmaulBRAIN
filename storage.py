@@ -3,7 +3,9 @@
 Layout (``ckpt_dir/``)::
 
     config.json          architecture + precision + paging configuration
-    manifest.json        step, expert ids, usage/growth metadata (commit point)
+    manifest.json        step, expert ids, usage/growth metadata (commit point),
+                         plus a SHA-256 map of every payload file for
+                         cross-file consistency checks on load
     resume_config.json   floor (min_experts), topology, scheduler snapshot —
                          the standalone pruner reads its floor from here
     meta.json            optimizer hparams + step count, RNG python state
@@ -19,10 +21,12 @@ Layout (``ckpt_dir/``)::
 No pickle anywhere: every tensor blob is safetensors, every non-tensor is
 JSON, so checkpoints are cleanly extractable (e.g. for GGUF converters).
 
-A crash during checkpointing cannot corrupt the model: every file is written
+A crash mid-save cannot silently corrupt the model: every file is written
 to a ``tmp_`` sidecar and atomically renamed; the manifest (written last,
 also atomic) is the commit point — a loader only trusts experts listed
-there. Single experts load/save without touching the rest of the model.
+there — and its SHA-256 file map lets the loader refuse a mixed generation
+(old manifest over new payloads or vice versa) loudly instead of training
+on it. Single experts load/save without touching the rest of the model.
 
 Per-expert sidecar rule: ``save_expert_file(rec, path)`` writes tensors to
 ``path`` and JSON meta to the sidecar derived from it — ``path`` with a
@@ -34,6 +38,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import random
@@ -257,6 +262,85 @@ def _atomic_write_json(payload: dict, path: str) -> None:
             os.remove(tmp_path)
 
 
+def _sha256_file(path: str) -> str:
+    """SHA-256 of a file, streamed in 1 MiB chunks (never fully in RAM)."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError as e:
+        raise ValueError(
+            f"checkpoint validation failed: unreadable file {path}: {e}"
+        ) from e
+    return h.hexdigest()
+
+
+def _manifest_rels(expert_ids: list[str]) -> list[str]:
+    """Manifest-tracked relative paths: every file a generation consists of."""
+    rels = ["config.json", "trunk.safetensors", "router.safetensors",
+            "optim.safetensors", "rng.safetensors", "meta.json",
+            "resume_config.json"]
+    for eid in expert_ids:
+        rels.append(f"experts/{eid}.safetensors")
+        rels.append(f"experts/{eid}.json")
+    return rels
+
+
+def refresh_manifest_hashes(ckpt_dir: str) -> dict:
+    """Recompute and atomically store the manifest's per-file SHA-256 map.
+
+    Used after in-place precision conversion (quantize.py), which rewrites
+    payload files without going through save_model. Rebuilds the map from
+    the manifest's expert list so old (hash-less) checkpoints gain coverage
+    too. Raises loudly on missing/unreadable files instead of certifying
+    a partial generation.
+    """
+    manifest = load_manifest(ckpt_dir)
+    eids = manifest.get("expert_ids", [])
+    if not isinstance(eids, list) or not all(isinstance(e, str) for e in eids):
+        raise ValueError("checkpoint validation failed: bad manifest expert_ids")
+    files: dict[str, str] = {}
+    for rel in _manifest_rels(eids):
+        p = os.path.join(ckpt_dir, rel)
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"cannot hash missing checkpoint file {p}")
+        files[rel] = _sha256_file(p)
+    manifest["files"] = files
+    _atomic_write_json(manifest, os.path.join(ckpt_dir, "manifest.json"))
+    return manifest
+
+
+def _verify_manifest_hashes(ckpt_dir: str, manifest: dict) -> None:
+    """Refuse mixed/corrupt generations: every tracked file must hash-match.
+
+    A crash between per-file publishes can leave an old manifest over new
+    payloads (or vice versa); per-file atomicity alone cannot see that, but
+    the hash map can. Manifests without a ``files`` map (pre-hash
+    checkpoints) skip verification for backward compatibility.
+    """
+    files_map = manifest.get("files", {})
+    if not isinstance(files_map, dict) or not files_map:
+        return
+    for rel, want in files_map.items():
+        if not isinstance(rel, str) or not isinstance(want, str):
+            raise ValueError(
+                "checkpoint validation failed: bad manifest files map"
+            )
+        p = os.path.join(ckpt_dir, rel)
+        if not os.path.exists(p):
+            raise ValueError(
+                f"checkpoint validation failed: tracked file missing {p} "
+                "(mixed generation; refusing)"
+            )
+        got = _sha256_file(p)
+        if got != want:
+            raise ValueError(
+                f"checkpoint validation failed: {rel} hash mismatch "
+                "(mixed/corrupt generation; refusing to load)"
+            )
+
+
 def _opt_kind(st: dict) -> str:
     if "v" in st:
         return "full"
@@ -434,6 +518,13 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
     either the previous or the new complete generation. Stale generation
     dirs and tmp sidecars from a prior crash are swept before staging.
 
+    Cross-file guarantee (exact scope): each file is individually atomic
+    (tmp sidecar + fsync + rename), and the manifest carries a SHA-256 map
+    of every payload file that :func:`load_model` re-verifies — so a crash
+    *between* per-file publishes cannot silently yield a mixed generation
+    (it is refused loudly on the next load), though the interrupted save
+    itself is lost and the previous complete generation remains live.
+
     Validates before writing anything: a topology that fails validation
     raises without touching the checkpoint directory, so a previous
     complete generation is never clobbered by a partial one.
@@ -545,6 +636,16 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
                                      os.path.join(st_exp, f"{eid}.safetensors"))
                 _atomic_write_json(expert_meta(rec),
                                    os.path.join(st_exp, f"{eid}.json"))
+            # Cross-file consistency: hash every staged payload into the
+            # manifest (written next, still pre-publish). The loader
+            # re-verifies these hashes, so a crash between per-file
+            # publishes — old manifest over new payloads or vice versa —
+            # is refused loudly instead of silently training on a mixed
+            # generation. Keys use "/" separators (portable, not os.sep).
+            manifest["files"] = {
+                rel: _sha256_file(os.path.join(staging, *rel.split("/")))
+                for rel in _manifest_rels(list(model.pool.order))
+            }
             _atomic_write_json(manifest, os.path.join(staging, "manifest.json"))
             _fsync_dir(st_exp)
             _fsync_dir(staging)
@@ -861,6 +962,10 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
                  and all(_is_num(v) for v in vals), f"bad manifest {key}")
     extra = manifest.get("extra", {})
     _require(isinstance(extra, dict), "bad manifest extra")
+    # Cross-file consistency before touching anything live: a mixed
+    # generation (crash between publishes, partial quantize) fails here,
+    # never as silent wrong-moment training later.
+    _verify_manifest_hashes(ckpt_dir, manifest)
     saved_cfg.num_experts = len(eids)
 
     # ---- phase 1b: tensors (read + validate, no live mutation) ----
@@ -973,6 +1078,15 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     model.router.register_buffer("usage_counts", new_usage)
     model.router.register_buffer("admit_counts", new_admit)
     model.cfg = saved_cfg
+    # Presence follows the checkpoint: byte-conv became default-on after
+    # checkpoints without it, so a conv-built model loading a pre-conv
+    # checkpoint must drop the module (strict=False silently skipped the
+    # missing keys, leaving random weights that forward keys off the
+    # module, not the flag). The reverse direction (conv checkpoint into a
+    # conv-less model) still refuses loudly at trunk validation above.
+    if not saved_cfg.use_byte_conv and getattr(model, "byte_conv", None) is not None:
+        model.byte_conv = None
+        model._conv_hist = None
     model.pager.mode = saved_cfg.paging_method
     model.pager.ram_cache = saved_cfg.ram_cache
     model.pager.vram_cache = saved_cfg.vram_cache
