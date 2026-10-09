@@ -36,8 +36,22 @@ def encode_text(text: str) -> list[int]:
     return list(text.encode("utf-8"))
 
 
+def _reject_negative(ids: list[int], what: str) -> None:
+    """Negative ids are never valid (bytes, specials, and OOB are >= 0)."""
+    bad = [i for i in ids if i < 0]
+    if bad:
+        raise ValueError(f"{what} contains {len(bad)} negative ids (e.g. {bad[:5]})")
+
+
 def decode_bytes(ids: list[int]) -> bytes:
-    """Token ids -> bytes; special ids (>=256) are skipped (structural only)."""
+    """Token ids -> bytes; special ids (>=256) are skipped (structural only).
+
+    Negative ids raise (never valid in any vocabulary); ids >= 256 that are
+    not known specials are also skipped — without a vocabulary context an
+    out-of-range id is indistinguishable from a future structural special,
+    so callers needing strictness should range-check before decoding.
+    """
+    _reject_negative(ids, "ids")
     return bytes(i for i in ids if 0 <= i < BYTE_VOCAB)
 
 
@@ -71,6 +85,7 @@ class IncrementalByteDecoder:
         self._dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
     def feed(self, ids: list[int]) -> str:
+        _reject_negative(ids, "ids")
         raw = bytes(i for i in ids if 0 <= i < BYTE_VOCAB)
         return self._dec.decode(raw, final=False)
 
