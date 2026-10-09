@@ -609,6 +609,26 @@ together, highest index first, keeping checkpoints index-consistent; the
 checkpoint is re-saved in place, still resumable (scheduler snapshot and
 RNG state preserved, so training continues on the next global step).
 
+### What is `synth_data.py`
+
+Synthetic training-text generator with no API keys and no paid models.
+It shells out to the local `opencode run` CLI using only OpenCode Zen
+**free** models (`--model`, default `big-pickle`; anything not on the free
+allowlist is refused — see `--list-models`). First authenticate once with
+`opencode auth login` (pick Zen). Built-in `--preset AB` generates two
+disjoint everyday domains (syslog lines vs cooking steps) as
+`<name>_train.txt` / `<name>_held.txt` plus a `manifest.json` with hashes;
+train/held splits are value-disjoint by construction (disjoint topic pools,
+dedup, overlap dropped loudly). Feed the files to training
+(`cli.py --data ...`) or the gauntlet
+(`retention_harness.py --data-a ... --data-b ...`).
+
+```bash
+python synth_data.py --list-models
+python synth_data.py --preset AB --model big-pickle --out data/ab
+python retention_harness.py --data-a data/ab/domainA_train.txt --data-b data/ab/domainB_train.txt
+```
+
 ### What is `quantize.py`
 
 Checkpoint conversion without full-model residency. `convert_expert_file`

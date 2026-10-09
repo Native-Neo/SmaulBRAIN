@@ -39,6 +39,7 @@ import argparse
 import math
 import os
 import random
+import sys
 import tempfile
 import time
 
@@ -143,11 +144,52 @@ def eval_heldout(model, seqs: list[list[int]], context: int) -> dict:
     return evaluate_loss(model, b, context)
 
 
+def load_text_domain(path: str, length: int) -> tuple[list[list[int]], list[list[int]]]:
+    """Load a synth_data text file as (train, held) byte-id seqs.
+
+    Lines split deterministically 80/20 (first lines train, rest held);
+    any held line identical to a train line is dropped with a stderr note
+    (line identity is the sample unit for text — see below). Each line is
+    UTF-8 encoded and chunked into non-overlapping ``length`` windows that
+    never cross line boundaries (no training on cross-sample
+    concatenations); ragged tails dropped, empty lines skipped.
+
+    Note on disjointness: for text, boilerplate substrings (e.g. shared
+    phrasing) legitimately recur across samples, so the strict window-value
+    gate used for the built-in byte-range domains would reject honest data.
+    Here the gate is line identity (no shared full samples), which
+    synth_data guarantees by construction (dedup + disjoint topic halves).
+    """
+    with open(path, encoding="utf-8") as f:
+        lines = [l for l in (s.strip() for s in f) if l]
+    if len(lines) < 5:
+        raise ValueError(f"need >= 5 non-empty lines in {path}, got {len(lines)}")
+    cut = max(1, (len(lines) * 4) // 5)
+    train_lines, held_lines = lines[:cut], lines[cut:]
+    dupes = set(held_lines) & set(train_lines)
+    if dupes:
+        print(f"note: dropping {len(dupes)} held lines identical to train lines in {path}",
+              file=sys.stderr)
+        held_lines = [l for l in held_lines if l not in dupes]
+    out: list[list[list[int]]] = []
+    for part in (train_lines, held_lines):
+        seqs: list[list[int]] = []
+        for line in part:
+            ids = list(line.encode("utf-8"))
+            seqs.extend(ids[i:i + length] for i in range(0, len(ids) - length + 1, length))
+        seqs = [s for s in seqs if len(s) == length]
+        if not seqs:
+            raise ValueError(f"lines in {path} too short for a {length}-window split")
+        out.append(seqs)
+    return out[0], out[1]
+
+
 def run_once(seed: int = DEF_SEED, steps_a: int = DEF_STEPS_A,
              steps_b: int = DEF_STEPS_B, batch: int = DEF_BATCH,
              grow_n: int = DEF_GROW_N,
              train_n: int = DEF_TRAIN_N, held_n: int = DEF_HELD_N,
-             context: int = DEF_CONTEXT) -> dict:
+             context: int = DEF_CONTEXT,
+             data_a: str | None = None, data_b: str | None = None) -> dict:
     """Execute the full A -> B-new / B-entire pipeline once. Deterministic."""
     # Fixed seeds everywhere; single thread for bitwise determinism.
     random.seed(seed)
@@ -156,18 +198,32 @@ def run_once(seed: int = DEF_SEED, steps_a: int = DEF_STEPS_A,
     torch.use_deterministic_algorithms(False)  # CPU ops already deterministic w/ 1 thread
 
     ctx = context
-    train_A = gen_domain_A(train_n, ctx + 1, seed=1000 + seed,
-                           allowed_offsets=TRAIN_OFFSETS)
-    held_A = gen_domain_A(held_n, ctx + 1, seed=1001 + seed,
-                          allowed_offsets=HELD_OFFSETS)
-    train_B = gen_domain_B(train_n, ctx + 1, seed=2000 + seed,
-                           allowed_offsets=TRAIN_OFFSETS)
-    held_B = gen_domain_B(held_n, ctx + 1, seed=2001 + seed,
-                          allowed_offsets=HELD_OFFSETS)
+    if data_a is None:
+        train_A = gen_domain_A(train_n, ctx + 1, seed=1000 + seed,
+                               allowed_offsets=TRAIN_OFFSETS)
+        held_A = gen_domain_A(held_n, ctx + 1, seed=1001 + seed,
+                              allowed_offsets=HELD_OFFSETS)
+    else:
+        train_A, held_A = load_text_domain(data_a, ctx + 1)
+    if data_b is None:
+        train_B = gen_domain_B(train_n, ctx + 1, seed=2000 + seed,
+                               allowed_offsets=TRAIN_OFFSETS)
+        held_B = gen_domain_B(held_n, ctx + 1, seed=2001 + seed,
+                              allowed_offsets=HELD_OFFSETS)
+    else:
+        train_B, held_B = load_text_domain(data_b, ctx + 1)
 
-    # Value-disjointness gate: held-out must share no sequence value with train.
-    trA_pool, heA_pool, interA = assert_value_disjoint(train_A, held_A, "A")
-    trB_pool, heB_pool, interB = assert_value_disjoint(train_B, held_B, "B")
+    # Value-disjointness gate for the built-in byte-range domains: held-out
+    # must share no sequence value with train (there the window IS the
+    # sample). File domains gate on line identity inside load_text_domain.
+    if data_a is None:
+        trA_pool, heA_pool, interA = assert_value_disjoint(train_A, held_A, "A")
+    else:
+        trA_pool, heA_pool, interA = (len(train_A), len(held_A), 0)
+    if data_b is None:
+        trB_pool, heB_pool, interB = assert_value_disjoint(train_B, held_B, "B")
+    else:
+        trB_pool, heB_pool, interB = (len(train_B), len(held_B), 0)
 
     train_kw = dict(batch_size=batch, grow_every=0, grow_loss_below=-1.0,
                     seed=seed, log_fn=lambda s: None)
@@ -320,13 +376,24 @@ def main(argv: list[str] | None = None) -> int:
                     help="Staged new experts grown on ckpt_A before mode=new B training.")
     ap.add_argument("--mode", type=str, default="both", choices=["both", "new", "entire"],
                     help="Which B branch(es) to run; default both (new + entire control).")
+    ap.add_argument("--data-a", type=str, default=None,
+                    help="Text file for domain A (one sample per line; "
+                         "first 80%% lines train, rest held-out). "
+                         "Omitted: built-in byte-range domain.")
+    ap.add_argument("--data-b", type=str, default=None,
+                    help="Text file for domain B (same split rule). "
+                         "Use synth_data.py to generate Zen-model text.")
     args = ap.parse_args(argv)
 
     print("== retention_harness.py ==")
     print(f"config: seed={args.seed} steps_a={args.steps_a} steps_b={args.steps_b} "
           f"batch={args.batch} grow_experts={args.grow_experts} mode={args.mode}")
-    print("domains: A=bytes 0..15 ascending, B=bytes 240..255 ascending (disjoint ranges, same +1 structure)")
-    print("split: train offsets 0..7, held-out offsets 8..15 (value-disjoint per domain; asserted in-script)")
+    print("domains: A=bytes 0..15 ascending, B=bytes 240..255 ascending (disjoint ranges, same +1 structure)"
+          if args.data_a is None and args.data_b is None else
+          f"domains: A={args.data_a} B={args.data_b} (UTF-8 text files, 80/20 line split)")
+    print("split: train offsets 0..7, held-out offsets 8..15 (value-disjoint per domain; asserted in-script)"
+          if args.data_a is None and args.data_b is None else
+          "split: text lines 80/20 per file, per-line windows (line-identity gate; asserted in-script)")
     print("model: d_model=32 n_heads=4 experts=4->+%d top_k=2 hidden=32 depth=2 ctx=16 lr=3e-2 fp32" % args.grow_experts)
     print("metric: evaluate_loss returns mean NLL in nats/byte "
           "(torch cross_entropy, natural log, PAD-masked); BPB = nats / ln(2).")
@@ -337,11 +404,13 @@ def main(argv: list[str] | None = None) -> int:
 
     t0 = time.perf_counter()
     r1 = run_once(seed=args.seed, steps_a=args.steps_a, steps_b=args.steps_b,
-                  batch=args.batch, grow_n=args.grow_experts)
+                  batch=args.batch, grow_n=args.grow_experts,
+                  data_a=args.data_a, data_b=args.data_b)
     t1 = time.perf_counter()
     # Determinism self-check: whole harness back-to-back must reproduce.
     r2 = run_once(seed=args.seed, steps_a=args.steps_a, steps_b=args.steps_b,
-                  batch=args.batch, grow_n=args.grow_experts)
+                  batch=args.batch, grow_n=args.grow_experts,
+                  data_a=args.data_a, data_b=args.data_b)
     t2 = time.perf_counter()
 
     ok, why = results_equal(r1, r2)

@@ -1,0 +1,33 @@
+{
+  "model": "opencode/big-pickle",
+  "preset": "AB",
+  "seed": 0,
+  "domains": {
+    "domainA": {
+      "label": "syslogs",
+      "train": {
+        "path": "data/ab/domainA_train.txt",
+        "lines": 64,
+        "sha256": "c6883350367e6c447f16bff0de2b3e3fba652902e64bb770af7de235f0ff8191"
+      },
+      "held": {
+        "path": "data/ab/domainA_held.txt",
+        "lines": 16,
+        "sha256": "da224ef5319a4457d946f0bd0619016d270d50cf828a489e9a52ebf852bc9d8e"
+      }
+    },
+    "domainB": {
+      "label": "recipes",
+      "train": {
+        "path": "data/ab/domainB_train.txt",
+        "lines": 64,
+        "sha256": "61c136c915d08091913dc782aaa5be72b68d3ab29ece70b90a8aa5f249d8b5bc"
+      },
+      "held": {
+        "path": "data/ab/domainB_held.txt",
+        "lines": 16,
+        "sha256": "f71e67920667926cb330a992a399f7bfad00609c6c1ce29b53e2fcc389328380"
+      }
+    }
+  }
+}

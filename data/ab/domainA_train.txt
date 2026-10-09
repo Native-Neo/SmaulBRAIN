@@ -1,0 +1,64 @@
+Oct 09 12:00:01 db01 postgres[2231]: LOG: duration: 5234.123 ms statement: SELECT * FROM orders
+Oct 09 12:00:07 db02 postgres[8812]: WARNING: slow query 3120.550 ms execute <unnamed>: UPDATE accounts SET bal=$1
+Oct 09 12:00:13 db01 postgres[2231]: LOG: duration: 9876.010 ms statement: SELECT count(*) FROM events
+Oct 09 12:00:19 db03 postgres[4410]: LOG: duration: 4112.770 ms statement: DELETE FROM sessions WHERE stale
+Oct 09 12:00:25 db02 postgres[8813]: WARNING: long-running query 6001.220 ms user=app db=shop
+Oct 09 12:00:31 db01 postgres[2232]: LOG: duration: 2577.900 ms statement: INSERT INTO audit_log SELECT *
+Oct 09 12:00:38 db04 postgres[9910]: LOG: duration: 15400.660 ms statement: VACUUM ANALYZE big_table
+Oct 09 12:00:44 db03 postgres[4411]: WARNING: query exceeded 5s: 5123.880 ms statement: SELECT pg_sleep
+Oct 09 03:14:22 db-node-01 smartd[1204]: Device /dev/sda FAILED SMART health status, backup now
+Oct 09 03:15:07 db-node-01 kernel: [1204.55] ata1.00: SMART error, reallocated sector count rising
+Oct 09 03:16:41 app-srv-07 smartd[3388]: Device: /dev/nvme0n1, 3 Currently unreadable pending sectors
+Oct 09 03:17:58 app-srv-07 smartd[3388]: Device: /dev/nvme0n1, SMART Usage Attribute now 92 percent
+Oct 09 03:19:12 fs-node-42 smartd[2210]: Device /dev/sdb, 18 currently unreadable offline uncorrectable sectors
+Oct 09 03:20:33 fs-node-42 kernel: [9981.02] sd 2:0:0:0: rejecting I/O to offline device
+Oct 09 03:22:04 backup-01 smartd[775]: Device /dev/sdc FAILED SMART self-test, drive temperature 63 C
+Oct 09 03:23:49 backup-01 kernel: [44210.7] blk_update_request: critical medium error dev sdc sector 9182736
+Oct  9 14:05:01 web01 nginx[4121]: nginx access spikes: 820 req/s
+Oct  9 14:09:22 lb01 nginx[4234]: access spikes: geo surge to EU
+Oct  9 14:13:43 cdn01 nginx[4345]: nginx access spikes: 960 req/s
+Oct  9 14:17:14 api01 nginx[4456]: access spikes: auth burst
+Oct  9 14:21:36 proxy01 nginx[4567]: nginx access spikes: bot traffic
+Oct  9 14:25:51 edge01 nginx[4678]: access spikes: 1024 req/s
+Oct  9 14:29:27 img01 nginx[4789]: nginx access spikes: asset flood
+Oct  9 14:33:08 cache01 nginx[4890]: access spikes: 2x API surge
+Oct  9 03:14:22 node07 kernel: [ 8842.11] kernel BUG at mm/slub.c:4127!
+Oct  9 03:14:23 node07 kernel: [ 8842.12] PID 4192 comm swapper/3 RIP: 0010:kmem_cache_alloc+0x1a2
+Oct  9 03:14:24 db01 kernel: [ 9910.44] Unable to handle kernel paging request at ffff9c1a
+Oct  9 03:14:25 db01 kernel: [ 9910.45] Oops: 0002 [#1] SMP PTI, CPU 5 PID 7712 comm nginx
+Oct  9 03:14:26 web03 kernel: [ 3021.77] Call Trace: <TASK> alloc_pages+0x91/0x120
+Oct  9 03:14:27 web03 kernel: [ 3021.78] RIP: 0010:__alloc_pages_nodemask+0x1c4/0x2b0
+Oct  9 03:14:28 api02 kernel: [ 6650.03] general protection fault, probably for non-canonical addr
+Oct  9 03:14:29 api02 kernel: [ 6650.04] Code: 48 8b 04 25 00 00 00 00 89 04 25 00 00 00 00 <crash>
+Oct  9 03:11:22 db-node-05 postgres[4821]: LOG: duration: 4321.987 ms statement: SELECT pg_sleep
+Oct  9 03:14:07 db-node-05 postgres[4833]: WARNING: slow query 2876.441 ms: UPDATE orders SET status
+Oct  9 03:18:55 db-node-06 postgres[5104]: LOG: duration: 5120.334 ms SELECT count(*) FROM events
+Oct  9 03:22:13 db-node-06 postgres[5119]: LOG: checkpoint slow query 1988.221 ms: INSERT INTO audit
+Oct  9 03:27:48 db-node-07 postgres[6042]: WARNING: duration 6742.019 ms: VACUUM ANALYZE big_table
+Oct  9 03:31:02 db-node-07 postgres[6061]: LOG: duration: 901.556 ms statement: DELETE FROM sessions WHERE
+Oct  9 03:35:29 db-node-08 postgres[7205]: LOG: slow query duration: 3450.778 ms: SELECT * FROM ledger
+Oct  9 03:40:44 db-node-08 postgres[7230]: WARNING: duration: 2210.913 ms statement: REINDEX INDEX ix_user
+Oct  9 14:02:11 db-node07 smartd[2841]: Device /dev/sdc SMART warning: Reallocated_Sector_Ct 48
+Oct  9 14:02:13 db-node07 kernel[0]: sd 4:0:0:0 [sdc] FAILED Result: hostbyte=DID_OK driverbyte=DRIVER_SENSE
+Oct  9 14:03:04 web-srv12 smartd[9902]: Device /dev/nvme0n1: Critical temperature 71C exceeds threshold
+Oct  9 14:03:45 cache-01 smartd[3321]: /dev/sdb Current_Pending_Sector raw 16 rising, backup advised
+Oct  9 14:04:19 cache-01 kernel[0]: blk_update_request: I/O error, dev sdb, sector 2048912 op WRITE
+Oct  9 14:05:02 store-04 smartd[1120]: Device /dev/sda SMART Self-test failed, read failure LBA 771200
+Oct  9 14:05:58 store-04 mdadm[4477]: FailSpare: sda1 marked faulty, array degraded, rebuilding on spare
+Oct  9 14:06:31 loghost smartd[7789]: Device /dev/sdd SMART Prefailure: spin retry count 5, replace disk
+Oct  9 03:14:22 srv-db01 smartd[2211]: Device /dev/sda FAILED SMART health, attribute 5 = 43
+Oct  9 03:15:07 srv-db01 kernel: ata1.00: exception Emask 0x0 SAct 0x0 SErr 0x0 action 0x6
+Oct  9 03:16:41 srv-db01 smartd[2211]: /dev/sda reallocated sector count worsening, now 128
+Oct  9 03:18:33 srv-db01 smartd[2211]: Warning: /dev/sda pending sector count 16 above threshold
+Oct  9 03:19:58 srv-db01 kernel: sda: Current: sense key: Medium Error Additional sense: Unrecovered read error
+Oct  9 03:22:10 srv-db01 smartd[2211]: Offline data collection completed, self-test FAILED on /dev/sda
+Oct  9 03:25:44 srv-db01 smartd[2211]: Device /dev/sdb SMART error log reports 3 uncorrectable errors
+Oct  9 03:27:19 srv-db01 systemd[1]: Detected failing disk /dev/sda, backup recommended before write
+Oct 09 14:01:02 web01 nginx[2041]: access spike detected rps=1200 zone=frontend
+Oct 09 14:02:15 web01 nginx[2041]: upstream latency rising p95=820ms backend=api
+Oct 09 14:03:44 web02 nginx[3120]: worker_connections 1024/1024 exhausted accept queue full
+Oct 09 14:04:09 web02 nginx[3120]: 503 rate exceeded client=198.51.100.7 uri=/checkout
+Oct 09 14:05:31 web03 nginx[987]: access log growth 480MB/min disk=tmpfs warning
+Oct 09 14:06:52 web03 nginx[987]: upstream timed out 30s while reading response from 10.0.4.9:8080
+Oct 09 14:07:18 lb01 haproxy[4410]: backend web01 down health check failed conn refused
+Oct 09 14:08:40 lb01 haproxy[4410]: traffic shifted 37% to web02 web03 after failover event
