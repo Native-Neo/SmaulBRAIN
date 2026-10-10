@@ -323,6 +323,34 @@ def _verify_manifest_hashes(ckpt_dir: str, manifest: dict) -> None:
     """
     files_map = manifest.get("files", {})
     if not isinstance(files_map, dict) or not files_map:
+        # Hash-less (pre-hash) checkpoints: no silent skip. Verify every
+        # tracked payload exists and is non-empty so truncated/missing files
+        # still refuse loudly; bit-flips without hashes remain a known
+        # limitation (use refresh_manifest_hashes to gain coverage).
+        import warnings as _warnings
+        _warnings.warn(
+            "manifest has no files hash map; verifying existence/size only "
+            "(run refresh_manifest_hashes to gain hash coverage)",
+            RuntimeWarning, stacklevel=2,
+        )
+        eids = manifest.get("expert_ids", [])
+        if isinstance(eids, list):
+            for rel in _manifest_rels([e for e in eids if isinstance(e, str)]):
+                p = _jailed_path(ckpt_dir, rel)
+                if not os.path.exists(p):
+                    raise ValueError(
+                        f"checkpoint validation failed: tracked file missing {p} "
+                        "(mixed generation; refusing)"
+                    )
+                try:
+                    if os.stat(p).st_size == 0:
+                        raise ValueError(
+                            f"checkpoint validation failed: empty file {p}"
+                        )
+                except OSError as e:
+                    raise ValueError(
+                        f"checkpoint validation failed: unreadable file {p}: {e}"
+                    ) from e
         return
     for rel, want in files_map.items():
         if not isinstance(rel, str) or not isinstance(want, str):
