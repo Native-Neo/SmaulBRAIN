@@ -747,6 +747,35 @@ def _require(cond: bool, msg: str) -> None:
         raise ValueError(f"checkpoint validation failed: {msg}")
 
 
+def _require_eid(eid: str) -> None:
+    """Reject expert ids that could escape the checkpoint jail.
+
+    Ids become path segments (experts/<id>.safetensors/.json), so they must
+    be plain names: no slashes, no absolute paths, no dot segments, no NUL.
+    """
+    _require(isinstance(eid, str) and eid != "", f"bad expert id {eid!r}")
+    _require("\x00" not in eid, f"bad expert id {eid!r}")
+    _require(not os.path.isabs(eid), f"bad expert id {eid!r}")
+    _require("/" not in eid and "\\" not in eid, f"bad expert id {eid!r}")
+    _require(eid not in (".", "..") and not eid.startswith("."),
+             f"bad expert id {eid!r}")
+
+
+def _jailed_path(ckpt_dir: str, rel: str) -> str:
+    """Join rel under ckpt_dir and refuse jail escapes (.., absolute, symlink).
+
+    Returns the absolute jailed path. Raises ValueError on traversal.
+    """
+    _require(isinstance(rel, str) and rel != "" and "\x00" not in rel,
+             f"bad checkpoint rel {rel!r}")
+    _require(not os.path.isabs(rel), f"bad checkpoint rel {rel!r}")
+    base = os.path.abspath(ckpt_dir)
+    p = os.path.abspath(os.path.join(ckpt_dir, rel))
+    _require(p == base or p.startswith(base + os.sep),
+             f"checkpoint path escapes dir: {rel!r}")
+    return p
+
+
 def _is_num(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool)
 
