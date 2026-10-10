@@ -738,6 +738,8 @@ def load_resume_config(ckpt_dir: str) -> dict:
 def make_disk_loader(ckpt_dir: str):
     """Pager loader reading single expert files (no full-model load)."""
     def load(expert_id: str) -> ExpertRecord:
+        _require_eid(expert_id)
+        _jailed_path(ckpt_dir, f"experts/{expert_id}.safetensors")
         return load_expert_file(os.path.join(ckpt_dir, "experts", f"{expert_id}.safetensors"))
     return load
 
