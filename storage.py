@@ -327,7 +327,7 @@ def _verify_manifest_hashes(ckpt_dir: str, manifest: dict) -> None:
             raise ValueError(
                 "checkpoint validation failed: bad manifest files map"
             )
-        p = os.path.join(ckpt_dir, rel)
+        p = _jailed_path(ckpt_dir, rel)
         if not os.path.exists(p):
             raise ValueError(
                 f"checkpoint validation failed: tracked file missing {p} "
