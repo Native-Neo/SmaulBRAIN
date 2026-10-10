@@ -392,9 +392,12 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
             # grad_scale stays 1.0: routing weights, ponder mass, and repeated
             # depth applications already scale these grads through autograd;
             # any manual factor here would double-count them.
-            opt.step_expert(rec, compute, 1.0, cfg.expert_lr * lr_scale)
-            model.pager.invalidate(eid)
-            stepped.append(eid)
+            activity = opt.step_expert(rec, compute, 1.0, cfg.expert_lr * lr_scale)
+            # Skipped updates (non-finite grads -> activity 0.0, no weight
+            # change) must not pose as stepped nor evict good cache entries.
+            if activity != 0.0:
+                model.pager.invalidate(eid)
+                stepped.append(eid)
         # Global optimizer steps: exactly one per train_step call, including
         # steps whose updates were skipped (see skipped-step semantics). The
         # per-tensor bias corrections use each tensor's own step counter.
