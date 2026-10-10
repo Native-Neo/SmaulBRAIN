@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 *.pyo
+*.o
+*.so
 .pytest_cache/
 checkpoints/
 weights/
