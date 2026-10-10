@@ -140,6 +140,13 @@ def linear_attn_forward(
             RuntimeWarning, stacklevel=2,
         )
     B, H, T, Dh = q.shape
+    # Cube transient is B*H*Tc*Dh^2*4B (x2 with prefix_S): refuse absurd Dh
+    # before allocating hundreds of MB per chunk.
+    if B * H * min(chunk_size, max(T, 1)) * Dh * Dh * 4 > 256 * 1024 * 1024:
+        raise ValueError(
+            f"linear-attention working set B={B} H={H} Tc={min(chunk_size, max(T, 1))} "
+            f"Dh={Dh} exceeds 256MB cube budget (reduce chunk_size or Dh)"
+        )
     if state is None:
         state = LinearAttnState.zeros(B, H, Dh, device=q.device)
     if not state.matches(B, H, Dh, q.device):
