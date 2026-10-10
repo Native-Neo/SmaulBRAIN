@@ -300,6 +300,8 @@ def refresh_manifest_hashes(ckpt_dir: str) -> dict:
     eids = manifest.get("expert_ids", [])
     if not isinstance(eids, list) or not all(isinstance(e, str) for e in eids):
         raise ValueError("checkpoint validation failed: bad manifest expert_ids")
+    for eid in eids:
+        _require_eid(eid)
     files: dict[str, str] = {}
     for rel in _manifest_rels(eids):
         p = os.path.join(ckpt_dir, rel)
