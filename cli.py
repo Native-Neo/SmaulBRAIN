@@ -466,8 +466,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "train":
         from train import run_training
         if args.data and os.path.exists(args.data):
+            try:
+                if os.stat(args.data).st_size > 64 * 1024 * 1024:
+                    print("error: --data file exceeds 64MB cap", file=sys.stderr)
+                    return 2
+            except OSError as e:
+                print(f"error: unreadable --data file: {e}", file=sys.stderr)
+                return 2
             with open(args.data, "rb") as f:
-                raw = f.read()
+                raw = f.read(64 * 1024 * 1024 + 1)
             seqs = [list(raw[i:i + cfg.context_length + 1])
                     for i in range(0, len(raw) - 1, cfg.context_length + 1)][:512] or _demo_seqs()
         else:
