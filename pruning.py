@@ -207,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
     from config import SmaulBrainConfig
     from model import SmaulBrainModel
     from smaulopt import SmaulOpt
-    from storage import load_manifest, load_model, load_resume_config, save_model
+    from storage import load_model, load_resume_config, save_model
 
     args = build_parser().parse_args(argv)
     if args.rm_worst < 0:
