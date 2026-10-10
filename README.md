@@ -801,6 +801,43 @@ res = run_training(model, opt, cfg, train_seqs, steps=20, batch_size=2,
 print(res["final_loss"], res["retention"])  # retention measured, not claimed
 ```
 
+### What is `native.py`
+
+Optional native toolchain: probes CPU features, compiles the C++ kernels in
+`kernels_cpp/` (`rmsnorm.cpp`, `linear_attn.cpp`, `fp8_quant.cpp`) with the
+system `g++`, verifies the ISA baseline via `objdump`, and `dlopen`s the
+result for bit-exact parity with the PyTorch paths. Disabled with
+`SMAUL_NATIVE=off`; every path falls back to pure PyTorch when the toolchain
+is missing.
+
+### What is `hybrid_fp8.py`
+
+Study-only module (not wired into the default path): simulates E4M3-forward /
+E5M2-backward mixed precision through real FP8 code points, with FP32 masters
+and accumulators. Covered by `tests/test_hybrid_fp8.py`; the production path
+uses `precision.py` FP8 storage + FP32 compute instead.
+
+### What is `retention_harness.py`
+
+Standalone A/B continual-learning gauntlet (not imported by training):
+trains on domain A, then domain B, and reports old/new loss deltas with a
+`retained` heuristic. Feed it the `synth_data.py` outputs:
+
+```bash
+python retention_harness.py --data-a data/ab/domainA_train.txt --data-b data/ab/domainB_train.txt
+```
+
+### What is `scripts/make_corpus.py`
+
+C4-download corpus builder (unpinned `huggingface_hub` fallback is optional):
+downloads shards, dedups via SQLite WAL, and writes training text. Distinct
+from `synth_data.py` (local free-model generator); use one or the other.
+
+### What is `benchmarks/bench.py`
+
+Tiny-config throughput harness: reports train tok/s, infer tok/s, and the
+BF16-vs-FP32 expert compute comparison on the current host.
+
 ## License
 
 SmaulBRAIN is distributed under the **PolyForm Noncommercial License 1.0.0**.
