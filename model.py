@@ -239,9 +239,9 @@ class SmaulBrainModel(nn.Module):
         """Fail loudly on out-of-vocabulary ids (never a cryptic IndexError)."""
         if ids.numel() == 0:
             return
-        # Single amax/amin pass: one host sync instead of min()+max().
-        lo = int(ids.amin().item())
-        hi = int(ids.amax().item())
+        # Single aminmax pass: one kernel + one sync instead of two.
+        mn, mx = torch.aminmax(ids)
+        lo, hi = int(mn.item()), int(mx.item())
         if not 0 <= lo or hi >= self.cfg.vocab_size:
             raise ValueError(
                 f"{what} has ids outside [0, {self.cfg.vocab_size}) "
