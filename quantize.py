@@ -197,7 +197,7 @@ def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -
                 raise ValueError(
                     f"checkpoint validation failed: empty file {p}"
                 )
-            obj = _checked_torch_load(p)
+            obj = _checked_sf_load(p)
             converted[name] = {k: (v.to(torch.bfloat16) if torch.is_tensor(v) and v.is_floating_point() else v)
                                for k, v in obj.items()}
         # Phase 2 (joint publish): stage to sidecars, then swap both into
