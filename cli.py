@@ -412,7 +412,16 @@ def main(argv: list[str] | None = None) -> int:
     from storage import load_model, save_model
 
     args = build_parser().parse_args(argv)
-    cli_cfg = config_from_args(args)
+    try:
+        args.ckpt = _safe_ckpt_dir(args.ckpt)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    try:
+        cli_cfg = config_from_args(args)
+    except (AssertionError, ValueError) as e:
+        print(f"error: invalid config: {e}", file=sys.stderr)
+        return 2
 
     if args.cmd == "quantize":
         from quantize import convert_checkpoint
