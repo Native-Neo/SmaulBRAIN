@@ -429,6 +429,11 @@ class SmaulBrainModel(nn.Module):
         memory stays at one [B, T, H] output plus one depth slice at a
         time instead of holding the full duplicated stack.
         """
+        if int(depths.min().item()) < 1 or int(depths.max().item()) > len(hs):
+            raise ValueError(
+                f"depths out of range [1, {len(hs)}] "
+                f"(min={int(depths.min().item())}, max={int(depths.max().item())})"
+            )
         out = torch.zeros_like(hs[0])
         for n, h_n in enumerate(hs):
             mask = (depths == (n + 1)).unsqueeze(-1)
