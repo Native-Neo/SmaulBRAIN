@@ -107,7 +107,11 @@ class SmaulBrainModel(nn.Module):
             y = self.pool.forward(x, plan.top_ids, plan.top_weights,
                                   plan.dropped, prov, step=step)
             # Balance over scored positions only: padding must not dilute it.
-            aux = self.router.balance_loss(plan.probs, keep=keep)
+            # Skip the O(N*E) one-hot when the weight is 0 (no gradient path).
+            if self.cfg.moe_balance_weight == 0.0:
+                aux = plan.probs.new_zeros(())
+            else:
+                aux = self.router.balance_loss(plan.probs, keep=keep)
             return y, aux, plan.top_ids
         return fn
 
