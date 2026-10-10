@@ -395,7 +395,7 @@ class SmaulBrainModel(nn.Module):
             raise
 
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward_infer(self, ids: torch.Tensor, step: int = 0) -> dict:
         """Inference forward: fixed-state recurrent pass with token-depth selection."""
         self._check_ids(ids, "ids")
