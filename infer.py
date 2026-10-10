@@ -53,6 +53,12 @@ DEFAULT_PROMPT_ID = 10
 
 
 def _check_ids(ids: list[int], vocab_size: int, what: str) -> None:
+    for i in ids:
+        if isinstance(i, bool) or not isinstance(i, int):
+            raise ValueError(
+                f"{what} must be a list of ints, got {i!r} "
+                f"({type(i).__name__}); no floats/bools/tensors"
+            )
     bad = [i for i in ids if not 0 <= i < vocab_size]
     if bad:
         raise ValueError(
