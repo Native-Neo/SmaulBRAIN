@@ -960,6 +960,16 @@ def _validate_rng_parts(tensors: dict, py_state) -> None:
     if py_state is not None:
         _require(isinstance(py_state, (list, tuple)) and len(py_state) == 3,
                  "rng snapshot bad python state")
+        _require(isinstance(py_state[0], int) and not isinstance(py_state[0], bool),
+                 "rng snapshot bad python version")
+        inner = py_state[1]
+        _require(isinstance(inner, (list, tuple)) and len(inner) == 625
+                 and all(isinstance(v, int) and not isinstance(v, bool)
+                         and 0 <= v < 2 ** 32 for v in inner),
+                 "rng snapshot bad python state vector")
+        _require(py_state[2] is None
+                 or (isinstance(py_state[2], float) and __import__("math").isfinite(py_state[2])),
+                 "rng snapshot bad python gauss")
 
 
 @_with_ckpt_lock(exclusive=False)
