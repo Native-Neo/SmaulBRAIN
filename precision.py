@@ -70,6 +70,11 @@ class FP8BlockTensor:
     shape: tuple[int, ...]
     tile: int = 64
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.tile, int) or isinstance(self.tile, bool) \
+                or self.tile < 1:
+            raise ValueError(f"fp8 tile must be a positive int, got {self.tile!r}")
+
     def nbytes(self) -> int:
         return self.codes.nelement() + self.scales.nelement() * 4
 
