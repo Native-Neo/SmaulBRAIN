@@ -263,6 +263,11 @@ class SmaulBrainModel(nn.Module):
                 "1M-token guard (D x head + CE transients scale with T; "
                 "chunk the input or reduce batch)"
             )
+        if ids.shape[0] * ids.shape[1] * self.cfg.vocab_size > 16_777_216:
+            raise ValueError(
+                f"B*T*V={ids.shape[0] * ids.shape[1] * self.cfg.vocab_size} exceeds "
+                "16M-element head budget (logits [B,T,V] transient; chunk T)"
+            )
         if self._leaves:
             raise RuntimeError(
                 f"unconsumed expert leaves from prior forward ({len(self._leaves)} experts); "
