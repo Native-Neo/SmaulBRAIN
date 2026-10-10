@@ -64,6 +64,10 @@ class ExpertPager:
     ) -> None:
         if mode not in ("D2R", "R2VR", "D2VR"):
             raise ValueError(f"unknown paging mode {mode}")
+        for name, val in (("ram_cache", ram_cache), ("vram_cache", vram_cache),
+                          ("max_staged", max_staged)):
+            if not isinstance(val, int) or isinstance(val, bool) or val < 1:
+                raise ValueError(f"{name} must be an int >= 1, got {val!r}")
         self.pool = pool
         self.mode = mode
         self.ram_cache = ram_cache
