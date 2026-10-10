@@ -997,6 +997,8 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     _require(isinstance(eids, list) and len(eids) > 0
              and all(isinstance(e, str) for e in eids)
              and len(set(eids)) == len(eids), "bad manifest expert_ids")
+    for eid in eids:
+        _require_eid(eid)
     step = manifest.get("step", -1)
     _require(isinstance(step, int) and not isinstance(step, bool), "bad manifest step")
     next_id = manifest.get("next_id", len(eids))
