@@ -30,11 +30,6 @@ from storage import (  # single source for crash-safe IO helpers
 )
 
 
-def _checked_torch_load(path: str):
-    # Thin alias over the storage single source (kept for back-compat).
-    return _checked_sf_load(path)
-
-
 def _sidecar(path: str) -> str:
     if path.endswith(".safetensors"):
         return path[: -len(".safetensors")] + ".json"
