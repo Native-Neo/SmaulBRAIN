@@ -29,6 +29,17 @@ def _validate_noise_std(noise_std: float) -> None:
         )
 
 
+def _validate_max_experts(max_experts: int | None) -> None:
+    if max_experts is not None and (
+        isinstance(max_experts, bool)
+        or not isinstance(max_experts, int)
+        or max_experts < 1
+    ):
+        raise ValueError(
+            f"max_experts must be a positive int or None, got {max_experts!r}"
+        )
+
+
 def _check_optim_width(optim_state: dict | None, expect: int) -> None:
     """Validate-first: every momentum buffer must already match pool width.
 
@@ -198,6 +209,7 @@ def grow_expert(
     """
     _check_topology_in_sync(pool, router)
     _validate_noise_std(noise_std)
+    _validate_max_experts(max_experts)
     if max_experts is not None and len(pool) >= max_experts:
         raise ValueError(f"at capacity: {len(pool)} >= max_experts={max_experts}")
     _check_optim_width(optim_state, len(pool))
@@ -285,6 +297,7 @@ def grow_topk_clones(
     so the prior topology returns exactly with no consumed IDs.
     """
     _check_topology_in_sync(pool, router)
+    _validate_max_experts(max_experts)
     if isinstance(k, bool) or not isinstance(k, int) or k < 1:
         raise ValueError(f"k must be a positive int, got {k!r}")
     if not 0.0 <= min_pct <= max_pct:
