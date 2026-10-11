@@ -4,9 +4,12 @@ __pycache__/
 *.o
 *.so
 *.convert_tmp
-tmp_ckpt_*/
-tmp_quant_*/
-tmp_json_*/
+tmp_ckpt_*
+tmp_quant_*
+tmp_json_*
+*.part
+bench_ckpt_*
+c4dl_*
 .pytest_cache/
 checkpoints/
 ckpt/
