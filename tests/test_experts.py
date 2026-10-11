@@ -530,3 +530,19 @@ def test_clones_differ_from_parent_by_one_to_ten_percent():
             for n in names:
                 assert torch.equal(rec.weights_fp8[n].codes, before[eid][n])
 
+
+
+def test_growth_pads_zero_row_optimizer_state_from_empty_pool():
+    pool = ExpertPool()
+    router = SparseRouter(d_model=8, num_experts=0, top_k=1)
+    optim_state = {
+        "router.proj.weight": {"m": torch.zeros((0, 8)), "v": torch.zeros((0, 8)), "step": 0},
+        "router.proj.bias": {"m": torch.zeros((0,)), "v": torch.zeros((0,)), "step": 0},
+    }
+    eid = grow_expert(pool, router, d_model=8, expert_hidden=16, step=0,
+                      seed=0, max_experts=2, optim_state=optim_state)
+    assert eid in pool.experts and router.num_experts == 1
+    assert optim_state["router.proj.weight"]["m"].shape == (1, 8)
+    assert optim_state["router.proj.weight"]["v"].shape == (1, 8)
+    assert optim_state["router.proj.bias"]["m"].shape == (1,)
+    assert optim_state["router.proj.bias"]["v"].shape == (1,)
