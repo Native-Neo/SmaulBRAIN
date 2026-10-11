@@ -220,20 +220,21 @@ def evaluate_loss(model, batch: torch.Tensor, context: int) -> dict:
     """
     was_training = model.training
     model.eval()
-    x = batch[:, :context]
-    y = batch[:, 1 : context + 1]
-    out = model.forward_infer(x)
-    logits = out["logits"].float()
-    valid = (y != PAD_ID)
-    n_valid = int(valid.sum().item())
-    ce = torch.nn.functional.cross_entropy(logits.reshape(-1, model.cfg.vocab_size),
-                                           y.reshape(-1), reduction="none",
-                                           ignore_index=PAD_ID)
-    loss = (ce.sum() / max(1, n_valid)).item()
-    acc = (((logits.argmax(-1) == y) & valid).float().sum() / max(1, n_valid)).item()
-    if was_training:
-        model.train()
-    return {"loss": loss, "acc": acc, "mean_executed": float(out["n_executed"])}
+    try:
+        x = batch[:, :context]
+        y = batch[:, 1 : context + 1]
+        out = model.forward_infer(x)
+        logits = out["logits"].float()
+        valid = (y != PAD_ID)
+        n_valid = int(valid.sum().item())
+        ce = torch.nn.functional.cross_entropy(logits.reshape(-1, model.cfg.vocab_size),
+                                               y.reshape(-1), reduction="none",
+                                               ignore_index=PAD_ID)
+        loss = (ce.sum() / max(1, n_valid)).item()
+        acc = (((logits.argmax(-1) == y) & valid).float().sum() / max(1, n_valid)).item()
+        return {"loss": loss, "acc": acc, "mean_executed": float(out["n_executed"])}
+    finally:
+        model.train(was_training)
 
 
 def retention_report(before: dict, after: dict) -> dict:
