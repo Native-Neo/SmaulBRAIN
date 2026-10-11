@@ -462,6 +462,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     has_ckpt = saved_cfg is not None
 
+    if args.cmd == "train":
+        if args.steps is not None and int(args.steps) < 1:
+            print(f"error: --steps must be >= 1, got {args.steps!r}", file=sys.stderr)
+            return 2
+        if args.batch is not None and int(args.batch) < 1:
+            print(f"error: --batch must be >= 1, got {args.batch!r}", file=sys.stderr)
+            return 2
+
     import torch
     torch.manual_seed(cfg.seed)
     torch.set_num_threads(cfg.threads)
