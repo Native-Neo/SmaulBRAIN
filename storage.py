@@ -321,8 +321,7 @@ def _verify_manifest_hashes(ckpt_dir: str, manifest: dict) -> None:
     the hash map can. Manifests without a ``files`` map (pre-hash
     checkpoints) skip verification for backward compatibility.
     """
-    files_map = manifest.get("files", {})
-    if not isinstance(files_map, dict) or not files_map:
+    if "files" not in manifest or manifest["files"] in ({}, None):
         # Hash-less (pre-hash) checkpoints: no silent skip. Verify every
         # tracked payload exists and is non-empty so truncated/missing files
         # still refuse loudly; bit-flips without hashes remain a known
@@ -352,6 +351,11 @@ def _verify_manifest_hashes(ckpt_dir: str, manifest: dict) -> None:
                         f"checkpoint validation failed: unreadable file {p}: {e}"
                     ) from e
         return
+    files_map = manifest.get("files")
+    if not isinstance(files_map, dict) or not files_map:
+        raise ValueError(
+            "checkpoint validation failed: bad manifest files map"
+        )
     for rel, want in files_map.items():
         if not isinstance(rel, str) or not isinstance(want, str):
             raise ValueError(
