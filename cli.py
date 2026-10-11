@@ -511,6 +511,19 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     import torch
+    # NNPACK can repeatedly emit a C++ warning on older CPUs that cannot
+    # initialize its kernels. Disable it on CPUs below AVX2 and use PyTorch's
+    # normal fallback kernels instead of flooding the training log.
+    nnpack = getattr(torch.backends, "nnpack", None)
+    cpu_backend = getattr(torch.backends, "cpu", None)
+    get_capability = getattr(cpu_backend, "get_cpu_capability", None)
+    cpu_capability = get_capability() if callable(get_capability) else "DEFAULT"
+    if (nnpack is not None and callable(getattr(nnpack, "set_flags", None))
+            and cpu_capability not in {"AVX2", "AVX512"}):
+        nnpack.set_flags(False)
+        if callable(getattr(nnpack, "is_available", None)) and nnpack.is_available():
+            print("[cpu] NNPACK disabled for this CPU; using fallback kernels.",
+                  file=sys.stderr)
     torch.manual_seed(cfg.seed)
     torch.set_num_threads(cfg.threads)
 
