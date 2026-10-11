@@ -819,3 +819,27 @@ def test_fp8_quantize_and_dequantize_non_aligned_cuda_tensor():
     assert back.device.type == "cuda"
     assert back.shape == w.shape
     assert torch.isfinite(back).all()
+
+
+def test_expert_row_range_preflight_prevents_partial_multiweight_update():
+    import pytest
+    from experts import make_expert
+    from train import _GradOnly
+
+    rec = make_expert("expert_00000", d_model=8, expert_hidden=16)
+    opt = SmaulOpt(SmaulOptHParams(state_dtype="fp32", factor_v=False))
+    compute = {
+        "w_gate": _GradOnly(torch.ones(16, 8)),
+        "w_down": _GradOnly(torch.ones(8, 16)),
+    }
+    before_codes = {n: rec.weights_fp8[n].codes.clone() for n in ("w_gate", "w_down")}
+    before_steps = {n: rec.optim_state[n]["step"] for n in ("w_gate", "w_down")}
+
+    # The range is valid for w_gate (16 rows) but invalid for w_down (8).
+    # It must be rejected before w_gate gets updated.
+    with pytest.raises(ValueError, match="invalid row range"):
+        opt.step_expert(rec, compute, 1.0, lr=1e-3, row_range=(10, 12))
+    assert rec.version == 0
+    assert {n: rec.optim_state[n]["step"] for n in before_steps} == before_steps
+    for name, codes in before_codes.items():
+        assert torch.equal(rec.weights_fp8[name].codes, codes)
