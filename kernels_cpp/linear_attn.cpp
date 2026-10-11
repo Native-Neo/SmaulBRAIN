@@ -37,7 +37,7 @@ extern "C" void smaul_linear_attn_step_buf(
     float* Si = S + i * Dh;
     for (std::size_t j = 0; j < Dh; ++j) Si[j] += kf[i] * v[j];
   }
-  float den = eps;
+  float den = 0.0f;
   for (std::size_t i = 0; i < Dh; ++i) den += qf[i] * z[i];
   if (den < eps) den = eps;
   for (std::size_t j = 0; j < Dh; ++j) {
