@@ -49,3 +49,14 @@ def test_unflatten_optimizer_rejects_malformed_saved_step(step):
 def test_unflatten_optimizer_rejects_non_dict_entry():
     with pytest.raises(ValueError, match="must be a dict"):
         storage._unflatten_opt_store({}, {"weight": 3}, "trunk")
+
+
+def test_unflatten_optimizer_preserves_valid_integer_step():
+    tensors = {
+        "trunk.weight.m": torch.zeros(2, 2),
+        "trunk.weight.v": torch.zeros(2, 2),
+    }
+    result = storage._unflatten_opt_store(
+        tensors, {"weight": {"step": 2, "kind": "full"}}, "trunk"
+    )
+    assert result["weight"]["step"] == 2
