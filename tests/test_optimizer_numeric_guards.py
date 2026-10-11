@@ -23,3 +23,23 @@ def test_global_grad_norm_preserves_tiny_finite_fp32_gradients():
     got = global_grad_norm([grad])
     assert got > 0.0
     assert abs(got / 1.0e-30 - 1.0) < 1e-6
+
+
+def test_optimizer_hyperparameters_reject_invalid_values():
+    import pytest
+    from smaulopt import SmaulOptHParams
+
+    for kwargs in (
+        {"beta_m": 1.0},
+        {"beta_v": 1.2},
+        {"beta_m": float("nan")},
+        {"lr": float("inf")},
+        {"eps": 0.0},
+        {"wd": -0.1},
+        {"clip": float("nan")},
+        {"update_clip": 0.0},
+        {"factor_v": 1},
+        {"state_dtype": "int8"},
+    ):
+        with pytest.raises(ValueError):
+            SmaulOptHParams(**kwargs)
