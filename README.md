@@ -843,12 +843,15 @@ result for bit-exact parity with the PyTorch paths. Disabled with
 `SMAUL_NATIVE=off`; every path falls back to pure PyTorch when the toolchain
 is missing.
 
-### What is `hybrid_fp8.py`
+### Hybrid FP8 precision
 
-Study-only module (not wired into the default path): simulates E4M3-forward /
-E5M2-backward mixed precision through real FP8 code points, with FP32 masters
-and accumulators. Covered by `tests/test_hybrid_fp8.py`; the production path
-uses `precision.py` FP8 storage + FP32 compute instead.
+The default model path uses `precision.py` for hybrid dense-projection execution:
+forward operands are quantized to E4M3, incoming backward gradients to E5M2,
+and FP32 master parameters/accumulators are retained. Activations are returned
+in the configured compute dtype (BF16 by default). Expert weights remain
+blockwise E4M3 FP8 storage with per-tile FP32 scales; they use the existing
+expert-local paging and optimizer path. Correctness and training behavior are
+covered by `tests/test_hybrid_fp8.py` and `tests/test_precision.py`.
 
 ### What is `retention_harness.py`
 
