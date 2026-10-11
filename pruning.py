@@ -165,6 +165,8 @@ def prune_experts(
     missing = [eid for eid in victims if eid not in pool.experts]
     if missing:
         raise ValueError(f"unknown victims (refusing to prune): {missing}")
+    if len(set(victims)) != len(victims):
+        raise ValueError("duplicate victims (refusing to prune): victim ids must be unique")
     if router.num_experts != len(pool):
         raise ValueError(
             f"pool/router out of sync: {len(pool)} experts vs "
