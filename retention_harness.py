@@ -160,6 +160,11 @@ def load_text_domain(path: str, length: int) -> tuple[list[list[int]], list[list
     Here the gate is line identity (no shared full samples), which
     synth_data guarantees by construction (dedup + disjoint topic halves).
     """
+    try:
+        if os.stat(path).st_size > 64 * 1024 * 1024:
+            raise ValueError(f"domain file {path} exceeds 64MB cap")
+    except OSError as e:
+        raise ValueError(f"unreadable domain file {path}: {e}") from e
     with open(path, encoding="utf-8") as f:
         lines = [l for l in (s.strip() for s in f) if l]
     if len(lines) < 5:
