@@ -224,14 +224,14 @@ def generate(
         ids = list(prompt_ids) or [DEFAULT_PROMPT_ID]
         _check_ids(ids, vocab, "prompt_ids")
         ids = ids[-ctx:]
+        if max_new == 0:
+            return {"ids": ids, "text": "", "depths": [],
+                    "paging": model.pager.stats.to_dict()}
         x = torch.tensor([ids], dtype=torch.long, device=dev)
         out, attn_states = model.forward_infer_stateful(x)
         depths: list[list[int]] = []
         decoder = IncrementalByteDecoder()
         text_parts: list[str] = []
-        if max_new <= 0:
-            return {"ids": ids, "text": "", "depths": depths,
-                    "paging": model.pager.stats.to_dict()}
         for _ in range(max_new):
             _check_logits(out["logits"], vocab)
             nxt = sample_next(out["logits"][0, -1], temperature, top_k, top_p, gen,
