@@ -218,10 +218,21 @@ def batch_from_seqs(seqs: list[list[int]], context: int, pad_id: int = PAD_ID) -
     hold >= 1 row; undersized replay is clipped by the sampler, never by
     silently stacking zero rows).
     """
-    if not seqs:
-        raise ValueError("batch_from_seqs needs >= 1 seq (got empty list)")
+    if isinstance(context, bool) or not isinstance(context, int) or context < 1:
+        raise ValueError(f"context must be an int >= 1, got {context!r}")
+    if isinstance(pad_id, bool) or not isinstance(pad_id, int) or pad_id < 0:
+        raise ValueError(f"pad_id must be a non-negative int (not bool), got {pad_id!r}")
+    if not isinstance(seqs, (list, tuple)) or not seqs:
+        raise ValueError("batch_from_seqs needs >= 1 sequence (got empty or invalid input)")
     rows = []
     for s in seqs:
+        if not isinstance(s, (list, tuple)):
+            raise ValueError(f"each sequence must be a list or tuple, got {type(s).__name__}")
+        for token in s:
+            if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+                raise ValueError(
+                    f"token IDs must be non-negative ints (not bool), got {token!r}"
+                )
         s = s[: context + 1]
         if len(s) < context + 1:
             s = s + [pad_id] * (context + 1 - len(s))
