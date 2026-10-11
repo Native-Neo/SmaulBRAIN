@@ -448,3 +448,12 @@ def test_unscored_forward_leaves_no_leaves_and_matches_infer_depths():
     m.eval()
     assert torch.equal(a["depths"], m.forward_infer(x)["depths"])
     m.pager.close()
+
+
+def test_generate_restores_training_mode_after_validation_error():
+    m, _, _ = _model()
+    m.train()
+    with pytest.raises(ValueError, match="context must be positive"):
+        generate(m, [104, 105], max_new=1, context=0)
+    assert m.training is True
+    m.pager.close()
