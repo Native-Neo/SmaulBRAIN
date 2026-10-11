@@ -34,7 +34,7 @@ def _check_optim_width(optim_state: dict | None, expect: int) -> None:
             continue
         for key in ("m", "v_row", "v"):
             t = st.get(key)
-            if torch.is_tensor(t) and t.shape[0] > 0 and t.shape[0] != expect:
+            if torch.is_tensor(t) and t.shape[0] != expect:
                 raise ValueError(
                     f"optim_state out of sync: buffer {key} has "
                     f"{t.shape[0]} rows vs {expect} experts (refusing to mutate)"
@@ -83,7 +83,7 @@ def _pad_state_rows(state: dict, n_new: int) -> None:
             continue
         for key in ("m", "v_row", "v"):
             t = st.get(key)
-            if torch.is_tensor(t) and t.shape[0] > 0:
+            if torch.is_tensor(t):
                 pending.append((st, key, torch.cat([t, torch.zeros(
                     (n_new, *t.shape[1:]), dtype=t.dtype, device=t.device)])))
     # Phase 2 (commit): assignments only; infallible after phase-1 build.
