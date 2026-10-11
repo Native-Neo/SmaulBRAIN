@@ -392,10 +392,13 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
             # grad_scale stays 1.0: routing weights, ponder mass, and repeated
             # depth applications already scale these grads through autograd;
             # any manual factor here would double-count them.
-            activity = opt.step_expert(rec, compute, 1.0, cfg.expert_lr * lr_scale)
-            # Skipped updates (non-finite grads -> activity 0.0, no weight
-            # change) must not pose as stepped nor evict good cache entries.
-            if activity != 0.0:
+            _ver_before = int(getattr(rec, "version", 0))
+            opt.step_expert(rec, compute, 1.0, cfg.expert_lr * lr_scale)
+            # Applied iff the version bumped: skipped updates (non-finite
+            # grads, no grads) bump nothing and must not pose as stepped nor
+            # evict good cache entries. Version-delta is unambiguous where
+            # the EMA activity signal is not (EMA can be exactly 0.0).
+            if int(getattr(rec, "version", 0)) != _ver_before:
                 model.pager.invalidate(eid)
                 stepped.append(eid)
         # Global optimizer steps: exactly one per train_step call, including
