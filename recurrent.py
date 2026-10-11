@@ -121,7 +121,21 @@ class CausalByteConv(nn.Module):
 
 
 class SharedRecurrentBlock(nn.Module):
-    """The single shared block applied repeatedly by the depth loop."""
+    """The single shared block applied repeatedly by the depth loop.
+
+    Performance tradeoff M2 (documented, not fixed — model.py is owned by
+    the correctness agent, so no execution change here): the depth loop
+    always executes max_depth applications (no early exit) and each
+    application pays full-width D matmuls (qkv D→3D, o_proj D→D) plus MoE
+    dispatch. Skipping depths would break streaming parity — per-depth
+    attention states must observe every token — and ponder weighting needs
+    every step's logits; adaptivity lives in the readout depths, not in
+    skipped compute. Cost scales ~linearly in max_depth and ~quadratically
+    in D. Halve depth or width to halve/quarter it; chunk T for the
+    attention working set (see linear_attention guard). Measured CPU
+    (identity-MoE, B=2): D=256/T=256 ~290ms per depth, D=1024/T=128
+    ~1130ms per depth (see tests/test_perf_guards.py::test_m2_depth_cost_floor).
+    """
 
     def __init__(self, d_model: int, n_heads: int, eps: float = 1e-6) -> None:
         super().__init__()

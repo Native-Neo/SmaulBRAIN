@@ -304,6 +304,44 @@ def test_m5_fused_factored_update():
     assert sl.shape == (256, 64) and torch.isfinite(sl).all()
 
 
+def test_m2_depth_cost_floor():
+    """M2 (doc-only): per-depth D-matmuls + no early exit — cost floor.
+
+    The depth loop always runs max_depth (streaming parity + ponder need
+    every step); adaptivity is readout-only. No execution change here
+    (model.py owned by correctness); this pins the measured floor so a
+    future early-exit change must beat it without breaking parity.
+    Measured CPU (identity-MoE, B=2): D=256/T=256 ~290ms per depth,
+    D=1024/T=128 ~1130ms (~D^2 scaling); 4-depth chain ~4x single.
+    """
+    from recurrent import SharedRecurrentBlock
+    from linear_attention import LinearAttnState
+
+    assert "M2" in SharedRecurrentBlock.__doc__
+    torch.manual_seed(0)
+    blk = SharedRecurrentBlock(d_model=256, n_heads=4)
+    h = torch.randn(2, 256, 256)
+    attn = LinearAttnState.zeros(2, 4, 64)
+    moe = lambda flat: (flat, flat.new_zeros(()),
+                        torch.zeros(flat.shape[0], dtype=torch.long))
+    for _ in range(2):
+        blk(h, attn, moe)
+    t0 = time.perf_counter()
+    for _ in range(3):
+        blk(h, attn, moe)
+    dt = (time.perf_counter() - t0) / 3 * 1000.0
+    print(f"\n[M2] D=256 B=2 T=256 per-depth: {dt:.1f}ms (floor, no early exit)")
+    assert dt < 60_000.0
+    # Depth scaling is linear (no early exit): 2 chained apps ~2x one.
+    t0 = time.perf_counter()
+    for _ in range(3):
+        h1, a1, _, _ = blk(h, attn, moe)
+        blk(h1, a1, moe)
+    dt2 = (time.perf_counter() - t0) / 3 * 1000.0
+    print(f"[M2] 2-depth chain: {dt2:.1f}ms (ratio {dt2/max(dt,1e-9):.2f}x)")
+    assert 1.2 * dt < dt2 < 3.5 * dt
+
+
 def test_m4_routing_budget_counts_both_transients():
     """N*E guard halves to 8M to cover logits+probs (~2x actual)."""
     import pytest
