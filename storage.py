@@ -331,49 +331,45 @@ def _verify_manifest_hashes(ckpt_dir: str, manifest: dict) -> None:
 
     A crash between per-file publishes can leave an old manifest over new
     payloads (or vice versa); per-file atomicity alone cannot see that, but
-    the hash map can. Manifests without a ``files`` map (pre-hash
-    checkpoints) skip verification for backward compatibility.
+    the hash map can. The ``files`` map must be exactly complete
+    (``set(files_map) == set(_manifest_rels(eids))`` after separator
+    normalization); missing/empty/None maps, incomplete maps, and extra
+    entries all raise loudly (no legacy warn-only path).
     """
-    if "files" not in manifest or manifest["files"] in ({}, None):
-        # Hash-less (pre-hash) checkpoints: no silent skip. Verify every
-        # tracked payload exists and is non-empty so truncated/missing files
-        # still refuse loudly; bit-flips without hashes remain a known
-        # limitation (use refresh_manifest_hashes to gain coverage).
-        import warnings as _warnings
-        _warnings.warn(
-            "manifest has no files hash map; verifying existence/size only "
-            "(run refresh_manifest_hashes to gain hash coverage)",
-            RuntimeWarning, stacklevel=2,
+    eids = manifest.get("expert_ids", [])
+    if not isinstance(eids, list) or not all(isinstance(e, str) for e in eids):
+        raise ValueError(
+            "checkpoint validation failed: bad manifest expert_ids"
         )
-        eids = manifest.get("expert_ids", [])
-        if isinstance(eids, list):
-            for rel in _manifest_rels([e for e in eids if isinstance(e, str)]):
-                p = _jailed_path(ckpt_dir, rel)
-                if not os.path.exists(p):
-                    raise ValueError(
-                        f"checkpoint validation failed: tracked file missing {p} "
-                        "(mixed generation; refusing)"
-                    )
-                try:
-                    if os.stat(p).st_size == 0:
-                        raise ValueError(
-                            f"checkpoint validation failed: empty file {p}"
-                        )
-                except OSError as e:
-                    raise ValueError(
-                        f"checkpoint validation failed: unreadable file {p}: {e}"
-                    ) from e
-        return
+    expected = set(_manifest_rels(eids))
     files_map = manifest.get("files")
     if not isinstance(files_map, dict) or not files_map:
         raise ValueError(
-            "checkpoint validation failed: bad manifest files map"
+            "checkpoint validation failed: missing files hash map "
+            "(mixed generation; refusing)"
         )
+    norm_to_want: dict[str, str] = {}
     for rel, want in files_map.items():
-        if not isinstance(rel, str) or not isinstance(want, str):
+        if not isinstance(rel, str) or not rel or not isinstance(want, str) or not want:
             raise ValueError(
                 "checkpoint validation failed: bad manifest files map"
             )
+        norm = rel.replace("\\", "/")
+        if norm in norm_to_want:
+            raise ValueError(
+                "checkpoint validation failed: bad manifest files map "
+                "(duplicate after separator normalization)"
+            )
+        norm_to_want[norm] = want
+    if set(norm_to_want) != expected:
+        missing = sorted(expected - set(norm_to_want))
+        extra = sorted(set(norm_to_want) - expected)
+        raise ValueError(
+            "checkpoint validation failed: files map incomplete "
+            f"(missing={missing} extra={extra}; refusing)"
+        )
+    for rel in sorted(expected):
+        want = norm_to_want[rel]
         p = _jailed_path(ckpt_dir, rel)
         if not os.path.exists(p):
             raise ValueError(
