@@ -193,64 +193,65 @@ def generate(
     validated against ``model.cfg.vocab_size`` each step.
     """
     was_training = model.training
-    model.eval()
-    dev = model.embed.weight.device
-    if context is not None and (isinstance(context, bool) or not isinstance(context, int)):
-        raise ValueError(f"context must be a positive int, got {context!r}")
-    ctx = model.cfg.context_length if context is None else context
-    if ctx <= 0:
-        raise ValueError(f"context must be positive, got {context!r}")
-    if isinstance(seed, bool) or not isinstance(seed, int):
-        raise ValueError(f"seed must be an int, got {seed!r}")
-    if not 0 <= seed < 2**64:
-        raise ValueError(f"seed must be in [0, 2**64), got {seed!r}")
-    if isinstance(stop_on_eos, bool) is False:
-        raise ValueError(f"stop_on_eos must be a bool, got {stop_on_eos!r}")
-    if isinstance(max_new, bool) or not isinstance(max_new, int):
-        raise ValueError(f"max_new must be an int >= 0, got {max_new!r}")
-    if max_new < 0:
-        raise ValueError(f"max_new must be >= 0, got {max_new!r}")
-    _check_sampler(temperature, top_k, top_p)
-    vocab = int(model.cfg.vocab_size)
-    if vocab < BYTE_VOCAB:
-        raise ValueError(f"vocab_size {vocab} < byte base {BYTE_VOCAB}")
-    forbidden = [i for i in NEVER_SAMPLE_IDS if 0 <= i < vocab]
-    gen = torch.Generator().manual_seed(seed)
-    if isinstance(prompt_ids, (str, bytes)) or not isinstance(prompt_ids, (list, tuple)):
-        raise ValueError(
-            f"prompt_ids must be a list of ints, got {type(prompt_ids).__name__}"
-        )
-    ids = list(prompt_ids) or [DEFAULT_PROMPT_ID]
-    _check_ids(ids, vocab, "prompt_ids")
-    ids = ids[-ctx:]
-    x = torch.tensor([ids], dtype=torch.long, device=dev)
-    out, attn_states = model.forward_infer_stateful(x)
-    depths: list[list[int]] = []
-    decoder = IncrementalByteDecoder()
-    text_parts: list[str] = []
-    if max_new <= 0:
+    try:
+        model.eval()
+        dev = model.embed.weight.device
+        if context is not None and (isinstance(context, bool) or not isinstance(context, int)):
+            raise ValueError(f"context must be a positive int, got {context!r}")
+        ctx = model.cfg.context_length if context is None else context
+        if ctx <= 0:
+            raise ValueError(f"context must be positive, got {context!r}")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError(f"seed must be an int, got {seed!r}")
+        if not 0 <= seed < 2**64:
+            raise ValueError(f"seed must be in [0, 2**64), got {seed!r}")
+        if isinstance(stop_on_eos, bool) is False:
+            raise ValueError(f"stop_on_eos must be a bool, got {stop_on_eos!r}")
+        if isinstance(max_new, bool) or not isinstance(max_new, int):
+            raise ValueError(f"max_new must be an int >= 0, got {max_new!r}")
+        if max_new < 0:
+            raise ValueError(f"max_new must be >= 0, got {max_new!r}")
+        _check_sampler(temperature, top_k, top_p)
+        vocab = int(model.cfg.vocab_size)
+        if vocab < BYTE_VOCAB:
+            raise ValueError(f"vocab_size {vocab} < byte base {BYTE_VOCAB}")
+        forbidden = [i for i in NEVER_SAMPLE_IDS if 0 <= i < vocab]
+        gen = torch.Generator().manual_seed(seed)
+        if isinstance(prompt_ids, (str, bytes)) or not isinstance(prompt_ids, (list, tuple)):
+            raise ValueError(
+                f"prompt_ids must be a list of ints, got {type(prompt_ids).__name__}"
+            )
+        ids = list(prompt_ids) or [DEFAULT_PROMPT_ID]
+        _check_ids(ids, vocab, "prompt_ids")
+        ids = ids[-ctx:]
+        x = torch.tensor([ids], dtype=torch.long, device=dev)
+        out, attn_states = model.forward_infer_stateful(x)
+        depths: list[list[int]] = []
+        decoder = IncrementalByteDecoder()
+        text_parts: list[str] = []
+        if max_new <= 0:
+            return {"ids": ids, "text": "", "depths": depths,
+                    "paging": model.pager.stats.to_dict()}
+        for _ in range(max_new):
+            _check_logits(out["logits"], vocab)
+            nxt = sample_next(out["logits"][0, -1], temperature, top_k, top_p, gen,
+                              forbidden_ids=forbidden, vocab_size=vocab)
+            ids.append(nxt)
+            depths.append([int(out["depths"][0, -1].item())])
+            text_parts.append(decoder.feed([nxt]))
+            if nxt == EOS_ID and stop_on_eos and EOS_ID < vocab:
+                break
+            x = torch.tensor([[nxt]], dtype=torch.long, device=dev)
+            out, attn_states = model.forward_infer_step(x, attn_states)
+
+        text_parts.append(decoder.flush())
         if was_training:
             model.train()
-        return {"ids": ids, "text": "", "depths": depths,
+        return {"ids": ids, "text": "".join(text_parts), "depths": depths,
                 "paging": model.pager.stats.to_dict()}
-    for _ in range(max_new):
-        _check_logits(out["logits"], vocab)
-        nxt = sample_next(out["logits"][0, -1], temperature, top_k, top_p, gen,
-                          forbidden_ids=forbidden, vocab_size=vocab)
-        ids.append(nxt)
-        depths.append([int(out["depths"][0, -1].item())])
-        text_parts.append(decoder.feed([nxt]))
-        if nxt == EOS_ID and stop_on_eos and EOS_ID < vocab:
-            break
-        x = torch.tensor([[nxt]], dtype=torch.long, device=dev)
-        out, attn_states = model.forward_infer_step(x, attn_states)
 
-    text_parts.append(decoder.flush())
-    if was_training:
-        model.train()
-    return {"ids": ids, "text": "".join(text_parts), "depths": depths,
-            "paging": model.pager.stats.to_dict()}
-
+    finally:
+        model.train(was_training)
 
 def encode_prompt(text: str) -> list[int]:
     return encode_text(text)
