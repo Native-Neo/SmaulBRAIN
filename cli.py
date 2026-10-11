@@ -563,6 +563,20 @@ def main(argv: list[str] | None = None) -> int:
             save_model(args.ckpt, model, opt, int(getattr(model, "_resume_step", -1)),
                        extra_meta={"scheduler": res["scheduler"]})
     elif args.cmd == "infer":
+        # Validate sampler args BEFORE the checkpoint gate so bad flags
+        # report as invalid-sampler even with no checkpoint present.
+        from infer import _check_sampler as _check_cli_sampler
+        try:
+            _check_cli_sampler(
+                args.temperature,
+                0 if getattr(args, "sampler_top_k", None) is None
+                else int(args.sampler_top_k),
+                1.0 if getattr(args, "sampler_top_p", None) is None
+                else float(args.sampler_top_p),
+            )
+        except (ValueError, TypeError) as e:
+            print(f"error: invalid sampler args: {e}", file=sys.stderr)
+            return 2
         # Inference is continuation-only: generating from a freshly
         # initialized model would emit confidently meaningless bytes.
         if not os.path.exists(os.path.join(args.ckpt, "manifest.json")):
