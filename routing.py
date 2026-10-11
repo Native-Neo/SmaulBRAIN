@@ -204,10 +204,11 @@ class SparseRouter(nn.Module):
 
         Vectorized greedy: tokens are stably priority-ordered (same key as
         the old sequential loop, so results are identical), then each
-        expert's queue position is a cumsum rank over the flattened
-        (token-major, slot-minor) order — exactly the order the sequential
-        loop visited. Rank < cap admits. No Python token loop, no host
-        transfers on the hot path.
+        expert's queue position is the within-expert occurrence rank of the
+        flattened (token-major, slot-minor) visit order — exactly the order
+        the old per-expert cumsum loop visited. Rank < cap admits. One
+        stable argsort + one bincount/scatter pass (O(L log L), no Python
+        loop over E or N, no host transfers on the hot path).
         """
         cap = max(1, int(self.capacity_factor * n_tokens * self.top_k / self.num_experts))
         # Stable priority: equal-confidence tokens keep input order, so the
@@ -215,14 +216,23 @@ class SparseRouter(nn.Module):
         order = torch.argsort(top_w.max(dim=-1).values, descending=True, stable=True)
         sorted_ids = top_ids[order]  # [N, K] priority order
         flat = sorted_ids.reshape(-1)  # token-major, slot-minor: loop order
-        admit_flat = torch.zeros(flat.shape[0], dtype=torch.bool, device=top_ids.device)
-        for e in range(self.num_experts):
-            is_e = flat == e
-            # Queue rank among this expert's slots in visit order; slots
-            # beyond capacity are refused. (All-False columns yield rank -1
-            # but stay masked out by is_e, so no empty-check sync is needed.)
-            rank = is_e.to(torch.int64).cumsum(0) - 1
-            admit_flat |= is_e & (rank < cap)
+        L = flat.numel()
+        admit_flat = torch.zeros(L, dtype=torch.bool, device=top_ids.device)
+        if L > 0:
+            # Occurrence rank without a per-expert loop: stably sort by
+            # expert id (ties keep visit order), then rank = position -
+            # group start. Bit-identical to per-expert cumsum(is_e)-1.
+            sort_idx = torch.argsort(flat, stable=True)
+            sorted_flat = flat[sort_idx]
+            change = torch.ones(L, dtype=torch.bool, device=flat.device)
+            if L > 1:
+                change[1:] = sorted_flat[1:] != sorted_flat[:-1]
+            group = change.to(torch.int64).cumsum(0) - 1
+            counts = torch.bincount(group)
+            starts = torch.cumsum(counts, 0) - counts
+            rank_sorted = (torch.arange(L, device=flat.device)
+                           - torch.repeat_interleave(starts, counts))
+            admit_flat[sort_idx] = rank_sorted < cap
         admit_sorted = admit_flat.reshape(sorted_ids.shape)
         admit = torch.empty_like(admit_sorted)
         admit[order] = admit_sorted
