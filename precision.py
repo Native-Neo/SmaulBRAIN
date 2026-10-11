@@ -248,6 +248,9 @@ def dequantize_fp8_block(
             f"got codes.ndim={t.codes.ndim} shape={t.shape}"
         )
     n_rows, n_cols = int(t.shape[0]), int(t.shape[-1])
+    bounds = (row_start, row_end, col_start, col_end)
+    if any(isinstance(v, bool) or not isinstance(v, int) for v in bounds):
+        raise ValueError(f"tile-block indices must be integers, got {bounds!r}")
     if not (0 <= row_start < row_end <= n_rows):
         raise ValueError(f"invalid row range [{row_start}, {row_end}) for {n_rows} rows")
     if not (0 <= col_start < col_end <= n_cols):
@@ -300,6 +303,9 @@ def update_fp8_tile_block(
             f"got codes.ndim={t.codes.ndim} shape={t.shape}"
         )
     n_rows, n_cols = int(t.shape[0]), int(t.shape[-1])
+    bounds = (row_start, row_end, col_start, col_end)
+    if any(isinstance(v, bool) or not isinstance(v, int) for v in bounds):
+        raise ValueError(f"tile-block indices must be integers, got {bounds!r}")
     if not (0 <= row_start < row_end <= n_rows):
         raise ValueError(f"invalid row range [{row_start}, {row_end}) for {n_rows} rows")
     if not (0 <= col_start < col_end <= n_cols):
