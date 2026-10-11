@@ -317,7 +317,11 @@ def refresh_manifest_hashes(ckpt_dir: str) -> dict:
         _require_eid(eid)
     files: dict[str, str] = {}
     for rel in _manifest_rels(eids):
-        p = os.path.join(ckpt_dir, rel)
+        p = _jailed_path(ckpt_dir, rel)
+        if os.path.islink(p):
+            raise ValueError(
+                f"checkpoint validation failed: refusing symlink {rel!r}"
+            )
         if not os.path.exists(p):
             raise FileNotFoundError(f"cannot hash missing checkpoint file {p}")
         files[rel] = _sha256_file(p)
