@@ -102,7 +102,8 @@ def set_rng_snapshot(snap: dict) -> None:
         if not (isinstance(_py, (list, tuple)) and len(_py) == 3):
             raise ValueError("checkpoint validation failed: bad python RNG state")
         version, inner, gauss = _py
-        if not (isinstance(version, int) and not isinstance(version, bool)):
+        if not (isinstance(version, int) and not isinstance(version, bool)
+                and version in (2, 3)):
             raise ValueError("checkpoint validation failed: bad python RNG state")
         if not (isinstance(inner, (list, tuple)) and len(inner) == 625
                 and all(isinstance(v, int) and not isinstance(v, bool)
@@ -1095,7 +1096,8 @@ def _validate_rng_parts(tensors: dict, py_state) -> None:
     if py_state is not None:
         _require(isinstance(py_state, (list, tuple)) and len(py_state) == 3,
                  "rng snapshot bad python state")
-        _require(isinstance(py_state[0], int) and not isinstance(py_state[0], bool),
+        _require(isinstance(py_state[0], int) and not isinstance(py_state[0], bool)
+                 and py_state[0] in (2, 3),
                  "rng snapshot bad python version")
         inner = py_state[1]
         _require(isinstance(inner, (list, tuple)) and len(inner) == 625
