@@ -599,3 +599,14 @@ def test_replay_restore_rejects_negative_token_ids():
     snap.update({"seen": 1, "buf": [[-1]]})
     with pytest.raises(ValueError, match="non-negative ints"):
         ReplayBuffer.from_dict(snap)
+
+
+def test_batch_from_seqs_rejects_lossy_or_invalid_token_inputs():
+    import pytest
+
+    for bad_seq in ([1.9, 2], [1, True], [1, -1], "123"):
+        with pytest.raises(ValueError):
+            batch_from_seqs([bad_seq], context=2)
+    for bad_context in (True, 1.5, 0, -1):
+        with pytest.raises(ValueError, match="context"):
+            batch_from_seqs([[1, 2]], context=bad_context)
