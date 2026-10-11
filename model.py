@@ -28,6 +28,7 @@ from linear_attention import LinearAttnState
 from paging import ExpertPager
 from recurrent import CausalByteConv, SharedRecurrentBlock
 from rmsnorm import RMSNorm
+from precision import enable_hybrid_fp8_linears
 from routing import SparseRouter
 
 
@@ -54,6 +55,13 @@ class SmaulBrainModel(nn.Module):
                                if config.lookahead_weight > 0 else None)
         self.head_boundary = (nn.Linear(d, 1)
                               if config.boundary_weight > 0 else None)
+        # Hybrid FP8 is the default for dense projections: E4M3 forward,
+        # E5M2 backward gradients, FP32 master parameters. Embeddings and
+        # convolution retain the configured compute dtype.
+        enable_hybrid_fp8_linears(
+            self, out_dtype=(torch.bfloat16 if config.dtype == "bf16"
+                             else torch.float32),
+        )
         # Streaming conv history: last (k-1) embeddings feeding single-step
         # inference (plain attr, never in state_dict). Reset per stream.
         self._conv_hist: torch.Tensor | None = None
@@ -72,14 +80,11 @@ class SmaulBrainModel(nn.Module):
         # Trunk linears/embeddings run in the compute dtype (precision policy:
         # BF16 activations; RMSNorm weights intentionally stay FP32).
         if config.dtype == "bf16":
-            trunk_mods = [self.embed, self.block.qkv, self.block.o_proj,
-                          self.block.halt, self.head, self.router.proj]
+            # Dense projections are already HybridFP8Linear and keep FP32
+            # master weights; only embedding/conv storage follows BF16.
+            trunk_mods = [self.embed]
             if self.byte_conv is not None:
                 trunk_mods.append(self.byte_conv.conv)
-            if self.head_lookahead is not None:
-                trunk_mods.append(self.head_lookahead)
-            if self.head_boundary is not None:
-                trunk_mods.append(self.head_boundary)
             for mod in trunk_mods:
                 mod.to(torch.bfloat16)
         # Active expert leaves (training): eid -> list of leaf weight dicts
