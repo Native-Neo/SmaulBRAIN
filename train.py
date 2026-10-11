@@ -280,7 +280,20 @@ def _new_cap_factor(old_delta: torch.Tensor, new_delta: torch.Tensor, cap: float
 def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
                mode: str = "entire", selected: list[str] | None = None,
                new_since_step: int = 0) -> dict:
-    """One optimizer step. Returns loss stats + stepped expert ids."""
+    """One optimizer step. Returns loss stats + stepped expert ids.
+
+    Stepped ledger semantics (pinned): ``stepped_experts`` lists exactly
+    the experts whose ``record.version`` bumped during this call, i.e.
+    whose optimizer moments moved (applied update, not a skip). Skipped
+    updates (no grads, non-finite grads) bump nothing and are never listed.
+    A zero effective LR (e.g. cosine decay pinned at ~0.0 past the horizon)
+    still counts as stepped: moments decay on the grad and ``version``
+    bumps, the pager entry is invalidated, and the id appears in
+    ``stepped`` even though weights are numerically unmoved. This churn is
+    intentional — version-delta is unambiguous where the EMA activity
+    signal can be exactly 0.0 — and callers must not interpret ``stepped``
+    as proof of weight movement.
+    """
     if mode not in _MODES:
         raise ValueError(f"unknown training mode {mode!r}; expected one of {_MODES}")
     if x.shape != y.shape or x.ndim != 2:
