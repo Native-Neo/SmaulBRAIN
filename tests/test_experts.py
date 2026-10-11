@@ -546,3 +546,19 @@ def test_growth_pads_zero_row_optimizer_state_from_empty_pool():
     assert optim_state["router.proj.weight"]["v"].shape == (1, 8)
     assert optim_state["router.proj.bias"]["m"].shape == (1,)
     assert optim_state["router.proj.bias"]["v"].shape == (1,)
+
+
+def test_step_expert_row_slice_keeps_full_optimizer_state_shape():
+    from experts import make_expert
+    from smaulopt import SmaulOpt, SmaulOptHParams
+    from train import _GradOnly
+
+    rec = make_expert("expert_00000", 32, 64, fp8_tile=64)
+    rec.optim_state = {}
+    opt = SmaulOpt(SmaulOptHParams(lr=0.01))
+    # A gradient containing only the selected rows is a supported input.
+    compute = {"w_gate": _GradOnly(torch.randn(8, 32))}
+    opt.step_expert(rec, compute, 1.0, lr=0.01, row_range=(8, 16))
+    state = rec.optim_state["w_gate"]
+    assert state["m"].shape == (64, 32)
+    assert state["v"].shape == (64, 32)
