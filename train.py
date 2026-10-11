@@ -79,9 +79,13 @@ class ReplayBuffer:
     """
 
     def __init__(self, capacity: int = 512, seed: int = 0) -> None:
-        if int(capacity) < 0:
+        if isinstance(capacity, bool) or not isinstance(capacity, int):
+            raise ValueError(
+                f"ReplayBuffer capacity must be an int (not bool), got {capacity!r}"
+            )
+        if capacity < 0:
             raise ValueError(f"ReplayBuffer capacity must be >= 0, got {capacity!r}")
-        self.capacity = int(capacity)
+        self.capacity = capacity
         self.buf: deque[list[int]] = deque()
         self.rng = random.Random(seed)
         self.seen = 0
