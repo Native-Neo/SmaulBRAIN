@@ -412,6 +412,13 @@ class SmaulBrainModel(nn.Module):
                 f"batch token count B*T={ids.shape[0] * ids.shape[1]} exceeds "
                 "1M-token guard (logits [B,T,V] scale with T; chunk the input)"
             )
+        if ids.shape[0] * ids.shape[1] == 0:
+            raise ValueError("empty batch carries no signal for inference")
+        if ids.shape[0] * ids.shape[1] * self.cfg.vocab_size > 16_777_216:
+            raise ValueError(
+                f"B*T*V={ids.shape[0] * ids.shape[1] * self.cfg.vocab_size} exceeds "
+                "16M-element head budget (logits [B,T,V] transient; chunk T)"
+            )
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
         emb = self.embed(ids)
