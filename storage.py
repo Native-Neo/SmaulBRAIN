@@ -561,7 +561,12 @@ def save_expert_file(rec: ExpertRecord, path: str) -> None:
 
 
 def load_expert_file(path: str) -> ExpertRecord:
-    """Load one expert written by :func:`save_expert_file`."""
+    """Load one expert written by :func:`save_expert_file`.
+
+    Unsafe on untrusted paths: ``path`` is used verbatim (no jail, follows
+    symlinks). Checkpoint code must use :func:`load_expert_file_jailed`
+    instead; this raw helper remains for trusted absolute paths only.
+    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"missing expert file {path}")
     sidecar = _expert_sidecar(path)
@@ -582,6 +587,23 @@ def load_expert_file(path: str) -> ExpertRecord:
             f"checkpoint validation failed: unreadable sidecar {sidecar}: {e}"
         ) from e
     return expert_from_parts(tensors, meta)
+
+
+def load_expert_file_jailed(ckpt_dir: str, eid: str) -> ExpertRecord:
+    """Jailed expert load: ``experts/<eid>.safetensors`` under ``ckpt_dir``.
+
+    Validates ``eid``, resolves both payload and JSON sidecar via
+    :func:`_jailed_path`, refuses symlinks, then delegates to the raw
+    :func:`load_expert_file` on the jailed absolute path.
+    """
+    _require_eid(eid)
+    p = _jailed_path(ckpt_dir, f"experts/{eid}.safetensors")
+    _jailed_path(ckpt_dir, f"experts/{eid}.json")
+    if os.path.islink(p):
+        raise ValueError(
+            f"checkpoint validation failed: refusing symlink {p}"
+        )
+    return load_expert_file(p)
 
 
 def _flatten_opt_store(store: dict, prefix: str) -> tuple[dict, dict]:
