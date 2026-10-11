@@ -107,7 +107,10 @@ def quantize_fp8_blockwise(w: torch.Tensor, tile: int = 64) -> FP8BlockTensor:
             return FP8BlockTensor(codes=codes_u8, scales=scales, shape=orig, tile=tile)
     pad = n_blocks * tile - n_cols
     if pad:
-        flat = torch.cat([flat, torch.zeros(flat.shape[0], pad)], dim=1)
+        flat = torch.cat([
+            flat,
+            torch.zeros(flat.shape[0], pad, dtype=flat.dtype, device=flat.device),
+        ], dim=1)
     blocks = flat.reshape(-1, n_blocks, tile)
     amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
     scales = (amax / FP8_MAX).reshape(-1, n_blocks).contiguous()  # fp32
@@ -136,7 +139,10 @@ def dequantize_fp8_blockwise(t: FP8BlockTensor, dtype: torch.dtype = torch.float
     flat = codes_f8.to(torch.float32)
     pad = n_blocks * t.tile - n_cols
     if pad:
-        flat = torch.cat([flat, torch.zeros(flat.shape[0], pad)], dim=1)
+        flat = torch.cat([
+            flat,
+            torch.zeros(flat.shape[0], pad, dtype=flat.dtype, device=flat.device),
+        ], dim=1)
     blocks = flat.reshape(-1, n_blocks, t.tile)
     # q ~= orig/amax*448 and scales = amax/448, so orig ~= q*scales.
     out = (blocks * t.scales.unsqueeze(-1)).reshape(flat.shape)[:, :n_cols]
