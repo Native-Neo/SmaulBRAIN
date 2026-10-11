@@ -814,14 +814,38 @@ def _jailed_path(ckpt_dir: str, rel: str) -> str:
     """Join rel under ckpt_dir and refuse jail escapes (.., absolute, symlink).
 
     Returns the absolute jailed path. Raises ValueError on traversal.
+    Both the lexical path and its realpath (symlink-resolved) must stay
+    inside the checkpoint dir; existing symlinks anywhere along the path
+    are refused.
     """
     _require(isinstance(rel, str) and rel != "" and "\x00" not in rel,
              f"bad checkpoint rel {rel!r}")
     _require(not os.path.isabs(rel), f"bad checkpoint rel {rel!r}")
-    base = os.path.abspath(ckpt_dir)
+    base = os.path.realpath(os.path.abspath(ckpt_dir))
     p = os.path.abspath(os.path.join(ckpt_dir, rel))
     _require(p == base or p.startswith(base + os.sep),
              f"checkpoint path escapes dir: {rel!r}")
+    # Refuse symlinks along the resolved path (lexical check alone can be
+    # bypassed by a planted experts/<id>.safetensors -> /etc/shadow link).
+    try:
+        r = os.path.realpath(p)
+    except OSError as e:
+        raise ValueError(
+            f"checkpoint validation failed: unreadable path {rel!r}: {e}"
+        ) from e
+    _require(r == base or r.startswith(base + os.sep),
+             f"checkpoint path escapes dir via symlink: {rel!r}")
+    # If the leaf itself exists as a symlink, refuse even when its target
+    # happens to stay inside (opaque-archive hygiene).
+    try:
+        if os.path.lexists(p) and os.path.islink(p):
+            raise ValueError(
+                f"checkpoint validation failed: refusing symlink {rel!r}"
+            )
+    except OSError as e:
+        raise ValueError(
+            f"checkpoint validation failed: unreadable path {rel!r}: {e}"
+        ) from e
     return p
 
 
