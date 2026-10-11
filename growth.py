@@ -40,6 +40,16 @@ def _validate_max_experts(max_experts: int | None) -> None:
         )
 
 
+def _validate_step(step: int) -> None:
+    if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+        raise ValueError(f"step must be a non-negative int, got {step!r}")
+
+
+def _validate_n_parents(n_parents: int) -> None:
+    if isinstance(n_parents, bool) or not isinstance(n_parents, int) or n_parents < 1:
+        raise ValueError(f"n_parents must be a positive int, got {n_parents!r}")
+
+
 def _check_optim_width(optim_state: dict | None, expect: int) -> None:
     """Validate-first: every momentum buffer must already match pool width.
 
@@ -208,6 +218,8 @@ def grow_expert(
     consumed IDs.
     """
     _check_topology_in_sync(pool, router)
+    _validate_step(step)
+    _validate_n_parents(n_parents)
     _validate_noise_std(noise_std)
     _validate_max_experts(max_experts)
     if max_experts is not None and len(pool) >= max_experts:
@@ -297,6 +309,7 @@ def grow_topk_clones(
     so the prior topology returns exactly with no consumed IDs.
     """
     _check_topology_in_sync(pool, router)
+    _validate_step(step)
     _validate_max_experts(max_experts)
     if isinstance(k, bool) or not isinstance(k, int) or k < 1:
         raise ValueError(f"k must be a positive int, got {k!r}")
