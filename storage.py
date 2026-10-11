@@ -77,28 +77,85 @@ def get_rng_snapshot() -> dict:
 def set_rng_snapshot(snap: dict) -> None:
     """Restore RNG state captured by get_rng_snapshot (legacy tensor tolerated)."""
     if isinstance(snap, torch.Tensor):
-        if snap.dtype != torch.uint8:
+        if snap.dtype != torch.uint8 or snap.numel() == 0:
             raise ValueError("checkpoint validation failed: bad torch RNG state")
-        torch.set_rng_state(snap)  # legacy rng.pt: torch CPU state only
+        try:
+            torch.set_rng_state(snap)  # legacy rng.pt: torch CPU state only
+        except Exception as e:
+            raise ValueError(
+                f"checkpoint validation failed: bad torch RNG state: {e}"
+            ) from e
         return
     if not isinstance(snap, dict) or "torch_cpu" not in snap:
         raise ValueError("checkpoint validation failed: bad RNG snapshot")
+    # Validate everything BEFORE mutating anything (mirror _validate_rng_parts).
     _cpu = snap["torch_cpu"]
-    if not torch.is_tensor(_cpu) or _cpu.dtype != torch.uint8:
+    if not torch.is_tensor(_cpu) or _cpu.dtype != torch.uint8 or _cpu.numel() == 0:
         raise ValueError("checkpoint validation failed: bad torch RNG state")
-    torch.set_rng_state(_cpu)
-    if "python" in snap:
-        _py = snap["python"]
+    for _k in snap:
+        if _k not in ("torch_cpu", "python", "cuda"):
+            raise ValueError(
+                f"checkpoint validation failed: bad RNG snapshot key {_k!r}"
+            )
+    _py = snap.get("python")
+    if _py is not None:
         if not (isinstance(_py, (list, tuple)) and len(_py) == 3):
             raise ValueError("checkpoint validation failed: bad python RNG state")
         version, inner, gauss = _py
         if not (isinstance(version, int) and not isinstance(version, bool)):
             raise ValueError("checkpoint validation failed: bad python RNG state")
-        if not (isinstance(inner, (list, tuple)) and len(inner) == 625):
+        if not (isinstance(inner, (list, tuple)) and len(inner) == 625
+                and all(isinstance(v, int) and not isinstance(v, bool)
+                        and 0 <= v < 2 ** 32 for v in inner)):
             raise ValueError("checkpoint validation failed: bad python RNG state")
-        random.setstate((int(version), tuple(int(v) for v in inner), gauss))
+        if not (gauss is None
+                or (isinstance(gauss, float)
+                    and __import__("math").isfinite(gauss))):
+            raise ValueError("checkpoint validation failed: bad python RNG state")
+    _cuda = snap.get("cuda")
+    if _cuda is not None:
+        if isinstance(_cuda, dict):
+            for _k, _t in _cuda.items():
+                if not (isinstance(_k, str) and _k.startswith("cuda.")
+                        and len(_k) > 5 and _k[5:].isdigit()):
+                    raise ValueError(
+                        "checkpoint validation failed: bad cuda RNG key "
+                        f"{_k!r}"
+                    )
+                if not torch.is_tensor(_t) or _t.dtype != torch.uint8:
+                    raise ValueError(
+                        "checkpoint validation failed: bad cuda RNG state"
+                    )
+        elif isinstance(_cuda, (list, tuple)):
+            for _t in _cuda:
+                if not torch.is_tensor(_t) or _t.dtype != torch.uint8:
+                    raise ValueError(
+                        "checkpoint validation failed: bad cuda RNG state"
+                    )
+        else:
+            raise ValueError("checkpoint validation failed: bad cuda RNG state")
+    try:
+        torch.set_rng_state(_cpu)
+    except Exception as e:
+        raise ValueError(
+            f"checkpoint validation failed: bad torch RNG state: {e}"
+        ) from e
+    if "python" in snap:
+        _py = snap["python"]
+        version, inner, gauss = _py
+        try:
+            random.setstate((int(version), tuple(int(v) for v in inner), gauss))
+        except Exception as e:
+            raise ValueError(
+                f"checkpoint validation failed: bad python RNG state: {e}"
+            ) from e
     if "cuda" in snap and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(snap["cuda"])
+        try:
+            torch.cuda.set_rng_state_all(snap["cuda"])
+        except Exception as e:
+            raise ValueError(
+                f"checkpoint validation failed: bad cuda RNG state: {e}"
+            ) from e
 
 
 def _fsync_file(path: str) -> None:
