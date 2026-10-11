@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 
-from hybrid_fp8 import E5M2_MAX, HybridFP8Linear
+from precision import E5M2_MAX, HybridFP8Linear
 
 
 def _pair(seed=0, with_bias=True):
