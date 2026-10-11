@@ -138,10 +138,10 @@ class SparseRouter(nn.Module):
         n_tokens = x.shape[0]
         if self.num_experts <= 0 and n_tokens > 0:
             raise ValueError("cannot route non-empty batch with 0 experts")
-        if n_tokens * self.num_experts > 16_777_216:
+        if n_tokens * self.num_experts > 8_388_608:
             raise ValueError(
-                f"N*E={n_tokens * self.num_experts} exceeds 16M-element routing "
-                "budget (logits [N,E] transient; chunk the batch)"
+                f"N*E={n_tokens * self.num_experts} exceeds 8M-element routing "
+                "budget (~2x logits+probs [N,E] transient; chunk the batch)"
             )
         if n_tokens == 0:
             dev = x.device

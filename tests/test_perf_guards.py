@@ -232,3 +232,20 @@ def test_m3_sparse_head_study_only_budget():
     assert res["winner"] in ("dense", "sparse")
     print(f"\n[M3] winner={res['winner']} dense={res['dense']['median_ms']:.2f}ms "
           f"sparse={res['sparse']['median_ms']:.2f}ms")
+
+
+def test_m4_routing_budget_counts_both_transients():
+    """N*E guard halves to 8M to cover logits+probs (~2x actual)."""
+    import pytest
+    from routing import SparseRouter
+
+    torch.manual_seed(0)
+    # E=64: N=150k -> N*E=9.6M > 8M trips pre-alloc (x itself is 150k*8 floats).
+    r = SparseRouter(d_model=8, num_experts=64, top_k=2)
+    x = torch.randn(150_000, 8)
+    with pytest.raises(ValueError, match="8M-element routing budget"):
+        r.route(x)
+    # Under budget runs.
+    x2 = torch.randn(1024, 8)
+    plan = r.route(x2)
+    assert plan.top_ids.shape == (1024, 2)
