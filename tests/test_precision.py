@@ -3,9 +3,10 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import pytest
 import torch
 from precision import (
-    PRECISION_POLICY, compute_dtype, dequantize_fp8_block,
+    FP8BlockTensor, PRECISION_POLICY, compute_dtype, dequantize_fp8_block,
     dequantize_fp8_blockwise, dequantize_fp8_row_block, quantize_fp8_blockwise,
     update_fp8_row_block, update_fp8_tile_block,
 )
@@ -805,3 +806,100 @@ def test_expert_grad_scale_zero_still_applies_not_a_skip():
 
 
 
+
+
+def test_fp8_quantize_and_dequantize_non_aligned_cuda_tensor():
+    if not torch.cuda.is_available():
+        import pytest
+        pytest.skip("CUDA is unavailable")
+    w = torch.randn(3, 70, device="cuda", dtype=torch.float32)
+    t = quantize_fp8_blockwise(w, tile=64)
+    assert t.codes.device.type == "cuda"
+    assert t.scales.device.type == "cuda"
+    back = dequantize_fp8_blockwise(t)
+    assert back.device.type == "cuda"
+    assert back.shape == w.shape
+    assert torch.isfinite(back).all()
+
+
+def test_expert_row_range_preflight_prevents_partial_multiweight_update():
+    import pytest
+    from experts import make_expert
+    from train import _GradOnly
+
+    rec = make_expert("expert_00000", d_model=8, expert_hidden=16)
+    opt = SmaulOpt(SmaulOptHParams(state_dtype="fp32", factor_v=False))
+    compute = {
+        "w_gate": _GradOnly(torch.ones(16, 8)),
+        "w_down": _GradOnly(torch.ones(8, 16)),
+    }
+    before_codes = {n: rec.weights_fp8[n].codes.clone() for n in ("w_gate", "w_down")}
+    before_steps = {n: rec.optim_state[n]["step"] for n in ("w_gate", "w_down")}
+
+    # The range is valid for w_gate (16 rows) but invalid for w_down (8).
+    # It must be rejected before w_gate gets updated.
+    with pytest.raises(ValueError, match="invalid row range"):
+        opt.step_expert(rec, compute, 1.0, lr=1e-3, row_range=(10, 12))
+    assert rec.version == 0
+    assert {n: rec.optim_state[n]["step"] for n in before_steps} == before_steps
+    for name, codes in before_codes.items():
+        assert torch.equal(rec.weights_fp8[name].codes, codes)
+
+
+@pytest.mark.parametrize("row_start,row_end", [(-1, 2), (0, 99), (2, 2), (True, 2)])
+def test_fp8_row_block_read_and_write_reject_invalid_ranges(row_start, row_end):
+    t = quantize_fp8_blockwise(torch.randn(4, 8), tile=8)
+    with pytest.raises(ValueError, match="invalid row range"):
+        dequantize_fp8_row_block(t, row_start, row_end)
+    with pytest.raises(ValueError, match="invalid row range"):
+        update_fp8_row_block(t, torch.randn(1, 8), row_start, row_end)
+
+
+def test_fp8_row_block_helpers_reject_non_matrix_storage():
+    t = quantize_fp8_blockwise(torch.randn(2, 3, 8), tile=8)
+    with pytest.raises(ValueError, match="require a 2-D"):
+        dequantize_fp8_row_block(t, 0, 1)
+    with pytest.raises(ValueError, match="require a 2-D"):
+        update_fp8_row_block(t, torch.randn(1, 3, 8), 0, 1)
+
+
+@pytest.mark.parametrize(
+    "codes,scales,shape,tile",
+    [
+        (torch.zeros(2, 4, dtype=torch.uint8), torch.ones(2, 1), (2, 5), 4),
+        (torch.zeros(2, 4, dtype=torch.float32), torch.ones(2, 1), (2, 4), 4),
+        (torch.zeros(2, 4, dtype=torch.uint8), torch.ones(2, 2), (2, 4), 4),
+        (torch.zeros(2, 4, dtype=torch.uint8), torch.ones(2, 1, dtype=torch.float64), (2, 4), 4),
+        (torch.zeros(2, 4, dtype=torch.uint8), torch.ones(2, 1), (2, 4), 0),
+    ],
+)
+def test_fp8_block_tensor_rejects_inconsistent_storage(codes, scales, shape, tile):
+    with pytest.raises(ValueError):
+        FP8BlockTensor(codes=codes, scales=scales, shape=shape, tile=tile)
+
+
+def test_fp8_block_tensor_rejects_nonpositive_logical_dimensions():
+    with pytest.raises(ValueError, match="logical shape"):
+        FP8BlockTensor(
+            codes=torch.empty(0, 4, dtype=torch.uint8),
+            scales=torch.empty(0, 1, dtype=torch.float32),
+            shape=(0, 4),
+            tile=4,
+        )
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        (0.0, 2, 0, 4),
+        (0, True, 0, 4),
+        (0, 2, 0, 4.0),
+        (0, 2, False, 4),
+    ],
+)
+def test_tile_block_rejects_non_integer_indices(bounds):
+    t = quantize_fp8_blockwise(torch.randn(4, 8), tile=4)
+    with pytest.raises(ValueError, match="indices must be integers"):
+        dequantize_fp8_block(t, *bounds)
+    with pytest.raises(ValueError, match="indices must be integers"):
+        update_fp8_tile_block(t, torch.randn(2, 4), *bounds)

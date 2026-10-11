@@ -139,3 +139,52 @@ def test_checkpoint_rng_parts_rejects_bad_torch_rng_payload():
         storage._validate_rng_parts(
             {"torch_cpu": torch.zeros(4, dtype=torch.uint8)}, snap["python"]
         )
+
+def test_noncontiguous_cuda_rng_dict_rejects_before_global_mutation():
+    snap = _good()
+    snap["cuda"] = {"cuda.1": torch.ones(8, dtype=torch.uint8)}
+    torch_before = torch.get_rng_state().clone()
+    python_before = __import__("random").getstate()
+    with pytest.raises(ValueError, match="contiguous"):
+        storage.set_rng_snapshot(snap)
+    assert torch.equal(torch.get_rng_state(), torch_before)
+    assert __import__("random").getstate() == python_before
+
+
+def test_empty_cuda_rng_state_rejects_before_global_mutation():
+    snap = _good()
+    snap["cuda"] = [torch.empty(0, dtype=torch.uint8)]
+    torch_before = torch.get_rng_state().clone()
+    python_before = __import__("random").getstate()
+    with pytest.raises(ValueError, match=r"(?i)cuda RNG state"):
+        storage.set_rng_snapshot(snap)
+    assert torch.equal(torch.get_rng_state(), torch_before)
+    assert __import__("random").getstate() == python_before
+
+def test_jailed_path_rejects_intermediate_symlink_even_inside_checkpoint(tmp_path):
+    ckpt = tmp_path / "checkpoint"
+    real = ckpt / "real_experts"
+    real.mkdir(parents=True)
+    (real / "expert_000.safetensors").write_bytes(b"inside")
+    (ckpt / "experts").symlink_to(real, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink component"):
+        storage._jailed_path(str(ckpt), "experts/expert_000.safetensors")
+
+
+def test_jailed_path_rejects_dotdot_even_when_normalized_path_stays_inside(tmp_path):
+    ckpt = tmp_path / "checkpoint"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text("{}")
+    with pytest.raises(ValueError, match="traversal"):
+        storage._jailed_path(str(ckpt), "experts/../config.json")
+
+def test_checkpoint_lock_rejects_symlink_root_before_creating_lock(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "checkpoint-link"
+    link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="checkpoint path escapes|symlink"):
+        with storage._ckpt_locked(str(link), exclusive=True):
+            pass
+    assert not (target / ".ckpt.lock").exists()

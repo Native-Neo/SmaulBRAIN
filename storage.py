@@ -40,6 +40,7 @@ import contextlib
 import functools
 import hashlib
 import json
+import math
 import os
 import random
 import shutil
@@ -126,27 +127,47 @@ def set_rng_snapshot(snap: dict) -> None:
                 f"checkpoint validation failed: bad python RNG state: {e}"
             ) from e
     _cuda = snap.get("cuda")
+    _cuda_states = None
     if _cuda is not None:
         if isinstance(_cuda, dict):
+            _indexed = {}
             for _k, _t in _cuda.items():
                 if not (isinstance(_k, str) and _k.startswith("cuda.")
-                        and len(_k) > 5 and _k[5:].isdigit()):
+                        and len(_k) > 5 and _k[5:].isdigit()
+                        and _k == f"cuda.{int(_k[5:])}"):
                     raise ValueError(
                         "checkpoint validation failed: bad cuda RNG key "
                         f"{_k!r}"
                     )
-                if not torch.is_tensor(_t) or _t.dtype != torch.uint8:
-                    raise ValueError(
-                        "checkpoint validation failed: bad cuda RNG state"
-                    )
+                _indexed[int(_k[5:])] = _t
+            if sorted(_indexed) != list(range(len(_indexed))):
+                raise ValueError(
+                    "checkpoint validation failed: CUDA RNG keys must be contiguous "
+                    "from cuda.0"
+                )
+            _cuda_states = [_indexed[i] for i in range(len(_indexed))]
         elif isinstance(_cuda, (list, tuple)):
-            for _t in _cuda:
-                if not torch.is_tensor(_t) or _t.dtype != torch.uint8:
-                    raise ValueError(
-                        "checkpoint validation failed: bad cuda RNG state"
-                    )
+            _cuda_states = list(_cuda)
         else:
             raise ValueError("checkpoint validation failed: bad cuda RNG state")
+        if not _cuda_states:
+            raise ValueError("checkpoint validation failed: empty CUDA RNG state")
+        for _t in _cuda_states:
+            if not torch.is_tensor(_t) or _t.dtype != torch.uint8 or _t.numel() == 0:
+                raise ValueError(
+                    "checkpoint validation failed: bad cuda RNG state"
+                )
+        # CUDA RNG blobs are opaque bytes. When CUDA is available, validate
+        # each blob with an isolated generator before changing CPU/Python
+        # globals, so a malformed CUDA state cannot leave a partial restore.
+        if torch.cuda.is_available():
+            try:
+                for _i, _t in enumerate(_cuda_states):
+                    torch.Generator(device=f"cuda:{_i}").set_state(_t.cpu())
+            except Exception as e:
+                raise ValueError(
+                    f"checkpoint validation failed: bad cuda RNG state: {e}"
+                ) from e
     try:
         torch.set_rng_state(_cpu)
     except Exception as e:
@@ -162,9 +183,9 @@ def set_rng_snapshot(snap: dict) -> None:
             raise ValueError(
                 f"checkpoint validation failed: bad python RNG state: {e}"
             ) from e
-    if "cuda" in snap and torch.cuda.is_available():
+    if _cuda_states is not None and torch.cuda.is_available():
         try:
-            torch.cuda.set_rng_state_all(snap["cuda"])
+            torch.cuda.set_rng_state_all(_cuda_states)
         except Exception as e:
             raise ValueError(
                 f"checkpoint validation failed: bad cuda RNG state: {e}"
@@ -235,6 +256,9 @@ def _ckpt_locked(ckpt_dir: str, exclusive: bool):
     ``fcntl`` this is a no-op. The lock file itself is never part of the
     checkpoint format and is ignored by the loader.
     """
+    # Validate before mkdir/open: otherwise a symlinked checkpoint root or
+    # lock file could create/modify .ckpt.lock outside the intended directory.
+    _jailed_path(ckpt_dir, ".ckpt.lock")
     if _fcntl is None:
         yield
         return
@@ -635,11 +659,29 @@ def _flatten_opt_store(store: dict, prefix: str) -> tuple[dict, dict]:
 
 
 def _unflatten_opt_store(tensors: dict, struct: dict, prefix: str) -> dict:
+    _require(isinstance(struct, dict),
+             f"{prefix} optimizer structure must be a dict")
     store: dict = {}
     for k, sm in struct.items():
-        st: dict = {"m": tensors[f"{prefix}.{k}.m"],
-                    "step": int(sm.get("step", 0))}
-        if sm.get("kind", "full") == "full":
+        _require(isinstance(k, str),
+                 f"{prefix} optimizer entry key must be a string, got {k!r}")
+        if not isinstance(sm, dict):
+            raise ValueError(
+                f"checkpoint validation failed: {prefix} optimizer entry {k!r} "
+                "must be a dict"
+            )
+        kind = sm.get("kind", "full")
+        _require(kind in ("full", "factored"),
+                 f"{prefix} optimizer entry {k!r} has invalid kind {kind!r}")
+        raw_step = sm.get("step", 0)
+        if (isinstance(raw_step, bool) or not isinstance(raw_step, int)
+                or raw_step < 0):
+            raise ValueError(
+                f"checkpoint validation failed: {prefix} optimizer entry {k!r} "
+                f"has invalid step {raw_step!r}"
+            )
+        st: dict = {"m": tensors[f"{prefix}.{k}.m"], "step": raw_step}
+        if kind == "full":
             st["v"] = tensors[f"{prefix}.{k}.v"]
         else:
             st["v_row"] = tensors[f"{prefix}.{k}.v_row"]
@@ -672,8 +714,14 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
     raises without touching the checkpoint directory, so a previous
     complete generation is never clobbered by a partial one.
     """
-    if int(step) < 0:
+    if isinstance(step, bool) or not isinstance(step, int):
+        raise ValueError(f"refusing to checkpoint non-integer step {step!r}")
+    if step < 0:
         raise ValueError(f"refusing to checkpoint negative step {step}")
+    # Reject a symlinked checkpoint root or experts directory before
+    # mkdir/locking/temp sweeping can touch paths outside the checkpoint.
+    _jailed_path(ckpt_dir, "manifest.json")
+    _jailed_path(ckpt_dir, "experts")
     if len(model.pool) == 0:
         raise ValueError("refusing to checkpoint an empty expert pool")
     if model.router.num_experts != len(model.pool):
@@ -919,13 +967,27 @@ def _jailed_path(ckpt_dir: str, rel: str) -> str:
     _require(isinstance(rel, str) and rel != "" and "\x00" not in rel,
              f"bad checkpoint rel {rel!r}")
     _require(not os.path.isabs(rel), f"bad checkpoint rel {rel!r}")
+    parts = rel.split("/")
+    _require(all(part not in ("", ".", "..") for part in parts),
+             f"bad checkpoint rel traversal {rel!r}")
     base = os.path.realpath(os.path.abspath(ckpt_dir))
     p = os.path.abspath(os.path.join(ckpt_dir, rel))
     _require(p == base or p.startswith(base + os.sep),
              f"checkpoint path escapes dir: {rel!r}")
-    # Refuse symlinks along the resolved path (lexical check alone can be
-    # bypassed by a planted experts/<id>.safetensors -> /etc/shadow link).
+    # Refuse symlinks at every existing component, including intermediate
+    # directories such as experts/ that resolve back inside the checkpoint.
     try:
+        current = os.path.abspath(ckpt_dir)
+        if os.path.lexists(current) and os.path.islink(current):
+            raise ValueError(
+                f"checkpoint validation failed: refusing symlink checkpoint root {ckpt_dir!r}"
+            )
+        for part in parts:
+            current = os.path.join(current, part)
+            if os.path.lexists(current) and os.path.islink(current):
+                raise ValueError(
+                    f"checkpoint validation failed: refusing symlink component {part!r} in {rel!r}"
+                )
         r = os.path.realpath(p)
     except OSError as e:
         raise ValueError(
@@ -955,16 +1017,18 @@ def _validate_expert_parts(tensors: dict, meta: dict, eid: str, saved_cfg) -> No
     """Type/shape validation for one raw expert (tensors + JSON meta)."""
     _require(isinstance(meta, dict), f"{eid}: meta is not a dict")
     _require(meta.get("expert_id") == eid, f"{eid}: id mismatch {meta.get('expert_id')!r}")
-    try:
-        d_model = int(meta.get("d_model", -1))
-        expert_hidden = int(meta.get("expert_hidden", -1))
-    except (TypeError, ValueError):
-        raise ValueError(
-            f"checkpoint validation failed: {eid}: bad d_model/expert_hidden"
-        ) from None
-    _require(d_model == saved_cfg.d_model, f"{eid}: bad d_model")
-    _require(expert_hidden == saved_cfg.expert_hidden,
-             f"{eid}: bad expert_hidden")
+    d_model = meta.get("d_model", -1)
+    expert_hidden = meta.get("expert_hidden", -1)
+    _require(
+        isinstance(d_model, int) and not isinstance(d_model, bool)
+        and d_model == saved_cfg.d_model,
+        f"{eid}: bad d_model {d_model!r}",
+    )
+    _require(
+        isinstance(expert_hidden, int) and not isinstance(expert_hidden, bool)
+        and expert_hidden == saved_cfg.expert_hidden,
+        f"{eid}: bad expert_hidden {expert_hidden!r}",
+    )
     want = {
         "w_gate": (saved_cfg.expert_hidden, saved_cfg.d_model),
         "w_up": (saved_cfg.expert_hidden, saved_cfg.d_model),
@@ -976,13 +1040,11 @@ def _validate_expert_parts(tensors: dict, meta: dict, eid: str, saved_cfg) -> No
         wm = wmeta.get(n)
         _require(isinstance(wm, dict), f"{eid}: {n} meta is not a dict")
         _require(tuple(wm.get("shape", ())) == want[n], f"{eid}: {n} bad shape")
-        try:
-            tile = int(wm.get("tile", 0))
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"checkpoint validation failed: {eid}: {n} bad tile"
-            ) from None
-        _require(tile >= 1, f"{eid}: {n} bad tile")
+        tile = wm.get("tile", 0)
+        _require(
+            isinstance(tile, int) and not isinstance(tile, bool) and tile >= 1,
+            f"{eid}: {n} bad tile {tile!r}",
+        )
         codes, scales = tensors.get(f"{n}.codes"), tensors.get(f"{n}.scales")
         _require(torch.is_tensor(codes) and codes.dtype == torch.uint8,
                  f"{eid}: {n} codes must be uint8")
@@ -998,13 +1060,11 @@ def _validate_expert_parts(tensors: dict, meta: dict, eid: str, saved_cfg) -> No
         _require(n in EXPERT_NAMES, f"{eid}: unknown optim entry {n!r}")
         _require(om.get("kind") in ("full", "factored"),
                  f"{eid}: optim {n} bad kind")
-        try:
-            s = int(om.get("step", -1))
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"checkpoint validation failed: {eid}: optim {n} bad step"
-            ) from None
-        _require(s >= 0, f"{eid}: optim {n} bad step")
+        s = om.get("step", -1)
+        _require(
+            isinstance(s, int) and not isinstance(s, bool) and s >= 0,
+            f"{eid}: optim {n} bad step {s!r}",
+        )
         fields = ("m", "v") if om.get("kind") == "full" else ("m", "v_row", "v_col")
         st = {f: tensors.get(f"optim.{n}.{f}") for f in fields}
         st["step"] = s
@@ -1012,19 +1072,17 @@ def _validate_expert_parts(tensors: dict, meta: dict, eid: str, saved_cfg) -> No
     m = meta.get("meta", {})
     _require(isinstance(m, dict), f"{eid}: bad meta")
     for k in ("birth_step", "last_used_step", "tokens_routed"):
-        try:
-            int(m.get(k, 0))
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"checkpoint validation failed: {eid}: bad meta {k}"
-            ) from None
+        value = m.get(k, 0)
+        _require(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+            f"{eid}: bad meta {k} {value!r}",
+        )
     for k in ("grad_activity", "contribution"):
-        try:
-            float(m.get(k, 0.0))
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"checkpoint validation failed: {eid}: bad meta {k}"
-            ) from None
+        value = m.get(k, 0.0)
+        _require(
+            _is_num(value) and math.isfinite(value) and value >= 0.0,
+            f"{eid}: bad meta {k} {value!r}",
+        )
     parents = m.get("parents", [])
     _require(isinstance(parents, list) and all(isinstance(x, str) for x in parents),
              f"{eid}: parents must be a list of str")
@@ -1078,9 +1136,25 @@ def _validate_optim_store(store: dict, expected: dict, label: str) -> None:
 
 def _validate_opt_hparams(saved_hp: dict) -> None:
     _require(isinstance(saved_hp, dict), "meta.json bad hparams")
-    for k in ("lr", "beta_m", "beta_v", "eps", "wd", "clip", "update_clip"):
-        if k in saved_hp:
-            _require(_is_num(saved_hp[k]), f"meta.json bad hparam {k}")
+    rules = {
+        "lr": (0.0, False),
+        "beta_m": (0.0, True),
+        "beta_v": (0.0, True),
+        "eps": (0.0, False),
+        "wd": (0.0, True),
+        "clip": (0.0, True),
+        "update_clip": (0.0, False),
+    }
+    for k, (floor, inclusive) in rules.items():
+        if k not in saved_hp:
+            continue
+        value = saved_hp[k]
+        valid = _is_num(value) and math.isfinite(value)
+        if valid:
+            valid = value >= floor if inclusive else value > floor
+            if k in ("beta_m", "beta_v"):
+                valid = valid and value < 1.0
+        _require(valid, f"meta.json bad hparam {k}: {value!r}")
     if "state_dtype" in saved_hp:
         _require(saved_hp["state_dtype"] in ("bf16", "fp32"),
                  "meta.json bad hparam state_dtype")

@@ -236,3 +236,26 @@ def test_rmsnorm_misaligned_buffer_matches_torch(tmp_path):
     ref = rmsnorm_fn(torch.from_numpy(np.array(x, dtype=np.float32)),
                      torch.from_numpy(w), eps=1e-6).numpy()
     assert np.allclose(y, ref, atol=1e-6, rtol=1e-5)
+
+
+def test_linear_attn_native_clamps_small_positive_denominator_like_torch(tmp_path):
+    lib = _build("linear_attn.cpp", tmp_path)
+    lib.smaul_linear_attn_step_buf.argtypes = [_F32, _F32, _F32, _F32, _F32,
+                                               _F32, _F32, _SZ, ctypes.c_float]
+    Dh = 1
+    S = np.zeros((1, 1), dtype=np.float32)
+    z = np.zeros(1, dtype=np.float32)
+    scratch = np.zeros(2, dtype=np.float32)
+    y = np.zeros(1, dtype=np.float32)
+    q = np.array([-13.92], dtype=np.float32)
+    k = np.array([-13.0], dtype=np.float32)
+    v = np.array([1.0], dtype=np.float32)
+    lib.smaul_linear_attn_step_buf(S.ctypes.data_as(_F32), z.ctypes.data_as(_F32),
+                                   q.ctypes.data_as(_F32), k.ctypes.data_as(_F32),
+                                   v.ctypes.data_as(_F32), y.ctypes.data_as(_F32),
+                                   scratch.ctypes.data_as(_F32), Dh, 1e-6)
+    state = LinearAttnState.zeros(1, 1, Dh)
+    ref, _ = linear_attn_step(state, torch.from_numpy(q)[None, None, :],
+                              torch.from_numpy(k)[None, None, :],
+                              torch.from_numpy(v)[None, None, :], eps=1e-6)
+    assert np.allclose(y, ref.numpy()[0, 0], atol=1e-5, rtol=1e-5)

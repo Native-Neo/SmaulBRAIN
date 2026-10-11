@@ -804,3 +804,81 @@ def test_load_drops_conv_for_pre_conv_checkpoint(tmp_path):
     ids = torch.randint(0, 256, (1, 8))
     assert m2.forward_infer(ids)["logits"].shape == (1, 8, m2.cfg.vocab_size)
     m.pager.close(); m2.pager.close()
+
+
+@pytest.mark.parametrize("bad_step", [1.5, True, "2", -1])
+def test_expert_optimizer_step_metadata_rejects_coercion(tmp_path, bad_step):
+    import json
+    from safetensors.torch import load_file
+    import storage as _st
+
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    eid = m.pool.order[0]
+    sidecar = os.path.join(d, "experts", f"{eid}.json")
+    with open(sidecar, encoding="utf-8") as f:
+        meta = json.load(f)
+    tensors = load_file(os.path.join(d, "experts", f"{eid}.safetensors"))
+    meta["optim"]["w_gate"]["step"] = bad_step
+
+    with pytest.raises(ValueError, match="bad step"):
+        _st._validate_expert_parts(tensors, meta, eid, m.cfg)
+    m.pager.close()
+
+
+def test_expert_usage_metadata_rejects_coercion_and_nonfinite_values(tmp_path):
+    import copy
+    import json
+    from safetensors.torch import load_file
+    import storage as _st
+
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    eid = m.pool.order[0]
+    sidecar = os.path.join(d, "experts", f"{eid}.json")
+    with open(sidecar, encoding="utf-8") as f:
+        original = json.load(f)
+    tensors = load_file(os.path.join(d, "experts", f"{eid}.safetensors"))
+    invalid = [
+        ("birth_step", 1.5), ("last_used_step", True),
+        ("tokens_routed", -1), ("grad_activity", float("nan")),
+        ("grad_activity", float("inf")), ("contribution", -0.1),
+        ("contribution", "0.5"), ("contribution", True),
+    ]
+    for key, value in invalid:
+        meta = copy.deepcopy(original)
+        meta["meta"][key] = value
+        with pytest.raises(ValueError, match=f"bad meta {key}"):
+            _st._validate_expert_parts(tensors, meta, eid, m.cfg)
+    m.pager.close()
+
+
+def test_expert_shape_and_tile_metadata_rejects_lossy_coercion(tmp_path):
+    import copy
+    import json
+    from safetensors.torch import load_file
+    import storage as _st
+
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    eid = m.pool.order[0]
+    sidecar = os.path.join(d, "experts", f"{eid}.json")
+    with open(sidecar, encoding="utf-8") as f:
+        original = json.load(f)
+    tensors = load_file(os.path.join(d, "experts", f"{eid}.safetensors"))
+    invalid = [
+        ("d_model", 32.5), ("d_model", True), ("d_model", "32"),
+        ("expert_hidden", 64.5), ("expert_hidden", False),
+        ("expert_hidden", "64"),
+    ]
+    for key, value in invalid:
+        meta = copy.deepcopy(original)
+        meta[key] = value
+        with pytest.raises(ValueError, match=f"bad {key}"):
+            _st._validate_expert_parts(tensors, meta, eid, m.cfg)
+    for value in (64.5, True, "64", 0):
+        meta = copy.deepcopy(original)
+        meta["weights"]["w_gate"]["tile"] = value
+        with pytest.raises(ValueError, match="bad tile"):
+            _st._validate_expert_parts(tensors, meta, eid, m.cfg)
+    m.pager.close()

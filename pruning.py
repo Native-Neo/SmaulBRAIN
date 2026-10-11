@@ -165,6 +165,8 @@ def prune_experts(
     missing = [eid for eid in victims if eid not in pool.experts]
     if missing:
         raise ValueError(f"unknown victims (refusing to prune): {missing}")
+    if len(set(victims)) != len(victims):
+        raise ValueError("duplicate victims (refusing to prune): victim ids must be unique")
     if router.num_experts != len(pool):
         raise ValueError(
             f"pool/router out of sync: {len(pool)} experts vs "
@@ -207,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
     from config import SmaulBrainConfig
     from model import SmaulBrainModel
     from smaulopt import SmaulOpt
-    from storage import load_model, load_resume_config, save_model
+    from storage import _jailed_path, load_model, load_resume_config, save_model
 
     args = build_parser().parse_args(argv)
     if args.rm_worst < 0:
@@ -216,7 +218,11 @@ def main(argv: list[str] | None = None) -> int:
     ckpt = args.ckpt
     try:
         resume_cfg = load_resume_config(ckpt)
-        floor = int(resume_cfg.get("min_experts", FLOOR_DEFAULT))
+        floor = resume_cfg.get("min_experts", FLOOR_DEFAULT)
+        if isinstance(floor, bool) or not isinstance(floor, int) or floor < 1:
+            raise ValueError(
+                f"min_experts must be a positive integer, got {floor!r}"
+            )
     except FileNotFoundError:
         print(f"warning: no resume_config.json in {ckpt}; using default floor {FLOOR_DEFAULT}",
               file=sys.stderr)
@@ -224,12 +230,25 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, TypeError) as e:
         print(json.dumps({"error": f"bad resume_config.json: {e}"}), file=sys.stderr)
         return 2
-    cfg_path = os.path.join(ckpt, "config.json")
+    try:
+        cfg_path = _jailed_path(ckpt, "config.json")
+    except ValueError as e:
+        print(json.dumps({"error": f"bad config.json path: {e}"}), file=sys.stderr)
+        return 2
     if not os.path.exists(cfg_path):
         print(json.dumps({"error": f"no checkpoint at {ckpt}; train first"}), file=sys.stderr)
         return 2
-    with open(cfg_path) as f:
-        cfg = SmaulBrainConfig.from_dict(json.load(f))
+    try:
+        with open(cfg_path) as f:
+            cfg = SmaulBrainConfig.from_dict(json.load(f))
+    except (OSError, ValueError, TypeError) as e:
+        print(json.dumps({"error": f"bad config.json: {e}"}), file=sys.stderr)
+        return 2
+    if floor < cfg.top_k:
+        print(json.dumps({
+            "error": f"resume_config min_experts={floor} is below top_k={cfg.top_k}; refusing unsafe pruning"
+        }), file=sys.stderr)
+        return 2
     survival = args.survival_steps if args.survival_steps is not None else cfg.prune_survival_steps
     usage = args.min_usage if args.min_usage is not None else cfg.prune_min_usage
     model = SmaulBrainModel(cfg)

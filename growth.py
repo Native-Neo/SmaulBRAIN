@@ -11,12 +11,43 @@ expert file + router row + metadata).
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from experts import ExpertPool, init_expert_optim_state, make_expert
 from precision import dequantize_fp8_blockwise
 
 _EXPERT_WEIGHTS = ("w_gate", "w_up", "w_down")
+
+
+def _validate_noise_std(noise_std: float) -> None:
+    if (isinstance(noise_std, bool) or not isinstance(noise_std, (int, float))
+            or not math.isfinite(noise_std) or noise_std < 0):
+        raise ValueError(
+            f"noise_std must be a finite non-negative number, got {noise_std!r}"
+        )
+
+
+def _validate_max_experts(max_experts: int | None) -> None:
+    if max_experts is not None and (
+        isinstance(max_experts, bool)
+        or not isinstance(max_experts, int)
+        or max_experts < 1
+    ):
+        raise ValueError(
+            f"max_experts must be a positive int or None, got {max_experts!r}"
+        )
+
+
+def _validate_step(step: int) -> None:
+    if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+        raise ValueError(f"step must be a non-negative int, got {step!r}")
+
+
+def _validate_n_parents(n_parents: int) -> None:
+    if isinstance(n_parents, bool) or not isinstance(n_parents, int) or n_parents < 1:
+        raise ValueError(f"n_parents must be a positive int, got {n_parents!r}")
 
 
 def _check_optim_width(optim_state: dict | None, expect: int) -> None:
@@ -112,6 +143,7 @@ def recombine_weights(
     generator: torch.Generator | None = None,
 ) -> dict[str, torch.Tensor]:
     """Convex combination of dequantized parent weights + seeded noise."""
+    _validate_noise_std(noise_std)
     if not parents:
         raise ValueError("need at least one parent (empty pool uses make_expert fallback)")
     missing = [eid for eid in parents if eid not in pool.experts]
@@ -186,6 +218,10 @@ def grow_expert(
     consumed IDs.
     """
     _check_topology_in_sync(pool, router)
+    _validate_step(step)
+    _validate_n_parents(n_parents)
+    _validate_noise_std(noise_std)
+    _validate_max_experts(max_experts)
     if max_experts is not None and len(pool) >= max_experts:
         raise ValueError(f"at capacity: {len(pool)} >= max_experts={max_experts}")
     _check_optim_width(optim_state, len(pool))
@@ -273,6 +309,10 @@ def grow_topk_clones(
     so the prior topology returns exactly with no consumed IDs.
     """
     _check_topology_in_sync(pool, router)
+    _validate_step(step)
+    _validate_max_experts(max_experts)
+    if isinstance(k, bool) or not isinstance(k, int) or k < 1:
+        raise ValueError(f"k must be a positive int, got {k!r}")
     if not 0.0 <= min_pct <= max_pct:
         raise ValueError(f"need 0 <= min_pct <= max_pct, got {min_pct!r}, {max_pct!r}")
     ranked = sorted(

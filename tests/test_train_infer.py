@@ -124,6 +124,38 @@ def test_eval_loss_invariant_to_pad_tail_length():
     m.pager.close()
 
 
+def test_evaluate_loss_restores_training_mode_after_forward_error():
+    m, _, cfg = _model()
+    m.train()
+
+    def fail_forward(*_args, **_kwargs):
+        raise RuntimeError("injected evaluation failure")
+
+    m.forward_infer = fail_forward
+    batch = batch_from_seqs([[10, 20, 30]], context=cfg.context_length)
+    try:
+        with pytest.raises(RuntimeError, match="injected evaluation failure"):
+            evaluate_loss(m, batch, cfg.context_length)
+        assert m.training is True
+    finally:
+        m.pager.close()
+
+
+
+def test_training_rejects_batch_with_only_padding_targets():
+    from bytes import PAD_ID
+
+    m, opt, cfg = _model()
+    x = torch.full((2, cfg.context_length), PAD_ID, dtype=torch.long)
+    y = torch.full_like(x, PAD_ID)
+    try:
+        with pytest.raises(ValueError, match="no non-padding tokens"):
+            train_step(m, opt, cfg, x, y, step=0)
+        assert opt.step_count == 0
+    finally:
+        m.pager.close()
+
+
 def test_train_loss_invariant_to_pad_tail_without_capacity_pressure():
     # Capacity binds nothing here (factor 1000), so per-position outputs are
     # prefix-determined and the valid-normalized loss must match exactly.
@@ -486,3 +518,9 @@ def test_generate_zero_tokens_skips_forward_pass():
         assert result["text"] == "" and result["depths"] == []
     finally:
         m.pager.close()
+
+
+def test_batch_from_seqs_pads_short_tuples():
+    batch = batch_from_seqs([(1, 2, 3)], context=4, pad_id=0)
+    assert batch.shape == (1, 5)
+    assert batch.tolist() == [[1, 2, 3, 0, 0]]

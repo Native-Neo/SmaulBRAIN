@@ -546,3 +546,67 @@ def test_reservoir_long_run_uniform_and_resume_equal():
     snap = a.to_dict()
     b = ReplayBuffer.from_dict(snap)
     assert [b.sample(3) for _ in range(5)] == [a.sample(3) for _ in range(5)]
+
+
+def test_replay_capacity_rejects_lossy_coercions():
+    import pytest
+
+    for bad in (True, False, 1.5, "4"):
+        with pytest.raises(ValueError, match="capacity must be an int"):
+            ReplayBuffer(capacity=bad)
+
+
+def test_replay_restore_rejects_inconsistent_reservoir_length():
+    import pytest
+
+    cases = [
+        {"capacity": 3, "seen": 0, "buf": [[1]]},
+        {"capacity": 2, "seen": 3, "buf": [[1]]},
+        {"capacity": 2, "seen": 3, "buf": [[1], [2], [3]]},
+    ]
+    for bad in cases:
+        snap = ReplayBuffer(capacity=bad["capacity"]).to_dict()
+        snap.update(bad)
+        with pytest.raises(ValueError, match="snapshot is inconsistent"):
+            ReplayBuffer.from_dict(snap)
+
+
+def test_replay_sample_rejects_non_integer_counts():
+    import pytest
+
+    buf = ReplayBuffer(capacity=2)
+    buf.add([1])
+    for bad in (True, False, 1.5, "1"):
+        with pytest.raises(ValueError, match="sample count must be an int"):
+            buf.sample(bad)
+
+
+def test_replay_add_rejects_malformed_token_sequences_without_advancing_cursor():
+    import pytest
+
+    for bad in ("123", [1, True], [1, -1], [1, 2.5], None):
+        buf = ReplayBuffer(capacity=3)
+        with pytest.raises(ValueError):
+            buf.add(bad)
+        assert buf.seen == 0
+        assert len(buf) == 0
+
+
+def test_replay_restore_rejects_negative_token_ids():
+    import pytest
+
+    snap = ReplayBuffer(capacity=2).to_dict()
+    snap.update({"seen": 1, "buf": [[-1]]})
+    with pytest.raises(ValueError, match="non-negative ints"):
+        ReplayBuffer.from_dict(snap)
+
+
+def test_batch_from_seqs_rejects_lossy_or_invalid_token_inputs():
+    import pytest
+
+    for bad_seq in ([1.9, 2], [1, True], [1, -1], "123"):
+        with pytest.raises(ValueError):
+            batch_from_seqs([bad_seq], context=2)
+    for bad_context in (True, 1.5, 0, -1):
+        with pytest.raises(ValueError, match="context"):
+            batch_from_seqs([[1, 2]], context=bad_context)

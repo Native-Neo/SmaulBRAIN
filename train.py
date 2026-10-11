@@ -79,14 +79,25 @@ class ReplayBuffer:
     """
 
     def __init__(self, capacity: int = 512, seed: int = 0) -> None:
-        if int(capacity) < 0:
+        if isinstance(capacity, bool) or not isinstance(capacity, int):
+            raise ValueError(
+                f"ReplayBuffer capacity must be an int (not bool), got {capacity!r}"
+            )
+        if capacity < 0:
             raise ValueError(f"ReplayBuffer capacity must be >= 0, got {capacity!r}")
-        self.capacity = int(capacity)
+        self.capacity = capacity
         self.buf: deque[list[int]] = deque()
         self.rng = random.Random(seed)
         self.seen = 0
 
     def add(self, seq: list[int]) -> None:
+        if not isinstance(seq, (list, tuple)):
+            raise ValueError(f"ReplayBuffer sequence must be a list or tuple, got {type(seq).__name__}")
+        for token in seq:
+            if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+                raise ValueError(
+                    f"ReplayBuffer token ids must be non-negative ints (not bool), got {token!r}"
+                )
         self.seen += 1
         seq = list(seq)  # ingress copy: later caller mutation must not corrupt replay
         if len(self.buf) < self.capacity:
@@ -106,6 +117,8 @@ class ReplayBuffer:
         fixed output length until the buffer holds ``>= n`` items. Egress
         values are copies: mutating them cannot corrupt replay.
         """
+        if isinstance(n, bool) or not isinstance(n, int):
+            raise ValueError(f"ReplayBuffer sample count must be an int (not bool), got {n!r}")
         if n <= 0 or not self.buf:
             return []
         return [list(self.rng.choice(self.buf)) for _ in range(min(n, len(self.buf)))]
@@ -153,13 +166,22 @@ class ReplayBuffer:
             if not isinstance(_s, (list, tuple)):
                 raise ValueError(f"ReplayBuffer buf entries must be lists, got {_s!r}")
             for _v in _s:
-                if isinstance(_v, bool) or not isinstance(_v, int):
-                    raise ValueError(f"ReplayBuffer buf entries must be ints (not bool), got {_v!r}")
+                if isinstance(_v, bool) or not isinstance(_v, int) or _v < 0:
+                    raise ValueError(
+                        f"ReplayBuffer token ids must be non-negative ints (not bool), got {_v!r}"
+                    )
         seen_raw = d.get("seen", 0)
         if isinstance(seen_raw, bool) or not isinstance(seen_raw, int):
             raise ValueError(f"ReplayBuffer seen must be an int (not bool), got {seen_raw!r}")
         if seen_raw < 0:
             raise ValueError(f"ReplayBuffer seen must be >= 0, got {seen_raw!r}")
+        expected_len = min(seen_raw, cap_raw)
+        if len(buf_raw) != expected_len:
+            raise ValueError(
+                "ReplayBuffer snapshot is inconsistent: "
+                f"len(buf)={len(buf_raw)}, seen={seen_raw}, capacity={cap_raw}; "
+                f"expected len(buf)={expected_len}"
+            )
         rng = d.get("rng")
         if rng is not None:
             if not (isinstance(rng, (list, tuple)) and len(rng) == 3):
@@ -196,11 +218,22 @@ def batch_from_seqs(seqs: list[list[int]], context: int, pad_id: int = PAD_ID) -
     hold >= 1 row; undersized replay is clipped by the sampler, never by
     silently stacking zero rows).
     """
-    if not seqs:
-        raise ValueError("batch_from_seqs needs >= 1 seq (got empty list)")
+    if isinstance(context, bool) or not isinstance(context, int) or context < 1:
+        raise ValueError(f"context must be an int >= 1, got {context!r}")
+    if isinstance(pad_id, bool) or not isinstance(pad_id, int) or pad_id < 0:
+        raise ValueError(f"pad_id must be a non-negative int (not bool), got {pad_id!r}")
+    if not isinstance(seqs, (list, tuple)) or not seqs:
+        raise ValueError("batch_from_seqs needs >= 1 sequence (got empty or invalid input)")
     rows = []
     for s in seqs:
-        s = s[: context + 1]
+        if not isinstance(s, (list, tuple)):
+            raise ValueError(f"each sequence must be a list or tuple, got {type(s).__name__}")
+        for token in s:
+            if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+                raise ValueError(
+                    f"token IDs must be non-negative ints (not bool), got {token!r}"
+                )
+        s = list(s[: context + 1])
         if len(s) < context + 1:
             s = s + [pad_id] * (context + 1 - len(s))
         rows.append(torch.tensor(s, dtype=torch.long))
@@ -220,20 +253,21 @@ def evaluate_loss(model, batch: torch.Tensor, context: int) -> dict:
     """
     was_training = model.training
     model.eval()
-    x = batch[:, :context]
-    y = batch[:, 1 : context + 1]
-    out = model.forward_infer(x)
-    logits = out["logits"].float()
-    valid = (y != PAD_ID)
-    n_valid = int(valid.sum().item())
-    ce = torch.nn.functional.cross_entropy(logits.reshape(-1, model.cfg.vocab_size),
-                                           y.reshape(-1), reduction="none",
-                                           ignore_index=PAD_ID)
-    loss = (ce.sum() / max(1, n_valid)).item()
-    acc = (((logits.argmax(-1) == y) & valid).float().sum() / max(1, n_valid)).item()
-    if was_training:
-        model.train()
-    return {"loss": loss, "acc": acc, "mean_executed": float(out["n_executed"])}
+    try:
+        x = batch[:, :context]
+        y = batch[:, 1 : context + 1]
+        out = model.forward_infer(x)
+        logits = out["logits"].float()
+        valid = (y != PAD_ID)
+        n_valid = int(valid.sum().item())
+        ce = torch.nn.functional.cross_entropy(logits.reshape(-1, model.cfg.vocab_size),
+                                               y.reshape(-1), reduction="none",
+                                               ignore_index=PAD_ID)
+        loss = (ce.sum() / max(1, n_valid)).item()
+        acc = (((logits.argmax(-1) == y) & valid).float().sum() / max(1, n_valid)).item()
+        return {"loss": loss, "acc": acc, "mean_executed": float(out["n_executed"])}
+    finally:
+        model.train(was_training)
 
 
 def retention_report(before: dict, after: dict) -> dict:

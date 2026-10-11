@@ -74,6 +74,30 @@ class FP8BlockTensor:
         if not isinstance(self.tile, int) or isinstance(self.tile, bool) \
                 or self.tile < 1:
             raise ValueError(f"fp8 tile must be a positive int, got {self.tile!r}")
+        if (not isinstance(self.shape, (tuple, list)) or not self.shape
+                or any(isinstance(dim, bool) or not isinstance(dim, int) or dim < 1
+                       for dim in self.shape)):
+            raise ValueError(f"FP8 logical shape must contain positive integer dimensions, got {self.shape!r}")
+        shape = tuple(self.shape)
+        if not torch.is_tensor(self.codes) or self.codes.dtype != torch.uint8:
+            raise ValueError("FP8 codes must be a uint8 tensor")
+        if tuple(self.codes.shape) != shape:
+            raise ValueError(
+                f"FP8 codes shape {tuple(self.codes.shape)} does not match logical shape {shape}"
+            )
+        if not torch.is_tensor(self.scales) or self.scales.dtype != torch.float32:
+            raise ValueError("FP8 scales must be a float32 tensor")
+        expected_scales = (
+            self.codes.numel() // shape[-1],
+            (shape[-1] + self.tile - 1) // self.tile,
+        )
+        if tuple(self.scales.shape) != expected_scales:
+            raise ValueError(
+                f"FP8 scales shape {tuple(self.scales.shape)} does not match "
+                f"expected {expected_scales} for shape {shape} and tile {self.tile}"
+            )
+        if self.scales.device != self.codes.device:
+            raise ValueError("FP8 codes and scales must be on the same device")
 
     def nbytes(self) -> int:
         return self.codes.nelement() + self.scales.nelement() * 4
@@ -107,7 +131,10 @@ def quantize_fp8_blockwise(w: torch.Tensor, tile: int = 64) -> FP8BlockTensor:
             return FP8BlockTensor(codes=codes_u8, scales=scales, shape=orig, tile=tile)
     pad = n_blocks * tile - n_cols
     if pad:
-        flat = torch.cat([flat, torch.zeros(flat.shape[0], pad)], dim=1)
+        flat = torch.cat([
+            flat,
+            torch.zeros(flat.shape[0], pad, dtype=flat.dtype, device=flat.device),
+        ], dim=1)
     blocks = flat.reshape(-1, n_blocks, tile)
     amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
     scales = (amax / FP8_MAX).reshape(-1, n_blocks).contiguous()  # fp32
@@ -136,17 +163,35 @@ def dequantize_fp8_blockwise(t: FP8BlockTensor, dtype: torch.dtype = torch.float
     flat = codes_f8.to(torch.float32)
     pad = n_blocks * t.tile - n_cols
     if pad:
-        flat = torch.cat([flat, torch.zeros(flat.shape[0], pad)], dim=1)
+        flat = torch.cat([
+            flat,
+            torch.zeros(flat.shape[0], pad, dtype=flat.dtype, device=flat.device),
+        ], dim=1)
     blocks = flat.reshape(-1, n_blocks, t.tile)
     # q ~= orig/amax*448 and scales = amax/448, so orig ~= q*scales.
     out = (blocks * t.scales.unsqueeze(-1)).reshape(flat.shape)[:, :n_cols]
     return out.reshape(t.shape).to(dtype)
 
 
+def _validate_fp8_row_range(t: FP8BlockTensor, row_start: int, row_end: int) -> None:
+    if t.codes.ndim != 2 or len(t.shape) != 2:
+        raise ValueError(
+            "row-block operations require a 2-D (rows x cols) FP8BlockTensor, "
+            f"got codes.ndim={t.codes.ndim} shape={t.shape}"
+        )
+    if (isinstance(row_start, bool) or not isinstance(row_start, int)
+            or isinstance(row_end, bool) or not isinstance(row_end, int)
+            or not (0 <= row_start < row_end <= t.shape[0])):
+        raise ValueError(
+            f"invalid row range [{row_start}, {row_end}) for tensor with {t.shape[0]} rows"
+        )
+
+
 def dequantize_fp8_row_block(
     t: FP8BlockTensor, row_start: int, row_end: int, dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
     """Dequantize only a row slice — avoids full-matrix transient for big experts."""
+    _validate_fp8_row_range(t, row_start, row_end)
     sub = FP8BlockTensor(
         codes=t.codes[row_start:row_end],
         scales=t.scales[row_start:row_end],
@@ -165,10 +210,7 @@ def update_fp8_row_block(
     ``new_rows`` must match the slice shape exactly:
     ``(row_end - row_start, *t.shape[1:])``.
     """
-    if row_start < 0 or row_end > t.shape[0] or row_start >= row_end:
-        raise ValueError(
-            f"invalid row range [{row_start}, {row_end}) for tensor with {t.shape[0]} rows"
-        )
+    _validate_fp8_row_range(t, row_start, row_end)
     expect = (row_end - row_start, *t.shape[1:])
     if tuple(new_rows.shape) != tuple(expect):
         raise ValueError(
@@ -206,6 +248,9 @@ def dequantize_fp8_block(
             f"got codes.ndim={t.codes.ndim} shape={t.shape}"
         )
     n_rows, n_cols = int(t.shape[0]), int(t.shape[-1])
+    bounds = (row_start, row_end, col_start, col_end)
+    if any(isinstance(v, bool) or not isinstance(v, int) for v in bounds):
+        raise ValueError(f"tile-block indices must be integers, got {bounds!r}")
     if not (0 <= row_start < row_end <= n_rows):
         raise ValueError(f"invalid row range [{row_start}, {row_end}) for {n_rows} rows")
     if not (0 <= col_start < col_end <= n_cols):
@@ -258,6 +303,9 @@ def update_fp8_tile_block(
             f"got codes.ndim={t.codes.ndim} shape={t.shape}"
         )
     n_rows, n_cols = int(t.shape[0]), int(t.shape[-1])
+    bounds = (row_start, row_end, col_start, col_end)
+    if any(isinstance(v, bool) or not isinstance(v, int) for v in bounds):
+        raise ValueError(f"tile-block indices must be integers, got {bounds!r}")
     if not (0 <= row_start < row_end <= n_rows):
         raise ValueError(f"invalid row range [{row_start}, {row_end}) for {n_rows} rows")
     if not (0 <= col_start < col_end <= n_cols):

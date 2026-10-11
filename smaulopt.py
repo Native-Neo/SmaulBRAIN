@@ -91,6 +91,36 @@ class SmaulOptHParams:
     factor_v: bool = True
     update_clip: float = 10.0
 
+    def __post_init__(self) -> None:
+        for name, value in (("beta_m", self.beta_m), ("beta_v", self.beta_v)):
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or not 0.0 <= value < 1.0):
+                raise ValueError(
+                    f"{name} must be finite and in [0, 1), got {value!r}"
+                )
+        for name, value, strictly_positive in (
+            ("lr", self.lr, True),
+            ("eps", self.eps, True),
+            ("wd", self.wd, False),
+            ("clip", self.clip, False),
+            ("update_clip", self.update_clip, True),
+        ):
+            invalid = (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or (value <= 0 if strictly_positive else value < 0)
+            )
+            if invalid:
+                relation = "> 0" if strictly_positive else ">= 0"
+                raise ValueError(
+                    f"{name} must be finite and {relation}, got {value!r}"
+                )
+        if self.state_dtype not in ("bf16", "fp32"):
+            raise ValueError(f"state_dtype must be bf16|fp32, got {self.state_dtype!r}")
+        if not isinstance(self.factor_v, bool):
+            raise ValueError(f"factor_v must be a bool, got {self.factor_v!r}")
+
 
 def _store_dtype(name: str) -> torch.dtype:
     return torch.bfloat16 if name == "bf16" else torch.float32
@@ -451,18 +481,27 @@ def smaul_update_range(
 def global_grad_norm(grads: list[torch.Tensor]) -> float:
     """Global L2 grad norm accumulated in float64 (SmaulNative parity).
 
-    Single-pass: squares accumulate in one fp64 scalar with a single host
-    sync (``.item()``) at the end. No per-tensor ``.double()`` transient
-    (which doubles peak bytes per grad) and no per-tensor sync: each grad
-    contributes ``g.float().pow(2).sum(dtype=torch.float64)`` (fp32 square,
-    fp64 accumulation) into a shared fp64 total kept on the grads' device.
-    Numerics match the old per-tensor-double loop to ~1e-9 relative.
+    Single-pass: scaled squares accumulate in one FP64 scalar with one host
+    sync at the end. Each gradient is divided by its FP32 max magnitude
+    before squaring, then the scalar scale is restored in FP64. This avoids
+    FP32 square overflow for large finite gradients while keeping the
+    per-element temporary in FP32 and avoiding a full-size FP64 copy.
     """
     total: torch.Tensor | None = None
     for g in grads:
         if g is None:
             continue
-        s = g.detach().float().pow(2).sum(dtype=torch.float64)
+        gf = g.detach().float()
+        if gf.numel() == 0:
+            continue
+        peak = gf.abs().amax()
+        # Normalize before squaring: a finite FP32 gradient such as 1e20
+        # must not overflow in FP32 merely because its square exceeds FP32.
+        # The scalar rescale is FP64, while the large per-element temporary
+        # remains FP32 (avoids a full-size double copy of every gradient).
+        safe_peak = torch.where(peak > 0, peak, torch.ones_like(peak))
+        scaled_sq = (gf / safe_peak).pow(2).sum(dtype=torch.float64)
+        s = scaled_sq * safe_peak.to(torch.float64).square()
         total = s if total is None else total + s.to(total.device)
     if total is None:
         return 0.0
@@ -613,6 +652,41 @@ class SmaulOpt:
         names = [n for n in ("w_gate", "w_up", "w_down") if n in compute and compute[n].grad is not None]
         if not names:
             return 0.0
+        for name, value in (("grad_scale", grad_scale), ("lr", lr)):
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be finite and >= 0, got {value!r}")
+        if row_range is not None:
+            if (not isinstance(row_range, (tuple, list)) or len(row_range) != 2):
+                raise ValueError(f"row_range must be a (start, end) pair, got {row_range!r}")
+            row_start, row_end = row_range
+        # Validate every participating tensor/range before the first state or
+        # FP8 mutation. Otherwise an invalid range on w_down can fail after
+        # w_gate has already been rewritten, violating expert-level atomicity.
+        for name in names:
+            weight_shape = tuple(record.weights_fp8[name].shape)
+            grad_shape = tuple(compute[name].grad.shape)
+            if row_start is None and row_end is None:
+                if grad_shape != weight_shape:
+                    raise ValueError(
+                        f"{name} gradient shape {grad_shape} != weight shape {weight_shape}"
+                    )
+                continue
+            total_rows = weight_shape[0]
+            r0 = 0 if row_start is None else row_start
+            r1 = total_rows if row_end is None else row_end
+            if (isinstance(r0, bool) or not isinstance(r0, int)
+                    or isinstance(r1, bool) or not isinstance(r1, int)
+                    or r0 < 0 or r1 > total_rows or r0 >= r1):
+                raise ValueError(
+                    f"invalid row range [{r0}, {r1}) for {name} with {total_rows} rows"
+                )
+            sliced_shape = (r1 - r0, *weight_shape[1:])
+            if grad_shape not in (weight_shape, sliced_shape):
+                raise ValueError(
+                    f"{name} gradient shape {grad_shape} must match full shape "
+                    f"{weight_shape} or row slice {sliced_shape}"
+                )
         norm = global_grad_norm([compute[n].grad for n in names])
         if not math.isfinite(norm):
             # Skipped step: leave state, version, FP8 bytes AND grads
@@ -626,7 +700,9 @@ class SmaulOpt:
         with torch.no_grad():
             for n in names:
                 grad_tensor = compute[n].grad
-                shape = tuple(compute[n].shape)
+                # Optimizer moments track the full FP8 weight, even when
+                # this call updates only a row slice.
+                shape = tuple(record.weights_fp8[n].shape)
                 st = record.optim_state.get(n)
                 st, action = ensure_state(st, shape, self.hp)
                 if action == "init" or record.optim_state.get(n) is not st:

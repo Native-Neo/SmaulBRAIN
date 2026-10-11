@@ -111,6 +111,8 @@ class SmaulBrainConfig:
             _v = getattr(self, _f)
             assert isinstance(_v, int) and not isinstance(_v, bool), \
                 f"{_f} must be an int (not bool), got {_v!r}"
+        assert self.d_model >= 1, f"d_model must be >= 1, got {self.d_model!r}"
+        assert self.n_heads >= 1, f"n_heads must be >= 1, got {self.n_heads!r}"
         assert self.d_model % self.n_heads == 0, "d_model must split over heads"
         assert isinstance(self.vocab_size, int) and not isinstance(self.vocab_size, bool) \
             and self.vocab_size >= total_vocab(), \
@@ -244,21 +246,19 @@ class SmaulBrainConfig:
             raise ValueError(
                 f"config fields must not be null (omit for defaults): {sorted(nulls)}"
             )
-        if "active_experts" in values and "top_k" in values:
-            try:
-                if int(values["active_experts"]) != int(values["top_k"]):
-                    raise ValueError(
-                        f"incompatible active_experts={values['active_experts']!r} "
-                        f"!= top_k={values['top_k']!r}; refusing to guess"
-                    )
-            except (TypeError, ValueError) as e:
-                # Preserve explicit mismatch errors; normalize bad-type
-                # coercion failures to ValueError per the from_dict contract.
-                if isinstance(e, ValueError) and "incompatible active_experts" in str(e):
-                    raise
+        if "active_experts" in values:
+            active = values["active_experts"]
+            if isinstance(active, bool) or not isinstance(active, int):
                 raise ValueError(
-                    f"config fields active_experts/top_k must be integers: {e}"
-                ) from e
+                    "config field active_experts must be an int (not bool), "
+                    f"got {active!r}"
+                )
+        if "active_experts" in values and "top_k" in values:
+            if values["active_experts"] != values["top_k"]:
+                raise ValueError(
+                    f"incompatible active_experts={values['active_experts']!r} "
+                    f"!= top_k={values['top_k']!r}; refusing to guess"
+                )
         # Mirror __post_init__ float/bool guards here so polluted payloads
         # raise ValueError directly (not via assert/TypeError downstream).
         _float_fields = (
