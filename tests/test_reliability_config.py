@@ -110,3 +110,13 @@ def test_from_dict_valid_roundtrip():
     c2 = SmaulBrainConfig.from_dict(d)
     assert c2.expert_lr == c.expert_lr
     assert c2.use_byte_conv is True or isinstance(c2.use_byte_conv, bool)
+
+
+# M2 regression (SECURITY owns cli.py data-file gate — test-first):
+# --data pointing at a directory must return rc 2, never traceback (rc 1).
+def test_cli_data_directory_returns_2(tmp_path):
+    from cli import main
+    ckpt = str(tmp_path / "ckpt")
+    rc = main(["--ckpt", ckpt, "train", "--steps", "1",
+               "--data", str(tmp_path)])
+    assert rc == 2
