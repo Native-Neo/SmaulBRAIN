@@ -815,7 +815,7 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
 
 
 def load_manifest(ckpt_dir: str) -> dict:
-    path = os.path.join(ckpt_dir, "manifest.json")
+    path = _jailed_path(ckpt_dir, "manifest.json")
     if not os.path.exists(path):
         raise FileNotFoundError(f"missing checkpoint file {path}")
     try:
@@ -839,7 +839,7 @@ def load_manifest(ckpt_dir: str) -> dict:
 
 def load_resume_config(ckpt_dir: str) -> dict:
     """Read the pruner/resume floor + topology snapshot (resume_config.json)."""
-    path = os.path.join(ckpt_dir, "resume_config.json")
+    path = _jailed_path(ckpt_dir, "resume_config.json")
     if not os.path.exists(path):
         raise FileNotFoundError(f"missing checkpoint file {path}")
     try:
