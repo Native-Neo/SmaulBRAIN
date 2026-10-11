@@ -41,6 +41,8 @@ def test_row_block_slice_matches_full():
 def test_bf16_activations_and_fp32_stats_present_in_policy():
     assert PRECISION_POLICY["expert_weights"][0] == "fp8"
     assert PRECISION_POLICY["activations"] == ("bf16", "bf16")
+    assert PRECISION_POLICY["large_projections"] == ("fp32", "hybrid_fp8")
+    assert compute_dtype("large_projections") == torch.bfloat16
     assert PRECISION_POLICY["norm_stats"] == ("fp32", "fp32")
     assert PRECISION_POLICY["optimizer_state"] == ("bf16", "fp32")
     assert compute_dtype("activations") == torch.bfloat16
