@@ -176,6 +176,10 @@ class ExpertPager:
         prefetch worker itself bypasses the join (thread-local flag) —
         joining your own future would deadlock.
         """
+        if not isinstance(expert_id, str) or not expert_id \
+                or "\x00" in expert_id or "/" in expert_id or "\\" in expert_id \
+                or expert_id.startswith(".") or expert_id in (".", ".."):
+            raise ValueError(f"bad expert id {expert_id!r}")
         while True:
             # 1. Join in-flight prefetch if present (outside global lock)
             if not getattr(self._tls, "prefetching", False):
