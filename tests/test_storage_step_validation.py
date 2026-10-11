@@ -93,3 +93,16 @@ def test_checkpoint_optimizer_hparams_accept_valid_values():
         "state_dtype": "bf16",
         "factor_v": True,
     })
+
+
+@pytest.mark.parametrize("kind", ["factored-ish", "", None, 1])
+def test_unflatten_optimizer_rejects_unknown_state_kind(kind):
+    with pytest.raises(ValueError, match="invalid kind"):
+        storage._unflatten_opt_store(
+            {}, {"weight": {"step": 0, "kind": kind}}, "trunk"
+        )
+
+
+def test_unflatten_optimizer_rejects_non_dict_structure():
+    with pytest.raises(ValueError, match="structure must be a dict"):
+        storage._unflatten_opt_store({}, [], "trunk")
