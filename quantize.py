@@ -149,6 +149,10 @@ def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -
         raise ValueError(
             f"checkpoint validation failed: unreadable/bad config.json: {e}"
         ) from e
+    # A present hash map is an integrity contract: never refresh it over a
+    # corrupt/mixed generation. Legacy manifests with no map can be upgraded.
+    if "files" in manifest:
+        _st._verify_manifest_hashes(ckpt_dir, manifest)
     # Drop crash leftovers only after source metadata has passed validation.
     _sweep_stale_tmp(ckpt_dir)
     _sweep_stale_tmp(exp_dir)
