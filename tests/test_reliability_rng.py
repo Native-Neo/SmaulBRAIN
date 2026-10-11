@@ -85,3 +85,16 @@ def test_checkpoint_rng_parts_rejects_noncontiguous_cuda_states():
                "cuda.2": torch.zeros(4, dtype=torch.uint8)}
     with pytest.raises(ValueError, match="contiguous cuda.0"):
         storage._validate_rng_parts(tensors, snap["python"])
+
+
+def test_manifest_and_resume_config_refuse_symlink_leaves(tmp_path):
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}")
+    ckpt = tmp_path / "checkpoint"
+    ckpt.mkdir()
+    (ckpt / "manifest.json").symlink_to(outside)
+    (ckpt / "resume_config.json").symlink_to(outside)
+    with pytest.raises(ValueError, match="refusing symlink"):
+        storage.load_manifest(str(ckpt))
+    with pytest.raises(ValueError, match="refusing symlink"):
+        storage.load_resume_config(str(ckpt))
