@@ -126,27 +126,47 @@ def set_rng_snapshot(snap: dict) -> None:
                 f"checkpoint validation failed: bad python RNG state: {e}"
             ) from e
     _cuda = snap.get("cuda")
+    _cuda_states = None
     if _cuda is not None:
         if isinstance(_cuda, dict):
+            _indexed = {}
             for _k, _t in _cuda.items():
                 if not (isinstance(_k, str) and _k.startswith("cuda.")
-                        and len(_k) > 5 and _k[5:].isdigit()):
+                        and len(_k) > 5 and _k[5:].isdigit()
+                        and _k == f"cuda.{int(_k[5:])}"):
                     raise ValueError(
                         "checkpoint validation failed: bad cuda RNG key "
                         f"{_k!r}"
                     )
-                if not torch.is_tensor(_t) or _t.dtype != torch.uint8:
-                    raise ValueError(
-                        "checkpoint validation failed: bad cuda RNG state"
-                    )
+                _indexed[int(_k[5:])] = _t
+            if sorted(_indexed) != list(range(len(_indexed))):
+                raise ValueError(
+                    "checkpoint validation failed: CUDA RNG keys must be contiguous "
+                    "from cuda.0"
+                )
+            _cuda_states = [_indexed[i] for i in range(len(_indexed))]
         elif isinstance(_cuda, (list, tuple)):
-            for _t in _cuda:
-                if not torch.is_tensor(_t) or _t.dtype != torch.uint8:
-                    raise ValueError(
-                        "checkpoint validation failed: bad cuda RNG state"
-                    )
+            _cuda_states = list(_cuda)
         else:
             raise ValueError("checkpoint validation failed: bad cuda RNG state")
+        if not _cuda_states:
+            raise ValueError("checkpoint validation failed: empty CUDA RNG state")
+        for _t in _cuda_states:
+            if not torch.is_tensor(_t) or _t.dtype != torch.uint8 or _t.numel() == 0:
+                raise ValueError(
+                    "checkpoint validation failed: bad cuda RNG state"
+                )
+        # CUDA RNG blobs are opaque bytes. When CUDA is available, validate
+        # each blob with an isolated generator before changing CPU/Python
+        # globals, so a malformed CUDA state cannot leave a partial restore.
+        if torch.cuda.is_available():
+            try:
+                for _i, _t in enumerate(_cuda_states):
+                    torch.Generator(device=f"cuda:{_i}").set_state(_t.cpu())
+            except Exception as e:
+                raise ValueError(
+                    f"checkpoint validation failed: bad cuda RNG state: {e}"
+                ) from e
     try:
         torch.set_rng_state(_cpu)
     except Exception as e:
@@ -162,9 +182,9 @@ def set_rng_snapshot(snap: dict) -> None:
             raise ValueError(
                 f"checkpoint validation failed: bad python RNG state: {e}"
             ) from e
-    if "cuda" in snap and torch.cuda.is_available():
+    if _cuda_states is not None and torch.cuda.is_available():
         try:
-            torch.cuda.set_rng_state_all(snap["cuda"])
+            torch.cuda.set_rng_state_all(_cuda_states)
         except Exception as e:
             raise ValueError(
                 f"checkpoint validation failed: bad cuda RNG state: {e}"
