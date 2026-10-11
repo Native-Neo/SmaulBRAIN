@@ -342,9 +342,19 @@ def load_saved_config(ckpt_dir: str) -> SmaulBrainConfig | None:
     man_path = os.path.join(ckpt_dir, "manifest.json")
     if not (os.path.exists(cfg_path) and os.path.exists(man_path)):
         return None
-    with open(cfg_path) as f:
-        raw = json.load(f)
-    return SmaulBrainConfig.from_dict(raw)
+    try:
+        with open(cfg_path) as f:
+            raw = json.load(f)
+    except (ValueError, OSError, UnicodeDecodeError) as e:
+        raise ValueError(
+            f"checkpoint validation failed: unreadable config.json: {e}"
+        ) from e
+    try:
+        return SmaulBrainConfig.from_dict(raw)
+    except ValueError as e:
+        if "validation failed" in str(e):
+            raise
+        raise ValueError(f"checkpoint validation failed: bad config {e}") from e
 
 
 def validate_resume_compatible(cli_cfg: SmaulBrainConfig,
@@ -435,7 +445,11 @@ def main(argv: list[str] | None = None) -> int:
     # Validate topology BEFORE constructing any model: an explicit shape
     # mismatch aborts here instead of building an incompatible model and
     # swapping part of it. Runtime fields come from the checkpoint.
-    saved_cfg = load_saved_config(args.ckpt)
+    try:
+        saved_cfg = load_saved_config(args.ckpt)
+    except (ValueError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     try:
         cfg = resolve_resume_config(args, cli_cfg, saved_cfg)
     except ValueError as e:
