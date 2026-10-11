@@ -262,8 +262,12 @@ class SparseRouter(nn.Module):
         if rows.shape[0] == 0:
             return probs.new_zeros(())
         top_ids = rows.argmax(dim=-1)
-        onehot = F.one_hot(top_ids, num_classes=self.num_experts).float()
-        frac = onehot.mean(dim=0)
+        # Avoid materializing the [tokens, experts] one-hot matrix. bincount
+        # produces the same per-expert argmax frequencies with O(tokens + E)
+        # storage instead of O(tokens * E); probabilities stay dense because
+        # the exact Switch-style auxiliary loss needs their mean.
+        frac = torch.bincount(top_ids, minlength=self.num_experts).to(rows.dtype)
+        frac = frac / rows.shape[0]
         mean_prob = rows.mean(dim=0)
         return (self.num_experts * (frac * mean_prob).sum()).to(probs.dtype)
 
@@ -287,29 +291,38 @@ class SparseRouter(nn.Module):
         return nn.Linear(self.d_model, out_features).to(
             device=self.proj.weight.device, dtype=self.proj.weight.dtype)
 
+    def add_expert_rows(self, initializers: list[torch.Tensor | None]) -> list[int]:
+        """Append multiple rows with one allocation/copy of the existing router."""
+        if not isinstance(initializers, list):
+            raise ValueError("initializers must be a list")
+        count = len(initializers)
+        if count == 0:
+            return []
+        old_count = self.num_experts
+        new = self._proj_like(old_count + count)
+        with torch.no_grad():
+            new.weight[:old_count] = self.proj.weight
+            new.bias[:old_count] = self.proj.bias
+            for offset, init in enumerate(initializers):
+                index = old_count + offset
+                if init is not None and init.numel() >= self.d_model:
+                    new.weight[index] = init[: self.d_model].to(
+                        device=new.weight.device, dtype=new.weight.dtype)
+                    new.bias[index] = 0.0
+                else:
+                    nn.init.normal_(new.weight[index], std=0.02)
+                    new.bias[index] = -1.0
+        self.proj = new
+        self.num_experts = old_count + count
+        dev = self.usage_counts.device
+        zeros = torch.zeros(count, dtype=torch.float64, device=dev)
+        self.register_buffer("usage_counts", torch.cat([self.usage_counts, zeros]))
+        self.register_buffer("admit_counts", torch.cat([self.admit_counts, zeros.clone()]))
+        return list(range(old_count, old_count + count))
+
     def add_expert_row(self, init: torch.Tensor | None = None) -> int:
         """Append one router row; returns the new expert index."""
-        new_index = self.num_experts
-        new = self._proj_like(self.num_experts + 1)
-        with torch.no_grad():
-            new.weight[: self.num_experts] = self.proj.weight
-            new.bias[: self.num_experts] = self.proj.bias
-            if init is not None and init.numel() >= self.d_model:
-                new.weight[new_index] = init[: self.d_model].float()
-                new.bias[new_index] = 0.0
-            else:
-                nn.init.normal_(new.weight[new_index], std=0.02)
-                new.bias[new_index] = -1.0  # newborn experts admit little traffic
-        self.proj = new
-        self.num_experts += 1
-        dev = self.usage_counts.device
-        self.register_buffer("usage_counts",
-                             torch.cat([self.usage_counts,
-                                        torch.zeros(1, dtype=torch.float64, device=dev)]))
-        self.register_buffer("admit_counts",
-                             torch.cat([self.admit_counts,
-                                        torch.zeros(1, dtype=torch.float64, device=dev)]))
-        return new_index
+        return self.add_expert_rows([init])[0]
 
     def remove_expert_row(self, index: int) -> None:
         """Delete router row ``index`` (called after expert pruning)."""
