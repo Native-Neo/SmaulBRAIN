@@ -567,6 +567,10 @@ def main(argv: list[str] | None = None) -> int:
                            save_every=args.save_every,
                            grow_every=grow_every,
                            grow_loss_below=args.grow_loss_below,
+                           # Growth trigger RNG derives from this seed: pass
+                           # the resolved cfg.seed (not the run_training
+                           # default 0) so --seed reproduces growth events.
+                           seed=cfg.seed,
                            # Progress/grow lines go to stderr: stdout
                            # stays pure JSON for scripting.
                            log_fn=lambda s: print(s, file=sys.stderr))
