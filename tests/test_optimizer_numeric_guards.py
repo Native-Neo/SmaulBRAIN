@@ -43,3 +43,9 @@ def test_optimizer_hyperparameters_reject_invalid_values():
     ):
         with pytest.raises(ValueError):
             SmaulOptHParams(**kwargs)
+
+
+def test_global_grad_norm_ignores_empty_gradients():
+    assert global_grad_norm([torch.empty(0)]) == 0.0
+    grad = torch.tensor([3.0, 4.0])
+    assert global_grad_norm([torch.empty(0), grad]) == 5.0
