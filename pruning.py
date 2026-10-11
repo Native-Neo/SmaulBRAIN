@@ -209,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
     from config import SmaulBrainConfig
     from model import SmaulBrainModel
     from smaulopt import SmaulOpt
-    from storage import load_model, load_resume_config, save_model
+    from storage import _jailed_path, load_model, load_resume_config, save_model
 
     args = build_parser().parse_args(argv)
     if args.rm_worst < 0:
@@ -226,12 +226,20 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, TypeError) as e:
         print(json.dumps({"error": f"bad resume_config.json: {e}"}), file=sys.stderr)
         return 2
-    cfg_path = os.path.join(ckpt, "config.json")
+    try:
+        cfg_path = _jailed_path(ckpt, "config.json")
+    except ValueError as e:
+        print(json.dumps({"error": f"bad config.json path: {e}"}), file=sys.stderr)
+        return 2
     if not os.path.exists(cfg_path):
         print(json.dumps({"error": f"no checkpoint at {ckpt}; train first"}), file=sys.stderr)
         return 2
-    with open(cfg_path) as f:
-        cfg = SmaulBrainConfig.from_dict(json.load(f))
+    try:
+        with open(cfg_path) as f:
+            cfg = SmaulBrainConfig.from_dict(json.load(f))
+    except (OSError, ValueError, TypeError) as e:
+        print(json.dumps({"error": f"bad config.json: {e}"}), file=sys.stderr)
+        return 2
     survival = args.survival_steps if args.survival_steps is not None else cfg.prune_survival_steps
     usage = args.min_usage if args.min_usage is not None else cfg.prune_min_usage
     model = SmaulBrainModel(cfg)
