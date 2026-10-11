@@ -83,7 +83,8 @@ def main():
     # --- checkpoint disk usage (actually written + measured) ---
     import tempfile
     from storage import save_model
-    ckpt_dir = tempfile.mkdtemp(prefix="bench_ckpt_")
+    _bench_tmp = tempfile.TemporaryDirectory(prefix="bench_ckpt_")
+    ckpt_dir = _bench_tmp.name
     save_model(ckpt_dir, model, opt, args.steps)
     report = {
         "paging_mode": args.mode,
