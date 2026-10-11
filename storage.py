@@ -696,6 +696,10 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
         raise ValueError(f"refusing to checkpoint non-integer step {step!r}")
     if step < 0:
         raise ValueError(f"refusing to checkpoint negative step {step}")
+    # Reject a symlinked checkpoint root or experts directory before
+    # mkdir/locking/temp sweeping can touch paths outside the checkpoint.
+    _jailed_path(ckpt_dir, "manifest.json")
+    _jailed_path(ckpt_dir, "experts")
     if len(model.pool) == 0:
         raise ValueError("refusing to checkpoint an empty expert pool")
     if model.router.num_experts != len(model.pool):
