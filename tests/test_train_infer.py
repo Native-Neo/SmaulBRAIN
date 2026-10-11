@@ -473,3 +473,16 @@ def test_unscored_forward_disables_autograd_for_entire_trunk():
     finally:
         hook.remove()
         m.pager.close()
+
+
+def test_generate_zero_tokens_skips_forward_pass():
+    m, _, _ = _model()
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("zero-token generation must not run the model")
+    m.forward_infer_stateful = unexpected
+    try:
+        result = generate(m, [104, 105], max_new=0)
+        assert result["ids"] == [104, 105]
+        assert result["text"] == "" and result["depths"] == []
+    finally:
+        m.pager.close()
