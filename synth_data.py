@@ -287,6 +287,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_models:
         print(list_models())
         return 0
+    if args.n_train <= 0 or args.n_held <= 0:
+        print("error: --n-train and --n-held must be > 0", file=sys.stderr)
+        return 2
+    if args.timeout <= 0:
+        print("error: --timeout must be > 0", file=sys.stderr)
+        return 2
     try:
         model = normalize_model(args.model)
     except ValueError as e:
