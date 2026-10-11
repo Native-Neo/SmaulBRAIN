@@ -86,8 +86,7 @@ class ShardWriter:
         idx = 0
         while os.path.exists(shard_path(out_dir, idx + 1)):
             idx += 1
-        if os.path.exists(shard_path(out_dir, idx)):
-            idx = idx  # continue filling the tail shard
+        # Tail shard (if any) is continued via append + getsize below.
         self.idx = idx
         self.fh = open(shard_path(out_dir, idx), "a", encoding="utf-8")
         self.size = os.path.getsize(shard_path(out_dir, idx))
