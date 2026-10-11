@@ -660,8 +660,19 @@ def _flatten_opt_store(store: dict, prefix: str) -> tuple[dict, dict]:
 def _unflatten_opt_store(tensors: dict, struct: dict, prefix: str) -> dict:
     store: dict = {}
     for k, sm in struct.items():
-        st: dict = {"m": tensors[f"{prefix}.{k}.m"],
-                    "step": int(sm.get("step", 0))}
+        if not isinstance(sm, dict):
+            raise ValueError(
+                f"checkpoint validation failed: {prefix} optimizer entry {k!r} "
+                "must be a dict"
+            )
+        raw_step = sm.get("step", 0)
+        if (isinstance(raw_step, bool) or not isinstance(raw_step, int)
+                or raw_step < 0):
+            raise ValueError(
+                f"checkpoint validation failed: {prefix} optimizer entry {k!r} "
+                f"has invalid step {raw_step!r}"
+            )
+        st: dict = {"m": tensors[f"{prefix}.{k}.m"], "step": raw_step}
         if sm.get("kind", "full") == "full":
             st["v"] = tensors[f"{prefix}.{k}.v"]
         else:
