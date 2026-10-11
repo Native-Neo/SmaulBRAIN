@@ -410,4 +410,6 @@ def test_depth_aware_activation_budget_refuses_wide_work_before_compute():
         model(ids, ids)
     with pytest.raises(ValueError, match="estimated retained activation memory exceeds 256 MiB"):
         model.forward_infer(ids)
+    with pytest.raises(ValueError, match="estimated retained activation memory exceeds 256 MiB"):
+        model.forward_infer_stateful(ids)
     model.pager.close()
