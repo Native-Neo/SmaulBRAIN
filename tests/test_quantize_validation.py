@@ -38,3 +38,21 @@ def test_quantizer_validates_config_before_sweeping_or_converting(tmp_path):
         convert_checkpoint(str(ckpt), to="fp8")
     assert root_tmp.read_text() == "keep-root"
     assert expert_tmp.read_text() == "keep-expert"
+
+def test_quantizer_refuses_incomplete_existing_hash_map_before_cleanup(tmp_path):
+    from config import SmaulBrainConfig
+
+    ckpt = tmp_path / "checkpoint"
+    experts = ckpt / "experts"
+    experts.mkdir(parents=True)
+    (ckpt / "manifest.json").write_text(json.dumps({
+        "expert_ids": ["expert_000"],
+        "files": {"not-a-checkpoint-payload": "deadbeef"},
+    }))
+    (ckpt / "config.json").write_text(json.dumps(SmaulBrainConfig().to_dict()))
+    keep = ckpt / "tmp_ckpt_keep"
+    keep.write_text("must survive")
+
+    with pytest.raises(ValueError, match="files map|manifest"):
+        convert_checkpoint(str(ckpt), to="fp8")
+    assert keep.read_text() == "must survive"
