@@ -945,13 +945,27 @@ def _jailed_path(ckpt_dir: str, rel: str) -> str:
     _require(isinstance(rel, str) and rel != "" and "\x00" not in rel,
              f"bad checkpoint rel {rel!r}")
     _require(not os.path.isabs(rel), f"bad checkpoint rel {rel!r}")
+    parts = rel.split("/")
+    _require(all(part not in ("", ".", "..") for part in parts),
+             f"bad checkpoint rel traversal {rel!r}")
     base = os.path.realpath(os.path.abspath(ckpt_dir))
     p = os.path.abspath(os.path.join(ckpt_dir, rel))
     _require(p == base or p.startswith(base + os.sep),
              f"checkpoint path escapes dir: {rel!r}")
-    # Refuse symlinks along the resolved path (lexical check alone can be
-    # bypassed by a planted experts/<id>.safetensors -> /etc/shadow link).
+    # Refuse symlinks at every existing component, including intermediate
+    # directories such as experts/ that resolve back inside the checkpoint.
     try:
+        current = os.path.abspath(ckpt_dir)
+        if os.path.lexists(current) and os.path.islink(current):
+            raise ValueError(
+                f"checkpoint validation failed: refusing symlink checkpoint root {ckpt_dir!r}"
+            )
+        for part in parts:
+            current = os.path.join(current, part)
+            if os.path.lexists(current) and os.path.islink(current):
+                raise ValueError(
+                    f"checkpoint validation failed: refusing symlink component {part!r} in {rel!r}"
+                )
         r = os.path.realpath(p)
     except OSError as e:
         raise ValueError(
