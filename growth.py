@@ -366,10 +366,13 @@ def grow_topk_clones(
     # rolls back the prefix so the prior topology returns exactly.
     new_ids: list[str] = []
     try:
-        for rec, parent_row in built:
+        # Add all expert records first, then resize/copy the router exactly
+        # once. Repeated add_expert_row calls copied the entire growing router
+        # for every clone, turning batch growth into repeated O(E*D) copies.
+        for rec, _parent_row in built:
             pool.add(rec)
             new_ids.append(rec.expert_id)
-            router.add_expert_row(init=parent_row)
+        router.add_expert_rows([parent_row for _rec, parent_row in built])
         if optim_state is not None and new_ids:
             _pad_state_rows(optim_state, len(new_ids))
     except Exception:
