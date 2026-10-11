@@ -255,6 +255,9 @@ def _ckpt_locked(ckpt_dir: str, exclusive: bool):
     ``fcntl`` this is a no-op. The lock file itself is never part of the
     checkpoint format and is ignored by the loader.
     """
+    # Validate before mkdir/open: otherwise a symlinked checkpoint root or
+    # lock file could create/modify .ckpt.lock outside the intended directory.
+    _jailed_path(ckpt_dir, ".ckpt.lock")
     if _fcntl is None:
         yield
         return
