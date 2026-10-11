@@ -84,9 +84,9 @@ class SparseRouter(nn.Module):
         if (isinstance(capacity_factor, bool)
                 or not isinstance(capacity_factor, (int, float))
                 or not _math.isfinite(float(capacity_factor))
-                or float(capacity_factor) <= 0):
+                or float(capacity_factor) < 0):
             raise ValueError(
-                f"capacity_factor must be finite and > 0, got {capacity_factor!r}"
+                f"capacity_factor must be finite and >= 0, got {capacity_factor!r}"
             )
         super().__init__()
         self.d_model = d_model
