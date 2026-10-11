@@ -149,10 +149,25 @@ def dequantize_fp8_blockwise(t: FP8BlockTensor, dtype: torch.dtype = torch.float
     return out.reshape(t.shape).to(dtype)
 
 
+def _validate_fp8_row_range(t: FP8BlockTensor, row_start: int, row_end: int) -> None:
+    if t.codes.ndim != 2 or len(t.shape) != 2:
+        raise ValueError(
+            "row-block operations require a 2-D (rows x cols) FP8BlockTensor, "
+            f"got codes.ndim={t.codes.ndim} shape={t.shape}"
+        )
+    if (isinstance(row_start, bool) or not isinstance(row_start, int)
+            or isinstance(row_end, bool) or not isinstance(row_end, int)
+            or not (0 <= row_start < row_end <= t.shape[0])):
+        raise ValueError(
+            f"invalid row range [{row_start}, {row_end}) for tensor with {t.shape[0]} rows"
+        )
+
+
 def dequantize_fp8_row_block(
     t: FP8BlockTensor, row_start: int, row_end: int, dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
     """Dequantize only a row slice — avoids full-matrix transient for big experts."""
+    _validate_fp8_row_range(t, row_start, row_end)
     sub = FP8BlockTensor(
         codes=t.codes[row_start:row_end],
         scales=t.scales[row_start:row_end],
@@ -171,10 +186,7 @@ def update_fp8_row_block(
     ``new_rows`` must match the slice shape exactly:
     ``(row_end - row_start, *t.shape[1:])``.
     """
-    if row_start < 0 or row_end > t.shape[0] or row_start >= row_end:
-        raise ValueError(
-            f"invalid row range [{row_start}, {row_end}) for tensor with {t.shape[0]} rows"
-        )
+    _validate_fp8_row_range(t, row_start, row_end)
     expect = (row_end - row_start, *t.shape[1:])
     if tuple(new_rows.shape) != tuple(expect):
         raise ValueError(
