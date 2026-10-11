@@ -590,3 +590,12 @@ def test_replay_add_rejects_malformed_token_sequences_without_advancing_cursor()
             buf.add(bad)
         assert buf.seen == 0
         assert len(buf) == 0
+
+
+def test_replay_restore_rejects_negative_token_ids():
+    import pytest
+
+    snap = ReplayBuffer(capacity=2).to_dict()
+    snap.update({"seen": 1, "buf": [[-1]]})
+    with pytest.raises(ValueError, match="non-negative ints"):
+        ReplayBuffer.from_dict(snap)
