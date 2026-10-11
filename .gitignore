@@ -3,9 +3,15 @@ __pycache__/
 *.pyo
 *.o
 *.so
+*.convert_tmp
+tmp_ckpt_*/
+tmp_quant_*/
+tmp_json_*/
 .pytest_cache/
 checkpoints/
+ckpt/
 weights/
 *.pt.tmp
 *.json.tmp
 data/corpus/
+data/ab/
