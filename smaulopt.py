@@ -650,6 +650,41 @@ class SmaulOpt:
         names = [n for n in ("w_gate", "w_up", "w_down") if n in compute and compute[n].grad is not None]
         if not names:
             return 0.0
+        for name, value in (("grad_scale", grad_scale), ("lr", lr)):
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be finite and >= 0, got {value!r}")
+        if row_range is not None:
+            if (not isinstance(row_range, (tuple, list)) or len(row_range) != 2):
+                raise ValueError(f"row_range must be a (start, end) pair, got {row_range!r}")
+            row_start, row_end = row_range
+        # Validate every participating tensor/range before the first state or
+        # FP8 mutation. Otherwise an invalid range on w_down can fail after
+        # w_gate has already been rewritten, violating expert-level atomicity.
+        for name in names:
+            weight_shape = tuple(record.weights_fp8[name].shape)
+            grad_shape = tuple(compute[name].grad.shape)
+            if row_start is None and row_end is None:
+                if grad_shape != weight_shape:
+                    raise ValueError(
+                        f"{name} gradient shape {grad_shape} != weight shape {weight_shape}"
+                    )
+                continue
+            total_rows = weight_shape[0]
+            r0 = 0 if row_start is None else row_start
+            r1 = total_rows if row_end is None else row_end
+            if (isinstance(r0, bool) or not isinstance(r0, int)
+                    or isinstance(r1, bool) or not isinstance(r1, int)
+                    or r0 < 0 or r1 > total_rows or r0 >= r1):
+                raise ValueError(
+                    f"invalid row range [{r0}, {r1}) for {name} with {total_rows} rows"
+                )
+            sliced_shape = (r1 - r0, *weight_shape[1:])
+            if grad_shape not in (weight_shape, sliced_shape):
+                raise ValueError(
+                    f"{name} gradient shape {grad_shape} must match full shape "
+                    f"{weight_shape} or row slice {sliced_shape}"
+                )
         norm = global_grad_norm([compute[n].grad for n in names])
         if not math.isfinite(norm):
             # Skipped step: leave state, version, FP8 bytes AND grads
