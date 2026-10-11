@@ -672,7 +672,9 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
     raises without touching the checkpoint directory, so a previous
     complete generation is never clobbered by a partial one.
     """
-    if int(step) < 0:
+    if isinstance(step, bool) or not isinstance(step, int):
+        raise ValueError(f"refusing to checkpoint non-integer step {step!r}")
+    if step < 0:
         raise ValueError(f"refusing to checkpoint negative step {step}")
     if len(model.pool) == 0:
         raise ValueError("refusing to checkpoint an empty expert pool")
