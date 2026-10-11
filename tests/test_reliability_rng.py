@@ -156,7 +156,7 @@ def test_empty_cuda_rng_state_rejects_before_global_mutation():
     snap["cuda"] = [torch.empty(0, dtype=torch.uint8)]
     torch_before = torch.get_rng_state().clone()
     python_before = __import__("random").getstate()
-    with pytest.raises(ValueError, match="CUDA RNG state"):
+    with pytest.raises(ValueError, match=r"(?i)cuda RNG state"):
         storage.set_rng_snapshot(snap)
     assert torch.equal(torch.get_rng_state(), torch_before)
     assert __import__("random").getstate() == python_before
