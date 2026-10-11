@@ -222,17 +222,17 @@ def generate_domain(label: str, topics: list[str], style: str, model: str,
             lines = clean_lines(run_opencode(
                 build_prompt(topic, style, per_call, batches + t + 1, batches + t + 1),
                 model, timeout, runner))
-            added = False
+            # Every attempt consumes budget (t increments unconditionally):
+            # duplicate-only batches continue until want or the want*2
+            # budget is exhausted; any remaining shortfall raises below
+            # (never a silent partial manifest).
+            t += 1
             for line in lines:
                 if line not in seen:
                     seen.add(line)
                     got[split].append(line)
-                    added = True
                     if len(got[split]) >= want:
                         break
-            if not added:
-                break
-            t += 1
     train, held = got["train"][:n_train], got["held"][:n_held]
     overlap = set(train) & set(held)
     if overlap:
