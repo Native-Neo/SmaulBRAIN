@@ -91,6 +91,13 @@ class ReplayBuffer:
         self.seen = 0
 
     def add(self, seq: list[int]) -> None:
+        if not isinstance(seq, (list, tuple)):
+            raise ValueError(f"ReplayBuffer sequence must be a list or tuple, got {type(seq).__name__}")
+        for token in seq:
+            if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+                raise ValueError(
+                    f"ReplayBuffer token ids must be non-negative ints (not bool), got {token!r}"
+                )
         self.seen += 1
         seq = list(seq)  # ingress copy: later caller mutation must not corrupt replay
         if len(self.buf) < self.capacity:
