@@ -321,7 +321,7 @@ def _new_cap_factor(old_delta: torch.Tensor, new_delta: torch.Tensor, cap: float
 
 def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
                mode: str = "entire", selected: list[str] | None = None,
-               new_since_step: int = 0) -> dict:
+               new_since_step: int = 0, profile: bool = False) -> dict:
     """One optimizer step. Returns loss stats + stepped expert ids.
 
     Stepped ledger semantics (pinned): ``stepped_experts`` lists exactly
@@ -343,6 +343,8 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
     if x.shape[0] < 1 or x.shape[1] < 1:
         raise ValueError(f"empty batch {tuple(x.shape)} carries no gradient signal")
     model.train()
+    model._profile_enabled = bool(profile)
+    model._profile_times = {"router_s": 0.0, "expert_s": 0.0, "balance_s": 0.0}
     model.zero_grad(set_to_none=True)
     # New-expert routing steering (runtime-only): in mode `new`, add
     # cfg.new_routing_bias to the router logits of experts born at/after
@@ -372,16 +374,22 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
             else:
                 _router.new_routing_bias = 0.0
                 _router.new_expert_idx = ()
+        forward_started = time.perf_counter() if profile else 0.0
         try:
             out = model(x, y, step=step)
         finally:
+            if profile:
+                forward_s = time.perf_counter() - forward_started
             if _router is not None:
                 _router.new_routing_bias = 0.0
                 _router.new_expert_idx = ()
         loss = out["loss"]
         if not torch.isfinite(loss.detach()).all().item():
             raise ValueError("non-finite training loss; refusing to step on NaN/inf")
+        backward_started = time.perf_counter() if profile else 0.0
         loss.backward()
+        backward_s = time.perf_counter() - backward_started if profile else 0.0
+        optimizer_started = time.perf_counter() if profile else 0.0
         stepped: list[str] = []
         train_trunk = mode in ("entire", "trunk")
         train_router = mode in ("entire", "trunk", "experts", "selected", "new")
@@ -519,6 +527,12 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
         "acc": float(out["acc"]),
         "mean_depth": float(out["mean_depth"]),
         "stepped_experts": stepped,
+        **({
+            **model._profile_times,
+            "forward_s": forward_s,
+            "backward_s": backward_s,
+            "optimizer_s": time.perf_counter() - optimizer_started,
+        } if profile else {}),
     }
 
 
@@ -541,6 +555,7 @@ def run_training(
     grow_loss_below: float | None = 1.0,
     seed: int = 0,
     log_fn=print,
+    profile: bool = False,
 ) -> dict:
     """Small-driver training over in-memory byte sequences.
 
@@ -694,7 +709,8 @@ def run_training(
         b = batch_from_seqs(batch_seqs, cfg.context_length)
         stats = train_step(model, opt, cfg, b[:, : cfg.context_length],
                            b[:, 1 : cfg.context_length + 1], step, mode=mode,
-                           selected=selected, new_since_step=new_since_step)
+                           selected=selected, new_since_step=new_since_step,
+                           profile=profile)
         stats["step"] = step
         # Throughput counts valid data bytes only: padded positions are
         # structural (PAD_ID, masked from the loss), not processed data.
@@ -704,6 +720,7 @@ def run_training(
         # Growth only: training never prunes (pool shrinkage is the manual
         # offline pruner). Successful growths increment the counter.
         new_ids: list[str] = []
+        growth_started = time.perf_counter() if profile else 0.0
         if grow_every and (step + 1) % grow_every == 0:
             new_ids += grow_batch(step, step * max(1, cfg.max_new_experts))
         # Loss-triggered growth on the falling edge below the threshold; the
@@ -714,6 +731,8 @@ def run_training(
             new_ids += grow_batch(step, step * max(1, cfg.max_new_experts) + 7919)
         prev_loss = loss_now
         grew = bool(new_ids)
+        if profile:
+            stats["growth_s"] = time.perf_counter() - growth_started
         if new_ids:
             events.append({"step": step, "type": "grow", "ids": list(new_ids)})
         if grew:
@@ -742,12 +761,41 @@ def run_training(
         bar = "#" * filled + "-" * (bar_width - filled)
         eta_seconds = int(round(eta))
         eta_label = f"{eta_seconds // 60:02d}:{eta_seconds % 60:02d}"
-        log_fn(
+        line = (
             f"[train] [{bar}] {fraction:5.1%} {completed:>4}/{steps} "
             f"| loss {stats['loss']:.4f} | bpb {stats['bpb']:.3f} "
             f"| acc {stats['acc']:.2%} | {step_bps:,.0f} B/s "
             f"| ETA {eta_label} | experts {len(model.pool)}"
         )
+        if profile:
+            line += (
+                f" | fwd {stats['forward_s']:.3f}s"
+                f" route {stats['router_s']:.3f}s"
+                f" expert {stats['expert_s']:.3f}s"
+                f" balance {stats['balance_s']:.3f}s"
+                f" bwd {stats['backward_s']:.3f}s"
+                f" opt {stats['optimizer_s']:.3f}s"
+                f" grow {stats['growth_s']:.3f}s"
+            )
+            rss_kib = avail_kib = None
+            try:
+                with open("/proc/self/status", encoding="utf-8") as f:
+                    for row in f:
+                        if row.startswith("VmRSS:"):
+                            rss_kib = int(row.split()[1])
+                            break
+                with open("/proc/meminfo", encoding="utf-8") as f:
+                    for row in f:
+                        if row.startswith("MemAvailable:"):
+                            avail_kib = int(row.split()[1])
+                            break
+            except (OSError, ValueError, IndexError):
+                pass
+            if rss_kib is not None:
+                line += f" | RSS {rss_kib / 1024:.0f} MiB"
+            if avail_kib is not None:
+                line += f" | MemAvailable {avail_kib / 1024:.0f} MiB"
+        log_fn(line)
     total_elapsed = time.perf_counter() - run_started
     if hist:
         model._resume_step = int(hist[-1]["step"])
