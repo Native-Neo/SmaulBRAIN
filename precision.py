@@ -1,13 +1,13 @@
 """Precision policy, hybrid FP8 execution, and blockwise FP8 storage.
 
-Policy (best precision per component, no giant hidden FP32 master copy):
-  FP8  - expert weights, large projection weights (storage; blockwise scaled)
-  BF16 - activations, optimizer-state storage
-  FP32 - recurrent attention state
-  FP32 - norm statistics, accumulators, loss, optimizer math, scales,
-         routing/halting statistics
+Policy (no duplicate full-model master copy):
+  FP8       - expert weights, blockwise-scaled storage
+  hybrid FP8 - dense projections: E4M3 forward operands, E5M2 backward gradients
+  BF16      - activations and optimizer-state storage
+  FP32      - dense-projection master parameters, recurrent state, norms,
+              accumulators, loss, optimizer math, scales, routing/halting stats
 
-FP8 format: E4M3 with per-block (tile) FP32 scales. A stored tensor is
+Expert FP8 format: E4M3 with per-block (tile) FP32 scales. A stored tensor is
 ``(codes: uint8, scales: float32, shape)`` — genuinely FP8 bytes on disk/RAM,
 not relabeled FP32. Dequantization happens per expert on activation (one
 expert at a time), never as a full-model FP32 transient.
