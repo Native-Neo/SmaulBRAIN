@@ -241,6 +241,12 @@ class SmaulBrainModel(nn.Module):
     # -- forward --
     def _check_ids(self, ids: torch.Tensor, what: str) -> None:
         """Fail loudly on out-of-vocabulary ids (never a cryptic IndexError)."""
+        if not isinstance(ids, torch.Tensor):
+            raise ValueError(f"{what} must be a Tensor, got {type(ids).__name__}")
+        if ids.dtype not in (torch.long, torch.int, torch.int32, torch.int64):
+            raise ValueError(
+                f"{what} must be an integer tensor, got {ids.dtype}"
+            )
         if ids.numel() == 0:
             return
         # Single aminmax pass: one kernel + one sync instead of two.
