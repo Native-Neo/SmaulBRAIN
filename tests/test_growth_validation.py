@@ -35,3 +35,35 @@ def test_growth_rejects_invalid_noise_before_mutation(bad_noise):
     assert len(pool) == router.num_experts == 0
     with pytest.raises(ValueError, match="noise_std"):
         recombine_weights(pool, [], noise_std=bad_noise)
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1, True, 4.5, "5"])
+def test_growth_rejects_invalid_capacity_limit_before_mutation(bad_limit):
+    from growth import grow_expert
+
+    pool = ExpertPool()
+    router = SparseRouter(d_model=8, num_experts=0, top_k=1)
+    before = (list(pool.order), pool._next_id, router.num_experts)
+    with pytest.raises(ValueError, match="max_experts must be a positive int"):
+        grow_expert(pool, router, d_model=8, expert_hidden=16,
+                    step=0, max_experts=bad_limit)
+    assert (list(pool.order), pool._next_id, router.num_experts) == before
+
+    with pytest.raises(ValueError, match="max_experts must be a positive int"):
+        grow_topk_clones(pool, router, d_model=8, expert_hidden=16,
+                         step=0, max_experts=bad_limit)
+    assert (list(pool.order), pool._next_id, router.num_experts) == before
+
+
+def test_growth_respects_integer_capacity_limit():
+    from growth import grow_expert
+
+    pool = ExpertPool()
+    router = SparseRouter(d_model=8, num_experts=0, top_k=1)
+    grow_expert(pool, router, d_model=8, expert_hidden=16,
+                step=0, max_experts=1)
+    assert len(pool) == router.num_experts == 1
+    with pytest.raises(ValueError, match="at capacity"):
+        grow_expert(pool, router, d_model=8, expert_hidden=16,
+                    step=1, max_experts=1)
+    assert len(pool) == router.num_experts == 1
