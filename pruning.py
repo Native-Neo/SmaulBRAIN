@@ -218,7 +218,11 @@ def main(argv: list[str] | None = None) -> int:
     ckpt = args.ckpt
     try:
         resume_cfg = load_resume_config(ckpt)
-        floor = int(resume_cfg.get("min_experts", FLOOR_DEFAULT))
+        floor = resume_cfg.get("min_experts", FLOOR_DEFAULT)
+        if isinstance(floor, bool) or not isinstance(floor, int) or floor < 1:
+            raise ValueError(
+                f"min_experts must be a positive integer, got {floor!r}"
+            )
     except FileNotFoundError:
         print(f"warning: no resume_config.json in {ckpt}; using default floor {FLOOR_DEFAULT}",
               file=sys.stderr)
@@ -239,6 +243,11 @@ def main(argv: list[str] | None = None) -> int:
             cfg = SmaulBrainConfig.from_dict(json.load(f))
     except (OSError, ValueError, TypeError) as e:
         print(json.dumps({"error": f"bad config.json: {e}"}), file=sys.stderr)
+        return 2
+    if floor < cfg.top_k:
+        print(json.dumps({
+            "error": f"resume_config min_experts={floor} is below top_k={cfg.top_k}; refusing unsafe pruning"
+        }), file=sys.stderr)
         return 2
     survival = args.survival_steps if args.survival_steps is not None else cfg.prune_survival_steps
     usage = args.min_usage if args.min_usage is not None else cfg.prune_min_usage
