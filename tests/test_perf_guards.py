@@ -234,6 +234,76 @@ def test_m3_sparse_head_study_only_budget():
           f"sparse={res['sparse']['median_ms']:.2f}ms")
 
 
+def test_m5_fused_factored_update():
+    """Vectorized block-denoms match the 256-loop to atol 1e-6; R8192 <2x."""
+    import copy
+    from smaulopt import smaul_update, SmaulOptHParams
+
+    def old_update(w, g, state, hp, lr):
+        w32 = w.detach().float()
+        g32 = g.detach().float()
+        state["step"] = int(state.get("step", 0)) + 1
+        t = state["step"]
+        bm, bv = hp.beta_m, hp.beta_v
+        bc1, bc2 = 1.0 - bm**t, 1.0 - bv**t
+        m = state["m"].float() * bm + g32 * (1.0 - bm)
+        ag = g32.abs()
+        vr = state["v_row"].float() * bv + ag.mean(dim=1, keepdim=True) * (1.0 - bv)
+        vc = state["v_col"].float() * bv + ag.mean(dim=0, keepdim=True) * (1.0 - bv)
+        state["v_row"] = vr.to(torch.bfloat16)
+        state["v_col"] = vc.to(torch.bfloat16)
+        state["m"] = m.to(torch.bfloat16)
+        vr_hat, vc_hat, m_hat = vr / bc2, vc / bc2, m / bc1
+        decay = lr * hp.wd
+        new_w = torch.empty_like(w32)
+        for o in range(0, ag.shape[0], 256):
+            sl = slice(o, o + 256)
+            rb = vr_hat[sl]
+            denom = rb.mean().clamp_min(1e-12)
+            v_blk = (rb * vc_hat) / denom
+            u_blk = m_hat[sl] / (v_blk + hp.eps)
+            if hp.state_dtype != "fp32":
+                u_blk = u_blk.clamp(-hp.update_clip, hp.update_clip)
+            new_w[sl] = w32[sl] * (1.0 - decay) - lr * u_blk
+        return new_w.detach()
+
+    hp = SmaulOptHParams()
+    # Bit-close incl. ragged tail (R=1000) and clip path; bench R=8192.
+    for R, C in [(512, 128), (1000, 64)]:
+        torch.manual_seed(3)
+        w, g = torch.randn(R, C), torch.randn(R, C)
+        st_n = {"m": torch.zeros(R, C, dtype=torch.bfloat16),
+                "v_row": torch.zeros(R, 1, dtype=torch.bfloat16),
+                "v_col": torch.zeros(1, C, dtype=torch.bfloat16), "step": 0}
+        st_o = copy.deepcopy(st_n)
+        out_n = smaul_update(w, g, st_n, hp, lr=2e-4)
+        out_o = old_update(w, g, st_o, hp, lr=2e-4)
+        assert torch.allclose(out_n, out_o, atol=1e-6), \
+            f"R={R} maxabs={(out_n - out_o).abs().max().item():.2e}"
+    torch.manual_seed(3)
+    w, g = torch.randn(8192, 256), torch.randn(8192, 256)
+    mk = lambda: {"m": torch.zeros(8192, 256, dtype=torch.bfloat16),
+                  "v_row": torch.zeros(8192, 1, dtype=torch.bfloat16),
+                  "v_col": torch.zeros(1, 256, dtype=torch.bfloat16), "step": 0}
+    t0 = time.perf_counter()
+    old_update(w, g, mk(), hp, lr=2e-4)
+    t_old = (time.perf_counter() - t0) * 1000.0
+    t0 = time.perf_counter()
+    out_n = smaul_update(w, g, mk(), hp, lr=2e-4)
+    t_new = (time.perf_counter() - t0) * 1000.0
+    assert torch.isfinite(out_n).all()
+    print(f"\n[M5] R8192: old={t_old:.1f}ms new={t_new:.1f}ms ratio={t_new/max(t_old,1e-9):.2f}x")
+    assert t_new < 2 * t_old, f"fused slower than 2x: {t_new:.1f} vs {t_old:.1f}"
+    # Range path still runs (same fused math on the slice).
+    torch.manual_seed(4)
+    w2, g2 = torch.randn(512, 64), torch.randn(512, 64)
+    st2 = {"m": torch.zeros(512, 64, dtype=torch.bfloat16),
+           "v_row": torch.zeros(512, 1, dtype=torch.bfloat16),
+           "v_col": torch.zeros(1, 64, dtype=torch.bfloat16), "step": 0}
+    sl = smaul_update(w2, g2, st2, hp, lr=2e-4, row_start=0, row_end=256)
+    assert sl.shape == (256, 64) and torch.isfinite(sl).all()
+
+
 def test_m4_routing_budget_counts_both_transients():
     """N*E guard halves to 8M to cover logits+probs (~2x actual)."""
     import pytest
