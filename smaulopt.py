@@ -462,7 +462,15 @@ def global_grad_norm(grads: list[torch.Tensor]) -> float:
     for g in grads:
         if g is None:
             continue
-        s = g.detach().float().pow(2).sum(dtype=torch.float64)
+        gf = g.detach().float()
+        peak = gf.abs().amax()
+        # Normalize before squaring: a finite FP32 gradient such as 1e20
+        # must not overflow in FP32 merely because its square exceeds FP32.
+        # The scalar rescale is FP64, while the large per-element temporary
+        # remains FP32 (avoids a full-size double copy of every gradient).
+        safe_peak = torch.where(peak > 0, peak, torch.ones_like(peak))
+        scaled_sq = (gf / safe_peak).pow(2).sum(dtype=torch.float64)
+        s = scaled_sq * safe_peak.to(torch.float64).square()
         total = s if total is None else total + s.to(total.device)
     if total is None:
         return 0.0
