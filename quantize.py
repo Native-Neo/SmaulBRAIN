@@ -127,11 +127,29 @@ def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -
     man_path = _st._jailed_path(ckpt_dir, "manifest.json")
     cfg_path = _st._jailed_path(ckpt_dir, "config.json")
     exp_dir = _st._jailed_path(ckpt_dir, "experts")
-    for _eid in manifest.get("expert_ids", []):
+    eids = manifest.get("expert_ids")
+    if (not isinstance(eids, list) or not eids
+            or not all(isinstance(eid, str) for eid in eids)
+            or len(set(eids)) != len(eids)):
+        raise ValueError("checkpoint validation failed: bad manifest expert_ids")
+    for _eid in eids:
         _st._require_eid(_eid)
         _st._jailed_path(ckpt_dir, f"experts/{_eid}.safetensors")
         _st._jailed_path(ckpt_dir, f"experts/{_eid}.json")
-    # Drop crash leftovers before staging new sidecars.
+    # Parse and validate config before the temp sweep or any conversion.
+    # Otherwise a bad config could fail only after expert files were replaced.
+    try:
+        with open(cfg_path) as f:
+            cfg_dict = json.load(f)
+        if not isinstance(cfg_dict, dict):
+            raise ValueError("config.json is not a dict")
+        from config import SmaulBrainConfig
+        SmaulBrainConfig.from_dict(cfg_dict)
+    except Exception as e:
+        raise ValueError(
+            f"checkpoint validation failed: unreadable/bad config.json: {e}"
+        ) from e
+    # Drop crash leftovers only after source metadata has passed validation.
     _sweep_stale_tmp(ckpt_dir)
     _sweep_stale_tmp(exp_dir)
     reports = []
@@ -175,13 +193,6 @@ def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -
                 os.rmdir(stage_dir)
             except OSError:
                 pass
-        try:
-            with open(cfg_path) as f:
-                cfg_dict = json.load(f)
-        except Exception as e:
-            raise ValueError(
-                f"checkpoint validation failed: unreadable config.json: {e}"
-            ) from e
         cfg_dict["fp8_tile"] = tile
         _atomic_write_json(cfg_dict, cfg_path)
     # to == "bf16": experts intentionally stay FP8; only the trunk converts.
