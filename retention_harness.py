@@ -165,8 +165,11 @@ def load_text_domain(path: str, length: int) -> tuple[list[list[int]], list[list
             raise ValueError(f"domain file {path} exceeds 64MB cap")
     except OSError as e:
         raise ValueError(f"unreadable domain file {path}: {e}") from e
-    with open(path, encoding="utf-8") as f:
-        lines = [l for l in (s.strip() for s in f) if l]
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = [l for l in (s.strip() for s in f) if l]
+    except (OSError, UnicodeError) as e:
+        raise ValueError(f"unreadable domain file {path}: {e}") from e
     if len(lines) < 5:
         raise ValueError(f"need >= 5 non-empty lines in {path}, got {len(lines)}")
     cut = max(1, (len(lines) * 4) // 5)
