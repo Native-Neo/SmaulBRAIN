@@ -347,7 +347,7 @@ def update_fp8_tile_block(
 #: component -> (storage dtype, compute dtype)
 PRECISION_POLICY: dict[str, tuple[str, str]] = {
     "expert_weights": ("fp8", "bf16"),
-    "large_projections": ("fp8", "bf16"),
+    "large_projections": ("fp32", "hybrid_fp8"),
     "activations": ("bf16", "bf16"),
     "recurrent_state": ("fp32", "fp32"),
     "optimizer_state": ("bf16", "fp32"),
@@ -362,7 +362,10 @@ PRECISION_POLICY: dict[str, tuple[str, str]] = {
 
 
 def compute_dtype(name: str, fallback: torch.dtype = torch.bfloat16) -> torch.dtype:
-    table = {"fp8": torch.float8_e4m3fn, "bf16": torch.bfloat16, "fp32": torch.float32}
+    # hybrid_fp8 returns activations in BF16 by default; its arithmetic
+    # itself uses E4M3 forward and E5M2 backward quantization.
+    table = {"fp8": torch.float8_e4m3fn, "bf16": torch.bfloat16,
+             "fp32": torch.float32, "hybrid_fp8": torch.bfloat16}
     entry = PRECISION_POLICY.get(name)
     if entry is None:
         return fallback
