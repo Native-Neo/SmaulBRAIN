@@ -92,27 +92,30 @@ class SmaulOptHParams:
     update_clip: float = 10.0
 
     def __post_init__(self) -> None:
-        bounds = (
-            ("lr", self.lr, 0.0, False),
-            ("beta_m", self.beta_m, 0.0, True),
-            ("beta_v", self.beta_v, 0.0, True),
-            ("eps", self.eps, 0.0, False),
-            ("wd", self.wd, 0.0, True),
-            ("clip", self.clip, 0.0, True),
-            ("update_clip", self.update_clip, 0.0, False),
-        )
-        for name, value, lower, inclusive in bounds:
+        for name, value in (("beta_m", self.beta_m), ("beta_v", self.beta_v)):
             if (isinstance(value, bool) or not isinstance(value, (int, float))
-                    or not math.isfinite(value)
-                    or (value < lower if inclusive else value <= lower)):
-                relation = ">= 0" if inclusive else "> 0"
-                if name in ("beta_m", "beta_v"):
-                    relation = "in [0, 1)"
-                    if (isinstance(value, bool) or not isinstance(value, (int, float))
-                            or not math.isfinite(value) or not 0.0 <= value < 1.0):
-                        raise ValueError(f"{name} must be finite and {relation}, got {value!r}")
-                    continue
-                raise ValueError(f"{name} must be finite and {relation}, got {value!r}")
+                    or not math.isfinite(value) or not 0.0 <= value < 1.0):
+                raise ValueError(
+                    f"{name} must be finite and in [0, 1), got {value!r}"
+                )
+        for name, value, strictly_positive in (
+            ("lr", self.lr, True),
+            ("eps", self.eps, True),
+            ("wd", self.wd, False),
+            ("clip", self.clip, False),
+            ("update_clip", self.update_clip, True),
+        ):
+            invalid = (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or (value <= 0 if strictly_positive else value < 0)
+            )
+            if invalid:
+                relation = "> 0" if strictly_positive else ">= 0"
+                raise ValueError(
+                    f"{name} must be finite and {relation}, got {value!r}"
+                )
         if self.state_dtype not in ("bf16", "fp32"):
             raise ValueError(f"state_dtype must be bf16|fp32, got {self.state_dtype!r}")
         if not isinstance(self.factor_v, bool):
