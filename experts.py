@@ -190,6 +190,13 @@ class ExpertPool:
             return out
         # Only experts actually addressed by this batch dispatch: O(active),
         # not O(pool). Router ids are pool indices (order[rid]).
+        # Stats (tokens_routed/contribution) defer their host reads: per-expert
+        # count/weight sums accumulate as tensors and flush in ONE host
+        # transfer (single .tolist on a stacked [P, 2] fp64 pair) instead of
+        # two .item() syncs per expert per depth. Values are bit-identical
+        # to the old per-expert .item() path (int64 counts are exact in
+        # fp64; fp32 sums cast exactly to fp64; same Python EMA formula).
+        pending: list = []
         for rid in torch.unique(top_ids).tolist():
             if not 0 <= rid < len(self.order):
                 raise ValueError(
@@ -213,10 +220,18 @@ class ExpertPool:
             weight = mask_slot[rows].float() * top_weights[rows]  # [M, K]
             out[rows] += weight.sum(dim=-1, keepdim=True).to(out.dtype) * y
             rec = self.experts[eid]
-            rec.tokens_routed += int(rows.sum().item())
-            rec.last_used_step = step
-            mean_weight = float(weight.sum().item()) / max(1, int(rows.sum().item()))
-            rec.contribution = 0.9 * rec.contribution + 0.1 * mean_weight
+            pending.append((rec, rows.sum(), weight.sum().detach()))
+        if pending:
+            cnt_t = torch.stack([c for _, c, _ in pending])
+            sum_t = torch.stack([s for _, _, s in pending])
+            combined = torch.stack(
+                [cnt_t.to(torch.float64), sum_t.to(torch.float64)], dim=1
+            ).tolist()
+            for (rec, _, _), (c_f, s_f) in zip(pending, combined):
+                c, s = int(c_f), float(s_f)
+                rec.tokens_routed += c
+                rec.last_used_step = step
+                rec.contribution = 0.9 * rec.contribution + 0.1 * (s / max(1, c))
         return out
 
     # -- stats --

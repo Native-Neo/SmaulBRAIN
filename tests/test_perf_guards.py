@@ -152,3 +152,64 @@ def test_j4_single_pass_grad_norm():
         dt = (time.perf_counter() - t0) / 5 * 1000.0
         print(f"\n[J4] nt={nt}: norm={n:.6f} maxabs={abs(o-n):.2e} {dt:.2f}ms")
         assert dt < 5000.0
+
+
+def test_m1_expert_stats_single_sync_identical():
+    """Batched stats flush equals the old per-expert .item() values exactly.
+
+    Bench (N=512, E=4, CPU): before ~7.25ms/forward (2 .item() syncs per
+    expert); after ~6.25ms with one stacked .tolist per forward.
+    """
+    import copy
+    from experts import ExpertPool, make_expert, swiglu_forward
+    from routing import SparseRouter
+
+    def old_forward(pool, x, top_ids, top_weights, dropped, provider, step=0):
+        out = torch.zeros_like(x)
+        live = ~dropped
+        admitted = live.unsqueeze(-1) & (top_weights > 0)
+        if top_ids.numel() == 0:
+            return out
+        for rid in torch.unique(top_ids).tolist():
+            mask_slot = (top_ids == rid) & admitted
+            if not mask_slot.any():
+                continue
+            eid = pool.order[rid]
+            w = provider(eid)
+            dtype = w["w_gate"].dtype
+            rows = mask_slot.any(dim=-1)
+            y = swiglu_forward(x[rows].to(dtype), w).to(out.dtype)
+            weight = mask_slot[rows].float() * top_weights[rows]
+            out[rows] += weight.sum(dim=-1, keepdim=True).to(out.dtype) * y
+            rec = pool.experts[eid]
+            rec.tokens_routed += int(rows.sum().item())
+            rec.last_used_step = step
+            mean_w = float(weight.sum().detach().item()) / max(1, int(rows.sum().item()))
+            rec.contribution = 0.9 * rec.contribution + 0.1 * mean_w
+        return out
+
+    torch.manual_seed(0)
+    pool_new = ExpertPool()
+    for _ in range(4):
+        pool_new.add(make_expert(pool_new.fresh_id(), d_model=32, expert_hidden=64))
+    pool_old = copy.deepcopy(pool_new)
+    router = SparseRouter(32, 4, 2)
+    torch.manual_seed(1)
+    x = torch.randn(512, 32)
+    plan = router.route(x)
+    pn = lambda eid: pool_new.experts[eid].dequantize(dtype=torch.float32)
+    po = lambda eid: pool_old.experts[eid].dequantize(dtype=torch.float32)
+    out_new = pool_new.forward(x, plan.top_ids, plan.top_weights, plan.dropped, pn, step=5)
+    out_old = old_forward(pool_old, x, plan.top_ids, plan.top_weights, plan.dropped, po, step=5)
+    assert torch.equal(out_new, out_old)
+    for eid in pool_new.order:
+        rn, ro = pool_new.experts[eid], pool_old.experts[eid]
+        assert rn.tokens_routed == ro.tokens_routed, eid
+        assert rn.last_used_step == ro.last_used_step, eid
+        assert rn.contribution == ro.contribution, eid
+    t0 = time.perf_counter()
+    for _ in range(5):
+        pool_new.forward(x, plan.top_ids, plan.top_weights, plan.dropped, pn, step=5)
+    dt = (time.perf_counter() - t0) / 5 * 1000.0
+    print(f"\n[M1] pool forward N=512 E=4: {dt:.2f}ms")
+    assert dt < 5000.0
