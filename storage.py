@@ -92,6 +92,12 @@ def set_rng_snapshot(snap: dict) -> None:
     _cpu = snap["torch_cpu"]
     if not torch.is_tensor(_cpu) or _cpu.dtype != torch.uint8 or _cpu.numel() == 0:
         raise ValueError("checkpoint validation failed: bad torch RNG state")
+    try:
+        torch.Generator(device="cpu").set_state(_cpu)
+    except Exception as e:
+        raise ValueError(
+            f"checkpoint validation failed: bad torch RNG state: {e}"
+        ) from e
     for _k in snap:
         if _k not in ("torch_cpu", "python", "cuda"):
             raise ValueError(
@@ -113,6 +119,12 @@ def set_rng_snapshot(snap: dict) -> None:
                 or (isinstance(gauss, float)
                     and __import__("math").isfinite(gauss))):
             raise ValueError("checkpoint validation failed: bad python RNG state")
+        try:
+            random.Random().setstate((version, tuple(inner), gauss))
+        except Exception as e:
+            raise ValueError(
+                f"checkpoint validation failed: bad python RNG state: {e}"
+            ) from e
     _cuda = snap.get("cuda")
     if _cuda is not None:
         if isinstance(_cuda, dict):
@@ -1081,6 +1093,12 @@ def _validate_rng_parts(tensors: dict, py_state) -> None:
     cpu = tensors.get("torch_cpu")
     _require(torch.is_tensor(cpu) and cpu.dtype == torch.uint8,
              "rng snapshot missing torch_cpu state")
+    try:
+        torch.Generator(device="cpu").set_state(cpu)
+    except Exception as e:
+        raise ValueError(
+            f"checkpoint validation failed: bad torch RNG state: {e}"
+        ) from e
     cuda_indices = []
     for k, t in tensors.items():
         _require(torch.is_tensor(t) and t.dtype == torch.uint8,
@@ -1107,6 +1125,12 @@ def _validate_rng_parts(tensors: dict, py_state) -> None:
         _require(py_state[2] is None
                  or (isinstance(py_state[2], float) and __import__("math").isfinite(py_state[2])),
                  "rng snapshot bad python gauss")
+        try:
+            random.Random().setstate((py_state[0], tuple(py_state[1]), py_state[2]))
+        except Exception as e:
+            raise ValueError(
+                f"checkpoint validation failed: bad python RNG state: {e}"
+            ) from e
 
 
 @_with_ckpt_lock(exclusive=False)
