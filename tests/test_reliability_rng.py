@@ -108,3 +108,34 @@ def test_unsupported_python_rng_version_rejects_before_mutating_global_rng():
         storage.set_rng_snapshot(snap)
     assert torch.equal(torch.get_rng_state(), torch_before)
     assert __import__("random").getstate() == python_before
+
+
+def test_invalid_torch_rng_payload_rejects_before_global_mutation():
+    snap = _good()
+    snap["torch_cpu"] = torch.zeros(4, dtype=torch.uint8)
+    before = torch.get_rng_state().clone()
+    with pytest.raises(ValueError, match="bad torch RNG state"):
+        storage.set_rng_snapshot(snap)
+    assert torch.equal(torch.get_rng_state(), before)
+
+
+def test_invalid_python_rng_index_rejects_before_global_mutation():
+    snap = _with_python()
+    version, inner, gauss = snap["python"]
+    invalid_inner = list(inner)
+    invalid_inner[-1] = 999999
+    snap["python"] = (version, invalid_inner, gauss)
+    torch_before = torch.get_rng_state().clone()
+    python_before = __import__("random").getstate()
+    with pytest.raises(ValueError, match="bad python RNG state"):
+        storage.set_rng_snapshot(snap)
+    assert torch.equal(torch.get_rng_state(), torch_before)
+    assert __import__("random").getstate() == python_before
+
+
+def test_checkpoint_rng_parts_rejects_bad_torch_rng_payload():
+    snap = storage.get_rng_snapshot()
+    with pytest.raises(ValueError, match="bad torch RNG state"):
+        storage._validate_rng_parts(
+            {"torch_cpu": torch.zeros(4, dtype=torch.uint8)}, snap["python"]
+        )
