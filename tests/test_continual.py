@@ -546,3 +546,11 @@ def test_reservoir_long_run_uniform_and_resume_equal():
     snap = a.to_dict()
     b = ReplayBuffer.from_dict(snap)
     assert [b.sample(3) for _ in range(5)] == [a.sample(3) for _ in range(5)]
+
+
+def test_replay_capacity_rejects_lossy_coercions():
+    import pytest
+
+    for bad in (True, False, 1.5, "4"):
+        with pytest.raises(ValueError, match="capacity must be an int"):
+            ReplayBuffer(capacity=bad)
