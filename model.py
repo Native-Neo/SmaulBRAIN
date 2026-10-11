@@ -581,6 +581,7 @@ class SmaulBrainModel(nn.Module):
                 f"B*T*V={ids.shape[0] * ids.shape[1] * self.cfg.vocab_size} exceeds "
                 "16M-element head budget (chunk T)"
             )
+        self._check_activation_budget(ids, training=False)
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, _T = ids.shape
         # Fresh stream: reset conv carryover BEFORE convolving, so the prompt
