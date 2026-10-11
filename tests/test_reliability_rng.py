@@ -9,6 +9,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
+import torch
 
 import storage
 
@@ -67,3 +68,20 @@ def test_version_bool_or_str_rejects(bad):
 def test_empty_dict_raises():
     with pytest.raises(ValueError):
         storage.set_rng_snapshot({})
+
+
+def test_checkpoint_rng_parts_rejects_unknown_tensor_keys():
+    snap = storage.get_rng_snapshot()
+    tensors = {"torch_cpu": snap["torch_cpu"],
+               "not_a_rng_state": torch.zeros(4, dtype=torch.uint8)}
+    with pytest.raises(ValueError, match="bad entry name"):
+        storage._validate_rng_parts(tensors, snap["python"])
+
+
+def test_checkpoint_rng_parts_rejects_noncontiguous_cuda_states():
+    snap = storage.get_rng_snapshot()
+    tensors = {"torch_cpu": snap["torch_cpu"],
+               "cuda.0": torch.zeros(4, dtype=torch.uint8),
+               "cuda.2": torch.zeros(4, dtype=torch.uint8)}
+    with pytest.raises(ValueError, match="contiguous cuda.0"):
+        storage._validate_rng_parts(tensors, snap["python"])
