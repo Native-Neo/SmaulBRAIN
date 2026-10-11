@@ -484,7 +484,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "train":
         from train import run_training
-        if args.data and os.path.exists(args.data):
+        if args.data:
+            if not os.path.exists(args.data):
+                print(f"error: --data file not found: {args.data}", file=sys.stderr)
+                return 2
+            print(f"training data source: file {args.data}", file=sys.stderr)
             try:
                 if os.stat(args.data).st_size > 64 * 1024 * 1024:
                     print("error: --data file exceeds 64MB cap", file=sys.stderr)
@@ -492,11 +496,17 @@ def main(argv: list[str] | None = None) -> int:
             except OSError as e:
                 print(f"error: unreadable --data file: {e}", file=sys.stderr)
                 return 2
-            with open(args.data, "rb") as f:
-                raw = f.read(64 * 1024 * 1024 + 1)
+            try:
+                with open(args.data, "rb") as f:
+                    raw = f.read(64 * 1024 * 1024 + 1)
+            except OSError as e:
+                print(f"error: unreadable --data file: {e}", file=sys.stderr)
+                return 2
             seqs = [list(raw[i:i + cfg.context_length + 1])
                     for i in range(0, len(raw) - 1, cfg.context_length + 1)][:512] or _demo_seqs()
         else:
+            print("training data source: synthetic demo (no --data given)",
+                  file=sys.stderr)
             seqs = _demo_seqs()
         grow_every = resolve_train_grow_every(args, cfg)
         cfg.grow_every = grow_every
