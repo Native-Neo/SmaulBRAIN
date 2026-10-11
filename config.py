@@ -116,8 +116,9 @@ class SmaulBrainConfig:
             and self.vocab_size >= total_vocab(), \
             f"vocab_size must be an int >= {total_vocab()} (bytes + specials)"
         assert 1 <= self.min_depth <= self.max_depth, "need 1 <= min <= max depth"
-        assert 0.0 < self.halting_threshold < 1.0, "halting threshold in (0,1)"
-        assert 0.0 < self.halt_prior < 1.0, "halt prior in (0,1)"
+        assert isinstance(self.halting_threshold, (int, float)) and not isinstance(self.halting_threshold, bool) and math.isfinite(self.halting_threshold) and 0.0 < self.halting_threshold < 1.0, "halting threshold in (0,1)"
+        assert isinstance(self.halt_prior, (int, float)) and not isinstance(self.halt_prior, bool) and math.isfinite(self.halt_prior) and 0.0 < self.halt_prior < 1.0, "halt prior in (0,1)"
+        assert isinstance(self.ponder_beta, (int, float)) and not isinstance(self.ponder_beta, bool) and math.isfinite(self.ponder_beta) and self.ponder_beta >= 0, "ponder beta must be finite and non-negative"
         assert 1 <= self.top_k <= self.num_experts, "need 1 <= top_k <= experts"
         assert self.num_experts >= 1 and self.max_experts >= self.num_experts
         assert self.min_experts >= self.top_k, "need min_experts >= top_k"
@@ -131,33 +132,35 @@ class SmaulBrainConfig:
         assert self.state_dtype in ("bf16", "fp32"), "state dtype bf16|fp32"
         assert self.expert_hidden >= 8, "expert hidden dim too small"
         assert self.attention_chunk_size >= 1, "attention chunk size must be positive"
-        assert self.capacity_factor > 0, "capacity factor must be positive"
-        assert self.moe_balance_weight >= 0, "balance weight must be non-negative"
-        assert self.expert_lr > 0, "expert LR must be positive"
-        assert self.trunk_lr_mult > 0, "trunk LR multiplier must be positive"
-        assert self.router_lr_mult > 0, "router LR multiplier must be positive"
-        assert self.router_lr_mult_new >= 0, "router new-mode LR multiplier must be non-negative"
-        assert math.isfinite(self.new_routing_bias) and self.new_routing_bias >= 0, \
+        assert isinstance(self.capacity_factor, (int, float)) and not isinstance(self.capacity_factor, bool) and math.isfinite(self.capacity_factor) and self.capacity_factor > 0, "capacity factor must be positive"
+        assert isinstance(self.moe_balance_weight, (int, float)) and not isinstance(self.moe_balance_weight, bool) and math.isfinite(self.moe_balance_weight) and self.moe_balance_weight >= 0, "balance weight must be non-negative"
+        assert isinstance(self.expert_lr, (int, float)) and not isinstance(self.expert_lr, bool) and math.isfinite(self.expert_lr) and self.expert_lr > 0, "expert LR must be positive"
+        assert isinstance(self.trunk_lr_mult, (int, float)) and not isinstance(self.trunk_lr_mult, bool) and math.isfinite(self.trunk_lr_mult) and self.trunk_lr_mult > 0, "trunk LR multiplier must be positive"
+        assert isinstance(self.router_lr_mult, (int, float)) and not isinstance(self.router_lr_mult, bool) and math.isfinite(self.router_lr_mult) and self.router_lr_mult > 0, "router LR multiplier must be positive"
+        assert isinstance(self.router_lr_mult_new, (int, float)) and not isinstance(self.router_lr_mult_new, bool) and math.isfinite(self.router_lr_mult_new) and self.router_lr_mult_new >= 0, "router new-mode LR multiplier must be non-negative"
+        assert isinstance(self.new_routing_bias, (int, float)) and not isinstance(self.new_routing_bias, bool) and math.isfinite(self.new_routing_bias) and self.new_routing_bias >= 0, \
             "new routing bias must be a finite value >= 0"
-        assert self.weight_decay >= 0, "weight decay must be non-negative"
+        assert isinstance(self.weight_decay, (int, float)) and not isinstance(self.weight_decay, bool) and math.isfinite(self.weight_decay) and self.weight_decay >= 0, "weight decay must be non-negative"
         # Clipping semantics: grad_clip > 0 caps the global grad norm;
         # 0 (or negative) disables clipping entirely.
-        assert self.grad_clip >= 0 and math.isfinite(self.grad_clip), \
+        assert isinstance(self.grad_clip, (int, float)) and not isinstance(self.grad_clip, bool) and math.isfinite(self.grad_clip) and self.grad_clip >= 0, \
             "grad clip must be finite and non-negative (0 disables)"
-        assert 0.0 <= self.beta_m < 1.0, "beta_m in [0, 1)"
-        assert 0.0 <= self.beta_v < 1.0, "beta_v in [0, 1)"
-        assert self.epsilon > 0, "epsilon must be positive"
+        assert isinstance(self.beta_m, (int, float)) and not isinstance(self.beta_m, bool) and math.isfinite(self.beta_m) and 0.0 <= self.beta_m < 1.0, "beta_m in [0, 1)"
+        assert isinstance(self.beta_v, (int, float)) and not isinstance(self.beta_v, bool) and math.isfinite(self.beta_v) and 0.0 <= self.beta_v < 1.0, "beta_v in [0, 1)"
+        assert isinstance(self.epsilon, (int, float)) and not isinstance(self.epsilon, bool) and math.isfinite(self.epsilon) and self.epsilon > 0, "epsilon must be positive"
         assert self.fp8_tile >= 8, "FP8 tile too small"
         assert self.threads >= 1, "need at least 1 thread"
         assert self.context_length >= 2, "context must fit input + target"
-        assert self.rmsnorm_eps > 0, "rmsnorm eps must be positive"
+        assert isinstance(self.rmsnorm_eps, (int, float)) and not isinstance(self.rmsnorm_eps, bool) and math.isfinite(self.rmsnorm_eps) and self.rmsnorm_eps > 0, "rmsnorm eps must be positive"
         assert self.grow_every >= 0, "grow_every must be non-negative (0 disables)"
         assert self.prune_survival_steps >= 1, "need a positive prune grace period"
-        assert self.prune_min_usage >= 0, "prune usage threshold must be non-negative"
+        assert isinstance(self.prune_min_usage, (int, float)) and not isinstance(self.prune_min_usage, bool) and math.isfinite(self.prune_min_usage) and self.prune_min_usage >= 0, "prune usage threshold must be non-negative"
         assert self.max_new_experts >= 1, "need at least 1 new expert per growth"
-        assert self.lookahead_weight >= 0, "lookahead weight must be non-negative"
-        assert self.boundary_weight >= 0, "boundary weight must be non-negative"
+        assert isinstance(self.lookahead_weight, (int, float)) and not isinstance(self.lookahead_weight, bool) and math.isfinite(self.lookahead_weight) and self.lookahead_weight >= 0, "lookahead weight must be non-negative"
+        assert isinstance(self.boundary_weight, (int, float)) and not isinstance(self.boundary_weight, bool) and math.isfinite(self.boundary_weight) and self.boundary_weight >= 0, "boundary weight must be non-negative"
         assert self.cosine_decay_steps >= 0, "cosine horizon must be non-negative (0 disables)"
+        assert isinstance(self.use_byte_conv, bool), \
+            f"use_byte_conv must be a bool, got {self.use_byte_conv!r}"
         # active_experts is a user-facing alias for top_k; keep them in sync.
         object.__setattr__(self, "active_experts", self.top_k)
 
@@ -256,6 +259,27 @@ class SmaulBrainConfig:
                 raise ValueError(
                     f"config fields active_experts/top_k must be integers: {e}"
                 ) from e
+        # Mirror __post_init__ float/bool guards here so polluted payloads
+        # raise ValueError directly (not via assert/TypeError downstream).
+        _float_fields = (
+            "halting_threshold", "halt_prior", "ponder_beta",
+            "moe_balance_weight", "capacity_factor", "expert_lr",
+            "trunk_lr_mult", "router_lr_mult", "router_lr_mult_new",
+            "new_routing_bias", "weight_decay", "grad_clip",
+            "beta_m", "beta_v", "epsilon", "rmsnorm_eps",
+            "prune_min_usage", "lookahead_weight", "boundary_weight",
+        )
+        for _f in _float_fields:
+            if _f in values:
+                _v = values[_f]
+                if not (isinstance(_v, (int, float)) and not isinstance(_v, bool) and math.isfinite(_v)):
+                    raise ValueError(
+                        f"config field {_f} must be a finite number (not bool), got {_v!r}"
+                    )
+        if "use_byte_conv" in values and not isinstance(values["use_byte_conv"], bool):
+            raise ValueError(
+                f"config field use_byte_conv must be a bool, got {values['use_byte_conv']!r}"
+            )
         try:
             return cls(**values)
         except (TypeError, AssertionError) as e:

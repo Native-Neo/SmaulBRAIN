@@ -165,8 +165,25 @@ def load_text_domain(path: str, length: int) -> tuple[list[list[int]], list[list
             raise ValueError(f"domain file {path} exceeds 64MB cap")
     except OSError as e:
         raise ValueError(f"unreadable domain file {path}: {e}") from e
-    with open(path, encoding="utf-8") as f:
-        lines = [l for l in (s.strip() for s in f) if l]
+    try:
+        with open(path, "rb") as f:
+            raw_bytes = f.read(64 * 1024 * 1024 + 1)
+    except (OSError, UnicodeError) as e:
+        raise ValueError(f"unreadable domain file {path}: {e}") from e
+    if len(raw_bytes) > 64 * 1024 * 1024:
+        raise ValueError(f"domain file {path} exceeds 64MB cap")
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeError as e:
+        raise ValueError(f"unreadable domain file {path}: {e}") from e
+    # Re-stat after read: the file may have grown between the pre-check
+    # and the read (TOCTOU); refuse a generation that no longer fits.
+    try:
+        if os.stat(path).st_size > 64 * 1024 * 1024:
+            raise ValueError(f"domain file {path} exceeds 64MB cap")
+    except OSError as e:
+        raise ValueError(f"unreadable domain file {path}: {e}") from e
+    lines = [l for l in (s.strip() for s in text.splitlines()) if l]
     if len(lines) < 5:
         raise ValueError(f"need >= 5 non-empty lines in {path}, got {len(lines)}")
     cut = max(1, (len(lines) * 4) // 5)
@@ -186,6 +203,9 @@ def load_text_domain(path: str, length: int) -> tuple[list[list[int]], list[list
         if not seqs:
             raise ValueError(f"lines in {path} too short for a {length}-window split")
         out.append(seqs)
+    if len(out[0]) + len(out[1]) > 65536:
+        raise ValueError(f"domain file {path} yields too many sequences "
+                         f"({len(out[0]) + len(out[1])} > 65536 cap)")
     return out[0], out[1]
 
 

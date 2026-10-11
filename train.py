@@ -123,14 +123,58 @@ class ReplayBuffer:
 
     @classmethod
     def from_dict(cls, d: dict, seed: int = 0) -> "ReplayBuffer":
-        """Rebuild a buffer from to_dict (exact RNG continuation)."""
-        buf = cls(capacity=int(d.get("capacity", 512)), seed=seed)
-        buf.buf = deque([list(s) for s in d.get("buf", [])])
-        buf.seen = int(d.get("seen", 0))
+        """Rebuild a buffer from to_dict (exact RNG continuation).
+
+        Strict input validation (mirrors storage._validate_rng_parts style,
+        duplicated locally to avoid a storage import cycle): bool values
+        never coerce (True -> 1 is rejected), inner state entries must be
+        ints in [0, 2**32), and gauss must be None or a finite float.
+        Violations raise ValueError.
+        """
+        if not isinstance(d, dict):
+            raise ValueError(f"ReplayBuffer payload must be a dict, got {type(d).__name__}")
+        cap_raw = d.get("capacity", 512)
+        if isinstance(cap_raw, bool) or not isinstance(cap_raw, int):
+            raise ValueError(f"ReplayBuffer capacity must be an int (not bool), got {cap_raw!r}")
+        if cap_raw < 0:
+            raise ValueError(f"ReplayBuffer capacity must be >= 0, got {cap_raw!r}")
+        buf_raw = d.get("buf", [])
+        if not isinstance(buf_raw, list):
+            raise ValueError(f"ReplayBuffer buf must be a list, got {type(buf_raw).__name__}")
+        for _s in buf_raw:
+            if not isinstance(_s, (list, tuple)):
+                raise ValueError(f"ReplayBuffer buf entries must be lists, got {_s!r}")
+            for _v in _s:
+                if isinstance(_v, bool) or not isinstance(_v, int):
+                    raise ValueError(f"ReplayBuffer buf entries must be ints (not bool), got {_v!r}")
+        seen_raw = d.get("seen", 0)
+        if isinstance(seen_raw, bool) or not isinstance(seen_raw, int):
+            raise ValueError(f"ReplayBuffer seen must be an int (not bool), got {seen_raw!r}")
+        if seen_raw < 0:
+            raise ValueError(f"ReplayBuffer seen must be >= 0, got {seen_raw!r}")
         rng = d.get("rng")
         if rng is not None:
+            if not (isinstance(rng, (list, tuple)) and len(rng) == 3):
+                raise ValueError(f"ReplayBuffer rng must be [version, inner, gauss], got {rng!r}")
             version, inner, gauss = rng
-            buf.rng.setstate((int(version), tuple(int(v) for v in inner), gauss))
+            if isinstance(version, bool) or not isinstance(version, int):
+                raise ValueError(f"ReplayBuffer rng version must be an int (not bool), got {version!r}")
+            if not (isinstance(inner, (list, tuple)) and len(inner) == 625):
+                raise ValueError("ReplayBuffer rng inner must be 625 entries")
+            for _v in inner:
+                if isinstance(_v, bool) or not isinstance(_v, int) or not (0 <= _v < 2 ** 32):
+                    raise ValueError(f"ReplayBuffer rng inner entries must be ints in [0, 2**32), got {_v!r}")
+            if not (gauss is None or (isinstance(gauss, float) and not isinstance(gauss, bool) and math.isfinite(gauss))):
+                raise ValueError(f"ReplayBuffer rng gauss must be None or a finite float, got {gauss!r}")
+            try:
+                rng_state = (int(version), tuple(int(v) for v in inner), gauss)
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"ReplayBuffer rng has bad entries: {e}") from e
+        buf = cls(capacity=cap_raw, seed=seed)
+        buf.buf = deque([list(s) for s in buf_raw])
+        buf.seen = seen_raw
+        if rng is not None:
+            buf.rng.setstate(rng_state)  # validated above; no bool coercion survives
         return buf
 
 
@@ -236,7 +280,20 @@ def _new_cap_factor(old_delta: torch.Tensor, new_delta: torch.Tensor, cap: float
 def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
                mode: str = "entire", selected: list[str] | None = None,
                new_since_step: int = 0) -> dict:
-    """One optimizer step. Returns loss stats + stepped expert ids."""
+    """One optimizer step. Returns loss stats + stepped expert ids.
+
+    Stepped ledger semantics (pinned): ``stepped_experts`` lists exactly
+    the experts whose ``record.version`` bumped during this call, i.e.
+    whose optimizer moments moved (applied update, not a skip). Skipped
+    updates (no grads, non-finite grads) bump nothing and are never listed.
+    A zero effective LR (e.g. cosine decay pinned at ~0.0 past the horizon)
+    still counts as stepped: moments decay on the grad and ``version``
+    bumps, the pager entry is invalidated, and the id appears in
+    ``stepped`` even though weights are numerically unmoved. This churn is
+    intentional — version-delta is unambiguous where the EMA activity
+    signal can be exactly 0.0 — and callers must not interpret ``stepped``
+    as proof of weight movement.
+    """
     if mode not in _MODES:
         raise ValueError(f"unknown training mode {mode!r}; expected one of {_MODES}")
     if x.shape != y.shape or x.ndim != 2:
