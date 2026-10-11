@@ -202,6 +202,8 @@ def generate(
         raise ValueError(f"context must be positive, got {context!r}")
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ValueError(f"seed must be an int, got {seed!r}")
+    if not 0 <= seed < 2**64:
+        raise ValueError(f"seed must be in [0, 2**64), got {seed!r}")
     if isinstance(stop_on_eos, bool) is False:
         raise ValueError(f"stop_on_eos must be a bool, got {stop_on_eos!r}")
     if isinstance(max_new, bool) or not isinstance(max_new, int):
