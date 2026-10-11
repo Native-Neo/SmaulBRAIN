@@ -110,3 +110,45 @@ def test_j3_admit_slots_bit_identical():
             r._admit_slots(plan.top_ids, plan.top_weights, N)
         dt = (time.perf_counter() - t0) / 10 * 1000.0
         assert dt < 50.0, f"admit too slow N={N} E={E}: {dt:.1f}ms"
+
+
+def test_j4_single_pass_grad_norm():
+    """Single-sync norm matches the old per-tensor-double loop (~1e-9).
+
+    Microbench (CPU, 256x256 fp32): before ~1.09/3.79/18.66ms for 4/16/64
+    tensors (per-tensor .double() + sync each); after ~0.66/2.58/11.57ms
+    with ONE sync and fp32-square/fp64-sum transients. Realistic-scale
+    grads (std 0.02) match to <1e-9 absolute; unit-scale bench grads match
+    to <1e-9 relative (maxabs reported below).
+    """
+    import math
+    from smaulopt import global_grad_norm
+
+    def old_norm(grads):
+        total = 0.0
+        for g in grads:
+            if g is None:
+                continue
+            total += float(g.detach().double().pow(2).sum().item())
+        return math.sqrt(total)
+
+    # Realistic scale: absolute < 1e-9.
+    for nt in (4, 16, 64):
+        torch.manual_seed(11)
+        grads = [torch.randn(64, 64) * 0.02 for _ in range(nt)]
+        o, n = old_norm(grads), global_grad_norm(grads)
+        assert abs(o - n) <= 1e-9, f"nt={nt}: {o} vs {n}"
+    assert global_grad_norm([]) == 0.0
+    assert global_grad_norm([None, None]) == 0.0
+    # Unit-scale microbench shapes: relative < 1e-9, timing recorded.
+    for nt in (4, 16, 64):
+        torch.manual_seed(7)
+        grads = [torch.randn(256, 256) for _ in range(nt)]
+        o, n = old_norm(grads), global_grad_norm(grads)
+        assert abs(o - n) / max(1.0, o) <= 1e-9, f"nt={nt} rel {abs(o-n)/o:.2e}"
+        t0 = time.perf_counter()
+        for _ in range(5):
+            global_grad_norm(grads)
+        dt = (time.perf_counter() - t0) / 5 * 1000.0
+        print(f"\n[J4] nt={nt}: norm={n:.6f} maxabs={abs(o-n):.2e} {dt:.2f}ms")
+        assert dt < 5000.0
