@@ -805,3 +805,17 @@ def test_expert_grad_scale_zero_still_applies_not_a_skip():
 
 
 
+
+
+def test_fp8_quantize_and_dequantize_non_aligned_cuda_tensor():
+    if not torch.cuda.is_available():
+        import pytest
+        pytest.skip("CUDA is unavailable")
+    w = torch.randn(3, 70, device="cuda", dtype=torch.float32)
+    t = quantize_fp8_blockwise(w, tile=64)
+    assert t.codes.device.type == "cuda"
+    assert t.scales.device.type == "cuda"
+    back = dequantize_fp8_blockwise(t)
+    assert back.device.type == "cuda"
+    assert back.shape == w.shape
+    assert torch.isfinite(back).all()
