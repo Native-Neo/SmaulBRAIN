@@ -124,6 +124,23 @@ def test_eval_loss_invariant_to_pad_tail_length():
     m.pager.close()
 
 
+def test_evaluate_loss_restores_training_mode_after_forward_error():
+    m, _, cfg = _model()
+    m.train()
+
+    def fail_forward(*_args, **_kwargs):
+        raise RuntimeError("injected evaluation failure")
+
+    m.forward_infer = fail_forward
+    batch = batch_from_seqs([[10, 20, 30]], context=cfg.context_length)
+    try:
+        with pytest.raises(RuntimeError, match="injected evaluation failure"):
+            evaluate_loss(m, batch, cfg.context_length)
+        assert m.training is True
+    finally:
+        m.pager.close()
+
+
 def test_train_loss_invariant_to_pad_tail_without_capacity_pressure():
     # Capacity binds nothing here (factor 1000), so per-position outputs are
     # prefix-determined and the valid-normalized loss must match exactly.
