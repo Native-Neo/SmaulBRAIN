@@ -549,6 +549,11 @@ class ExpertPager:
     # -- async prefetch --
     def prefetch(self, expert_ids: list[str]) -> None:
         """Begin loading predicted experts in the background. Collapses duplicates."""
+        for eid in expert_ids:
+            if not isinstance(eid, str) or not eid \
+                    or "\x00" in eid or "/" in eid or "\\" in eid \
+                    or eid.startswith(".") or eid in (".", ".."):
+                raise ValueError(f"bad expert id {eid!r}")
         with self._lock:
             if self._closed:
                 raise RuntimeError("pager is closed")
