@@ -6,6 +6,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch
 
 from precision import E5M2_MAX, HybridFP8Linear
+from config import SmaulBrainConfig
+from model import SmaulBrainModel
 
 
 def _pair(seed=0, with_bias=True):
@@ -99,3 +101,20 @@ def test_no_bias_variant_trains():
 
 def test_e5m2_range_exceeds_e4m3():
     assert E5M2_MAX > 100 * 448.0  # grads get the wide exponent range
+
+
+def test_default_model_uses_hybrid_fp8_for_dense_projections():
+    cfg = SmaulBrainConfig(
+        d_model=16, n_heads=4, expert_hidden=16,
+        num_experts=2, top_k=1, active_experts=1,
+        max_experts=4, min_experts=1, use_byte_conv=False,
+    )
+    model = SmaulBrainModel(cfg)
+    try:
+        linears = [m for m in model.modules() if isinstance(m, HybridFP8Linear)]
+        assert len(linears) >= 4
+        assert all(m.weight.dtype == torch.float32 for m in linears)
+        assert model.block.qkv.out_dtype == torch.bfloat16
+        assert model.head.out_dtype == torch.bfloat16
+    finally:
+        model.pager.close()
