@@ -135,6 +135,15 @@ class SparseRouter(nn.Module):
         every slot): otherwise chunked/streaming inference would admit
         different slots than a full pass over the same tokens.
         """
+        if not isinstance(x, torch.Tensor):
+            raise ValueError(f"x must be a Tensor, got {type(x).__name__}")
+        if x.ndim != 2:
+            raise ValueError(f"x must be [N,D], got shape {tuple(x.shape)}")
+        if x.shape[1] != self.d_model:
+            raise ValueError(
+                f"x must be [N,D] with D={self.d_model}, "
+                f"got shape {tuple(x.shape)}"
+            )
         n_tokens = x.shape[0]
         if self.num_experts <= 0 and n_tokens > 0:
             raise ValueError("cannot route non-empty batch with 0 experts")
