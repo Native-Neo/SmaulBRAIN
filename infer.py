@@ -108,6 +108,8 @@ def sample_next(logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0,
     return type is a single int; batch callers loop explicitly).
     """
     _check_sampler(temperature, top_k, top_p)
+    if not isinstance(logits, torch.Tensor):
+        raise ValueError(f"logits must be a Tensor, got {type(logits).__name__}")
     if logits.ndim != 1:
         raise ValueError(
             f"logits must be 1-D [V], got shape {tuple(logits.shape)}; "
