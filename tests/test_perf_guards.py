@@ -390,3 +390,24 @@ def test_m4_routing_budget_counts_both_transients():
     x2 = torch.randn(1024, 8)
     plan = r.route(x2)
     assert plan.top_ids.shape == (1024, 2)
+
+
+def test_depth_aware_activation_budget_refuses_wide_work_before_compute():
+    """B*T and B*T*V can pass while the retained per-depth stack is unsafe."""
+    import pytest
+    from config import SmaulBrainConfig
+    from model import SmaulBrainModel
+
+    cfg = SmaulBrainConfig(
+        d_model=64, n_heads=4, max_depth=8, min_depth=1,
+        num_experts=4, top_k=1, expert_hidden=32,
+    )
+    model = SmaulBrainModel(cfg)
+    ids = torch.zeros((8, 4096), dtype=torch.long)
+    # B*T=32768 and B*T*V=8,519,680 both pass the older independent guards,
+    # but per-depth logits plus hidden states exceed the 256 MiB estimate.
+    with pytest.raises(ValueError, match="estimated retained activation memory exceeds 256 MiB"):
+        model(ids, ids)
+    with pytest.raises(ValueError, match="estimated retained activation memory exceeds 256 MiB"):
+        model.forward_infer(ids)
+    model.pager.close()
