@@ -511,6 +511,18 @@ class SmaulBrainModel(nn.Module):
     ) -> tuple[dict, list[LinearAttnState]]:
         """Process a prompt/chunk and return its updated fixed-size recurrent states."""
         self._check_ids(ids, "ids")
+        if ids.ndim != 2:
+            raise ValueError(f"ids must be [B, T], got shape {tuple(ids.shape)}")
+        if ids.shape[0] * ids.shape[1] > 1_048_576:
+            raise ValueError(
+                f"batch token count B*T={ids.shape[0] * ids.shape[1]} exceeds "
+                "1M-token guard (chunk the input)"
+            )
+        if ids.shape[0] * ids.shape[1] * self.cfg.vocab_size > 16_777_216:
+            raise ValueError(
+                f"B*T*V={ids.shape[0] * ids.shape[1] * self.cfg.vocab_size} exceeds "
+                "16M-element head budget (chunk T)"
+            )
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, _T = ids.shape
         # Fresh stream: reset conv carryover BEFORE convolving, so the prompt
