@@ -74,6 +74,30 @@ class FP8BlockTensor:
         if not isinstance(self.tile, int) or isinstance(self.tile, bool) \
                 or self.tile < 1:
             raise ValueError(f"fp8 tile must be a positive int, got {self.tile!r}")
+        if (not isinstance(self.shape, (tuple, list)) or not self.shape
+                or any(isinstance(dim, bool) or not isinstance(dim, int) or dim < 1
+                       for dim in self.shape)):
+            raise ValueError(f"FP8 logical shape must contain positive integer dimensions, got {self.shape!r}")
+        shape = tuple(self.shape)
+        if not torch.is_tensor(self.codes) or self.codes.dtype != torch.uint8:
+            raise ValueError("FP8 codes must be a uint8 tensor")
+        if tuple(self.codes.shape) != shape:
+            raise ValueError(
+                f"FP8 codes shape {tuple(self.codes.shape)} does not match logical shape {shape}"
+            )
+        if not torch.is_tensor(self.scales) or self.scales.dtype != torch.float32:
+            raise ValueError("FP8 scales must be a float32 tensor")
+        expected_scales = (
+            self.codes.numel() // shape[-1],
+            (shape[-1] + self.tile - 1) // self.tile,
+        )
+        if tuple(self.scales.shape) != expected_scales:
+            raise ValueError(
+                f"FP8 scales shape {tuple(self.scales.shape)} does not match "
+                f"expected {expected_scales} for shape {shape} and tile {self.tile}"
+            )
+        if self.scales.device != self.codes.device:
+            raise ValueError("FP8 codes and scales must be on the same device")
 
     def nbytes(self) -> int:
         return self.codes.nelement() + self.scales.nelement() * 4
