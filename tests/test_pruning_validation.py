@@ -44,3 +44,16 @@ def test_pruning_cli_rejects_symlinked_config_before_model_construction(tmp_path
 
     assert main(["--ckpt", str(ckpt), "--rm-worst", "0"]) == 2
     assert "symlink" in capsys.readouterr().err
+
+@pytest.mark.parametrize("bad_floor", [-1, 0, True, "2"])
+def test_pruning_cli_rejects_invalid_resume_floor(tmp_path, capsys, bad_floor):
+    import json
+    from pruning import main
+
+    ckpt = tmp_path / "checkpoint"
+    ckpt.mkdir()
+    (ckpt / "resume_config.json").write_text(
+        json.dumps({"min_experts": bad_floor})
+    )
+    assert main(["--ckpt", str(ckpt), "--rm-worst", "0"]) == 2
+    assert "min_experts" in capsys.readouterr().err
