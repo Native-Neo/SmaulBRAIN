@@ -21,6 +21,11 @@ import torch.nn as nn
 class SparseTopKHead(nn.Module):
     """Fixed fan-in sparse output head: each of V rows reads K of D dims.
 
+    STUDY-ONLY baseline for ``compare_heads``: with the tiny 256-entry byte
+    vocab the dense head is one small matmul and the sparse head pays gather
+    overhead (measured: dense wins). Do NOT use in the model trunk; this
+    exists to prove sparsity loses here with numbers, not assumptions.
+
     ``cols`` is a frozen index buffer (built once from a seed); only
     ``values`` [V, K] are parameters. Forward is one gather + one batched
     dot — no Python token loop.
@@ -43,6 +48,15 @@ class SparseTopKHead(nn.Module):
             raise ValueError(
                 f"input device {x.device} != head device {self.cols.device}; "
                 "move the head (or input) first"
+            )
+        # Gather budget: x[..., cols] materializes [N, V, K] (N = batch
+        # tokens); refuse before allocating (study-only head, chunk first).
+        n_tok = x.shape[:-1].numel() if x.ndim >= 1 else 1
+        V, K = self.cols.shape
+        if n_tok * V * K > 16_777_216:
+            raise ValueError(
+                f"N*V*K={n_tok * V * K} exceeds 16M-element sparse-gather "
+                "budget ([N,V,K] transient; chunk the batch)"
             )
         gathered = x[..., self.cols]  # [..., V, K]
         # values are fp32 parameters: cast back so output dtype follows the

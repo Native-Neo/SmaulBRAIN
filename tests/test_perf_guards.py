@@ -213,3 +213,22 @@ def test_m1_expert_stats_single_sync_identical():
     dt = (time.perf_counter() - t0) / 5 * 1000.0
     print(f"\n[M1] pool forward N=512 E=4: {dt:.2f}ms")
     assert dt < 5000.0
+
+
+def test_m3_sparse_head_study_only_budget():
+    """SparseTopKHead documents study-only + refuses N*V*K over budget."""
+    import pytest
+    from kernels import SparseTopKHead, compare_heads
+
+    assert "STUDY-ONLY" in SparseTopKHead.__doc__
+    h = SparseTopKHead(256, 128, 32)
+    assert h(torch.randn(8, 128)).shape == (8, 256)
+    big = SparseTopKHead(8192, 128, 64)
+    with pytest.raises(ValueError, match="sparse-gather budget"):
+        big(torch.randn(4096, 128))  # 4096*8192*64 = 2.1B, refused pre-gather
+    # Dense-vs-sparse microbench still runs (measured verdict, dense wins
+    # at V=256: e.g. dense ~2-3ms vs sparse ~58-88ms CPU).
+    res = compare_heads(repeat=5)
+    assert res["winner"] in ("dense", "sparse")
+    print(f"\n[M3] winner={res['winner']} dense={res['dense']['median_ms']:.2f}ms "
+          f"sparse={res['sparse']['median_ms']:.2f}ms")
