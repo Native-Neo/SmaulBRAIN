@@ -40,6 +40,7 @@ import contextlib
 import functools
 import hashlib
 import json
+import math
 import os
 import random
 import shutil
@@ -1145,7 +1146,7 @@ def _validate_opt_hparams(saved_hp: dict) -> None:
         if k not in saved_hp:
             continue
         value = saved_hp[k]
-        valid = _is_num(value) and __import__("math").isfinite(value)
+        valid = _is_num(value) and math.isfinite(value)
         if valid:
             valid = value >= floor if inclusive else value > floor
             if k in ("beta_m", "beta_v"):
