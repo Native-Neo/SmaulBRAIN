@@ -270,7 +270,9 @@ class SmaulBrainModel(nn.Module):
         batch_tokens = ids.shape[0] * ids.shape[1]
         dtype_bytes = 2 if self.cfg.dtype == "bf16" else 4
         hidden_bytes = batch_tokens * self.cfg.d_model * self.cfg.max_depth * dtype_bytes
-        head_depths = self.cfg.max_depth if training else 1
+        # Training retains CE logits for each depth plus the separate
+        # ponder-mixed prediction tensor; inference returns one mixed tensor.
+        head_depths = self.cfg.max_depth + 1 if training else 1
         logits_bytes = batch_tokens * self.cfg.vocab_size * head_depths * 4
         # CE maps and the pondered CE stack are also retained during training.
         ce_bytes = batch_tokens * self.cfg.max_depth * 4 if training else 0
