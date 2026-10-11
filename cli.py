@@ -313,7 +313,12 @@ def explicit_config_fields(args: argparse.Namespace) -> dict:
     out: dict = {}
     for field, dest in ARG_TO_CONFIG.items():
         if field == "grow_every":
-            continue  # schedule lives on train --grow-every; see resolve_train_grow_every
+            # Tracked separately: --grow-every-default/--config-grow-every sets
+            # the config default; train --grow-every overrides per-run.
+            val = getattr(args, dest, None)
+            if val is not None:
+                out[field] = val
+            continue
         val = getattr(args, dest, None)
         if val is not None:
             if dest == "paging_method":
