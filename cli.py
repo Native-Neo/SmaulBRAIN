@@ -373,8 +373,12 @@ def _safe_ckpt_dir(ckpt_dir: str, allow_outside: bool = False) -> str:
 def load_saved_config(ckpt_dir: str, allow_outside: bool = False) -> SmaulBrainConfig | None:
     """Checkpoint config without building a model (None when no checkpoint)."""
     ckpt_dir = _safe_ckpt_dir(ckpt_dir, allow_outside=allow_outside)
-    cfg_path = os.path.join(ckpt_dir, "config.json")
-    man_path = os.path.join(ckpt_dir, "manifest.json")
+    from storage import _jailed_path
+    try:
+        cfg_path = _jailed_path(ckpt_dir, "config.json")
+        man_path = _jailed_path(ckpt_dir, "manifest.json")
+    except ValueError as e:
+        raise ValueError(f"checkpoint validation failed: {e}") from e
     if not (os.path.exists(cfg_path) and os.path.exists(man_path)):
         return None
     try:
