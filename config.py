@@ -111,6 +111,8 @@ class SmaulBrainConfig:
             _v = getattr(self, _f)
             assert isinstance(_v, int) and not isinstance(_v, bool), \
                 f"{_f} must be an int (not bool), got {_v!r}"
+        assert self.d_model >= 1, f"d_model must be >= 1, got {self.d_model!r}"
+        assert self.n_heads >= 1, f"n_heads must be >= 1, got {self.n_heads!r}"
         assert self.d_model % self.n_heads == 0, "d_model must split over heads"
         assert isinstance(self.vocab_size, int) and not isinstance(self.vocab_size, bool) \
             and self.vocab_size >= total_vocab(), \
