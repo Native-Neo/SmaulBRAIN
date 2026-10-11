@@ -1010,16 +1010,18 @@ def _validate_expert_parts(tensors: dict, meta: dict, eid: str, saved_cfg) -> No
     """Type/shape validation for one raw expert (tensors + JSON meta)."""
     _require(isinstance(meta, dict), f"{eid}: meta is not a dict")
     _require(meta.get("expert_id") == eid, f"{eid}: id mismatch {meta.get('expert_id')!r}")
-    try:
-        d_model = int(meta.get("d_model", -1))
-        expert_hidden = int(meta.get("expert_hidden", -1))
-    except (TypeError, ValueError):
-        raise ValueError(
-            f"checkpoint validation failed: {eid}: bad d_model/expert_hidden"
-        ) from None
-    _require(d_model == saved_cfg.d_model, f"{eid}: bad d_model")
-    _require(expert_hidden == saved_cfg.expert_hidden,
-             f"{eid}: bad expert_hidden")
+    d_model = meta.get("d_model", -1)
+    expert_hidden = meta.get("expert_hidden", -1)
+    _require(
+        isinstance(d_model, int) and not isinstance(d_model, bool)
+        and d_model == saved_cfg.d_model,
+        f"{eid}: bad d_model {d_model!r}",
+    )
+    _require(
+        isinstance(expert_hidden, int) and not isinstance(expert_hidden, bool)
+        and expert_hidden == saved_cfg.expert_hidden,
+        f"{eid}: bad expert_hidden {expert_hidden!r}",
+    )
     want = {
         "w_gate": (saved_cfg.expert_hidden, saved_cfg.d_model),
         "w_up": (saved_cfg.expert_hidden, saved_cfg.d_model),
@@ -1031,13 +1033,11 @@ def _validate_expert_parts(tensors: dict, meta: dict, eid: str, saved_cfg) -> No
         wm = wmeta.get(n)
         _require(isinstance(wm, dict), f"{eid}: {n} meta is not a dict")
         _require(tuple(wm.get("shape", ())) == want[n], f"{eid}: {n} bad shape")
-        try:
-            tile = int(wm.get("tile", 0))
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"checkpoint validation failed: {eid}: {n} bad tile"
-            ) from None
-        _require(tile >= 1, f"{eid}: {n} bad tile")
+        tile = wm.get("tile", 0)
+        _require(
+            isinstance(tile, int) and not isinstance(tile, bool) and tile >= 1,
+            f"{eid}: {n} bad tile {tile!r}",
+        )
         codes, scales = tensors.get(f"{n}.codes"), tensors.get(f"{n}.scales")
         _require(torch.is_tensor(codes) and codes.dtype == torch.uint8,
                  f"{eid}: {n} codes must be uint8")
