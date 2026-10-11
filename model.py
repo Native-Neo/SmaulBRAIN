@@ -586,6 +586,11 @@ class SmaulBrainModel(nn.Module):
         step: int = 0,
     ) -> tuple[dict, list[LinearAttnState]]:
         """Process one or more new tokens using persistent per-depth state."""
+        if attn_states is None:
+            raise ValueError(
+                "forward_infer_step requires persistent attn_states; "
+                "use forward_infer_stateful for a fresh stream"
+            )
         if ids.ndim == 1:
             ids = ids.unsqueeze(1)
         if ids.ndim != 2 or ids.shape[1] != 1:
