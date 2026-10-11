@@ -197,6 +197,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Cosine LR decay horizon in steps (default: 0 = constant LR).")
     p.add_argument("--ckpt", type=str, default="checkpoints/smaulbrain",
                    help="Checkpoint directory.")
+    p.add_argument("--allow-outside-ckpt", action="store_true", default=False,
+                   help="Allow --ckpt outside the CWD workspace (default: refuse).")
     sub = p.add_subparsers(dest="cmd", required=True)
     # train
     t = sub.add_parser("train", help="Train / fine-tune (same model, modes differ).")
@@ -329,21 +331,48 @@ def explicit_config_fields(args: argparse.Namespace) -> dict:
     return out
 
 
-def _safe_ckpt_dir(ckpt_dir: str) -> str:
+def _safe_ckpt_dir(ckpt_dir: str, allow_outside: bool = False) -> str:
     """Canonicalize a user-supplied checkpoint dir (no shell, no traversal surprise).
 
     Rejects empty/NUL paths and returns the normalized absolute path so
     sibling joins (config.json, manifest.json, experts/...) always resolve
-    inside the intended directory. Callers pass the result to storage APIs.
+    inside the intended directory. Refuses paths resolving outside the CWD
+    workspace (system temp dir is also treated as workspace for tests)
+    unless ``allow_outside`` (--allow-outside-ckpt) is set, and refuses
+    non-directory / non-creatable locations. Callers pass the result to
+    storage APIs.
     """
     if not isinstance(ckpt_dir, str) or not ckpt_dir or "\x00" in ckpt_dir:
         raise ValueError(f"invalid checkpoint dir {ckpt_dir!r}")
-    return os.path.normpath(os.path.abspath(ckpt_dir))
+    p = os.path.normpath(os.path.abspath(ckpt_dir))
+    try:
+        if os.path.islink(p):
+            raise ValueError(f"invalid checkpoint dir (symlink) {ckpt_dir!r}")
+        if os.path.lexists(p):
+            if not os.path.isdir(p):
+                raise ValueError(f"invalid checkpoint dir (not a directory) {ckpt_dir!r}")
+        else:
+            parent = os.path.dirname(p) or os.sep
+            if os.path.lexists(parent) and not os.path.isdir(parent):
+                raise ValueError(f"invalid checkpoint dir (parent not a directory) {ckpt_dir!r}")
+    except OSError as e:
+        raise ValueError(f"invalid checkpoint dir {ckpt_dir!r}: {e}") from e
+    import tempfile as _tf
+    cwd = os.path.abspath(os.getcwd())
+    tmp = os.path.abspath(_tf.gettempdir())
+    inside = (p == cwd or p.startswith(cwd + os.sep)
+              or p == tmp or p.startswith(tmp + os.sep))
+    if not inside and not allow_outside:
+        raise ValueError(
+            f"refusing --ckpt outside workspace: {ckpt_dir!r} "
+            "(use --allow-outside-ckpt to override)"
+        )
+    return p
 
 
-def load_saved_config(ckpt_dir: str) -> SmaulBrainConfig | None:
+def load_saved_config(ckpt_dir: str, allow_outside: bool = False) -> SmaulBrainConfig | None:
     """Checkpoint config without building a model (None when no checkpoint)."""
-    ckpt_dir = _safe_ckpt_dir(ckpt_dir)
+    ckpt_dir = _safe_ckpt_dir(ckpt_dir, allow_outside=allow_outside)
     cfg_path = os.path.join(ckpt_dir, "config.json")
     man_path = os.path.join(ckpt_dir, "manifest.json")
     if not (os.path.exists(cfg_path) and os.path.exists(man_path)):
@@ -429,7 +458,8 @@ def main(argv: list[str] | None = None) -> int:
 
     args = build_parser().parse_args(argv)
     try:
-        args.ckpt = _safe_ckpt_dir(args.ckpt)
+        args.ckpt = _safe_ckpt_dir(args.ckpt,
+                                   allow_outside=getattr(args, "allow_outside_ckpt", False))
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -456,7 +486,8 @@ def main(argv: list[str] | None = None) -> int:
     # mismatch aborts here instead of building an incompatible model and
     # swapping part of it. Runtime fields come from the checkpoint.
     try:
-        saved_cfg = load_saved_config(args.ckpt)
+        saved_cfg = load_saved_config(args.ckpt,
+                                      allow_outside=getattr(args, "allow_outside_ckpt", False))
     except (ValueError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
