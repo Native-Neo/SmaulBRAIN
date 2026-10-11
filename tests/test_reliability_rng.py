@@ -9,6 +9,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
+import torch
 
 import storage
 
@@ -58,7 +59,7 @@ def test_inner_out_of_range_rejects():
         storage.set_rng_snapshot(_with_python(inner=tuple([-1] * 625)))
 
 
-@pytest.mark.parametrize("bad", [True, "3"])
+@pytest.mark.parametrize("bad", [True, "3", 1, 999])
 def test_version_bool_or_str_rejects(bad):
     with pytest.raises(ValueError):
         storage.set_rng_snapshot(_with_python(version=bad))
@@ -67,3 +68,74 @@ def test_version_bool_or_str_rejects(bad):
 def test_empty_dict_raises():
     with pytest.raises(ValueError):
         storage.set_rng_snapshot({})
+
+
+def test_checkpoint_rng_parts_rejects_unknown_tensor_keys():
+    snap = storage.get_rng_snapshot()
+    tensors = {"torch_cpu": snap["torch_cpu"],
+               "not_a_rng_state": torch.zeros(4, dtype=torch.uint8)}
+    with pytest.raises(ValueError, match="bad entry name"):
+        storage._validate_rng_parts(tensors, snap["python"])
+
+
+def test_checkpoint_rng_parts_rejects_noncontiguous_cuda_states():
+    snap = storage.get_rng_snapshot()
+    tensors = {"torch_cpu": snap["torch_cpu"],
+               "cuda.0": torch.zeros(4, dtype=torch.uint8),
+               "cuda.2": torch.zeros(4, dtype=torch.uint8)}
+    with pytest.raises(ValueError, match="contiguous cuda.0"):
+        storage._validate_rng_parts(tensors, snap["python"])
+
+
+def test_manifest_and_resume_config_refuse_symlink_leaves(tmp_path):
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}")
+    ckpt = tmp_path / "checkpoint"
+    ckpt.mkdir()
+    (ckpt / "manifest.json").symlink_to(outside)
+    (ckpt / "resume_config.json").symlink_to(outside)
+    with pytest.raises(ValueError, match="symlink"):
+        storage.load_manifest(str(ckpt))
+    with pytest.raises(ValueError, match="symlink"):
+        storage.load_resume_config(str(ckpt))
+
+
+def test_unsupported_python_rng_version_rejects_before_mutating_global_rng():
+    snap = _with_python(version=999)
+    torch_before = torch.get_rng_state().clone()
+    python_before = __import__("random").getstate()
+    with pytest.raises(ValueError, match="bad python RNG state"):
+        storage.set_rng_snapshot(snap)
+    assert torch.equal(torch.get_rng_state(), torch_before)
+    assert __import__("random").getstate() == python_before
+
+
+def test_invalid_torch_rng_payload_rejects_before_global_mutation():
+    snap = _good()
+    snap["torch_cpu"] = torch.zeros(4, dtype=torch.uint8)
+    before = torch.get_rng_state().clone()
+    with pytest.raises(ValueError, match="bad torch RNG state"):
+        storage.set_rng_snapshot(snap)
+    assert torch.equal(torch.get_rng_state(), before)
+
+
+def test_invalid_python_rng_index_rejects_before_global_mutation():
+    snap = _with_python()
+    version, inner, gauss = snap["python"]
+    invalid_inner = list(inner)
+    invalid_inner[-1] = 999999
+    snap["python"] = (version, invalid_inner, gauss)
+    torch_before = torch.get_rng_state().clone()
+    python_before = __import__("random").getstate()
+    with pytest.raises(ValueError, match="bad python RNG state"):
+        storage.set_rng_snapshot(snap)
+    assert torch.equal(torch.get_rng_state(), torch_before)
+    assert __import__("random").getstate() == python_before
+
+
+def test_checkpoint_rng_parts_rejects_bad_torch_rng_payload():
+    snap = storage.get_rng_snapshot()
+    with pytest.raises(ValueError, match="bad torch RNG state"):
+        storage._validate_rng_parts(
+            {"torch_cpu": torch.zeros(4, dtype=torch.uint8)}, snap["python"]
+        )

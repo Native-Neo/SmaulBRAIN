@@ -259,10 +259,51 @@ class SmaulBrainModel(nn.Module):
                 f"(min={lo}, max={hi})"
             )
 
+    def _check_activation_budget(self, ids: torch.Tensor, *, training: bool) -> None:
+        """Refuse shapes whose retained depth activations exceed 256 MiB.
+
+        The token and single-head guards do not account for width or depth.
+        Training retains one hidden state and one CE-logit graph per depth;
+        inference retains the hidden states plus one mixed logits tensor.
+        Both retain batch-sized FP32 attention accumulators at every depth.
+        Estimate these known large tensors before embedding or attention work.
+        """
+        batch_tokens = ids.shape[0] * ids.shape[1]
+        dtype_bytes = 2 if self.cfg.dtype == "bf16" else 4
+        hidden_bytes = batch_tokens * self.cfg.d_model * self.cfg.max_depth * dtype_bytes
+        # Training retains CE logits for each depth plus the separate
+        # ponder-mixed prediction tensor; inference returns one mixed tensor.
+        head_depths = self.cfg.max_depth + 1 if training else 1
+        logits_bytes = batch_tokens * self.cfg.vocab_size * head_depths * 4
+        # CE maps and the pondered CE stack are also retained during training.
+        ce_bytes = batch_tokens * self.cfg.max_depth * 4 if training else 0
+        head_dim = self.cfg.d_model // self.cfg.n_heads
+        # S: [B, H, Dh, Dh] and z: [B, H, Dh], both FP32 at every depth.
+        state_bytes = (ids.shape[0] * self.cfg.n_heads
+                       * (head_dim * head_dim + head_dim) * self.cfg.max_depth * 4)
+        estimated = hidden_bytes + logits_bytes + ce_bytes + state_bytes
+        budget = 256 * 1024 * 1024
+        if estimated > budget:
+            raise ValueError(
+                "estimated retained activation memory exceeds 256 MiB budget "
+                f"(hidden={hidden_bytes / 1048576:.1f} MiB, "
+                f"logits={logits_bytes / 1048576:.1f} MiB, "
+                f"CE={ce_bytes / 1048576:.1f} MiB, "
+                f"state={state_bytes / 1048576:.1f} MiB); reduce B*T, d_model, "
+                "or max_depth"
+            )
+
     def forward(
         self, ids: torch.Tensor, targets: torch.Tensor | None = None, step: int = 0
     ) -> dict:
         """Training forward (grad enabled by caller). Returns logits/loss/stats."""
+        # An unscored readout is an inference operation even when called from
+        # a grad-enabled Python context. Re-enter once under inference_mode so
+        # embeddings, recurrent states, and router work never build an unused
+        # autograd graph. The recursive call terminates because grad is off.
+        if targets is None and torch.is_grad_enabled():
+            with torch.inference_mode():
+                return self.forward(ids, targets=None, step=step)
         self._check_ids(ids, "ids")
         if targets is not None:
             self._check_ids(targets, "targets")
@@ -290,6 +331,7 @@ class SmaulBrainModel(nn.Module):
                 f"B*T*V={ids.shape[0] * ids.shape[1] * self.cfg.vocab_size} exceeds "
                 "16M-element head budget (logits [B,T,V] transient; chunk T)"
             )
+        self._check_activation_budget(ids, training=targets is not None)
         if self._leaves:
             raise RuntimeError(
                 f"unconsumed expert leaves from prior forward ({len(self._leaves)} experts); "
@@ -431,6 +473,7 @@ class SmaulBrainModel(nn.Module):
                 f"B*T*V={ids.shape[0] * ids.shape[1] * self.cfg.vocab_size} exceeds "
                 "16M-element head budget (logits [B,T,V] transient; chunk T)"
             )
+        self._check_activation_budget(ids, training=False)
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
         emb = self.embed(ids)
@@ -546,6 +589,7 @@ class SmaulBrainModel(nn.Module):
                 f"B*T*V={ids.shape[0] * ids.shape[1] * self.cfg.vocab_size} exceeds "
                 "16M-element head budget (chunk T)"
             )
+        self._check_activation_budget(ids, training=False)
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, _T = ids.shape
         # Fresh stream: reset conv carryover BEFORE convolving, so the prompt

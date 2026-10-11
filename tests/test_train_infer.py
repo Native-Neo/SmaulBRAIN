@@ -448,3 +448,41 @@ def test_unscored_forward_leaves_no_leaves_and_matches_infer_depths():
     m.eval()
     assert torch.equal(a["depths"], m.forward_infer(x)["depths"])
     m.pager.close()
+
+
+def test_generate_restores_training_mode_after_validation_error():
+    m, _, _ = _model()
+    m.train()
+    with pytest.raises(ValueError, match="context must be positive"):
+        generate(m, [104, 105], max_new=1, context=0)
+    assert m.training is True
+    m.pager.close()
+
+
+def test_unscored_forward_disables_autograd_for_entire_trunk():
+    m, _, cfg = _model()
+    observed = []
+    hook = m.block.register_forward_hook(
+        lambda _module, _inputs, _output: observed.append(torch.is_grad_enabled())
+    )
+    ids = torch.randint(0, 256, (1, 6))
+    try:
+        out = m(ids, targets=None)
+        assert out["logits"].shape == (1, 6, cfg.vocab_size)
+        assert observed and not any(observed)
+    finally:
+        hook.remove()
+        m.pager.close()
+
+
+def test_generate_zero_tokens_skips_forward_pass():
+    m, _, _ = _model()
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("zero-token generation must not run the model")
+    m.forward_infer_stateful = unexpected
+    try:
+        result = generate(m, [104, 105], max_new=0)
+        assert result["ids"] == [104, 105]
+        assert result["text"] == "" and result["depths"] == []
+    finally:
+        m.pager.close()

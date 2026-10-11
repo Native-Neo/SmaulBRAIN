@@ -92,6 +92,12 @@ def set_rng_snapshot(snap: dict) -> None:
     _cpu = snap["torch_cpu"]
     if not torch.is_tensor(_cpu) or _cpu.dtype != torch.uint8 or _cpu.numel() == 0:
         raise ValueError("checkpoint validation failed: bad torch RNG state")
+    try:
+        torch.Generator(device="cpu").set_state(_cpu)
+    except Exception as e:
+        raise ValueError(
+            f"checkpoint validation failed: bad torch RNG state: {e}"
+        ) from e
     for _k in snap:
         if _k not in ("torch_cpu", "python", "cuda"):
             raise ValueError(
@@ -102,7 +108,8 @@ def set_rng_snapshot(snap: dict) -> None:
         if not (isinstance(_py, (list, tuple)) and len(_py) == 3):
             raise ValueError("checkpoint validation failed: bad python RNG state")
         version, inner, gauss = _py
-        if not (isinstance(version, int) and not isinstance(version, bool)):
+        if not (isinstance(version, int) and not isinstance(version, bool)
+                and version in (2, 3)):
             raise ValueError("checkpoint validation failed: bad python RNG state")
         if not (isinstance(inner, (list, tuple)) and len(inner) == 625
                 and all(isinstance(v, int) and not isinstance(v, bool)
@@ -112,6 +119,12 @@ def set_rng_snapshot(snap: dict) -> None:
                 or (isinstance(gauss, float)
                     and __import__("math").isfinite(gauss))):
             raise ValueError("checkpoint validation failed: bad python RNG state")
+        try:
+            random.Random().setstate((version, tuple(inner), gauss))
+        except Exception as e:
+            raise ValueError(
+                f"checkpoint validation failed: bad python RNG state: {e}"
+            ) from e
     _cuda = snap.get("cuda")
     if _cuda is not None:
         if isinstance(_cuda, dict):
@@ -815,7 +828,7 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
 
 
 def load_manifest(ckpt_dir: str) -> dict:
-    path = os.path.join(ckpt_dir, "manifest.json")
+    path = _jailed_path(ckpt_dir, "manifest.json")
     if not os.path.exists(path):
         raise FileNotFoundError(f"missing checkpoint file {path}")
     try:
@@ -839,7 +852,7 @@ def load_manifest(ckpt_dir: str) -> dict:
 
 def load_resume_config(ckpt_dir: str) -> dict:
     """Read the pruner/resume floor + topology snapshot (resume_config.json)."""
-    path = os.path.join(ckpt_dir, "resume_config.json")
+    path = _jailed_path(ckpt_dir, "resume_config.json")
     if not os.path.exists(path):
         raise FileNotFoundError(f"missing checkpoint file {path}")
     try:
@@ -1080,13 +1093,29 @@ def _validate_rng_parts(tensors: dict, py_state) -> None:
     cpu = tensors.get("torch_cpu")
     _require(torch.is_tensor(cpu) and cpu.dtype == torch.uint8,
              "rng snapshot missing torch_cpu state")
+    try:
+        torch.Generator(device="cpu").set_state(cpu)
+    except Exception as e:
+        raise ValueError(
+            f"checkpoint validation failed: bad torch RNG state: {e}"
+        ) from e
+    cuda_indices = []
     for k, t in tensors.items():
         _require(torch.is_tensor(t) and t.dtype == torch.uint8,
                  f"rng snapshot bad entry {k}")
+        if k == "torch_cpu":
+            continue
+        _require(isinstance(k, str) and k.startswith("cuda.")
+                 and k[5:].isdigit() and k == f"cuda.{int(k[5:])}",
+                 f"rng snapshot bad entry name {k!r}")
+        cuda_indices.append(int(k[5:]))
+    _require(sorted(cuda_indices) == list(range(len(cuda_indices))),
+             "rng snapshot CUDA states must use contiguous cuda.0..cuda.N keys")
     if py_state is not None:
         _require(isinstance(py_state, (list, tuple)) and len(py_state) == 3,
                  "rng snapshot bad python state")
-        _require(isinstance(py_state[0], int) and not isinstance(py_state[0], bool),
+        _require(isinstance(py_state[0], int) and not isinstance(py_state[0], bool)
+                 and py_state[0] in (2, 3),
                  "rng snapshot bad python version")
         inner = py_state[1]
         _require(isinstance(inner, (list, tuple)) and len(inner) == 625
@@ -1096,6 +1125,12 @@ def _validate_rng_parts(tensors: dict, py_state) -> None:
         _require(py_state[2] is None
                  or (isinstance(py_state[2], float) and __import__("math").isfinite(py_state[2])),
                  "rng snapshot bad python gauss")
+        try:
+            random.Random().setstate((py_state[0], tuple(py_state[1]), py_state[2]))
+        except Exception as e:
+            raise ValueError(
+                f"checkpoint validation failed: bad python RNG state: {e}"
+            ) from e
 
 
 @_with_ckpt_lock(exclusive=False)
