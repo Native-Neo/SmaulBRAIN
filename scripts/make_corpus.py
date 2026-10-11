@@ -200,7 +200,7 @@ def download_shard(i: int, tmp_dir: str, part_dir: str | None = None):
         except Exception as e:  # noqa: BLE001 - retry then fallback
             last_err = e
             have = os.path.getsize(part) if os.path.exists(part) else 0
-            time.sleep(2 ** attempt)
+            time.sleep(min(2 ** attempt, 60))
     try:
         from huggingface_hub import hf_hub_download
         return name, hf_hub_download(REPO, filename=name, repo_type="dataset",
@@ -241,7 +241,7 @@ def run(out: str, target_bytes: int, shard_bytes: int, start: int,
                 continue
             log(f"[{i:05d}] downloading {name} ...")
             try:
-                _, path = download_shard(i, tmp_dir, part_dir=out)
+                _, path = download_shard(i, tmp_dir)
             except Exception as e:
                 log(f"[{i:05d}] download failed, skipping: {e}")
                 continue
@@ -276,10 +276,9 @@ def run(out: str, target_bytes: int, shard_bytes: int, start: int,
         writer.close()
         con.commit()
         con.close()
-    try:
-        os.rmdir(tmp_dir)
-    except OSError:
-        pass
+        # Always remove the staging dir (shards + .parts): rmdir alone
+        # leaks tmp_dir whenever a shard file remains.
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     return stats
 
 
