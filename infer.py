@@ -214,6 +214,10 @@ def generate(
         raise ValueError(f"vocab_size {vocab} < byte base {BYTE_VOCAB}")
     forbidden = [i for i in NEVER_SAMPLE_IDS if 0 <= i < vocab]
     gen = torch.Generator().manual_seed(seed)
+    if isinstance(prompt_ids, (str, bytes)) or not isinstance(prompt_ids, (list, tuple)):
+        raise ValueError(
+            f"prompt_ids must be a list of ints, got {type(prompt_ids).__name__}"
+        )
     ids = list(prompt_ids) or [DEFAULT_PROMPT_ID]
     _check_ids(ids, vocab, "prompt_ids")
     ids = ids[-ctx:]
