@@ -590,6 +590,8 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
             f"experts vs {model.router.num_experts} router rows"
         )
     for eid in model.pool.order:
+        _require_eid(eid)
+    for eid in model.pool.order:
         rec = model.pool.experts[eid]
         want = {
             "w_gate": (rec.expert_hidden, rec.d_model),
@@ -702,16 +704,16 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
             for name in ("config.json", "trunk.safetensors", "router.safetensors",
                          "optim.safetensors", "rng.safetensors", "meta.json",
                          "resume_config.json"):
-                os.replace(os.path.join(staging, name), os.path.join(ckpt_dir, name))
+                os.replace(os.path.join(staging, name), _jailed_path(ckpt_dir, name))
             for eid in model.pool.order:
                 os.replace(os.path.join(st_exp, f"{eid}.safetensors"),
-                           os.path.join(exp_dir, f"{eid}.safetensors"))
+                           _jailed_path(ckpt_dir, f"experts/{eid}.safetensors"))
                 os.replace(os.path.join(st_exp, f"{eid}.json"),
-                           os.path.join(exp_dir, f"{eid}.json"))
+                           _jailed_path(ckpt_dir, f"experts/{eid}.json"))
             _fsync_dir(exp_dir)
             _fsync_dir(ckpt_dir)
             os.replace(os.path.join(staging, "manifest.json"),
-                       os.path.join(ckpt_dir, "manifest.json"))
+                       _jailed_path(ckpt_dir, "manifest.json"))
             _fsync_dir(ckpt_dir)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
