@@ -77,12 +77,25 @@ def get_rng_snapshot() -> dict:
 def set_rng_snapshot(snap: dict) -> None:
     """Restore RNG state captured by get_rng_snapshot (legacy tensor tolerated)."""
     if isinstance(snap, torch.Tensor):
+        if snap.dtype != torch.uint8:
+            raise ValueError("checkpoint validation failed: bad torch RNG state")
         torch.set_rng_state(snap)  # legacy rng.pt: torch CPU state only
         return
-    if "torch_cpu" in snap:
-        torch.set_rng_state(snap["torch_cpu"])
+    if not isinstance(snap, dict) or "torch_cpu" not in snap:
+        raise ValueError("checkpoint validation failed: bad RNG snapshot")
+    _cpu = snap["torch_cpu"]
+    if not torch.is_tensor(_cpu) or _cpu.dtype != torch.uint8:
+        raise ValueError("checkpoint validation failed: bad torch RNG state")
+    torch.set_rng_state(_cpu)
     if "python" in snap:
-        version, inner, gauss = snap["python"]
+        _py = snap["python"]
+        if not (isinstance(_py, (list, tuple)) and len(_py) == 3):
+            raise ValueError("checkpoint validation failed: bad python RNG state")
+        version, inner, gauss = _py
+        if not (isinstance(version, int) and not isinstance(version, bool)):
+            raise ValueError("checkpoint validation failed: bad python RNG state")
+        if not (isinstance(inner, (list, tuple)) and len(inner) == 625):
+            raise ValueError("checkpoint validation failed: bad python RNG state")
         random.setstate((int(version), tuple(int(v) for v in inner), gauss))
     if "cuda" in snap and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(snap["cuda"])
