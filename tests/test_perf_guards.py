@@ -399,7 +399,7 @@ def test_depth_aware_activation_budget_refuses_wide_work_before_compute():
     from model import SmaulBrainModel
 
     cfg = SmaulBrainConfig(
-        d_model=64, n_heads=4, max_depth=8, min_depth=1,
+        d_model=512, n_heads=4, max_depth=8, min_depth=1,
         num_experts=4, top_k=1, expert_hidden=32,
     )
     model = SmaulBrainModel(cfg)
