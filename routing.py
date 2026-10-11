@@ -67,12 +67,26 @@ class SparseRouter(nn.Module):
         top_k: int,
         capacity_factor: float = 1.5,
     ) -> None:
+        import math as _math
+        if isinstance(d_model, bool) or not isinstance(d_model, int) or d_model < 1:
+            raise ValueError(f"d_model must be an int >= 1, got {d_model!r}")
+        if isinstance(num_experts, bool) or not isinstance(num_experts, int):
+            raise ValueError(f"num_experts must be an int >= 0, got {num_experts!r}")
         if num_experts < 0:
             raise ValueError(f"num_experts must be >= 0, got {num_experts!r}")
+        if isinstance(top_k, bool) or not isinstance(top_k, int):
+            raise ValueError(f"top_k must be an int, got {top_k!r}")
         if num_experts > 0 and not 1 <= top_k <= num_experts:
             raise ValueError(
                 f"need 1 <= top_k <= num_experts, got top_k={top_k!r} "
                 f"num_experts={num_experts!r}"
+            )
+        if (isinstance(capacity_factor, bool)
+                or not isinstance(capacity_factor, (int, float))
+                or not _math.isfinite(float(capacity_factor))
+                or float(capacity_factor) <= 0):
+            raise ValueError(
+                f"capacity_factor must be finite and > 0, got {capacity_factor!r}"
             )
         super().__init__()
         self.d_model = d_model
