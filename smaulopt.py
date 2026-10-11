@@ -700,7 +700,9 @@ class SmaulOpt:
         with torch.no_grad():
             for n in names:
                 grad_tensor = compute[n].grad
-                shape = tuple(compute[n].shape)
+                # Optimizer moments track the full FP8 weight, even when
+                # this call updates only a row slice.
+                shape = tuple(record.weights_fp8[n].shape)
                 st = record.optim_state.get(n)
                 st, action = ensure_state(st, shape, self.hp)
                 if action == "init" or record.optim_state.get(n) is not st:
