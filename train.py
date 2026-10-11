@@ -166,8 +166,10 @@ class ReplayBuffer:
             if not isinstance(_s, (list, tuple)):
                 raise ValueError(f"ReplayBuffer buf entries must be lists, got {_s!r}")
             for _v in _s:
-                if isinstance(_v, bool) or not isinstance(_v, int):
-                    raise ValueError(f"ReplayBuffer buf entries must be ints (not bool), got {_v!r}")
+                if isinstance(_v, bool) or not isinstance(_v, int) or _v < 0:
+                    raise ValueError(
+                        f"ReplayBuffer token ids must be non-negative ints (not bool), got {_v!r}"
+                    )
         seen_raw = d.get("seen", 0)
         if isinstance(seen_raw, bool) or not isinstance(seen_raw, int):
             raise ValueError(f"ReplayBuffer seen must be an int (not bool), got {seen_raw!r}")
