@@ -289,6 +289,13 @@ class SmaulBrainModel(nn.Module):
         self, ids: torch.Tensor, targets: torch.Tensor | None = None, step: int = 0
     ) -> dict:
         """Training forward (grad enabled by caller). Returns logits/loss/stats."""
+        # An unscored readout is an inference operation even when called from
+        # a grad-enabled Python context. Re-enter once under inference_mode so
+        # embeddings, recurrent states, and router work never build an unused
+        # autograd graph. The recursive call terminates because grad is off.
+        if targets is None and torch.is_grad_enabled():
+            with torch.inference_mode():
+                return self.forward(ids, targets=None, step=step)
         self._check_ids(ids, "ids")
         if targets is not None:
             self._check_ids(targets, "targets")
