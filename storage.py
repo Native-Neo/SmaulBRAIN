@@ -1288,12 +1288,13 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         parts.append((t, m))
     try:
         on_disk = {n for n in os.listdir(os.path.join(ckpt_dir, "experts"))
-                   if n.endswith(".safetensors")}
+                   if n.endswith((".safetensors", ".json"))}
     except OSError as e:
         raise ValueError(
             f"checkpoint validation failed: unreadable experts dir: {e}"
         ) from e
-    _require(on_disk == {f"{eid}.safetensors" for eid in eids},
+    _require(on_disk == {f"{eid}.safetensors" for eid in eids}
+             | {f"{eid}.json" for eid in eids},
              f"experts dir mismatch: disk {sorted(on_disk)} vs manifest {eids}")
 
     import torch.nn as nn
