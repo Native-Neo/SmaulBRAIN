@@ -160,3 +160,20 @@ def test_empty_cuda_rng_state_rejects_before_global_mutation():
         storage.set_rng_snapshot(snap)
     assert torch.equal(torch.get_rng_state(), torch_before)
     assert __import__("random").getstate() == python_before
+
+def test_jailed_path_rejects_intermediate_symlink_even_inside_checkpoint(tmp_path):
+    ckpt = tmp_path / "checkpoint"
+    real = ckpt / "real_experts"
+    real.mkdir(parents=True)
+    (real / "expert_000.safetensors").write_bytes(b"inside")
+    (ckpt / "experts").symlink_to(real, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink component"):
+        storage._jailed_path(str(ckpt), "experts/expert_000.safetensors")
+
+
+def test_jailed_path_rejects_dotdot_even_when_normalized_path_stays_inside(tmp_path):
+    ckpt = tmp_path / "checkpoint"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text("{}")
+    with pytest.raises(ValueError, match="traversal"):
+        storage._jailed_path(str(ckpt), "experts/../config.json")
