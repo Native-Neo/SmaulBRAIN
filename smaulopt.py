@@ -481,12 +481,11 @@ def smaul_update_range(
 def global_grad_norm(grads: list[torch.Tensor]) -> float:
     """Global L2 grad norm accumulated in float64 (SmaulNative parity).
 
-    Single-pass: squares accumulate in one fp64 scalar with a single host
-    sync (``.item()``) at the end. No per-tensor ``.double()`` transient
-    (which doubles peak bytes per grad) and no per-tensor sync: each grad
-    contributes ``g.float().pow(2).sum(dtype=torch.float64)`` (fp32 square,
-    fp64 accumulation) into a shared fp64 total kept on the grads' device.
-    Numerics match the old per-tensor-double loop to ~1e-9 relative.
+    Single-pass: scaled squares accumulate in one FP64 scalar with one host
+    sync at the end. Each gradient is divided by its FP32 max magnitude
+    before squaring, then the scalar scale is restored in FP64. This avoids
+    FP32 square overflow for large finite gradients while keeping the
+    per-element temporary in FP32 and avoiding a full-size FP64 copy.
     """
     total: torch.Tensor | None = None
     for g in grads:
