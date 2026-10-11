@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import sys
 
 from bytes import decode_text, encode_text
@@ -440,7 +441,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "quantize":
         from quantize import convert_checkpoint
-        reports = convert_checkpoint(args.ckpt, to=args.to)
+        try:
+            reports = convert_checkpoint(args.ckpt, to=args.to)
+        except (ValueError, OSError) as e:
+            print(f"error: quantize failed: {e}", file=sys.stderr)
+            return 2
         print(json.dumps({"to": args.to,
                           "converted_experts": len(reports),
                           "bytes_before": sum(r.get("bytes_before", 0) for r in reports),
@@ -484,16 +489,34 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "train":
         from train import run_training
-        if args.data and os.path.exists(args.data):
+        if args.data:
             try:
-                if os.stat(args.data).st_size > 64 * 1024 * 1024:
+                if not os.path.isfile(args.data):
+                    print(f"error: --data is not a regular file: {args.data}",
+                          file=sys.stderr)
+                    return 2
+                lst = os.lstat(args.data)
+                if stat.S_ISLNK(lst.st_mode):
+                    print(f"error: --data refuses symlink: {args.data}",
+                          file=sys.stderr)
+                    return 2
+                st = os.stat(args.data)
+                if not stat.S_ISREG(st.st_mode):
+                    print(f"error: --data refuses non-regular file: {args.data}",
+                          file=sys.stderr)
+                    return 2
+                if st.st_size > 64 * 1024 * 1024:
                     print("error: --data file exceeds 64MB cap", file=sys.stderr)
                     return 2
             except OSError as e:
                 print(f"error: unreadable --data file: {e}", file=sys.stderr)
                 return 2
-            with open(args.data, "rb") as f:
-                raw = f.read(64 * 1024 * 1024 + 1)
+            try:
+                with open(args.data, "rb") as f:
+                    raw = f.read(64 * 1024 * 1024 + 1)
+            except OSError as e:
+                print(f"error: unreadable --data file: {e}", file=sys.stderr)
+                return 2
             seqs = [list(raw[i:i + cfg.context_length + 1])
                     for i in range(0, len(raw) - 1, cfg.context_length + 1)][:512] or _demo_seqs()
         else:
