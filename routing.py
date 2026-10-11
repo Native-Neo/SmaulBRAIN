@@ -289,7 +289,14 @@ class SparseRouter(nn.Module):
 
     def remove_expert_row(self, index: int) -> None:
         """Delete router row ``index`` (called after expert pruning)."""
-        assert 0 <= index < self.num_experts and self.num_experts > 1
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise ValueError(f"index must be an int, got {index!r}")
+        if not 0 <= index < self.num_experts:
+            raise ValueError(
+                f"index {index!r} out of range for {self.num_experts} experts"
+            )
+        if self.num_experts <= 1:
+            raise ValueError("cannot remove the last router row")
         keep = [i for i in range(self.num_experts) if i != index]
         new = self._proj_like(self.num_experts - 1)
         with torch.no_grad():
