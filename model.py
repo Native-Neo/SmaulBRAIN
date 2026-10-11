@@ -316,6 +316,10 @@ class SmaulBrainModel(nn.Module):
                     f"targets shape {tuple(targets.shape)} != "
                     f"ids shape {tuple(ids.shape)}"
                 )
+            if not bool((targets != PAD_ID).any().item()):
+                raise ValueError(
+                    "targets contain no non-padding tokens; batch carries no gradient signal"
+                )
         if ids.ndim != 2:
             raise ValueError(f"ids must be [B, T], got shape {tuple(ids.shape)}")
         if ids.shape[0] * ids.shape[1] > 1_048_576:
