@@ -21,3 +21,17 @@ def test_topk_growth_rejects_invalid_clone_count_without_mutation(bad_k):
         grow_topk_clones(pool, router, d_model=8, expert_hidden=16,
                          step=0, k=bad_k)
     assert (list(pool.order), pool._next_id, router.num_experts) == before
+
+
+@pytest.mark.parametrize("bad_noise", [-1.0, float("nan"), float("inf"), True, "0.1"])
+def test_growth_rejects_invalid_noise_before_mutation(bad_noise):
+    from growth import grow_expert, recombine_weights
+
+    pool = ExpertPool()
+    router = SparseRouter(d_model=8, num_experts=0, top_k=1)
+    with pytest.raises(ValueError, match="noise_std"):
+        grow_expert(pool, router, d_model=8, expert_hidden=16,
+                    step=0, noise_std=bad_noise)
+    assert len(pool) == router.num_experts == 0
+    with pytest.raises(ValueError, match="noise_std"):
+        recombine_weights(pool, [], noise_std=bad_noise)
