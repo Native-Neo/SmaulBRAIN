@@ -233,7 +233,7 @@ def batch_from_seqs(seqs: list[list[int]], context: int, pad_id: int = PAD_ID) -
                 raise ValueError(
                     f"token IDs must be non-negative ints (not bool), got {token!r}"
                 )
-        s = s[: context + 1]
+        s = list(s[: context + 1])
         if len(s) < context + 1:
             s = s + [pad_id] * (context + 1 - len(s))
         rows.append(torch.tensor(s, dtype=torch.long))
