@@ -3,6 +3,7 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import pytest
 import torch
 from precision import (
     PRECISION_POLICY, compute_dtype, dequantize_fp8_block,
