@@ -214,6 +214,8 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--data", type=str, default=None,
                    help="Text file for training bytes (default: synthetic demo).")
     t.add_argument("--save-every", type=int, default=0, help="Checkpoint every N steps (0=off).")
+    t.add_argument("--profile", action="store_true",
+                   help="Report forward/router/expert/backward/optimizer/growth timings and Linux RAM usage.")
     t.add_argument("--grow-every", type=int, default=None, help="Growth eval every N steps (0=off; omitted: config grow_every=20000).")
     t.add_argument("--grow-experts", type=int, default=0,
                    help="Grow N experts once at run start (before training) for a new skill; "
@@ -638,6 +640,7 @@ def main(argv: list[str] | None = None) -> int:
                            # the resolved cfg.seed (not the run_training
                            # default 0) so --seed reproduces growth events.
                            seed=cfg.seed,
+                           profile=args.profile,
                            # Progress/grow lines go to stderr: stdout
                            # stays pure JSON for scripting.
                            log_fn=lambda s: print(s, file=sys.stderr))
