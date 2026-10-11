@@ -843,3 +843,20 @@ def test_expert_row_range_preflight_prevents_partial_multiweight_update():
     assert {n: rec.optim_state[n]["step"] for n in before_steps} == before_steps
     for name, codes in before_codes.items():
         assert torch.equal(rec.weights_fp8[name].codes, codes)
+
+
+@pytest.mark.parametrize("row_start,row_end", [(-1, 2), (0, 99), (2, 2), (True, 2)])
+def test_fp8_row_block_read_and_write_reject_invalid_ranges(row_start, row_end):
+    t = quantize_fp8_blockwise(torch.randn(4, 8), tile=8)
+    with pytest.raises(ValueError, match="invalid row range"):
+        dequantize_fp8_row_block(t, row_start, row_end)
+    with pytest.raises(ValueError, match="invalid row range"):
+        update_fp8_row_block(t, torch.randn(1, 8), row_start, row_end)
+
+
+def test_fp8_row_block_helpers_reject_non_matrix_storage():
+    t = quantize_fp8_blockwise(torch.randn(2, 3, 8), tile=8)
+    with pytest.raises(ValueError, match="require a 2-D"):
+        dequantize_fp8_row_block(t, 0, 1)
+    with pytest.raises(ValueError, match="require a 2-D"):
+        update_fp8_row_block(t, torch.randn(1, 3, 8), 0, 1)
