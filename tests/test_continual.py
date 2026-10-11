@@ -569,3 +569,13 @@ def test_replay_restore_rejects_inconsistent_reservoir_length():
         snap.update(bad)
         with pytest.raises(ValueError, match="snapshot is inconsistent"):
             ReplayBuffer.from_dict(snap)
+
+
+def test_replay_sample_rejects_non_integer_counts():
+    import pytest
+
+    buf = ReplayBuffer(capacity=2)
+    buf.add([1])
+    for bad in (True, False, 1.5, "1"):
+        with pytest.raises(ValueError, match="sample count must be an int"):
+            buf.sample(bad)
