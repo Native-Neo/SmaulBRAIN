@@ -1065,19 +1065,17 @@ def _validate_expert_parts(tensors: dict, meta: dict, eid: str, saved_cfg) -> No
     m = meta.get("meta", {})
     _require(isinstance(m, dict), f"{eid}: bad meta")
     for k in ("birth_step", "last_used_step", "tokens_routed"):
-        try:
-            int(m.get(k, 0))
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"checkpoint validation failed: {eid}: bad meta {k}"
-            ) from None
+        value = m.get(k, 0)
+        _require(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+            f"{eid}: bad meta {k} {value!r}",
+        )
     for k in ("grad_activity", "contribution"):
-        try:
-            float(m.get(k, 0.0))
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"checkpoint validation failed: {eid}: bad meta {k}"
-            ) from None
+        value = m.get(k, 0.0)
+        _require(
+            _is_num(value) and math.isfinite(value) and value >= 0.0,
+            f"{eid}: bad meta {k} {value!r}",
+        )
     parents = m.get("parents", [])
     _require(isinstance(parents, list) and all(isinstance(x, str) for x in parents),
              f"{eid}: parents must be a list of str")
