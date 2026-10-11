@@ -273,6 +273,8 @@ def grow_topk_clones(
     so the prior topology returns exactly with no consumed IDs.
     """
     _check_topology_in_sync(pool, router)
+    if isinstance(k, bool) or not isinstance(k, int) or k < 1:
+        raise ValueError(f"k must be a positive int, got {k!r}")
     if not 0.0 <= min_pct <= max_pct:
         raise ValueError(f"need 0 <= min_pct <= max_pct, got {min_pct!r}, {max_pct!r}")
     ranked = sorted(
