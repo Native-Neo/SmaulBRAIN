@@ -134,7 +134,7 @@ def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -
     _sweep_stale_tmp(exp_dir)
     reports = []
     if to == "fp8":
-        paths = [(eid, os.path.join(ckpt_dir, "experts", f"{eid}.safetensors"))
+        paths = [(eid, _st._jailed_path(ckpt_dir, f"experts/{eid}.safetensors"))
                  for eid in manifest["expert_ids"]]
         missing = [eid for eid, p in paths
                    if not (os.path.exists(p) and os.path.exists(_sidecar(p)))]
@@ -189,7 +189,7 @@ def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -
         # publish, so a bad input cannot commit a half-converted pair.
         converted: dict[str, dict] = {}
         for name in ("trunk.safetensors", "router.safetensors"):
-            p = os.path.join(ckpt_dir, name)
+            p = _st2._jailed_path(ckpt_dir, name)
             if not os.path.exists(p):
                 continue
             if os.stat(p).st_size == 0:
@@ -208,7 +208,7 @@ def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -
             for name, obj in converted.items():
                 tmp = os.path.join(ckpt_dir, name + ".convert_tmp")
                 _st2._atomic_save_tensors(obj, tmp)
-                staged.append((tmp, os.path.join(ckpt_dir, name)))
+                staged.append((tmp, _st2._jailed_path(ckpt_dir, name)))
             for tmp, p in staged:
                 _fsync_file(tmp)
                 os.replace(tmp, p)

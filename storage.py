@@ -77,28 +77,85 @@ def get_rng_snapshot() -> dict:
 def set_rng_snapshot(snap: dict) -> None:
     """Restore RNG state captured by get_rng_snapshot (legacy tensor tolerated)."""
     if isinstance(snap, torch.Tensor):
-        if snap.dtype != torch.uint8:
+        if snap.dtype != torch.uint8 or snap.numel() == 0:
             raise ValueError("checkpoint validation failed: bad torch RNG state")
-        torch.set_rng_state(snap)  # legacy rng.pt: torch CPU state only
+        try:
+            torch.set_rng_state(snap)  # legacy rng.pt: torch CPU state only
+        except Exception as e:
+            raise ValueError(
+                f"checkpoint validation failed: bad torch RNG state: {e}"
+            ) from e
         return
     if not isinstance(snap, dict) or "torch_cpu" not in snap:
         raise ValueError("checkpoint validation failed: bad RNG snapshot")
+    # Validate everything BEFORE mutating anything (mirror _validate_rng_parts).
     _cpu = snap["torch_cpu"]
-    if not torch.is_tensor(_cpu) or _cpu.dtype != torch.uint8:
+    if not torch.is_tensor(_cpu) or _cpu.dtype != torch.uint8 or _cpu.numel() == 0:
         raise ValueError("checkpoint validation failed: bad torch RNG state")
-    torch.set_rng_state(_cpu)
-    if "python" in snap:
-        _py = snap["python"]
+    for _k in snap:
+        if _k not in ("torch_cpu", "python", "cuda"):
+            raise ValueError(
+                f"checkpoint validation failed: bad RNG snapshot key {_k!r}"
+            )
+    _py = snap.get("python")
+    if _py is not None:
         if not (isinstance(_py, (list, tuple)) and len(_py) == 3):
             raise ValueError("checkpoint validation failed: bad python RNG state")
         version, inner, gauss = _py
         if not (isinstance(version, int) and not isinstance(version, bool)):
             raise ValueError("checkpoint validation failed: bad python RNG state")
-        if not (isinstance(inner, (list, tuple)) and len(inner) == 625):
+        if not (isinstance(inner, (list, tuple)) and len(inner) == 625
+                and all(isinstance(v, int) and not isinstance(v, bool)
+                        and 0 <= v < 2 ** 32 for v in inner)):
             raise ValueError("checkpoint validation failed: bad python RNG state")
-        random.setstate((int(version), tuple(int(v) for v in inner), gauss))
+        if not (gauss is None
+                or (isinstance(gauss, float)
+                    and __import__("math").isfinite(gauss))):
+            raise ValueError("checkpoint validation failed: bad python RNG state")
+    _cuda = snap.get("cuda")
+    if _cuda is not None:
+        if isinstance(_cuda, dict):
+            for _k, _t in _cuda.items():
+                if not (isinstance(_k, str) and _k.startswith("cuda.")
+                        and len(_k) > 5 and _k[5:].isdigit()):
+                    raise ValueError(
+                        "checkpoint validation failed: bad cuda RNG key "
+                        f"{_k!r}"
+                    )
+                if not torch.is_tensor(_t) or _t.dtype != torch.uint8:
+                    raise ValueError(
+                        "checkpoint validation failed: bad cuda RNG state"
+                    )
+        elif isinstance(_cuda, (list, tuple)):
+            for _t in _cuda:
+                if not torch.is_tensor(_t) or _t.dtype != torch.uint8:
+                    raise ValueError(
+                        "checkpoint validation failed: bad cuda RNG state"
+                    )
+        else:
+            raise ValueError("checkpoint validation failed: bad cuda RNG state")
+    try:
+        torch.set_rng_state(_cpu)
+    except Exception as e:
+        raise ValueError(
+            f"checkpoint validation failed: bad torch RNG state: {e}"
+        ) from e
+    if "python" in snap:
+        _py = snap["python"]
+        version, inner, gauss = _py
+        try:
+            random.setstate((int(version), tuple(int(v) for v in inner), gauss))
+        except Exception as e:
+            raise ValueError(
+                f"checkpoint validation failed: bad python RNG state: {e}"
+            ) from e
     if "cuda" in snap and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(snap["cuda"])
+        try:
+            torch.cuda.set_rng_state_all(snap["cuda"])
+        except Exception as e:
+            raise ValueError(
+                f"checkpoint validation failed: bad cuda RNG state: {e}"
+            ) from e
 
 
 def _fsync_file(path: str) -> None:
@@ -317,7 +374,11 @@ def refresh_manifest_hashes(ckpt_dir: str) -> dict:
         _require_eid(eid)
     files: dict[str, str] = {}
     for rel in _manifest_rels(eids):
-        p = os.path.join(ckpt_dir, rel)
+        p = _jailed_path(ckpt_dir, rel)
+        if os.path.islink(p):
+            raise ValueError(
+                f"checkpoint validation failed: refusing symlink {rel!r}"
+            )
         if not os.path.exists(p):
             raise FileNotFoundError(f"cannot hash missing checkpoint file {p}")
         files[rel] = _sha256_file(p)
@@ -331,49 +392,45 @@ def _verify_manifest_hashes(ckpt_dir: str, manifest: dict) -> None:
 
     A crash between per-file publishes can leave an old manifest over new
     payloads (or vice versa); per-file atomicity alone cannot see that, but
-    the hash map can. Manifests without a ``files`` map (pre-hash
-    checkpoints) skip verification for backward compatibility.
+    the hash map can. The ``files`` map must be exactly complete
+    (``set(files_map) == set(_manifest_rels(eids))`` after separator
+    normalization); missing/empty/None maps, incomplete maps, and extra
+    entries all raise loudly (no legacy warn-only path).
     """
-    if "files" not in manifest or manifest["files"] in ({}, None):
-        # Hash-less (pre-hash) checkpoints: no silent skip. Verify every
-        # tracked payload exists and is non-empty so truncated/missing files
-        # still refuse loudly; bit-flips without hashes remain a known
-        # limitation (use refresh_manifest_hashes to gain coverage).
-        import warnings as _warnings
-        _warnings.warn(
-            "manifest has no files hash map; verifying existence/size only "
-            "(run refresh_manifest_hashes to gain hash coverage)",
-            RuntimeWarning, stacklevel=2,
+    eids = manifest.get("expert_ids", [])
+    if not isinstance(eids, list) or not all(isinstance(e, str) for e in eids):
+        raise ValueError(
+            "checkpoint validation failed: bad manifest expert_ids"
         )
-        eids = manifest.get("expert_ids", [])
-        if isinstance(eids, list):
-            for rel in _manifest_rels([e for e in eids if isinstance(e, str)]):
-                p = _jailed_path(ckpt_dir, rel)
-                if not os.path.exists(p):
-                    raise ValueError(
-                        f"checkpoint validation failed: tracked file missing {p} "
-                        "(mixed generation; refusing)"
-                    )
-                try:
-                    if os.stat(p).st_size == 0:
-                        raise ValueError(
-                            f"checkpoint validation failed: empty file {p}"
-                        )
-                except OSError as e:
-                    raise ValueError(
-                        f"checkpoint validation failed: unreadable file {p}: {e}"
-                    ) from e
-        return
+    expected = set(_manifest_rels(eids))
     files_map = manifest.get("files")
     if not isinstance(files_map, dict) or not files_map:
         raise ValueError(
-            "checkpoint validation failed: bad manifest files map"
+            "checkpoint validation failed: missing files hash map "
+            "(mixed generation; refusing)"
         )
+    norm_to_want: dict[str, str] = {}
     for rel, want in files_map.items():
-        if not isinstance(rel, str) or not isinstance(want, str):
+        if not isinstance(rel, str) or not rel or not isinstance(want, str) or not want:
             raise ValueError(
                 "checkpoint validation failed: bad manifest files map"
             )
+        norm = rel.replace("\\", "/")
+        if norm in norm_to_want:
+            raise ValueError(
+                "checkpoint validation failed: bad manifest files map "
+                "(duplicate after separator normalization)"
+            )
+        norm_to_want[norm] = want
+    if set(norm_to_want) != expected:
+        missing = sorted(expected - set(norm_to_want))
+        extra = sorted(set(norm_to_want) - expected)
+        raise ValueError(
+            "checkpoint validation failed: files map incomplete "
+            f"(missing={missing} extra={extra}; refusing)"
+        )
+    for rel in sorted(expected):
+        want = norm_to_want[rel]
         p = _jailed_path(ckpt_dir, rel)
         if not os.path.exists(p):
             raise ValueError(
@@ -504,7 +561,12 @@ def save_expert_file(rec: ExpertRecord, path: str) -> None:
 
 
 def load_expert_file(path: str) -> ExpertRecord:
-    """Load one expert written by :func:`save_expert_file`."""
+    """Load one expert written by :func:`save_expert_file`.
+
+    Unsafe on untrusted paths: ``path`` is used verbatim (no jail, follows
+    symlinks). Checkpoint code must use :func:`load_expert_file_jailed`
+    instead; this raw helper remains for trusted absolute paths only.
+    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"missing expert file {path}")
     sidecar = _expert_sidecar(path)
@@ -525,6 +587,23 @@ def load_expert_file(path: str) -> ExpertRecord:
             f"checkpoint validation failed: unreadable sidecar {sidecar}: {e}"
         ) from e
     return expert_from_parts(tensors, meta)
+
+
+def load_expert_file_jailed(ckpt_dir: str, eid: str) -> ExpertRecord:
+    """Jailed expert load: ``experts/<eid>.safetensors`` under ``ckpt_dir``.
+
+    Validates ``eid``, resolves both payload and JSON sidecar via
+    :func:`_jailed_path`, refuses symlinks, then delegates to the raw
+    :func:`load_expert_file` on the jailed absolute path.
+    """
+    _require_eid(eid)
+    p = _jailed_path(ckpt_dir, f"experts/{eid}.safetensors")
+    _jailed_path(ckpt_dir, f"experts/{eid}.json")
+    if os.path.islink(p):
+        raise ValueError(
+            f"checkpoint validation failed: refusing symlink {p}"
+        )
+    return load_expert_file(p)
 
 
 def _flatten_opt_store(store: dict, prefix: str) -> tuple[dict, dict]:
@@ -589,6 +668,8 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
             f"refusing to checkpoint diverged topology: {len(model.pool)} "
             f"experts vs {model.router.num_experts} router rows"
         )
+    for eid in model.pool.order:
+        _require_eid(eid)
     for eid in model.pool.order:
         rec = model.pool.experts[eid]
         want = {
@@ -702,16 +783,16 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
             for name in ("config.json", "trunk.safetensors", "router.safetensors",
                          "optim.safetensors", "rng.safetensors", "meta.json",
                          "resume_config.json"):
-                os.replace(os.path.join(staging, name), os.path.join(ckpt_dir, name))
+                os.replace(os.path.join(staging, name), _jailed_path(ckpt_dir, name))
             for eid in model.pool.order:
                 os.replace(os.path.join(st_exp, f"{eid}.safetensors"),
-                           os.path.join(exp_dir, f"{eid}.safetensors"))
+                           _jailed_path(ckpt_dir, f"experts/{eid}.safetensors"))
                 os.replace(os.path.join(st_exp, f"{eid}.json"),
-                           os.path.join(exp_dir, f"{eid}.json"))
+                           _jailed_path(ckpt_dir, f"experts/{eid}.json"))
             _fsync_dir(exp_dir)
             _fsync_dir(ckpt_dir)
             os.replace(os.path.join(staging, "manifest.json"),
-                       os.path.join(ckpt_dir, "manifest.json"))
+                       _jailed_path(ckpt_dir, "manifest.json"))
             _fsync_dir(ckpt_dir)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
@@ -786,8 +867,12 @@ def make_disk_loader(ckpt_dir: str):
     """Pager loader reading single expert files (no full-model load)."""
     def load(expert_id: str) -> ExpertRecord:
         _require_eid(expert_id)
-        _jailed_path(ckpt_dir, f"experts/{expert_id}.safetensors")
-        return load_expert_file(os.path.join(ckpt_dir, "experts", f"{expert_id}.safetensors"))
+        p = _jailed_path(ckpt_dir, f"experts/{expert_id}.safetensors")
+        if os.path.islink(p):
+            raise ValueError(
+                f"checkpoint validation failed: refusing symlink {p}"
+            )
+        return load_expert_file(p)
     return load
 
 
@@ -1029,12 +1114,24 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     from config import SmaulBrainConfig, __version__ as _schema
 
     def _path(*parts: str) -> str:
-        p = os.path.join(ckpt_dir, *parts)
+        rel = "/".join(parts)
+        p = _jailed_path(ckpt_dir, rel)
         _require(os.path.exists(p), f"missing checkpoint file {p}")
         try:
             _require(os.stat(p).st_size > 0, f"empty file {p}")
         except OSError as e:
             raise ValueError(f"checkpoint validation failed: unreadable file {p}: {e}") from e
+        if os.path.islink(p):
+            raise ValueError(
+                f"checkpoint validation failed: refusing symlink {rel!r}"
+            )
+        try:
+            base = os.path.realpath(os.path.abspath(ckpt_dir))
+            r = os.path.realpath(p)
+        except OSError as e:
+            raise ValueError(f"checkpoint validation failed: unreadable path {rel!r}: {e}") from e
+        _require(r == base or r.startswith(base + os.sep),
+                 f"checkpoint path escapes dir via symlink: {rel!r}")
         return p
 
     try:
@@ -1168,8 +1265,12 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     parts = []
     for eid in eids:
         t = _checked_sf_load(_path("experts", f"{eid}.safetensors"))
-        sidecar = os.path.join(ckpt_dir, "experts", f"{eid}.json")
+        sidecar = _jailed_path(ckpt_dir, f"experts/{eid}.json")
         _require(os.path.exists(sidecar), f"missing checkpoint file {sidecar}")
+        if os.path.islink(sidecar):
+            raise ValueError(
+                f"checkpoint validation failed: refusing symlink {sidecar}"
+            )
         try:
             with open(sidecar) as f:
                 m = json.load(f)
@@ -1187,12 +1288,13 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         parts.append((t, m))
     try:
         on_disk = {n for n in os.listdir(os.path.join(ckpt_dir, "experts"))
-                   if n.endswith(".safetensors")}
+                   if n.endswith((".safetensors", ".json"))}
     except OSError as e:
         raise ValueError(
             f"checkpoint validation failed: unreadable experts dir: {e}"
         ) from e
-    _require(on_disk == {f"{eid}.safetensors" for eid in eids},
+    _require(on_disk == {f"{eid}.safetensors" for eid in eids}
+             | {f"{eid}.json" for eid in eids},
              f"experts dir mismatch: disk {sorted(on_disk)} vs manifest {eids}")
 
     import torch.nn as nn
