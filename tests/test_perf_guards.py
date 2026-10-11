@@ -13,6 +13,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
+import pytest
 
 
 def test_j1_cube_guard_counts_both_cubes():
@@ -413,3 +414,39 @@ def test_depth_aware_activation_budget_refuses_wide_work_before_compute():
     with pytest.raises(ValueError, match="estimated retained activation memory exceeds 256 MiB"):
         model.forward_infer_stateful(ids)
     model.pager.close()
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "fp32"])
+@pytest.mark.parametrize("training", [False, True])
+def test_activation_budget_counts_batch_sized_fp32_states(dtype, training):
+    from config import SmaulBrainConfig
+    from linear_attention import LinearAttnState
+    from model import SmaulBrainModel
+
+    cfg = SmaulBrainConfig(
+        d_model=512, n_heads=4, max_depth=8, min_depth=1,
+        num_experts=4, top_k=1, expert_hidden=32, dtype=dtype,
+    )
+    model = SmaulBrainModel(cfg)
+    try:
+        # Use actual FP32 S/z storage to find the last admitted batch at T=1.
+        state = LinearAttnState.zeros(1, cfg.n_heads, cfg.d_model // cfg.n_heads)
+        per_batch = (
+            state.nbytes() * cfg.max_depth
+            + cfg.d_model * cfg.max_depth * (2 if dtype == "bf16" else 4)
+            + cfg.vocab_size * (cfg.max_depth + 1 if training else 1) * 4
+            + (cfg.max_depth * 4 if training else 0)
+        )
+        max_batch = (256 * 1024 * 1024) // per_batch
+        model._check_activation_budget(torch.zeros(max_batch, 1, dtype=torch.long),
+                                       training=training)
+        ids = torch.zeros(max_batch + 1, 1, dtype=torch.long)
+        with pytest.raises(ValueError, match="state="):
+            model(ids, ids if training else None)
+        if not training:
+            with pytest.raises(ValueError, match="state="):
+                model.forward_infer(ids)
+            with pytest.raises(ValueError, match="state="):
+                model.forward_infer_stateful(ids)
+    finally:
+        model.pager.close()

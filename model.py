@@ -265,6 +265,7 @@ class SmaulBrainModel(nn.Module):
         The token and single-head guards do not account for width or depth.
         Training retains one hidden state and one CE-logit graph per depth;
         inference retains the hidden states plus one mixed logits tensor.
+        Both retain batch-sized FP32 attention accumulators at every depth.
         Estimate these known large tensors before embedding or attention work.
         """
         batch_tokens = ids.shape[0] * ids.shape[1]
@@ -276,14 +277,19 @@ class SmaulBrainModel(nn.Module):
         logits_bytes = batch_tokens * self.cfg.vocab_size * head_depths * 4
         # CE maps and the pondered CE stack are also retained during training.
         ce_bytes = batch_tokens * self.cfg.max_depth * 4 if training else 0
-        estimated = hidden_bytes + logits_bytes + ce_bytes
+        head_dim = self.cfg.d_model // self.cfg.n_heads
+        # S: [B, H, Dh, Dh] and z: [B, H, Dh], both FP32 at every depth.
+        state_bytes = (ids.shape[0] * self.cfg.n_heads
+                       * (head_dim * head_dim + head_dim) * self.cfg.max_depth * 4)
+        estimated = hidden_bytes + logits_bytes + ce_bytes + state_bytes
         budget = 256 * 1024 * 1024
         if estimated > budget:
             raise ValueError(
                 "estimated retained activation memory exceeds 256 MiB budget "
                 f"(hidden={hidden_bytes / 1048576:.1f} MiB, "
                 f"logits={logits_bytes / 1048576:.1f} MiB, "
-                f"CE={ce_bytes / 1048576:.1f} MiB); reduce B*T, d_model, "
+                f"CE={ce_bytes / 1048576:.1f} MiB, "
+                f"state={state_bytes / 1048576:.1f} MiB); reduce B*T, d_model, "
                 "or max_depth"
             )
 
