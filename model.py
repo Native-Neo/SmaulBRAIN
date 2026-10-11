@@ -265,6 +265,15 @@ class SmaulBrainModel(nn.Module):
         self._check_ids(ids, "ids")
         if targets is not None:
             self._check_ids(targets, "targets")
+            if targets.ndim != 2:
+                raise ValueError(
+                    f"targets must be [B, T], got shape {tuple(targets.shape)}"
+                )
+            if targets.shape != ids.shape:
+                raise ValueError(
+                    f"targets shape {tuple(targets.shape)} != "
+                    f"ids shape {tuple(ids.shape)}"
+                )
         if ids.ndim != 2:
             raise ValueError(f"ids must be [B, T], got shape {tuple(ids.shape)}")
         if ids.shape[0] * ids.shape[1] > 1_048_576:
