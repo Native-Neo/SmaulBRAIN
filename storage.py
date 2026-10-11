@@ -788,8 +788,12 @@ def make_disk_loader(ckpt_dir: str):
     """Pager loader reading single expert files (no full-model load)."""
     def load(expert_id: str) -> ExpertRecord:
         _require_eid(expert_id)
-        _jailed_path(ckpt_dir, f"experts/{expert_id}.safetensors")
-        return load_expert_file(os.path.join(ckpt_dir, "experts", f"{expert_id}.safetensors"))
+        p = _jailed_path(ckpt_dir, f"experts/{expert_id}.safetensors")
+        if os.path.islink(p):
+            raise ValueError(
+                f"checkpoint validation failed: refusing symlink {p}"
+            )
+        return load_expert_file(p)
     return load
 
 
@@ -1031,12 +1035,24 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     from config import SmaulBrainConfig, __version__ as _schema
 
     def _path(*parts: str) -> str:
-        p = os.path.join(ckpt_dir, *parts)
+        rel = "/".join(parts)
+        p = _jailed_path(ckpt_dir, rel)
         _require(os.path.exists(p), f"missing checkpoint file {p}")
         try:
             _require(os.stat(p).st_size > 0, f"empty file {p}")
         except OSError as e:
             raise ValueError(f"checkpoint validation failed: unreadable file {p}: {e}") from e
+        if os.path.islink(p):
+            raise ValueError(
+                f"checkpoint validation failed: refusing symlink {rel!r}"
+            )
+        try:
+            base = os.path.realpath(os.path.abspath(ckpt_dir))
+            r = os.path.realpath(p)
+        except OSError as e:
+            raise ValueError(f"checkpoint validation failed: unreadable path {rel!r}: {e}") from e
+        _require(r == base or r.startswith(base + os.sep),
+                 f"checkpoint path escapes dir via symlink: {rel!r}")
         return p
 
     try:
@@ -1170,8 +1186,12 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     parts = []
     for eid in eids:
         t = _checked_sf_load(_path("experts", f"{eid}.safetensors"))
-        sidecar = os.path.join(ckpt_dir, "experts", f"{eid}.json")
+        sidecar = _jailed_path(ckpt_dir, f"experts/{eid}.json")
         _require(os.path.exists(sidecar), f"missing checkpoint file {sidecar}")
+        if os.path.islink(sidecar):
+            raise ValueError(
+                f"checkpoint validation failed: refusing symlink {sidecar}"
+            )
         try:
             with open(sidecar) as f:
                 m = json.load(f)
