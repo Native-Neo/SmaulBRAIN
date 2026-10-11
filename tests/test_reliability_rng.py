@@ -59,7 +59,7 @@ def test_inner_out_of_range_rejects():
         storage.set_rng_snapshot(_with_python(inner=tuple([-1] * 625)))
 
 
-@pytest.mark.parametrize("bad", [True, "3"])
+@pytest.mark.parametrize("bad", [True, "3", 1, 999])
 def test_version_bool_or_str_rejects(bad):
     with pytest.raises(ValueError):
         storage.set_rng_snapshot(_with_python(version=bad))
@@ -98,3 +98,13 @@ def test_manifest_and_resume_config_refuse_symlink_leaves(tmp_path):
         storage.load_manifest(str(ckpt))
     with pytest.raises(ValueError, match="refusing symlink"):
         storage.load_resume_config(str(ckpt))
+
+
+def test_unsupported_python_rng_version_rejects_before_mutating_global_rng():
+    snap = _with_python(version=999)
+    torch_before = torch.get_rng_state().clone()
+    python_before = __import__("random").getstate()
+    with pytest.raises(ValueError, match="bad python RNG state"):
+        storage.set_rng_snapshot(snap)
+    assert torch.equal(torch.get_rng_state(), torch_before)
+    assert __import__("random").getstate() == python_before
