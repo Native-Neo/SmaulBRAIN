@@ -243,7 +243,8 @@ class SmaulBrainModel(nn.Module):
         """Fail loudly on out-of-vocabulary ids (never a cryptic IndexError)."""
         if not isinstance(ids, torch.Tensor):
             raise ValueError(f"{what} must be a Tensor, got {type(ids).__name__}")
-        if ids.dtype not in (torch.long, torch.int, torch.int32, torch.int64):
+        if ids.dtype not in (torch.uint8, torch.int8, torch.int16,
+                               torch.int32, torch.int64):
             raise ValueError(
                 f"{what} must be an integer tensor, got {ids.dtype}"
             )
