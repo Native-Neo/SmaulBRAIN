@@ -804,3 +804,23 @@ def test_load_drops_conv_for_pre_conv_checkpoint(tmp_path):
     ids = torch.randint(0, 256, (1, 8))
     assert m2.forward_infer(ids)["logits"].shape == (1, 8, m2.cfg.vocab_size)
     m.pager.close(); m2.pager.close()
+
+
+@pytest.mark.parametrize("bad_step", [1.5, True, "2", -1])
+def test_expert_optimizer_step_metadata_rejects_coercion(tmp_path, bad_step):
+    import json
+    from safetensors.torch import load_file
+    import storage as _st
+
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    eid = m.pool.order[0]
+    sidecar = os.path.join(d, "experts", f"{eid}.json")
+    with open(sidecar, encoding="utf-8") as f:
+        meta = json.load(f)
+    tensors = load_file(os.path.join(d, "experts", f"{eid}.safetensors"))
+    meta["optim"]["w_gate"]["step"] = bad_step
+
+    with pytest.raises(ValueError, match="bad step"):
+        _st._validate_expert_parts(tensors, meta, eid, m.cfg)
+    m.pager.close()
