@@ -25,10 +25,12 @@ git-ignored (gigabytes do not belong in the repo).
 from __future__ import annotations
 
 import argparse
+import errno
 import gzip
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -142,19 +144,25 @@ def download_shard(i: int, tmp_dir: str, part_dir: str | None = None):
 
     Rationale: the /resolve/ endpoint plus the hub client stall on this
     link, while the redirected Xet CDN host moves ~10x faster. Resolve
-    once, then ranged-GET the CDN URL with resume into a .part file
-    (kept in ``part_dir`` so restarts resume mid-file). Falls back to
-    hf_hub_download only if direct fails throughout.
+    once, then ranged-GET the CDN URL with resume into a .part file.
+    The .part file is staged in ``tmp_dir`` (same filesystem as ``dest``)
+    so the publish ``os.replace`` never crosses filesystems (EXDEV);
+    a ``shutil.move`` fallback is kept for exotic mounts. ``part_dir``
+    is accepted for API compatibility but ignored (crash/resume across
+    runs is via dedupe.db ``done_files``, not mid-file .part resume).
+    Falls back to hf_hub_download only if direct fails throughout.
     """
     import time
     import urllib.error
     import urllib.request
     name = FILE_TEMPLATE.format(i=i)
     url = f"https://huggingface.co/datasets/{REPO}/resolve/main/{name}"
-    pdir = part_dir or tmp_dir
-    os.makedirs(pdir, exist_ok=True)
+    os.makedirs(tmp_dir, exist_ok=True)
     dest = os.path.join(tmp_dir, name)
-    part = os.path.join(pdir, name + ".part")
+    part = os.path.join(tmp_dir, name + ".part")
+    # Shard names contain a subdirectory (en/...): ensure parents exist so
+    # the .part open cannot fail with FileNotFoundError and spin retries.
+    os.makedirs(os.path.dirname(dest) or tmp_dir, exist_ok=True)
     if os.path.exists(dest):
         return name, dest
     try:
@@ -180,12 +188,19 @@ def download_shard(i: int, tmp_dir: str, part_dir: str | None = None):
                         if not chunk:
                             break
                         f.write(chunk)
-            os.replace(part, dest)
+            try:
+                os.replace(part, dest)
+            except OSError as e:
+                if e.errno == errno.EXDEV:
+                    # Cross-filesystem (e.g. tmp on another mount): copy+unlink.
+                    shutil.move(part, dest)
+                else:
+                    raise
             return name, dest
         except Exception as e:  # noqa: BLE001 - retry then fallback
             last_err = e
             have = os.path.getsize(part) if os.path.exists(part) else 0
-            time.sleep(2 ** attempt)
+            time.sleep(min(2 ** attempt, 60))
     try:
         from huggingface_hub import hf_hub_download
         return name, hf_hub_download(REPO, filename=name, repo_type="dataset",
@@ -226,7 +241,7 @@ def run(out: str, target_bytes: int, shard_bytes: int, start: int,
                 continue
             log(f"[{i:05d}] downloading {name} ...")
             try:
-                _, path = download_shard(i, tmp_dir, part_dir=out)
+                _, path = download_shard(i, tmp_dir)
             except Exception as e:
                 log(f"[{i:05d}] download failed, skipping: {e}")
                 continue
@@ -261,10 +276,9 @@ def run(out: str, target_bytes: int, shard_bytes: int, start: int,
         writer.close()
         con.commit()
         con.close()
-    try:
-        os.rmdir(tmp_dir)
-    except OSError:
-        pass
+        # Always remove the staging dir (shards + .parts): rmdir alone
+        # leaks tmp_dir whenever a shard file remains.
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     return stats
 
 

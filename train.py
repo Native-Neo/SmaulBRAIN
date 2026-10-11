@@ -15,6 +15,14 @@ invalidation for rewritten experts. Replay interleaving, growth schedule,
 retention eval, and checkpointing are all driven here. Pruning never happens
 during training: pool shrinkage is a manual offline operation
 (``python pruning.py --rm-worst N``).
+
+Machine-readable ledger (stable API): every per-step ``stats`` dict carries
+``grew`` (bool), ``new_experts`` (ids added this step), and
+``pruned_experts`` (always ``[]`` — training never prunes; the key exists
+as a list by contract and is reserved for offline-pruner integration, so
+consumers may rely on its presence). ``run_training`` additionally returns
+``growth_prune_events`` (one entry per growth event, in execution order)
+and ``growth_events`` (count of successful growths).
 """
 
 from __future__ import annotations

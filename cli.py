@@ -498,6 +498,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     has_ckpt = saved_cfg is not None
 
+    if args.cmd == "train":
+        if args.steps is not None and int(args.steps) < 1:
+            print(f"error: --steps must be >= 1, got {args.steps!r}", file=sys.stderr)
+            return 2
+        if args.batch is not None and int(args.batch) < 1:
+            print(f"error: --batch must be >= 1, got {args.batch!r}", file=sys.stderr)
+            return 2
+
     import torch
     torch.manual_seed(cfg.seed)
     torch.set_num_threads(cfg.threads)
@@ -521,6 +529,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "train":
         from train import run_training
         if args.data:
+            if not os.path.exists(args.data):
+                print(f"error: --data file not found: {args.data}", file=sys.stderr)
+                return 2
+            print(f"training data source: file {args.data}", file=sys.stderr)
             try:
                 if not os.path.isfile(args.data):
                     print(f"error: --data is not a regular file: {args.data}",
@@ -551,6 +563,8 @@ def main(argv: list[str] | None = None) -> int:
             seqs = [list(raw[i:i + cfg.context_length + 1])
                     for i in range(0, len(raw) - 1, cfg.context_length + 1)][:512] or _demo_seqs()
         else:
+            print("training data source: synthetic demo (no --data given)",
+                  file=sys.stderr)
             seqs = _demo_seqs()
         grow_every = resolve_train_grow_every(args, cfg)
         cfg.grow_every = grow_every
@@ -603,6 +617,10 @@ def main(argv: list[str] | None = None) -> int:
                            save_every=args.save_every,
                            grow_every=grow_every,
                            grow_loss_below=args.grow_loss_below,
+                           # Growth trigger RNG derives from this seed: pass
+                           # the resolved cfg.seed (not the run_training
+                           # default 0) so --seed reproduces growth events.
+                           seed=cfg.seed,
                            # Progress/grow lines go to stderr: stdout
                            # stays pure JSON for scripting.
                            log_fn=lambda s: print(s, file=sys.stderr))

@@ -83,24 +83,23 @@ def main():
     # --- checkpoint disk usage (actually written + measured) ---
     import tempfile
     from storage import save_model
-    _bench_tmp = tempfile.TemporaryDirectory(prefix="bench_ckpt_")
-    ckpt_dir = _bench_tmp.name
-    save_model(ckpt_dir, model, opt, args.steps)
-    report = {
-        "paging_mode": args.mode,
-        "train_tokens_per_s": round(train_tps, 1),
-        "train_bytes_per_s": round(train_tps, 1),  # byte vocab: 1 token = 1 byte
-        "infer_tokens_per_s": round(infer_tps, 1),
-        "infer_bytes_per_s": round(infer_tps, 1),
-        "peak_rss_mb": round(rss_mb(), 1),
-        "checkpoint_disk_mb": round(disk_mb(ckpt_dir), 3),
-        "param_counts": model.param_counts(),
-        "paging": model.pager.stats.to_dict(),
-        "routing_share": [round(v, 4) for v in share],
-        "mean_depth_per_step": depths,
-        "expert_fp32_ms": round(fp32_t, 3),
-        "expert_bf16_ms": round(bf16_t, 3),
-    }
+    with tempfile.TemporaryDirectory(prefix="bench_ckpt_") as ckpt_dir:
+        save_model(ckpt_dir, model, opt, args.steps)
+        report = {
+            "paging_mode": args.mode,
+            "train_tokens_per_s": round(train_tps, 1),
+            "train_bytes_per_s": round(train_tps, 1),  # byte vocab: 1 token = 1 byte
+            "infer_tokens_per_s": round(infer_tps, 1),
+            "infer_bytes_per_s": round(infer_tps, 1),
+            "peak_rss_mb": round(rss_mb(), 1),
+            "checkpoint_disk_mb": round(disk_mb(ckpt_dir), 3),
+            "param_counts": model.param_counts(),
+            "paging": model.pager.stats.to_dict(),
+            "routing_share": [round(v, 4) for v in share],
+            "mean_depth_per_step": depths,
+            "expert_fp32_ms": round(fp32_t, 3),
+            "expert_bf16_ms": round(bf16_t, 3),
+        }
     print(json.dumps(report, indent=2))
     model.pager.close()
 

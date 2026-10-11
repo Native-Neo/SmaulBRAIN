@@ -20,8 +20,8 @@ SmaulBRAIN combines ideas from SmaulNative and [mini-AGI](https://github.com/vol
 ## Requirements and quickstart
 
 * Python 3.10+ and `pip install -r requirements.txt`
-  (`torch>=2.2`, `numpy`, `pytest`, `safetensors`). Developed and measured
-  with Python 3.14 + torch 2.14 (CPU); CUDA works wherever torch does.
+  (`torch==2.14.1`, `numpy`, `pytest`, `safetensors`). Developed and measured
+  with Python 3.14 + torch 2.14.1 (CPU); CUDA works wherever torch does.
 * No tokenizer files, no downloads, no build step — clone and run.
 
 ```bash
@@ -235,7 +235,7 @@ It is an experimental architecture.
 
 ### Measured
 
-421 tests pass (`python -m pytest tests/ -q`). Measured on CPU (torch 2.14,
+421 tests pass (`python -m pytest tests/ -q`). Measured on CPU (torch 2.14.1,
 4-core, 7.6 GB RAM) with tiny configs unless noted:
 
 * 16K context forward: +61 MB delta RSS, ~6 s (d=32, 4 experts, top-1,
@@ -324,6 +324,39 @@ Bare defaults are the tiny 246K config (fast CPU smoke runs). `--full`
 switches to the full preset: 64 experts, top-8 routing, ~5.12M params/expert
 (328.5M total, 42.2M active). Any architecture flag passed explicitly
 overrides the preset.
+
+Complete flag reference (same as `python cli.py --help`,
+`python cli.py train --help`, `python cli.py infer --help`):
+
+* Global (every subcommand): `--vocab-size`, `--d-model`, `--n-heads`,
+  `--experts`, `--expert-size`, `--full`, `--active-experts`, `--max-experts`,
+  `--min-experts`, `--capacity-factor`, `--moe-balance-weight`, `--max-depth`,
+  `--min-depth`, `--halting-threshold`, `--halt-prior`, `--ponder-beta`,
+  `--paging-method`, `--ram-cache`, `--vram-cache`, `--expert-lr`,
+  `--trunk-lr-mult`, `--router-lr-mult`, `--router-lr-mult-new`,
+  `--new-routing-bias`, `--weight-decay`, `--grad-clip`, `--beta-m`,
+  `--beta-v`, `--epsilon`, `--fp8-tile`, `--state-dtype`, `--context-length`,
+  `--attention-chunk-size`, `--threads`, `--dtype`, `--seed`,
+  `--rmsnorm-eps`, `--grow-every-default` (alias `--config-grow-every`),
+  `--max-new-experts`, `--use-byte-conv` / `--no-byte-conv`,
+  `--lookahead-weight`, `--boundary-weight`, `--cosine-decay-steps`,
+  `--ckpt`.
+* `train`: `--steps` (optimizer steps, must be >= 1), `--batch` (sequences,
+  must be >= 1), `--mode entire|trunk|experts|selected|new`, `--selected
+  expert_00001,expert_00002`, `--new-since <step>`, `--data <file>`
+  (an explicitly passed but missing/unreadable file aborts with exit 2;
+  omitted trains the synthetic demo), `--save-every N` (checkpoint every N
+  steps, 0 = save once at end), `--grow-every N` (growth eval cadence,
+  0 = off; omitted falls back to config `grow_every`), `--grow-experts N`
+  (grow N experts once at run start, 0 = off), `--grow-loss-below <float>`
+  (grow on a new dip below this loss; negative disables).
+* `infer`: `--prompt`, `--max-new`, `--temperature` (0 = greedy),
+  `--top-k` (0 = off), `--top-p` (1.0 = off), `--infer-context` (prompt
+  window override; default: model `context_length`), `--infer-seed`
+  (sampling seed; default: config `seed`), `--stop-on-eos` /
+  `--no-stop-on-eos` (default: stop at EOS).
+* `report`: no extra flags (dynamic parameter counts + paging stats).
+* `quantize`: `--to fp8|bf16` (experts requantize vs trunk cast).
 
 ```bash
 python cli.py --ckpt ckpt/demo train --steps 20 --batch 2
@@ -829,9 +862,12 @@ python retention_harness.py --data-a data/ab/domainA_train.txt --data-b data/ab/
 
 ### What is `scripts/make_corpus.py`
 
-C4-download corpus builder (unpinned `huggingface_hub` fallback is optional):
-downloads shards, dedups via SQLite WAL, and writes training text. Distinct
-from `synth_data.py` (local free-model generator); use one or the other.
+C4-download corpus builder: downloads shards, dedups via SQLite WAL, and
+writes training text. Distinct from `synth_data.py` (local free-model
+generator); use one or the other. The `huggingface_hub` direct-download
+fallback is optional and pinned (`huggingface-hub==2.1.1` in
+requirements.txt — install that exact version before using the fallback,
+or vendor the single `hf_hub_download` call if the pin goes stale).
 
 ### What is `benchmarks/bench.py`
 
