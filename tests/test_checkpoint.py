@@ -851,3 +851,34 @@ def test_expert_usage_metadata_rejects_coercion_and_nonfinite_values(tmp_path):
         with pytest.raises(ValueError, match=f"bad meta {key}"):
             _st._validate_expert_parts(tensors, meta, eid, m.cfg)
     m.pager.close()
+
+
+def test_expert_shape_and_tile_metadata_rejects_lossy_coercion(tmp_path):
+    import copy
+    import json
+    from safetensors.torch import load_file
+    import storage as _st
+
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    eid = m.pool.order[0]
+    sidecar = os.path.join(d, "experts", f"{eid}.json")
+    with open(sidecar, encoding="utf-8") as f:
+        original = json.load(f)
+    tensors = load_file(os.path.join(d, "experts", f"{eid}.safetensors"))
+    invalid = [
+        ("d_model", 32.5), ("d_model", True), ("d_model", "32"),
+        ("expert_hidden", 64.5), ("expert_hidden", False),
+        ("expert_hidden", "64"),
+    ]
+    for key, value in invalid:
+        meta = copy.deepcopy(original)
+        meta[key] = value
+        with pytest.raises(ValueError, match=f"bad {key}"):
+            _st._validate_expert_parts(tensors, meta, eid, m.cfg)
+    for value in (64.5, True, "64", 0):
+        meta = copy.deepcopy(original)
+        meta["weights"]["w_gate"]["tile"] = value
+        with pytest.raises(ValueError, match="bad tile"):
+            _st._validate_expert_parts(tensors, meta, eid, m.cfg)
+    m.pager.close()
