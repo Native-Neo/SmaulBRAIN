@@ -15,6 +15,7 @@ Training minimizes sum_n p_n * CE(logits_n) + ponder_beta * KL + MoE balance.
 from __future__ import annotations
 
 import math
+import time
 
 import torch
 import torch.nn as nn
@@ -36,6 +37,8 @@ class SmaulBrainModel(nn.Module):
     def __init__(self, config: SmaulBrainConfig) -> None:
         super().__init__()
         self.cfg = config
+        self._profile_enabled = False
+        self._profile_times = {"router_s": 0.0, "expert_s": 0.0, "balance_s": 0.0}
         d = config.d_model
         self.embed = nn.Embedding(config.vocab_size, d)
         self.n_init = RMSNorm(d, config.rmsnorm_eps)
@@ -102,16 +105,24 @@ class SmaulBrainModel(nn.Module):
             # Capacity binds only in training: it is batch-size relative,
             # so enforcing it at inference would make chunked/streaming
             # results differ from a full pass over the same tokens.
+            prof = self._profile_enabled
+            started = time.perf_counter() if prof else 0.0
             plan = self.router.route(x, enforce_capacity=train)
+            if prof:
+                self._profile_times["router_s"] += time.perf_counter() - started
+                started = time.perf_counter()
             prov = self._train_provider if train else self._eval_provider
             y = self.pool.forward(x, plan.top_ids, plan.top_weights,
                                   plan.dropped, prov, step=step)
-            # Balance over scored positions only: padding must not dilute it.
-            # Skip the O(N*E) one-hot when the weight is 0 (no gradient path).
+            if prof:
+                self._profile_times["expert_s"] += time.perf_counter() - started
+                started = time.perf_counter()
             if self.cfg.moe_balance_weight == 0.0:
                 aux = plan.probs.new_zeros(())
             else:
                 aux = self.router.balance_loss(plan.probs, keep=keep)
+            if prof:
+                self._profile_times["balance_s"] += time.perf_counter() - started
             return y, aux, plan.top_ids
         return fn
 
