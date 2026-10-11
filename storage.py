@@ -1080,9 +1080,18 @@ def _validate_rng_parts(tensors: dict, py_state) -> None:
     cpu = tensors.get("torch_cpu")
     _require(torch.is_tensor(cpu) and cpu.dtype == torch.uint8,
              "rng snapshot missing torch_cpu state")
+    cuda_indices = []
     for k, t in tensors.items():
         _require(torch.is_tensor(t) and t.dtype == torch.uint8,
                  f"rng snapshot bad entry {k}")
+        if k == "torch_cpu":
+            continue
+        _require(isinstance(k, str) and k.startswith("cuda.")
+                 and k[5:].isdigit() and k == f"cuda.{int(k[5:])}",
+                 f"rng snapshot bad entry name {k!r}")
+        cuda_indices.append(int(k[5:]))
+    _require(sorted(cuda_indices) == list(range(len(cuda_indices))),
+             "rng snapshot CUDA states must use contiguous cuda.0..cuda.N keys")
     if py_state is not None:
         _require(isinstance(py_state, (list, tuple)) and len(py_state) == 3,
                  "rng snapshot bad python state")
