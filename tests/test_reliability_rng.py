@@ -177,3 +177,14 @@ def test_jailed_path_rejects_dotdot_even_when_normalized_path_stays_inside(tmp_p
     (ckpt / "config.json").write_text("{}")
     with pytest.raises(ValueError, match="traversal"):
         storage._jailed_path(str(ckpt), "experts/../config.json")
+
+def test_checkpoint_lock_rejects_symlink_root_before_creating_lock(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "checkpoint-link"
+    link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="checkpoint path escapes|symlink"):
+        with storage._ckpt_locked(str(link), exclusive=True):
+            pass
+    assert not (target / ".ckpt.lock").exists()
