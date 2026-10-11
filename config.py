@@ -103,6 +103,14 @@ class SmaulBrainConfig:
     cosine_decay_steps: int = 0
 
     def __post_init__(self) -> None:
+        for _f in ("d_model", "n_heads", "vocab_size", "num_experts", "top_k",
+                   "max_experts", "min_experts", "expert_hidden", "context_length",
+                   "attention_chunk_size", "ram_cache", "vram_cache", "fp8_tile",
+                   "threads", "seed", "grow_every", "prune_survival_steps",
+                   "max_new_experts", "cosine_decay_steps", "min_depth", "max_depth"):
+            _v = getattr(self, _f)
+            assert isinstance(_v, int) and not isinstance(_v, bool), \
+                f"{_f} must be an int (not bool), got {_v!r}"
         assert self.d_model % self.n_heads == 0, "d_model must split over heads"
         assert isinstance(self.vocab_size, int) and not isinstance(self.vocab_size, bool) \
             and self.vocab_size >= total_vocab(), \
