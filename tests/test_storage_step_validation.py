@@ -60,3 +60,36 @@ def test_unflatten_optimizer_preserves_valid_integer_step():
         tensors, {"weight": {"step": 2, "kind": "full"}}, "trunk"
     )
     assert result["weight"]["step"] == 2
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("lr", -1.0),
+        ("lr", float("inf")),
+        ("beta_m", 1.0),
+        ("beta_v", float("nan")),
+        ("eps", 0.0),
+        ("wd", -0.1),
+        ("clip", -1.0),
+        ("update_clip", 0.0),
+        ("lr", True),
+    ],
+)
+def test_checkpoint_optimizer_hparams_reject_invalid_values(name, value):
+    with pytest.raises(ValueError, match="bad hparam"):
+        storage._validate_opt_hparams({name: value})
+
+
+def test_checkpoint_optimizer_hparams_accept_valid_values():
+    storage._validate_opt_hparams({
+        "lr": 2e-4,
+        "beta_m": 0.9,
+        "beta_v": 0.999,
+        "eps": 1e-8,
+        "wd": 0.01,
+        "clip": 1.0,
+        "update_clip": 10.0,
+        "state_dtype": "bf16",
+        "factor_v": True,
+    })
