@@ -886,3 +886,20 @@ def test_fp8_block_tensor_rejects_nonpositive_logical_dimensions():
             shape=(0, 4),
             tile=4,
         )
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        (0.0, 2, 0, 4),
+        (0, True, 0, 4),
+        (0, 2, 0, 4.0),
+        (0, 2, False, 4),
+    ],
+)
+def test_tile_block_rejects_non_integer_indices(bounds):
+    t = quantize_fp8_blockwise(torch.randn(4, 8), tile=4)
+    with pytest.raises(ValueError, match="indices must be integers"):
+        dequantize_fp8_block(t, *bounds)
+    with pytest.raises(ValueError, match="indices must be integers"):
+        update_fp8_tile_block(t, torch.randn(2, 4), *bounds)
