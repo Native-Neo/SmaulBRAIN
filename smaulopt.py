@@ -492,6 +492,8 @@ def global_grad_norm(grads: list[torch.Tensor]) -> float:
         if g is None:
             continue
         gf = g.detach().float()
+        if gf.numel() == 0:
+            continue
         peak = gf.abs().amax()
         # Normalize before squaring: a finite FP32 gradient such as 1e20
         # must not overflow in FP32 merely because its square exceeds FP32.
