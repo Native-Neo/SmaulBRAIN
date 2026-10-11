@@ -110,6 +110,8 @@ class ReplayBuffer:
         fixed output length until the buffer holds ``>= n`` items. Egress
         values are copies: mutating them cannot corrupt replay.
         """
+        if isinstance(n, bool) or not isinstance(n, int):
+            raise ValueError(f"ReplayBuffer sample count must be an int (not bool), got {n!r}")
         if n <= 0 or not self.buf:
             return []
         return [list(self.rng.choice(self.buf)) for _ in range(min(n, len(self.buf)))]
