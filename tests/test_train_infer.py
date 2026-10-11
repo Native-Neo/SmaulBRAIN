@@ -518,3 +518,9 @@ def test_generate_zero_tokens_skips_forward_pass():
         assert result["text"] == "" and result["depths"] == []
     finally:
         m.pager.close()
+
+
+def test_batch_from_seqs_pads_short_tuples():
+    batch = batch_from_seqs([(1, 2, 3)], context=4, pad_id=0)
+    assert batch.shape == (1, 5)
+    assert batch.tolist() == [[1, 2, 3, 0, 0]]
