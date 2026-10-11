@@ -734,17 +734,19 @@ def run_training(
         eta = max(0.0, (steps - completed) * avg_step)
         step_bps = step_bytes / max(elapsed, 1e-12)
         avg_bps = bytes_processed / max(total_elapsed, 1e-12)
-        stepped = ",".join(stats["stepped_experts"]) or "-"
+        # Compact progress display: a visual bar plus the metrics most useful
+        # during a small CPU run. Keep the full metric history in the result.
+        fraction = min(1.0, completed / max(steps, 1))
+        bar_width = 18
+        filled = int(fraction * bar_width)
+        bar = "#" * filled + "-" * (bar_width - filled)
+        eta_seconds = int(round(eta))
+        eta_label = f"{eta_seconds // 60:02d}:{eta_seconds % 60:02d}"
         log_fn(
-            f"[train] step {completed}/{steps} (global={step}) "
-            f"loss={stats['loss']:.4f} nll={stats['nll']:.4f} "
-            f"bpb={stats['bpb']:.4f} "
-            f"acc={stats['acc']:.2%} depth={stats['mean_depth']:.2f} "
-            f"time={elapsed:.2f}s bytes/s={step_bps:.1f} "
-            f"avg_bytes/s={avg_bps:.1f} ETA={eta:.1f}s "
-            f"experts={len(model.pool)} updated={stepped} "
-            f"lr(trunk/router/expert)={cfg.trunk_lr:.2g}/"
-            f"{cfg.router_lr:.2g}/{cfg.expert_lr:.2g}"
+            f"[train] [{bar}] {fraction:5.1%} {completed:>4}/{steps} "
+            f"| loss {stats['loss']:.4f} | bpb {stats['bpb']:.3f} "
+            f"| acc {stats['acc']:.2%} | {step_bps:,.0f} B/s "
+            f"| ETA {eta_label} | experts {len(model.pool)}"
         )
     total_elapsed = time.perf_counter() - run_started
     if hist:
