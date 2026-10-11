@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest
 import torch
 from precision import (
-    PRECISION_POLICY, compute_dtype, dequantize_fp8_block,
+    FP8BlockTensor, PRECISION_POLICY, compute_dtype, dequantize_fp8_block,
     dequantize_fp8_blockwise, dequantize_fp8_row_block, quantize_fp8_blockwise,
     update_fp8_row_block, update_fp8_tile_block,
 )
@@ -861,3 +861,28 @@ def test_fp8_row_block_helpers_reject_non_matrix_storage():
         dequantize_fp8_row_block(t, 0, 1)
     with pytest.raises(ValueError, match="require a 2-D"):
         update_fp8_row_block(t, torch.randn(1, 3, 8), 0, 1)
+
+
+@pytest.mark.parametrize(
+    "codes,scales,shape,tile",
+    [
+        (torch.zeros(2, 4, dtype=torch.uint8), torch.ones(2, 1), (2, 5), 4),
+        (torch.zeros(2, 4, dtype=torch.float32), torch.ones(2, 1), (2, 4), 4),
+        (torch.zeros(2, 4, dtype=torch.uint8), torch.ones(2, 2), (2, 4), 4),
+        (torch.zeros(2, 4, dtype=torch.uint8), torch.ones(2, 1, dtype=torch.float64), (2, 4), 4),
+        (torch.zeros(2, 4, dtype=torch.uint8), torch.ones(2, 1), (2, 4), 0),
+    ],
+)
+def test_fp8_block_tensor_rejects_inconsistent_storage(codes, scales, shape, tile):
+    with pytest.raises(ValueError):
+        FP8BlockTensor(codes=codes, scales=scales, shape=shape, tile=tile)
+
+
+def test_fp8_block_tensor_rejects_nonpositive_logical_dimensions():
+    with pytest.raises(ValueError, match="logical shape"):
+        FP8BlockTensor(
+            codes=torch.empty(0, 4, dtype=torch.uint8),
+            scales=torch.empty(0, 1, dtype=torch.float32),
+            shape=(0, 4),
+            tile=4,
+        )
