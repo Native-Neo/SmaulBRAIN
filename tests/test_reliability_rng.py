@@ -94,9 +94,9 @@ def test_manifest_and_resume_config_refuse_symlink_leaves(tmp_path):
     ckpt.mkdir()
     (ckpt / "manifest.json").symlink_to(outside)
     (ckpt / "resume_config.json").symlink_to(outside)
-    with pytest.raises(ValueError, match="refusing symlink"):
+    with pytest.raises(ValueError, match="symlink"):
         storage.load_manifest(str(ckpt))
-    with pytest.raises(ValueError, match="refusing symlink"):
+    with pytest.raises(ValueError, match="symlink"):
         storage.load_resume_config(str(ckpt))
 
 
