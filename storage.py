@@ -1132,9 +1132,25 @@ def _validate_optim_store(store: dict, expected: dict, label: str) -> None:
 
 def _validate_opt_hparams(saved_hp: dict) -> None:
     _require(isinstance(saved_hp, dict), "meta.json bad hparams")
-    for k in ("lr", "beta_m", "beta_v", "eps", "wd", "clip", "update_clip"):
-        if k in saved_hp:
-            _require(_is_num(saved_hp[k]), f"meta.json bad hparam {k}")
+    rules = {
+        "lr": (0.0, False),
+        "beta_m": (0.0, True),
+        "beta_v": (0.0, True),
+        "eps": (0.0, False),
+        "wd": (0.0, True),
+        "clip": (0.0, True),
+        "update_clip": (0.0, False),
+    }
+    for k, (floor, inclusive) in rules.items():
+        if k not in saved_hp:
+            continue
+        value = saved_hp[k]
+        valid = _is_num(value) and __import__("math").isfinite(value)
+        if valid:
+            valid = value >= floor if inclusive else value > floor
+            if k in ("beta_m", "beta_v"):
+                valid = valid and value < 1.0
+        _require(valid, f"meta.json bad hparam {k}: {value!r}")
     if "state_dtype" in saved_hp:
         _require(saved_hp["state_dtype"] in ("bf16", "fp32"),
                  "meta.json bad hparam state_dtype")
