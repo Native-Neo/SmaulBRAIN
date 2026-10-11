@@ -164,6 +164,13 @@ class ReplayBuffer:
             raise ValueError(f"ReplayBuffer seen must be an int (not bool), got {seen_raw!r}")
         if seen_raw < 0:
             raise ValueError(f"ReplayBuffer seen must be >= 0, got {seen_raw!r}")
+        expected_len = min(seen_raw, cap_raw)
+        if len(buf_raw) != expected_len:
+            raise ValueError(
+                "ReplayBuffer snapshot is inconsistent: "
+                f"len(buf)={len(buf_raw)}, seen={seen_raw}, capacity={cap_raw}; "
+                f"expected len(buf)={expected_len}"
+            )
         rng = d.get("rng")
         if rng is not None:
             if not (isinstance(rng, (list, tuple)) and len(rng) == 3):
