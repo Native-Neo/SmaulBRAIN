@@ -24,6 +24,18 @@ from linear_attention import LinearAttnState, linear_attn_forward
 from rmsnorm import RMSNorm
 
 
+def rough_state_bytes(B: int, T: int, d: int, D: int, element_bytes: int = 4) -> int:
+    """Width-aware qkv working-set estimate in bytes: B*T*d*D*element_bytes.
+
+    ``d`` is the projection expansion (3 for the fused qkv [B,T,3D]
+    transient materialized per depth before chunking); ``D`` is the model
+    width. The old B*T-only guard is D-blind: a narrow and a wide model
+    trip at the same token count despite ~D× different transients. Refuse
+    when this exceeds 256MB (see ``SharedRecurrentBlock.forward``).
+    """
+    return int(B) * int(T) * int(d) * int(D) * int(element_bytes)
+
+
 @dataclass
 class RecurrentState:
     """Carried across recurrent applications within one forward pass.
@@ -166,6 +178,15 @@ class SharedRecurrentBlock(nn.Module):
             )
         if keep is not None and keep.shape != (B, T):
             raise ValueError(f"keep must have shape [B, T]=[{B}, {T}], got {tuple(keep.shape)}")
+        # Width-aware qkv budget: the fused qkv [B,T,3D] transient per depth
+        # scales with D, so a B*T-only guard lets wide models allocate ~D×
+        # more than narrow ones. Refuse before the matmul (no model.py edit:
+        # this is the per-depth entry every forward/infer path funnels through).
+        if rough_state_bytes(B, T, 3, D) > 256 * 1024 * 1024:
+            raise ValueError(
+                f"qkv working set B={B} T={T} D={D} (~{rough_state_bytes(B, T, 3, D) / 1e6:.0f}MB) "
+                "exceeds 256MB budget (reduce B*T or D)"
+            )
         # -- linear attention branch (residual) --
         a = self.n1(h)
         qkv = self.qkv(a).view(B, T, 3, self.n_heads, self.head_dim)
