@@ -122,13 +122,15 @@ def convert_checkpoint(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[d
 def _convert_checkpoint_locked(ckpt_dir: str, to: str = "fp8", tile: int = 64) -> list[dict]:
     import storage as _st
     manifest = _st.load_manifest(ckpt_dir)
+    # Resolve every directory/file path before sweeping or staging anything.
+    # A planted experts/ symlink must never redirect the temp-file sweep.
+    man_path = _st._jailed_path(ckpt_dir, "manifest.json")
+    cfg_path = _st._jailed_path(ckpt_dir, "config.json")
+    exp_dir = _st._jailed_path(ckpt_dir, "experts")
     for _eid in manifest.get("expert_ids", []):
         _st._require_eid(_eid)
         _st._jailed_path(ckpt_dir, f"experts/{_eid}.safetensors")
         _st._jailed_path(ckpt_dir, f"experts/{_eid}.json")
-    man_path = os.path.join(ckpt_dir, "manifest.json")
-    cfg_path = os.path.join(ckpt_dir, "config.json")
-    exp_dir = os.path.join(ckpt_dir, "experts")
     # Drop crash leftovers before staging new sidecars.
     _sweep_stale_tmp(ckpt_dir)
     _sweep_stale_tmp(exp_dir)
