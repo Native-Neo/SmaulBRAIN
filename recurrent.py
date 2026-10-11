@@ -24,6 +24,18 @@ from linear_attention import LinearAttnState, linear_attn_forward
 from rmsnorm import RMSNorm
 
 
+def rough_state_bytes(B: int, T: int, d: int, D: int, element_bytes: int = 4) -> int:
+    """Width-aware qkv working-set estimate in bytes: B*T*d*D*element_bytes.
+
+    ``d`` is the projection expansion (3 for the fused qkv [B,T,3D]
+    transient materialized per depth before chunking); ``D`` is the model
+    width. The old B*T-only guard is D-blind: a narrow and a wide model
+    trip at the same token count despite ~D× different transients. Refuse
+    when this exceeds 256MB (see ``SharedRecurrentBlock.forward``).
+    """
+    return int(B) * int(T) * int(d) * int(D) * int(element_bytes)
+
+
 @dataclass
 class RecurrentState:
     """Carried across recurrent applications within one forward pass.
@@ -109,7 +121,21 @@ class CausalByteConv(nn.Module):
 
 
 class SharedRecurrentBlock(nn.Module):
-    """The single shared block applied repeatedly by the depth loop."""
+    """The single shared block applied repeatedly by the depth loop.
+
+    Performance tradeoff M2 (documented, not fixed — model.py is owned by
+    the correctness agent, so no execution change here): the depth loop
+    always executes max_depth applications (no early exit) and each
+    application pays full-width D matmuls (qkv D→3D, o_proj D→D) plus MoE
+    dispatch. Skipping depths would break streaming parity — per-depth
+    attention states must observe every token — and ponder weighting needs
+    every step's logits; adaptivity lives in the readout depths, not in
+    skipped compute. Cost scales ~linearly in max_depth and ~quadratically
+    in D. Halve depth or width to halve/quarter it; chunk T for the
+    attention working set (see linear_attention guard). Measured CPU
+    (identity-MoE, B=2): D=256/T=256 ~290ms per depth, D=1024/T=128
+    ~1130ms per depth (see tests/test_perf_guards.py::test_m2_depth_cost_floor).
+    """
 
     def __init__(self, d_model: int, n_heads: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -166,6 +192,15 @@ class SharedRecurrentBlock(nn.Module):
             )
         if keep is not None and keep.shape != (B, T):
             raise ValueError(f"keep must have shape [B, T]=[{B}, {T}], got {tuple(keep.shape)}")
+        # Width-aware qkv budget: the fused qkv [B,T,3D] transient per depth
+        # scales with D, so a B*T-only guard lets wide models allocate ~D×
+        # more than narrow ones. Refuse before the matmul (no model.py edit:
+        # this is the per-depth entry every forward/infer path funnels through).
+        if rough_state_bytes(B, T, 3, D) > 256 * 1024 * 1024:
+            raise ValueError(
+                f"qkv working set B={B} T={T} D={D} (~{rough_state_bytes(B, T, 3, D) / 1e6:.0f}MB) "
+                "exceeds 256MB budget (reduce B*T or D)"
+            )
         # -- linear attention branch (residual) --
         a = self.n1(h)
         qkv = self.qkv(a).view(B, T, 3, self.n_heads, self.head_dim)

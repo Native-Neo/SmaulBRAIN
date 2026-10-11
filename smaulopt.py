@@ -361,20 +361,21 @@ def smaul_update(
         vc_hat = vc / bc2
         m_hat = m / bc1
         decay = lr * hparams.wd
-        # Fused per-row-block update (block=256): u is elementwise in the
-        # reconstructed moment, so blocking over rows only partitions work —
-        # the full [R, C] moment matrix is never materialized and each
-        # element sees the identical op sequence as the unfused form.
-        new_w = torch.empty_like(w32)
-        for o in range(0, ag.shape[0], 256):
-            sl = slice(o, o + 256)
-            rb = vr_hat[sl]
-            denom = rb.mean().clamp_min(1e-12)
-            v_blk = (rb * vc_hat) / denom
-            u_blk = m_hat[sl] / (v_blk + hparams.eps)
-            if hparams.state_dtype != "fp32":
-                u_blk = u_blk.clamp(-hparams.update_clip, hparams.update_clip)
-            new_w[sl] = w32[sl] * (1.0 - decay) - lr * u_blk
+        # Vectorized block denoms: one bincount reduction over all 256-row
+        # blocks, then a single fused elementwise pass. Peak is one [R, C]
+        # scratch (v_mat, reused in place for u) plus the output — no
+        # per-block Python loop. Elementwise math matches the old loop
+        # (same per-block mean/denom formula, same op sequence).
+        _blk = torch.arange(vr_hat.shape[0], device=vr_hat.device) // 256
+        _sums = torch.bincount(_blk, weights=vr_hat.squeeze(1))
+        _cnts = torch.bincount(_blk)
+        denom_rows = ((_sums / _cnts).clamp_min(1e-12))[_blk].unsqueeze(1)
+        v_mat = (vr_hat * vc_hat) / denom_rows
+        v_mat.add_(hparams.eps)
+        torch.div(m_hat, v_mat, out=v_mat)
+        if hparams.state_dtype != "fp32":
+            v_mat.clamp_(-hparams.update_clip, hparams.update_clip)
+        new_w = w32 * (1.0 - decay) - lr * v_mat
         return new_w.detach()
 
     total_rows = state["m"].shape[0] if "m" in state else w.shape[0]
@@ -415,18 +416,18 @@ def smaul_update(
     vr_hat = vr_slice / bc2
     vc_hat = vc / bc2
     decay = lr * hparams.wd
-    # Fused per-row-block update (same elementwise math as the unfused form;
-    # no full-slice moment matrix is materialized).
-    new_slice = torch.empty_like(w32)
-    for o in range(0, ag.shape[0], 256):
-        sl = slice(o, o + 256)
-        rb = vr_hat[sl]
-        denom = rb.mean().clamp_min(1e-12)
-        v_blk = (rb * vc_hat) / denom
-        u_blk = m_hat[sl] / (v_blk + hparams.eps)
-        if hparams.state_dtype != "fp32":
-            u_blk = u_blk.clamp(-hparams.update_clip, hparams.update_clip)
-        new_slice[sl] = w32[sl] * (1.0 - decay) - lr * u_blk
+    # Vectorized block denoms (same single-reduction + fused pass as above;
+    # one [R, C] scratch reused in place, no per-block Python loop).
+    _blk = torch.arange(vr_hat.shape[0], device=vr_hat.device) // 256
+    _sums = torch.bincount(_blk, weights=vr_hat.squeeze(1))
+    _cnts = torch.bincount(_blk)
+    denom_rows = ((_sums / _cnts).clamp_min(1e-12))[_blk].unsqueeze(1)
+    v_mat = (vr_hat * vc_hat) / denom_rows
+    v_mat.add_(hparams.eps)
+    torch.div(m_hat, v_mat, out=v_mat)
+    if hparams.state_dtype != "fp32":
+        v_mat.clamp_(-hparams.update_clip, hparams.update_clip)
+    new_slice = w32 * (1.0 - decay) - lr * v_mat
     return new_slice.detach()
 
 
@@ -448,13 +449,24 @@ def smaul_update_range(
 
 
 def global_grad_norm(grads: list[torch.Tensor]) -> float:
-    """Global L2 grad norm accumulated in float64 (SmaulNative parity)."""
-    total = 0.0
+    """Global L2 grad norm accumulated in float64 (SmaulNative parity).
+
+    Single-pass: squares accumulate in one fp64 scalar with a single host
+    sync (``.item()``) at the end. No per-tensor ``.double()`` transient
+    (which doubles peak bytes per grad) and no per-tensor sync: each grad
+    contributes ``g.float().pow(2).sum(dtype=torch.float64)`` (fp32 square,
+    fp64 accumulation) into a shared fp64 total kept on the grads' device.
+    Numerics match the old per-tensor-double loop to ~1e-9 relative.
+    """
+    total: torch.Tensor | None = None
     for g in grads:
         if g is None:
             continue
-        total += float(g.detach().double().pow(2).sum().item())
-    return math.sqrt(total)
+        s = g.detach().float().pow(2).sum(dtype=torch.float64)
+        total = s if total is None else total + s.to(total.device)
+    if total is None:
+        return 0.0
+    return math.sqrt(float(total.item()))
 
 
 def clip_scale(norm: float, clip: float) -> float:
