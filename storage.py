@@ -1053,13 +1053,11 @@ def _validate_expert_parts(tensors: dict, meta: dict, eid: str, saved_cfg) -> No
         _require(n in EXPERT_NAMES, f"{eid}: unknown optim entry {n!r}")
         _require(om.get("kind") in ("full", "factored"),
                  f"{eid}: optim {n} bad kind")
-        try:
-            s = int(om.get("step", -1))
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"checkpoint validation failed: {eid}: optim {n} bad step"
-            ) from None
-        _require(s >= 0, f"{eid}: optim {n} bad step")
+        s = om.get("step", -1)
+        _require(
+            isinstance(s, int) and not isinstance(s, bool) and s >= 0,
+            f"{eid}: optim {n} bad step {s!r}",
+        )
         fields = ("m", "v") if om.get("kind") == "full" else ("m", "v_row", "v_col")
         st = {f: tensors.get(f"optim.{n}.{f}") for f in fields}
         st["step"] = s
