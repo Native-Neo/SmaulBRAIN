@@ -303,6 +303,12 @@ def write_manifest(out: str, stats: dict) -> dict:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.target_gb <= 0 or args.shard_mb <= 0:
+        print("error: --target-gb and --shard-mb must be > 0", file=sys.stderr)
+        return 2
+    if args.start < 0 or args.min_chars < 0:
+        print("error: --start and --min-chars must be >= 0", file=sys.stderr)
+        return 2
     target = int(args.target_gb * 2**30)
     if args.dry_run:
         print(f"source={REPO}/{CONFIG} first={FILE_TEMPLATE.format(i=args.start)} "
