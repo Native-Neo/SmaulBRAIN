@@ -579,3 +579,14 @@ def test_replay_sample_rejects_non_integer_counts():
     for bad in (True, False, 1.5, "1"):
         with pytest.raises(ValueError, match="sample count must be an int"):
             buf.sample(bad)
+
+
+def test_replay_add_rejects_malformed_token_sequences_without_advancing_cursor():
+    import pytest
+
+    for bad in ("123", [1, True], [1, -1], [1, 2.5], None):
+        buf = ReplayBuffer(capacity=3)
+        with pytest.raises(ValueError):
+            buf.add(bad)
+        assert buf.seen == 0
+        assert len(buf) == 0
