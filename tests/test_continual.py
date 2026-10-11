@@ -554,3 +554,18 @@ def test_replay_capacity_rejects_lossy_coercions():
     for bad in (True, False, 1.5, "4"):
         with pytest.raises(ValueError, match="capacity must be an int"):
             ReplayBuffer(capacity=bad)
+
+
+def test_replay_restore_rejects_inconsistent_reservoir_length():
+    import pytest
+
+    cases = [
+        {"capacity": 3, "seen": 0, "buf": [[1]]},
+        {"capacity": 2, "seen": 3, "buf": [[1]]},
+        {"capacity": 2, "seen": 3, "buf": [[1], [2], [3]]},
+    ]
+    for bad in cases:
+        snap = ReplayBuffer(capacity=bad["capacity"]).to_dict()
+        snap.update(bad)
+        with pytest.raises(ValueError, match="snapshot is inconsistent"):
+            ReplayBuffer.from_dict(snap)
