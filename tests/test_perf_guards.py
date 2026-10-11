@@ -342,6 +342,39 @@ def test_m2_depth_cost_floor():
     assert 1.2 * dt < dt2 < 3.5 * dt
 
 
+def test_m6_generate_loop_floor():
+    """M6 (doc-only, infer.py untouched): per-token generate loop floor.
+
+    ``generate`` steps max_new times through ``forward_infer_step`` with
+    T=1 stateful calls (matmuls never amortize over T) plus a per-step
+    ``.item()`` (depths) and sampler on the hot path. No execution change
+    here (infer.py owned by correctness); this pins the measured floor.
+    Measured CPU (tiny d32/4-exp/max_depth=2 model): ~8.2ms/token
+    (~120 tok/s) for max_new=8; larger widths scale ~D^2 per step.
+    """
+    from config import SmaulBrainConfig
+    from model import SmaulBrainModel
+    from infer import generate
+
+    torch.manual_seed(0)
+    cfg = SmaulBrainConfig(d_model=32, n_heads=4, num_experts=4, top_k=1,
+                           expert_hidden=64, min_depth=1, max_depth=2,
+                           context_length=512)
+    m = SmaulBrainModel(cfg)
+    m.eval()
+    try:
+        r = generate(m, [65, 66, 67, 68], max_new=4, seed=0)
+        assert len(r["ids"]) == 4 + 4
+        t0 = time.perf_counter()
+        generate(m, [65, 66, 67, 68], max_new=4, seed=0)
+        dt = (time.perf_counter() - t0) / 4 * 1000.0
+        print(f"\n[M6] generate per-token floor: {dt:.1f}ms/token "
+              f"({1000.0/max(dt, 1e-9):.0f} tok/s, tiny model)")
+        assert dt < 60_000.0
+    finally:
+        m.pager.close()
+
+
 def test_m4_routing_budget_counts_both_transients():
     """N*E guard halves to 8M to cover logits+probs (~2x actual)."""
     import pytest
