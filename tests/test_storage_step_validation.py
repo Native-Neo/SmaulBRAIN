@@ -5,6 +5,7 @@ import os
 import sys
 
 import pytest
+import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -37,3 +38,14 @@ def test_save_model_rejects_symlinked_checkpoint_root_before_cleanup(tmp_path):
     with pytest.raises(ValueError, match="checkpoint path escapes|symlink"):
         storage.save_model(str(link), model, None, step=0)
     assert keep.read_text() == "must survive"
+
+
+@pytest.mark.parametrize("step", [1.5, True, "2", None, -1])
+def test_unflatten_optimizer_rejects_malformed_saved_step(step):
+    with pytest.raises(ValueError, match="invalid step"):
+        storage._unflatten_opt_store({}, {"weight": {"step": step}}, "trunk")
+
+
+def test_unflatten_optimizer_rejects_non_dict_entry():
+    with pytest.raises(ValueError, match="must be a dict"):
+        storage._unflatten_opt_store({}, {"weight": 3}, "trunk")
