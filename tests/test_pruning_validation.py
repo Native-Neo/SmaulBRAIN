@@ -30,3 +30,17 @@ def test_prune_rejects_duplicate_victims_without_partial_mutation():
     assert len(pool) == 2
     assert router.num_experts == 2
     assert router.proj.weight.shape[0] == 2
+
+def test_pruning_cli_rejects_symlinked_config_before_model_construction(tmp_path, capsys):
+    import json
+    from pruning import main
+
+    ckpt = tmp_path / "checkpoint"
+    ckpt.mkdir()
+    (ckpt / "resume_config.json").write_text(json.dumps({"min_experts": 1}))
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"d_model": 1_000_000}))
+    (ckpt / "config.json").symlink_to(outside)
+
+    assert main(["--ckpt", str(ckpt), "--rm-worst", "0"]) == 2
+    assert "symlink" in capsys.readouterr().err
