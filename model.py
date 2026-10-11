@@ -451,6 +451,11 @@ class SmaulBrainModel(nn.Module):
         memory stays at one [B, T, H] output plus one depth slice at a
         time instead of holding the full duplicated stack.
         """
+        if depths.dtype not in (torch.uint8, torch.int8, torch.int16,
+                                torch.int32, torch.int64):
+            raise ValueError(
+                f"depths must be an integer tensor, got {depths.dtype}"
+            )
         if depths.numel() == 0:
             return torch.zeros(
                 (depths.shape[0], depths.shape[1], hs[0].shape[-1]),
