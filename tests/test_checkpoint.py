@@ -824,3 +824,30 @@ def test_expert_optimizer_step_metadata_rejects_coercion(tmp_path, bad_step):
     with pytest.raises(ValueError, match="bad step"):
         _st._validate_expert_parts(tensors, meta, eid, m.cfg)
     m.pager.close()
+
+
+def test_expert_usage_metadata_rejects_coercion_and_nonfinite_values(tmp_path):
+    import copy
+    import json
+    from safetensors.torch import load_file
+    import storage as _st
+
+    d = str(tmp_path / "c")
+    m, _ = _trained(d)
+    eid = m.pool.order[0]
+    sidecar = os.path.join(d, "experts", f"{eid}.json")
+    with open(sidecar, encoding="utf-8") as f:
+        original = json.load(f)
+    tensors = load_file(os.path.join(d, "experts", f"{eid}.safetensors"))
+    invalid = [
+        ("birth_step", 1.5), ("last_used_step", True),
+        ("tokens_routed", -1), ("grad_activity", float("nan")),
+        ("grad_activity", float("inf")), ("contribution", -0.1),
+        ("contribution", "0.5"), ("contribution", True),
+    ]
+    for key, value in invalid:
+        meta = copy.deepcopy(original)
+        meta["meta"][key] = value
+        with pytest.raises(ValueError, match=f"bad meta {key}"):
+            _st._validate_expert_parts(tensors, meta, eid, m.cfg)
+    m.pager.close()
