@@ -195,9 +195,13 @@ def generate(
     was_training = model.training
     model.eval()
     dev = model.embed.weight.device
-    ctx = model.cfg.context_length if context is None else int(context)
+    if context is not None and (isinstance(context, bool) or not isinstance(context, int)):
+        raise ValueError(f"context must be a positive int, got {context!r}")
+    ctx = model.cfg.context_length if context is None else context
     if ctx <= 0:
         raise ValueError(f"context must be positive, got {context!r}")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError(f"seed must be an int, got {seed!r}")
     if isinstance(stop_on_eos, bool) is False:
         raise ValueError(f"stop_on_eos must be a bool, got {stop_on_eos!r}")
     if isinstance(max_new, bool) or not isinstance(max_new, int):
