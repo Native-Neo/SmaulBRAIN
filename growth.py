@@ -11,12 +11,22 @@ expert file + router row + metadata).
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from experts import ExpertPool, init_expert_optim_state, make_expert
 from precision import dequantize_fp8_blockwise
 
 _EXPERT_WEIGHTS = ("w_gate", "w_up", "w_down")
+
+
+def _validate_noise_std(noise_std: float) -> None:
+    if (isinstance(noise_std, bool) or not isinstance(noise_std, (int, float))
+            or not math.isfinite(noise_std) or noise_std < 0):
+        raise ValueError(
+            f"noise_std must be a finite non-negative number, got {noise_std!r}"
+        )
 
 
 def _check_optim_width(optim_state: dict | None, expect: int) -> None:
@@ -112,6 +122,7 @@ def recombine_weights(
     generator: torch.Generator | None = None,
 ) -> dict[str, torch.Tensor]:
     """Convex combination of dequantized parent weights + seeded noise."""
+    _validate_noise_std(noise_std)
     if not parents:
         raise ValueError("need at least one parent (empty pool uses make_expert fallback)")
     missing = [eid for eid in parents if eid not in pool.experts]
@@ -186,6 +197,7 @@ def grow_expert(
     consumed IDs.
     """
     _check_topology_in_sync(pool, router)
+    _validate_noise_std(noise_std)
     if max_experts is not None and len(pool) >= max_experts:
         raise ValueError(f"at capacity: {len(pool)} >= max_experts={max_experts}")
     _check_optim_width(optim_state, len(pool))
