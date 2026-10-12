@@ -19,6 +19,7 @@ from typing import Callable
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from precision import FP8BlockTensor, dequantize_fp8_blockwise, quantize_fp8_blockwise
 from config import expert_param_count  # single source (config.py owns the formula)
@@ -63,9 +64,26 @@ def ternary_qat_weight(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.T
     return quantized.detach() + (w - w.detach())
 
 
+def _swiglu_tensors(
+    x: torch.Tensor, w_gate: torch.Tensor, w_up: torch.Tensor, w_down: torch.Tensor
+) -> torch.Tensor:
+    """Tensor-only SwiGLU core, suitable for activation checkpointing."""
+    gate = F.linear(x, w_gate)
+    up = F.linear(x, w_up)
+    return F.linear(F.silu(gate) * up, w_down)
+
+
 def swiglu_forward(x: torch.Tensor, w: dict[str, torch.Tensor]) -> torch.Tensor:
-    """SwiGLU: down(silu(gate(x)) * up(x)). x: [N, D] -> [N, D]."""
-    return F.linear(F.silu(F.linear(x, w["w_gate"])) * F.linear(x, w["w_up"]), w["w_down"])
+    """SwiGLU with recomputation during backward to avoid retaining gate/up.
+
+    Checkpointing stores only inputs for this expert FFN and recomputes its
+    large intermediate tensors during backward. Inference stays on the direct
+    path; use_reentrant=False supports gradients for both inputs and weights.
+    """
+    args = (x, w["w_gate"], w["w_up"], w["w_down"])
+    if torch.is_grad_enabled() and any(t.requires_grad for t in args):
+        return checkpoint(_swiglu_tensors, *args, use_reentrant=False)
+    return _swiglu_tensors(*args)
 
 
 @dataclass

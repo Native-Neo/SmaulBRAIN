@@ -491,8 +491,16 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
                 key=_key)
         else:  # trunk mode: experts frozen
             targets = []
+        # Drop gradients for frozen/unselected experts before stepping.
+        # This matters for modes such as trunk/selected/new: their forward
+        # passes can still produce expert grads, but those grads must not sit
+        # resident for the rest of the optimizer phase.
+        target_set = set(targets)
+        for eid in list(expert_grads):
+            if eid not in target_set:
+                expert_grads.pop(eid, None)
         for eid in targets:
-            grads = expert_grads[eid]
+            grads = expert_grads.pop(eid, {})
             if not grads:
                 continue
             rec = model.pool.experts[eid]
@@ -509,6 +517,9 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
             if int(getattr(rec, "version", 0)) != _ver_before:
                 model.pager.invalidate(eid)
                 stepped.append(eid)
+            # The optimizer has consumed this expert's gradients; release
+            # their final references before moving to the next expert.
+            del compute, grads
         # Global optimizer steps: exactly one per train_step call, including
         # steps whose updates were skipped (see skipped-step semantics). The
         # per-tensor bias corrections use each tensor's own step counter.

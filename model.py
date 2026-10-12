@@ -87,9 +87,10 @@ class SmaulBrainModel(nn.Module):
                 trunk_mods.append(self.byte_conv.conv)
             for mod in trunk_mods:
                 mod.to(torch.bfloat16)
-        # Active expert leaves (training): eid -> list of leaf weight dicts
-        # (one entry per depth-step activation; grads are summed at opt time).
-        self._leaves: dict[str, list[dict[str, torch.Tensor]]] = {}
+        # One external leaf-weight dictionary per expert per train step.
+        # Recurrent depth reuses these leaves, so autograd accumulates all
+        # uses into one .grad tensor instead of retaining full weight copies.
+        self._leaves: dict[str, dict[str, torch.Tensor]] = {}
         self._ternary_eval_cache: dict[str, tuple[tuple[int, int], dict[str, torch.Tensor]]] = {}
         self._last_step: int = 0
 
@@ -100,9 +101,13 @@ class SmaulBrainModel(nn.Module):
             if self.cfg.ternary_qat:
                 return {k: ternary_qat_weight(v) for k, v in base.items()}
             return base
-        leaves = {k: v.detach().to(base[k].dtype).requires_grad_(True)
-                  for k, v in base.items()}
-        self._leaves.setdefault(expert_id, []).append(leaves)
+        leaves = self._leaves.get(expert_id)
+        if leaves is None:
+            leaves = {
+                k: v.detach().requires_grad_(True)
+                for k, v in base.items()
+            }
+            self._leaves[expert_id] = leaves
         if self.cfg.ternary_qat:
             return {k: ternary_qat_weight(v) for k, v in leaves.items()}
         return leaves
@@ -159,34 +164,34 @@ class SmaulBrainModel(nn.Module):
 
     def clear_expert_grads(self, set_to_none: bool = True) -> None:
         """Clear external gradients on active expert leaves and release references."""
-        for copies in self._leaves.values():
-            for leaves in copies:
-                for leaf in leaves.values():
-                    if leaf.grad is not None:
-                        if set_to_none:
-                            leaf.grad = None
-                        else:
-                            leaf.grad.zero_()
+        for leaves in self._leaves.values():
+            for leaf in leaves.values():
+                if leaf.grad is not None:
+                    if set_to_none:
+                        leaf.grad = None
+                    else:
+                        leaf.grad.zero_()
         self._leaves.clear()
 
     def take_expert_grads(self) -> dict[str, dict[str, torch.Tensor]]:
-        """Sum leaf grads per expert across depth-step copies; clear the buffer.
+        """Collect accumulated per-expert leaf grads and clear the buffer.
 
-        Returns eid -> {wname: summed grad or None}. Call after loss.backward().
+        A shared leaf receives autograd contributions from every recurrent
+        depth. Returns eid -> {wname: gradient}; call after loss.backward().
         """
         agg: dict[str, dict[str, torch.Tensor]] = {}
         try:
-            for eid, copies in self._leaves.items():
-                summed: dict[str, torch.Tensor] = {}
-                for leaves in copies:
-                    for n, leaf in leaves.items():
-                        if leaf.grad is None:
-                            continue
-                        g = leaf.grad.detach().float()
-                        summed[n] = g if n not in summed else summed[n] + g
-                        leaf.grad = None  # clear stale external gradients
-                if summed:
-                    agg[eid] = summed
+            for eid, leaves in self._leaves.items():
+                grads: dict[str, torch.Tensor] = {}
+                for name, leaf in leaves.items():
+                    if leaf.grad is None:
+                        continue
+                    # Transfer the gradient reference without an FP32
+                    # duplicate. SmaulOpt performs FP32 math inside the update.
+                    grads[name] = leaf.grad.detach()
+                    leaf.grad = None
+                if grads:
+                    agg[eid] = grads
             return agg
         finally:
             self.clear_expert_grads()
@@ -298,13 +303,14 @@ class SmaulBrainModel(nn.Module):
             )
 
     def _check_activation_budget(self, ids: torch.Tensor, *, training: bool) -> None:
-        """Refuse shapes whose retained depth activations exceed 256 MiB.
+        """Guard retained activations and available memory before training.
 
-        The token and single-head guards do not account for width or depth.
-        Training retains one hidden state and one CE-logit graph per depth;
-        inference retains the hidden states plus one mixed logits tensor.
-        Both retain batch-sized FP32 attention accumulators at every depth.
-        Estimate these known large tensors before embedding or attention work.
+        The 256 MiB activation estimate covers retained hidden/logit/CE tensors
+        and FP32 attention states. Expert SwiGLU intermediates are checkpointed
+        and recomputed during backward; the working-set check additionally
+        budgets one leaf-weight copy and its gradient buffer per potentially
+        active expert and the checkpoint inputs. Expert FP8 storage and
+        optimizer state are already resident when this method runs.
         """
         batch_tokens = ids.shape[0] * ids.shape[1]
         dtype_bytes = 2 if self.cfg.dtype == "bf16" else 4
@@ -329,6 +335,52 @@ class SmaulBrainModel(nn.Module):
                 f"CE={ce_bytes / 1048576:.1f} MiB, "
                 f"state={state_bytes / 1048576:.1f} MiB); reduce B*T, d_model, "
                 "or max_depth"
+            )
+        if not training:
+            return
+
+        # Expert leaves are materialized once per active expert, not once per
+        # recurrent depth. Bound the worst-case leaf working set and account
+        # for the checkpoint inputs (the large SwiGLU intermediates themselves
+        # are recomputed, not retained). FP8 weights and factored optimizer
+        # state are already resident by this point; report their footprint in
+        # the failure message but do not double-count them against MemAvailable.
+        active_upper = min(self.cfg.num_experts, batch_tokens * self.cfg.top_k)
+        expert_params = 3 * self.cfg.d_model * self.cfg.expert_hidden
+        expert_leaf_bytes = active_upper * expert_params * dtype_bytes
+        # Autograd retains a same-shaped, same-dtype gradient for each leaf.
+        expert_grad_bytes = expert_leaf_bytes
+        checkpoint_input_bytes = (
+            batch_tokens * self.cfg.top_k * self.cfg.d_model
+            * self.cfg.max_depth * dtype_bytes
+        )
+        transient_bytes = (estimated + expert_leaf_bytes + expert_grad_bytes
+                           + checkpoint_input_bytes)
+        static_expert_bytes = self.cfg.num_experts * expert_params * 3
+        # Linux exposes current system headroom after model weights and
+        # optimizer state have been allocated. Keep 35% of that headroom for
+        # the desktop, allocator fragmentation, data batches, and OS activity.
+        try:
+            with open("/proc/meminfo", encoding="ascii") as meminfo:
+                available_kib = next(
+                    int(line.split()[1]) for line in meminfo
+                    if line.startswith("MemAvailable:")
+                )
+            safe_bytes = int(available_kib * 1024 * 0.65)
+        except (OSError, StopIteration, ValueError, IndexError):
+            safe_bytes = None
+        if safe_bytes is not None and transient_bytes > safe_bytes:
+            raise ValueError(
+                "estimated training working set exceeds 65% of currently "
+                "available system memory: "
+                f"retained_activations={estimated / 1048576:.1f} MiB, "
+                f"expert_leaves={expert_leaf_bytes / 1048576:.1f} MiB, "
+                f"expert_grads={expert_grad_bytes / 1048576:.1f} MiB, "
+                f"checkpoint_inputs={checkpoint_input_bytes / 1048576:.1f} MiB, "
+                f"resident_expert_weights_plus_optimizer_estimate="
+                f"{static_expert_bytes / 1048576:.1f} MiB, "
+                f"safe_budget={safe_bytes / 1048576:.1f} MiB; reduce batch, "
+                "context_length, top_k, or expert_hidden"
             )
 
     def forward(
