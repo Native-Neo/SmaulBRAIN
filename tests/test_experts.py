@@ -65,6 +65,25 @@ def test_model_ternary_qat_wires_train_and_eval_providers():
     assert eid in grads
     assert all(g is not None and torch.isfinite(g).all() for g in grads[eid].values())
 
+    # Evaluation tensors are cached until the pager invalidates that expert.
+    cached = model._eval_provider(eid)
+    assert model._eval_provider(eid) is cached
+    model.pager.invalidate(eid)
+    assert model._eval_provider(eid) is not cached
+
+    # The no-grad training-provider path must still quantize without leaves.
+    model.clear_expert_grads()
+    with torch.no_grad():
+        no_grad_weights = model._train_provider(eid)
+    assert eid not in model._leaves
+    for weight in no_grad_weights.values():
+        for row in weight.float():
+            scale = row.abs().max()
+            normalized = row / scale if scale > 0 else row
+            assert set(torch.unique(torch.round(normalized, decimals=5)).tolist()) <= {
+                -1.0, 0.0, 1.0
+            }
+
 
 def test_expert_size_explicit_and_512_target():
     from config import SmaulBrainConfig, expert_hidden_for_target
