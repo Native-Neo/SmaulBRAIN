@@ -245,13 +245,16 @@ def generate(
             out, attn_states = model.forward_infer_step(x, attn_states)
 
         text_parts.append(decoder.flush())
-        if was_training:
-            model.train()
         return {"ids": ids, "text": "".join(text_parts), "depths": depths,
                 "paging": model.pager.stats.to_dict()}
 
     finally:
-        model.train(was_training)
+        # Use the public mode methods instead of train(bool), so lightweight
+        # model adapters and test doubles need only implement train()/eval().
+        if was_training:
+            model.train()
+        else:
+            model.eval()
 
 def encode_prompt(text: str) -> list[int]:
     return encode_text(text)
