@@ -212,7 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--new-since", type=int, default=0,
                    help="Birth-step cutoff for --mode new.")
     t.add_argument("--data", type=str, default=None,
-                   help="Text file for training bytes (default: synthetic demo).")
+                   help="Text file or dataset directory (recursive; default: synthetic demo).")
     t.add_argument("--save-every", type=int, default=0, help="Checkpoint every N steps (0=off).")
     t.add_argument("--profile", action="store_true",
                    help="Report forward/router/expert/backward/optimizer/growth timings and Linux RAM usage.")
