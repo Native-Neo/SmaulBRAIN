@@ -35,8 +35,8 @@ def _aged_ckpt(d, n_exp=6, min_experts=2, useful=None):
     import shutil
     m, opt, _ = _model(n_exp, min_experts)
     for rec in m.pool.experts.values():
-        rec.birth_step = -600
-        rec.last_used_step = -600
+        rec.birth_step = 0
+        rec.last_used_step = 0
     if useful is not None:
         u = m.pool.experts[useful]
         u.tokens_routed = 1000
