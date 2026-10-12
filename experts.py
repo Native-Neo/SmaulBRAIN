@@ -60,7 +60,7 @@ def ternary_qat_weight(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.T
     count = nonzero.sum(dim=-1, keepdim=True).clamp_min(1)
     scale = (w32.abs() * nonzero).sum(dim=-1, keepdim=True) / count
     quantized = (trits * scale).to(dtype=w.dtype)
-    return w + (quantized - w).detach()
+    return quantized.detach() + (w - w.detach())
 
 
 def swiglu_forward(x: torch.Tensor, w: dict[str, torch.Tensor]) -> torch.Tensor:
