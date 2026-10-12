@@ -548,6 +548,24 @@ def main(argv: list[str] | None = None) -> int:
     # checkpoint-sized network only to exit with an input error afterward.
     seqs = None
     if args.cmd == "train":
+        if args.data:
+            from data_input import load_training_sequences
+            try:
+                seqs, source_kind = load_training_sequences(
+                    args.data, cfg.context_length
+                )
+            except (OSError, ValueError) as e:
+                print(f"error: --data: {e}", file=sys.stderr)
+                return 2
+            print(
+                f"training data source: {source_kind} {args.data} "
+                f"({len(seqs)} sequences loaded)",
+                file=sys.stderr,
+            )
+        else:
+            print("training data source: synthetic demo (no --data given)",
+                  file=sys.stderr)
+            seqs = _demo_seqs()
 
     model = SmaulBrainModel(cfg)
     opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr, wd=cfg.weight_decay,
@@ -567,24 +585,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "train":
         from train import run_training
-        if args.data:
-            from data_input import load_training_sequences
-            try:
-                seqs, source_kind = load_training_sequences(
-                    args.data, cfg.context_length
-                )
-            except (OSError, ValueError) as e:
-                print(f"error: --data: {e}", file=sys.stderr)
-                return 2
-            print(
-                f"training data source: {source_kind} {args.data} "
-                f"({len(seqs)} sequences loaded)",
-                file=sys.stderr,
-            )
-        else:
-            print("training data source: synthetic demo (no --data given)",
-                  file=sys.stderr)
-            seqs = _demo_seqs()
         grow_every = resolve_train_grow_every(args, cfg)
         cfg.grow_every = grow_every
         grow_n = int(getattr(args, "grow_experts", 0) or 0)
