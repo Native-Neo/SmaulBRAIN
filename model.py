@@ -308,9 +308,9 @@ class SmaulBrainModel(nn.Module):
         The 256 MiB activation estimate covers retained hidden/logit/CE tensors
         and FP32 attention states. Expert SwiGLU intermediates are checkpointed
         and recomputed during backward; the working-set check additionally
-        budgets one leaf-weight copy per potentially active expert and the
-        checkpoint inputs. Expert FP8 storage and optimizer state are already
-        resident when this method runs.
+        budgets one leaf-weight copy and its gradient buffer per potentially
+        active expert and the checkpoint inputs. Expert FP8 storage and
+        optimizer state are already resident when this method runs.
         """
         batch_tokens = ids.shape[0] * ids.shape[1]
         dtype_bytes = 2 if self.cfg.dtype == "bf16" else 4
@@ -348,11 +348,14 @@ class SmaulBrainModel(nn.Module):
         active_upper = min(self.cfg.num_experts, batch_tokens * self.cfg.top_k)
         expert_params = 3 * self.cfg.d_model * self.cfg.expert_hidden
         expert_leaf_bytes = active_upper * expert_params * dtype_bytes
+        # Autograd retains a same-shaped, same-dtype gradient for each leaf.
+        expert_grad_bytes = expert_leaf_bytes
         checkpoint_input_bytes = (
             batch_tokens * self.cfg.top_k * self.cfg.d_model
             * self.cfg.max_depth * dtype_bytes
         )
-        transient_bytes = estimated + expert_leaf_bytes + checkpoint_input_bytes
+        transient_bytes = (estimated + expert_leaf_bytes + expert_grad_bytes
+                           + checkpoint_input_bytes)
         static_expert_bytes = self.cfg.num_experts * expert_params * 3
         # Linux exposes current system headroom after model weights and
         # optimizer state have been allocated. Keep 35% of that headroom for
@@ -372,6 +375,7 @@ class SmaulBrainModel(nn.Module):
                 "available system memory: "
                 f"retained_activations={estimated / 1048576:.1f} MiB, "
                 f"expert_leaves={expert_leaf_bytes / 1048576:.1f} MiB, "
+                f"expert_grads={expert_grad_bytes / 1048576:.1f} MiB, "
                 f"checkpoint_inputs={checkpoint_input_bytes / 1048576:.1f} MiB, "
                 f"resident_expert_weights_plus_optimizer_estimate="
                 f"{static_expert_bytes / 1048576:.1f} MiB, "

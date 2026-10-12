@@ -2,7 +2,9 @@
 
 import os
 import sys
+from unittest.mock import mock_open
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -12,7 +14,7 @@ from experts import _swiglu_tensors, swiglu_forward
 from model import SmaulBrainModel
 
 
-def _tiny_model():
+def _tiny_model(dtype="bf16"):
     cfg = SmaulBrainConfig(
         d_model=16,
         n_heads=4,
@@ -26,8 +28,36 @@ def _tiny_model():
         ram_cache=1,
         vram_cache=1,
         use_byte_conv=False,
+        dtype=dtype,
     )
     return SmaulBrainModel(cfg)
+
+
+@pytest.mark.parametrize("dtype, available_kib", [("bf16", 48), ("fp32", 56)])
+def test_training_budget_includes_retained_expert_gradients(
+    monkeypatch, dtype, available_kib
+):
+    model = _tiny_model(dtype=dtype)
+    try:
+        ids = torch.zeros(1, 8, dtype=torch.long)
+        # This headroom fits activations, leaves, and checkpoint inputs, but
+        # cannot also hold the gradients retained by those leaves.
+        monkeypatch.setattr(
+            "builtins.open", mock_open(read_data=f"MemAvailable: {available_kib} kB\n")
+        )
+        with pytest.raises(
+            ValueError, match="estimated training working set exceeds 65%"
+        ) as exc:
+            model._check_activation_budget(ids, training=True)
+        assert "expert_grads=" in str(exc.value)
+        model._check_activation_budget(ids, training=False)
+
+        monkeypatch.setattr(
+            "builtins.open", mock_open(read_data="MemAvailable: 1024 kB\n")
+        )
+        model._check_activation_budget(ids, training=True)
+    finally:
+        model.pager.close()
 
 
 def test_training_reuses_one_expert_leaf_dictionary_across_depths():
