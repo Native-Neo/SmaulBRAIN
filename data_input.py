@@ -73,7 +73,7 @@ def _iter_file_text(path: Path, remaining: int) -> Iterator[bytes]:
         for row in rows:
             encoded = _json_bytes(row)
             if len(encoded) > remaining:
-                yield encoded[:remaining]
+                return
                 return
             remaining -= len(encoded)
             yield encoded
@@ -85,7 +85,7 @@ def _iter_file_text(path: Path, remaining: int) -> Iterator[bytes]:
             for row in reader:
                 encoded = _json_bytes(row)
                 if len(encoded) > remaining:
-                    yield encoded[:remaining]
+                    return
                     return
                 remaining -= len(encoded)
                 yield encoded
@@ -106,7 +106,7 @@ def _iter_file_text(path: Path, remaining: int) -> Iterator[bytes]:
                 for row in batch.to_pylist():
                     encoded = _json_bytes(row)
                     if len(encoded) > remaining:
-                        yield encoded[:remaining]
+                        return
                         return
                     remaining -= len(encoded)
                     yield encoded
