@@ -90,12 +90,15 @@ class SmaulBrainModel(nn.Module):
         # Active expert leaves (training): eid -> list of leaf weight dicts
         # (one entry per depth-step activation; grads are summed at opt time).
         self._leaves: dict[str, list[dict[str, torch.Tensor]]] = {}
+        self._ternary_eval_cache: dict[str, tuple[tuple[int, int], dict[str, torch.Tensor]]] = {}
         self._last_step: int = 0
 
     # -- MoE wiring --
     def _train_provider(self, expert_id: str) -> dict[str, torch.Tensor]:
         base = self.pager.provider(expert_id)
         if not torch.is_grad_enabled():
+            if self.cfg.ternary_qat:
+                return {k: ternary_qat_weight(v) for k, v in base.items()}
             return base
         leaves = {k: v.detach().to(base[k].dtype).requires_grad_(True)
                   for k, v in base.items()}
@@ -105,10 +108,24 @@ class SmaulBrainModel(nn.Module):
         return leaves
 
     def _eval_provider(self, expert_id: str) -> dict[str, torch.Tensor]:
+        if not self.cfg.ternary_qat:
+            return self.pager.provider(expert_id)
+        rec = self.pool.experts.get(expert_id)
+        if rec is None:
+            return self.pager.provider(expert_id)  # Preserve the pager's normal missing-expert error.
+        tag = (self.pager._get_version(expert_id), id(rec))
+        cached = self._ternary_eval_cache.get(expert_id)
+        if cached is not None and cached[0] == tag:
+            return cached[1]
         weights = self.pager.provider(expert_id)
-        if self.cfg.ternary_qat:
-            return {k: ternary_qat_weight(v) for k, v in weights.items()}
-        return weights
+        transformed = {k: ternary_qat_weight(v) for k, v in weights.items()}
+        # Do not publish a result if the expert changed while weights were loaded.
+        live_rec = self.pool.experts.get(expert_id)
+        live_tag = ((self.pager._get_version(expert_id), id(live_rec))
+                    if live_rec is not None else None)
+        if live_tag == tag:
+            self._ternary_eval_cache[expert_id] = (tag, transformed)
+        return transformed
 
     def _moe_fn(self, train: bool, step: int, keep: torch.Tensor | None = None):
         def fn(x: torch.Tensor):
