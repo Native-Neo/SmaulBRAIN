@@ -174,9 +174,10 @@ class SmaulBrainModel(nn.Module):
         self._leaves.clear()
 
     def take_expert_grads(self) -> dict[str, dict[str, torch.Tensor]]:
-        """Sum leaf grads per expert across depth-step copies; clear the buffer.
+        """Collect accumulated per-expert leaf grads and clear the buffer.
 
-        Returns eid -> {wname: summed grad or None}. Call after loss.backward().
+        A shared leaf receives autograd contributions from every recurrent
+        depth. Returns eid -> {wname: gradient}; call after loss.backward().
         """
         agg: dict[str, dict[str, torch.Tensor]] = {}
         try:
@@ -303,13 +304,14 @@ class SmaulBrainModel(nn.Module):
             )
 
     def _check_activation_budget(self, ids: torch.Tensor, *, training: bool) -> None:
-        """Refuse shapes whose retained depth activations exceed 256 MiB.
+        """Guard retained activations and available memory before training.
 
-        The token and single-head guards do not account for width or depth.
-        Training retains one hidden state and one CE-logit graph per depth;
-        inference retains the hidden states plus one mixed logits tensor.
-        Both retain batch-sized FP32 attention accumulators at every depth.
-        Estimate these known large tensors before embedding or attention work.
+        The 256 MiB activation estimate covers retained hidden/logit/CE tensors
+        and FP32 attention states. Expert SwiGLU intermediates are checkpointed
+        and recomputed during backward; the working-set check additionally
+        budgets one leaf-weight copy per potentially active expert and the
+        checkpoint inputs. Expert FP8 storage and optimizer state are already
+        resident when this method runs.
         """
         batch_tokens = ids.shape[0] * ids.shape[1]
         dtype_bytes = 2 if self.cfg.dtype == "bf16" else 4
