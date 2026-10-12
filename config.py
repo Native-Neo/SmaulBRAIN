@@ -83,6 +83,7 @@ class SmaulBrainConfig:
     fp8_tile: int = 64  # block size for FP8 per-block scaling
     state_dtype: str = "bf16"  # optimizer state storage: bf16 | fp32
     ternary_qat: bool = False  # scaled ternary expert forward with STE; FP8 remains stored
+    ternary_backward: bool = False  # zero-skipping CPU FP32 dX kernel for ternary QAT
     threads: int = 2
     seed: int = 0
     rmsnorm_eps: float = 1e-6
@@ -134,6 +135,9 @@ class SmaulBrainConfig:
         assert self.dtype in ("bf16", "fp32"), "compute dtype bf16|fp32"
         assert self.state_dtype in ("bf16", "fp32"), "state dtype bf16|fp32"
         assert isinstance(self.ternary_qat, bool), "ternary_qat must be a bool"
+        assert isinstance(self.ternary_backward, bool), "ternary_backward must be a bool"
+        assert not self.ternary_backward or self.ternary_qat, \
+            "ternary_backward requires ternary_qat=True"
         assert self.expert_hidden >= 8, "expert hidden dim too small"
         assert self.attention_chunk_size >= 1, "attention chunk size must be positive"
         assert isinstance(self.capacity_factor, (int, float)) and not isinstance(self.capacity_factor, bool) and math.isfinite(self.capacity_factor) and self.capacity_factor > 0, "capacity factor must be positive"

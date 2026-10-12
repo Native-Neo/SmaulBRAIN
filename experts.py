@@ -19,6 +19,8 @@ from typing import Callable
 
 import torch
 import torch.nn.functional as F
+
+from native import call_ternary_backward_input
 from torch.utils.checkpoint import checkpoint
 
 from precision import FP8BlockTensor, dequantize_fp8_blockwise, quantize_fp8_blockwise
@@ -45,8 +47,12 @@ def init_expert_weights(
 def ternary_qat_weight(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.Tensor:
     """Per-output-row ternary QAT with a straight-through estimator.
 
-    Forward values are {-scale, 0, +scale}; gradients pass through as the
-    identity to the latent compute tensor. Expert storage remains blockwise FP8.
+    Forward values are {-scale, 0, +scale}. In a following linear operation,
+    input gradients therefore use these ternary-valued weights, while the
+    straight-through estimator gives the latent weights dense weight gradients
+    for the optimizer. This changes the backward operands, not the GEMM kernel:
+    PyTorch still executes dense matrix multiplication. Expert storage remains
+    blockwise FP8.
     """
     if w.ndim < 2:
         raise ValueError(f"ternary QAT expects a matrix or higher-rank tensor, got {tuple(w.shape)}")
@@ -64,24 +70,61 @@ def ternary_qat_weight(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.T
     return quantized.detach() + (w - w.detach())
 
 
+class _TernaryLinear(torch.autograd.Function):
+    """Linear autograd with an optional zero-skipping ternary dX kernel."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, enabled: bool):
+        ctx.enabled = bool(enabled)
+        ctx.save_for_backward(x, weight)
+        return F.linear(x, weight)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        x, weight = ctx.saved_tensors
+        grad_out_2d = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
+        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        grad_input = None
+        if ctx.needs_input_grad[0]:
+            if ctx.enabled:
+                grad_input = call_ternary_backward_input(
+                    grad_out_2d, weight.contiguous()
+                )
+            if grad_input is None:
+                grad_input = grad_out_2d @ weight
+            grad_input = grad_input.reshape_as(x)
+        grad_weight = None
+        if ctx.needs_input_grad[1]:
+            grad_weight = grad_out_2d.transpose(0, 1) @ x_2d
+        return grad_input, grad_weight, None
+
+
+def _linear(x: torch.Tensor, weight: torch.Tensor, ternary_backward: bool):
+    if ternary_backward:
+        return _TernaryLinear.apply(x, weight, True)
+    return F.linear(x, weight)
+
+
 def _swiglu_tensors(
-    x: torch.Tensor, w_gate: torch.Tensor, w_up: torch.Tensor, w_down: torch.Tensor
+    x: torch.Tensor, w_gate: torch.Tensor, w_up: torch.Tensor,
+    w_down: torch.Tensor, ternary_backward: bool = False,
 ) -> torch.Tensor:
     """Tensor-only SwiGLU core, suitable for activation checkpointing."""
-    gate = F.linear(x, w_gate)
-    up = F.linear(x, w_up)
-    return F.linear(F.silu(gate) * up, w_down)
+    gate = _linear(x, w_gate, ternary_backward)
+    up = _linear(x, w_up, ternary_backward)
+    return _linear(F.silu(gate) * up, w_down, ternary_backward)
 
 
-def swiglu_forward(x: torch.Tensor, w: dict[str, torch.Tensor]) -> torch.Tensor:
-    """SwiGLU with recomputation during backward to avoid retaining gate/up.
+def swiglu_forward(
+    x: torch.Tensor, w: dict[str, torch.Tensor], ternary_backward: bool = False
+) -> torch.Tensor:
+    """SwiGLU with optional ternary-aware dX and activation checkpointing.
 
-    Checkpointing stores only inputs for this expert FFN and recomputes its
-    large intermediate tensors during backward. Inference stays on the direct
-    path; use_reentrant=False supports gradients for both inputs and weights.
+    The native kernel is currently CPU float32-only. Unsupported inputs fall
+    back to PyTorch GEMM. The STE weight gradient and optimizer remain dense.
     """
-    args = (x, w["w_gate"], w["w_up"], w["w_down"])
-    if torch.is_grad_enabled() and any(t.requires_grad for t in args):
+    args = (x, w["w_gate"], w["w_up"], w["w_down"], ternary_backward)
+    if torch.is_grad_enabled() and any(t.requires_grad for t in args[:4]):
         return checkpoint(_swiglu_tensors, *args, use_reentrant=False)
     return _swiglu_tensors(*args)
 
@@ -215,6 +258,7 @@ class ExpertPool:
         dropped: torch.Tensor,
         provider: WeightProvider,
         step: int = 0,
+        ternary_backward: bool = False,
     ) -> torch.Tensor:
         """Weighted expert combination. x: [N, D] -> [N, D].
 
@@ -256,7 +300,7 @@ class ExpertPool:
             dtype = w["w_gate"].dtype
             rows = mask_slot.any(dim=-1)  # tokens touching this expert
             xs = x[rows].to(dtype)  # [M, D]
-            y = swiglu_forward(xs, w).to(out.dtype)  # [M, D]
+            y = swiglu_forward(xs, w, ternary_backward=ternary_backward).to(out.dtype)  # [M, D]
             weight = mask_slot[rows].float() * top_weights[rows]  # [M, K]
             out[rows] += weight.sum(dim=-1, keepdim=True).to(out.dtype) * y
             rec = self.experts[eid]

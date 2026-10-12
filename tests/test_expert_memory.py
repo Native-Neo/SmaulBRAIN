@@ -105,3 +105,57 @@ def test_checkpointed_swiglu_matches_direct_forward_and_gradients():
         assert torch.allclose(
             w_checkpoint[name].grad, w_direct[name].grad, atol=1e-6, rtol=1e-6
         )
+
+def test_ternary_qat_backward_uses_ternary_weights_and_full_precision_ste_gradients():
+    from experts import ternary_qat_weight
+
+    torch.manual_seed(19)
+    x = torch.randn(3, 4, dtype=torch.float32, requires_grad=True)
+    w = torch.tensor(
+        [[-1.0, -0.2, 0.4, 1.2],
+         [0.1, -0.8, 0.7, 0.3],
+         [0.9, -0.4, -0.1, 0.6]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    q = ternary_qat_weight(w, threshold_ratio=0.5)
+    grad_output = torch.randn(3, 3, dtype=torch.float32)
+
+    output = torch.nn.functional.linear(x, q)
+    output.backward(grad_output)
+
+    # Input gradients use the actual ternary forward weights, not latent w.
+    expected_dx = grad_output @ q.detach()
+    # STE preserves the dense weight-gradient estimate for the optimizer.
+    expected_dw = grad_output.T @ x.detach()
+    assert torch.allclose(x.grad, expected_dx, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(w.grad, expected_dw, atol=1e-6, rtol=1e-6)
+    assert not torch.equal(q.detach(), w.detach())
+
+def test_ternary_linear_backward_matches_dense_autograd():
+    from experts import _TernaryLinear
+
+    torch.manual_seed(23)
+    x0 = torch.randn(5, 4, dtype=torch.float32)
+    weight0 = torch.tensor(
+        [[1.0, 0.0, -0.5, 0.0],
+         [0.0, 0.25, 0.0, -1.0],
+         [-0.75, 0.0, 0.0, 0.5]],
+        dtype=torch.float32,
+    )
+    upstream = torch.randn(5, 3, dtype=torch.float32)
+
+    x_native = x0.clone().requires_grad_(True)
+    w_native = weight0.clone().requires_grad_(True)
+    y_native = _TernaryLinear.apply(x_native, w_native, True)
+    (y_native * upstream).sum().backward()
+
+    x_dense = x0.clone().requires_grad_(True)
+    w_dense = weight0.clone().requires_grad_(True)
+    y_dense = torch.nn.functional.linear(x_dense, w_dense)
+    (y_dense * upstream).sum().backward()
+
+    assert torch.allclose(y_native, y_dense, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(x_native.grad, x_dense.grad, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(w_native.grad, w_dense.grad, atol=1e-6, rtol=1e-6)
+
