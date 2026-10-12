@@ -104,6 +104,10 @@ def test_inference_identical_after_reload(tmp_path):
     a = m.forward_infer(ids)["logits"]
     m2 = SmaulBrainModel(m.cfg)
     load_model(d, m2, SmaulOpt(SmaulOptHParams()))
+    assert type(m2.router.proj) is type(m.router.proj), (
+        "checkpoint load changed router projection execution class: "
+        f"{type(m.router.proj).__name__} -> {type(m2.router.proj).__name__}"
+    )
     # Compare non-tensor execution policy too: a checkpoint can restore every
     # tensor while silently changing a config switch that changes forward math.
     assert m.cfg.to_dict() == m2.cfg.to_dict(), (
