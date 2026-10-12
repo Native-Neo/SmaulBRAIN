@@ -87,9 +87,10 @@ class SmaulBrainModel(nn.Module):
                 trunk_mods.append(self.byte_conv.conv)
             for mod in trunk_mods:
                 mod.to(torch.bfloat16)
-        # Active expert leaves (training): eid -> list of leaf weight dicts
-        # (one entry per depth-step activation; grads are summed at opt time).
-        self._leaves: dict[str, list[dict[str, torch.Tensor]]] = {}
+        # One external leaf-weight dictionary per expert per train step.
+        # Recurrent depth reuses these leaves, so autograd accumulates all
+        # uses into one .grad tensor instead of retaining full weight copies.
+        self._leaves: dict[str, dict[str, torch.Tensor]] = {}
         self._ternary_eval_cache: dict[str, tuple[tuple[int, int], dict[str, torch.Tensor]]] = {}
         self._last_step: int = 0
 
@@ -100,9 +101,13 @@ class SmaulBrainModel(nn.Module):
             if self.cfg.ternary_qat:
                 return {k: ternary_qat_weight(v) for k, v in base.items()}
             return base
-        leaves = {k: v.detach().to(base[k].dtype).requires_grad_(True)
-                  for k, v in base.items()}
-        self._leaves.setdefault(expert_id, []).append(leaves)
+        leaves = self._leaves.get(expert_id)
+        if leaves is None:
+            leaves = {
+                k: v.detach().requires_grad_(True)
+                for k, v in base.items()
+            }
+            self._leaves[expert_id] = leaves
         if self.cfg.ternary_qat:
             return {k: ternary_qat_weight(v) for k, v in leaves.items()}
         return leaves
@@ -159,14 +164,13 @@ class SmaulBrainModel(nn.Module):
 
     def clear_expert_grads(self, set_to_none: bool = True) -> None:
         """Clear external gradients on active expert leaves and release references."""
-        for copies in self._leaves.values():
-            for leaves in copies:
-                for leaf in leaves.values():
-                    if leaf.grad is not None:
-                        if set_to_none:
-                            leaf.grad = None
-                        else:
-                            leaf.grad.zero_()
+        for leaves in self._leaves.values():
+            for leaf in leaves.values():
+                if leaf.grad is not None:
+                    if set_to_none:
+                        leaf.grad = None
+                    else:
+                        leaf.grad.zero_()
         self._leaves.clear()
 
     def take_expert_grads(self) -> dict[str, dict[str, torch.Tensor]]:
@@ -176,17 +180,18 @@ class SmaulBrainModel(nn.Module):
         """
         agg: dict[str, dict[str, torch.Tensor]] = {}
         try:
-            for eid, copies in self._leaves.items():
-                summed: dict[str, torch.Tensor] = {}
-                for leaves in copies:
-                    for n, leaf in leaves.items():
-                        if leaf.grad is None:
-                            continue
-                        g = leaf.grad.detach().float()
-                        summed[n] = g if n not in summed else summed[n] + g
-                        leaf.grad = None  # clear stale external gradients
-                if summed:
-                    agg[eid] = summed
+            for eid, leaves in self._leaves.items():
+                grads: dict[str, torch.Tensor] = {}
+                for name, leaf in leaves.items():
+                    if leaf.grad is None:
+                        continue
+                    # Keep the accumulated gradient alive after dropping the
+                    # leaf reference; float() preserves the optimizer's FP32
+                    # math contract while releasing the original .grad slot.
+                    grads[name] = leaf.grad.detach().float()
+                    leaf.grad = None
+                if grads:
+                    agg[eid] = grads
             return agg
         finally:
             self.clear_expert_grads()
