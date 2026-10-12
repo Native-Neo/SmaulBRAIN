@@ -144,3 +144,15 @@ def test_jsonl_large_line_is_read_with_a_bounded_budget(tmp_path: Path) -> None:
     (root / "rows.jsonl").write_bytes(b'{"text":"' + b"x" * 100_000 + b'"}\n')
     with pytest.raises(ValueError, match="no usable text"):
         load_training_sequences(root, context_length=4, max_bytes=64)
+
+
+
+def test_csv_budget_does_not_emit_a_partial_structured_row(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    root.mkdir()
+    (root / "rows.csv").write_text(
+        "text\\nthis row is much larger than the budget\\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="no usable text"):
+        load_training_sequences(root, context_length=4, max_bytes=12)
