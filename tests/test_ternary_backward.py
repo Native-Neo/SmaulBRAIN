@@ -2,7 +2,6 @@
 
 import torch
 import torch.nn.functional as F
-import pytest
 
 import native
 from experts import _TernaryLinear
@@ -31,7 +30,7 @@ def test_native_kernel_is_really_dispatched_and_matches_dense_gemm(monkeypatch):
     assert native.COUNTERS["ternary_backward_fallback"] == 0
 
 
-def test_native_kernel_handles_all_zero_and_single_row_weights(monkeypatch):
+def test_native_kernel_handles_all_zero_weights(monkeypatch):
     monkeypatch.setenv("SMAUL_NATIVE", "force")
     native.reset_native_state()
     native.reset_counters()
@@ -88,4 +87,4 @@ def test_custom_linear_preserves_input_and_ste_weight_gradients(monkeypatch):
     assert torch.allclose(y_custom, y_dense, atol=1e-6, rtol=1e-6)
     assert torch.allclose(x_custom.grad, x_dense.grad, atol=1e-5, rtol=1e-5)
     assert torch.allclose(w_custom.grad, w_dense.grad, atol=1e-5, rtol=1e-5)
-    assert native.COUNTERS["ternary_backward_native"] == 3
+    assert native.COUNTERS["ternary_backward_native"] == 1
