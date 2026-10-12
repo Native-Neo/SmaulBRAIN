@@ -173,7 +173,9 @@ def load_training_sequences(
         files = [path]
 
     raw = bytearray()
-    for file_path in files:
+    for file_index, file_path in enumerate(files):
+        if file_index and raw and raw[-1] not in b"\\r\\n\\t " and len(raw) < max_bytes:
+            raw.extend(b"\\n")
         remaining = max_bytes - len(raw)
         if remaining <= 0:
             break
