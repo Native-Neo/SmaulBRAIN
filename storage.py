@@ -1423,7 +1423,22 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     new_admit = torch.tensor(manifest.get("router_admit", [0.0] * len(eids)),
                              dtype=torch.float64, device=dev)
 
-    model.load_state_dict(trunk, strict=False)
+    incompatible = model.load_state_dict(trunk, strict=False)
+    # Router tensors and counters are restored from their dedicated files and
+    # manifest below. Every other model tensor must have been loaded; silently
+    # ignoring a renamed/missing trunk key can produce a valid-looking but
+    # behaviorally different checkpoint.
+    allowed_missing = {
+        key for key in model_sd
+        if key.startswith("router.") or "usage_" in key or "admit_" in key
+    }
+    unexpected_missing = set(incompatible.missing_keys) - allowed_missing
+    if unexpected_missing or incompatible.unexpected_keys:
+        raise ValueError(
+            "checkpoint validation failed: trunk state did not load cleanly; "
+            f"missing={sorted(unexpected_missing)}, "
+            f"unexpected={sorted(incompatible.unexpected_keys)}"
+        )
     model.pool.experts = new_experts
     model.pool.order = new_order
     model.pool._next_id = int(next_id)
@@ -1475,6 +1490,13 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     model.pager.ram.clear()
     model.pager.vram.clear()
     model.pager.ram_records.clear()
+    # Tags and runtime-only inference/training state belong to the old model
+    # generation too. Clear them together with their payloads so loading into
+    # a previously-used model cannot retain stale cache or stream state.
+    for attr in ("_ram_tag", "_vram_tag", "_staged_tag"):
+        buf = getattr(model.pager, attr, None)
+        if buf is not None:
+            buf.clear()
     for attr in ("_forgotten", "_versions", "_prefetched"):
         buf = getattr(model.pager, attr, None)
         if buf is not None:
@@ -1485,5 +1507,13 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
             buf.clear()
     if model.cfg.paging_method == "R2VR":
         model.pager.warm_ram()
+    # These are deliberately runtime-only and never checkpointed. Restoring
+    # a checkpoint starts a fresh stream and fresh autograd leaf generation.
+    if hasattr(model, "_conv_hist"):
+        model._conv_hist = None
+    for attr in ("_leaves", "_ternary_eval_cache"):
+        cache = getattr(model, attr, None)
+        if cache is not None:
+            cache.clear()
     model._resume_step = int(step)
     return manifest
