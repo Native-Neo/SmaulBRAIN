@@ -8,8 +8,10 @@ from experts import _TernaryLinear
 
 
 def _ternary_matrix(rows: int, cols: int) -> torch.Tensor:
-    values = torch.tensor([-0.75, 0.0, 0.5, 0.0, 0.0, 1.25], dtype=torch.float32)
-    return values.repeat((rows * cols + values.numel() - 1) // values.numel())[: rows * cols].reshape(rows, cols)
+    trits = torch.arange(rows * cols, dtype=torch.int64).reshape(rows, cols).remainder(3)
+    trits = trits.to(torch.float32) - 1.0
+    row_scales = torch.linspace(0.25, 1.25, rows, dtype=torch.float32).unsqueeze(1)
+    return trits * row_scales
 
 
 def test_native_kernel_is_really_dispatched_and_matches_dense_gemm(monkeypatch):
