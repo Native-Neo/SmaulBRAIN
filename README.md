@@ -169,18 +169,24 @@ The planned setup includes:
 The exact formats can change depending on the hardware and the part of the model.
 
 
-### Experimental ternary backward kernel
+### Native ternary-aware backward path
 
 ```bash
 python cli.py --dtype fp32 --ternary-qat --ternary-backward train --steps 1 --batch 1
 ```
 
-The opt-in kernel skips zero entries while calculating expert linear layers'
-input gradients. Weight gradients and optimizer math remain dense and full
-precision. It currently dispatches only for contiguous CPU FP32 tensors;
-BF16, accelerator, and unsupported inputs use PyTorch's dense fallback.
-The scalar C++ kernel has not yet demonstrated a speedup over optimized BLAS,
-so this flag is experimental and should be benchmarked on the target machine.
+This opt-in native path skips exact-zero weight entries when computing expert
+linear-layer input gradients. The straight-through estimator still computes
+dense, full-precision weight gradients; the optimizer is unchanged. Native
+dispatch is limited to non-empty, contiguous CPU FP32 matrices. BF16,
+accelerator, non-contiguous, and unsupported inputs use PyTorch's dense
+fallback. The native implementation is covered by a dispatch-and-gradient
+parity test and is built with baseline x86-64 flags.
+
+This path is not enabled by default, and no general speedup is promised:
+zero-skipping scalar loops can lose to optimized BLAS depending on matrix size
+and sparsity. Benchmark on the target CPU before enabling it for production
+training workloads.
 
 ## Architecture
 

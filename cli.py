@@ -177,10 +177,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Disable ternary expert QAT (default: off).")
     p.add_argument("--ternary-backward", action="store_true", default=None,
                    dest="ternary_backward",
-                   help="Experimental zero-skipping CPU FP32 dX kernel; requires --ternary-qat.")
+                   help="Use the native zero-skipping CPU FP32 input-gradient kernel; requires --ternary-qat.")
     p.add_argument("--no-ternary-backward", action="store_false", default=None,
                    dest="ternary_backward",
-                   help="Disable the experimental ternary backward kernel.")
+                   help="Disable the native ternary-aware input-gradient kernel.")
     p.add_argument("--context-length", type=int, default=None, help="Training context (default: tiny=128, full=1024). Checkpoint wins on resume.")
     p.add_argument("--attention-chunk-size", type=int, default=None, dest="attention_chunk_size",
                    help="Causal linear-attention training chunk size (default: 256). "
