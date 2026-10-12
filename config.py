@@ -83,7 +83,7 @@ class SmaulBrainConfig:
     fp8_tile: int = 64  # block size for FP8 per-block scaling
     state_dtype: str = "bf16"  # optimizer state storage: bf16 | fp32
     ternary_qat: bool = False  # scaled ternary expert forward with STE; FP8 remains stored
-    ternary_backward: bool = False  # zero-skipping CPU FP32 dX kernel for ternary QAT
+    ternary_backward: bool = False  # opt-in zero-skipping CPU FP32 dX kernel for ternary QAT
     threads: int = 2
     seed: int = 0
     rmsnorm_eps: float = 1e-6
