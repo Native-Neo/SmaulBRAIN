@@ -129,7 +129,7 @@ def test_jsonl_budget_never_emits_a_partial_oversized_record(tmp_path: Path) -> 
     root = tmp_path / "dataset"
     root.mkdir()
     (root / "rows.jsonl").write_text(
-        json.dumps({"text": "this record is much larger than the budget"}) + "\\n",
+        json.dumps({"text": "this record is much larger than the budget"}) + "\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="no usable text"):
@@ -141,6 +141,6 @@ def test_jsonl_large_line_is_read_with_a_bounded_budget(tmp_path: Path) -> None:
     root.mkdir()
     # Directory mode uses the configured byte budget rather than file size;
     # this line must be rejected without loading/emitting a partial JSON row.
-    (root / "rows.jsonl").write_bytes(b'{"text":"' + b"x" * 100_000 + b'"}\\n')
+    (root / "rows.jsonl").write_bytes(b'{"text":"' + b"x" * 100_000 + b'"}\n')
     with pytest.raises(ValueError, match="no usable text"):
         load_training_sequences(root, context_length=4, max_bytes=64)
