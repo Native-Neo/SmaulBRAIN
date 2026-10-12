@@ -87,6 +87,7 @@ ARG_TO_CONFIG = {
     "dtype": "dtype",
     "fp8_tile": "fp8_tile",
     "state_dtype": "state_dtype",
+    "ternary_qat": "ternary_qat",
     "threads": "threads",
     "seed": "seed",
     "rmsnorm_eps": "rmsnorm_eps",
@@ -169,6 +170,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--state-dtype", type=str, default=None, dest="state_dtype",
                    choices=["bf16", "fp32"],
                    help="Optimizer state storage dtype (default: bf16). Checkpoint wins on resume.")
+    p.add_argument("--ternary-qat", action="store_true", default=None, dest="ternary_qat",
+                    help="Use per-row scaled ternary expert weights in train and inference forward passes.")
+    p.add_argument("--no-ternary-qat", action="store_false", default=None, dest="ternary_qat",
+                    help="Disable ternary expert QAT (default: off).")
     p.add_argument("--context-length", type=int, default=None, help="Training context (default: tiny=128, full=1024). Checkpoint wins on resume.")
     p.add_argument("--attention-chunk-size", type=int, default=None, dest="attention_chunk_size",
                    help="Causal linear-attention training chunk size (default: 256). "
@@ -303,6 +308,7 @@ def config_from_args(args: argparse.Namespace) -> SmaulBrainConfig:
         dtype=pick_cfg(getattr(args, "dtype", None), "dtype"),
         fp8_tile=pick_cfg(getattr(args, "fp8_tile", None), "fp8_tile"),
         state_dtype=pick_cfg(getattr(args, "state_dtype", None), "state_dtype"),
+        ternary_qat=pick_cfg(getattr(args, "ternary_qat", None), "ternary_qat"),
         threads=pick_cfg(getattr(args, "threads", None), "threads"),
         seed=pick_cfg(getattr(args, "seed", None), "seed"),
         rmsnorm_eps=pick_cfg(getattr(args, "rmsnorm_eps", None), "rmsnorm_eps"),
