@@ -568,13 +568,13 @@ class _HybridFP8Matmul(torch.autograd.Function):
 
 
 class HybridFP8Linear(nn.Module):
-    """Drop-in linear layer: E4M3 forward, E5M2 backward, FP32 masters.
+    """Drop-in linear layer: stateless E4M3 forward, E5M2 backward, FP32 masters.
 
     Args:
         in_features, out_features, bias: as nn.Linear.
         out_dtype: compute/output dtype for activations (bfloat16 default).
-        history_len: delayed-scaler amax window per tensor.
-        e5m2_for_grads: False forces E4M3 also in backward (ablation).
+        history_len: accepted for API compatibility; scaling is stateless.
+        e5m2_for_grads: False bypasses E5M2 gradient quantization (ablation).
     """
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True,
