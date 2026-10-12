@@ -1450,6 +1450,14 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     model.router.register_buffer("usage_counts", new_usage)
     model.router.register_buffer("admit_counts", new_admit)
     model.cfg = saved_cfg
+    # Config is checkpoint-authoritative, so synchronize runtime attributes
+    # that are not represented by tensors. Merely replacing model.cfg leaves
+    # constructor-time module settings active and silently changes inference.
+    model.router.capacity_factor = saved_cfg.capacity_factor
+    from rmsnorm import RMSNorm
+    for module in model.modules():
+        if isinstance(module, RMSNorm):
+            module.eps = saved_cfg.rmsnorm_eps
     # Presence follows the checkpoint: byte-conv became default-on after
     # checkpoints without it, so a conv-built model loading a pre-conv
     # checkpoint must drop the module (strict=False silently skipped the
