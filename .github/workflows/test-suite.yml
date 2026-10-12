@@ -32,6 +32,11 @@ jobs:
           python -m pip install -r requirements.txt
       - name: Compile Python sources
         run: python -m compileall -q .
+      - name: Benchmark CLI smoke test
+        run: >-
+          python benchmarks/bench.py --steps 1 --d-model 32 --experts 2
+          --top-k 1 --expert-hidden 32 --context-length 16 --batch-size 1
+          --max-params 1000000
       - name: Run full regression suite
         env:
           PYTHONFAULTHANDLER: "1"
