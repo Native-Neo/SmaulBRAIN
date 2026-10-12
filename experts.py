@@ -41,6 +41,28 @@ def init_expert_weights(
             "w_down": rand(d_model, expert_hidden)}
 
 
+def ternary_qat_weight(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.Tensor:
+    """Per-output-row ternary QAT with a straight-through estimator.
+
+    Forward values are {-scale, 0, +scale}; gradients pass through as the
+    identity to the latent compute tensor. Expert storage remains blockwise FP8.
+    """
+    if w.ndim < 2:
+        raise ValueError(f"ternary QAT expects a matrix or higher-rank tensor, got {tuple(w.shape)}")
+    if not 0.0 <= threshold_ratio < 1.0:
+        raise ValueError(f"threshold_ratio must be in [0, 1), got {threshold_ratio}")
+    w32 = w.float()
+    mean_abs = w32.abs().mean(dim=-1, keepdim=True)
+    threshold = mean_abs * threshold_ratio
+    trits = torch.where(w32 > threshold, 1.0,
+                        torch.where(w32 < -threshold, -1.0, 0.0))
+    nonzero = trits != 0
+    count = nonzero.sum(dim=-1, keepdim=True).clamp_min(1)
+    scale = (w32.abs() * nonzero).sum(dim=-1, keepdim=True) / count
+    quantized = (trits * scale).to(dtype=w.dtype)
+    return w + (quantized - w).detach()
+
+
 def swiglu_forward(x: torch.Tensor, w: dict[str, torch.Tensor]) -> torch.Tensor:
     """SwiGLU: down(silu(gate(x)) * up(x)). x: [N, D] -> [N, D]."""
     return F.linear(F.silu(F.linear(x, w["w_gate"])) * F.linear(x, w["w_up"]), w["w_down"])
