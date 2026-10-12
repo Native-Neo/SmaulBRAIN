@@ -9,7 +9,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: full-test-suite-${{ github.workflow }}-${{ github.ref }}
+  # Push and pull_request events for the same PR branch share one suite.
+  group: full-test-suite-${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
