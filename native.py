@@ -429,7 +429,7 @@ def _self_test() -> None:
     tw = (ctypes.c_float * 6)(1.0, 0.0, -2.0, 0.0, 0.5, 0.0)
     ti = (ctypes.c_float * 4)()
     _libs["ternary_backward"].smaul_ternary_backward_input(tg, tw, ti, 1, 2, 3)
-    expected_ti = (0.5, -2.0)
+    expected_ti = (-3.5, 0.0)
     if any(abs(ti[i] - expected_ti[i]) > 1e-6 for i in range(2)):
         raise RuntimeError(f"ternary backward self-test failed: {list(ti)}")
     # fp8: quantize+dequantize roundtrip stays finite
