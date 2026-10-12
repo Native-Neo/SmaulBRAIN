@@ -102,3 +102,30 @@ def test_ternary_qat_backward_uses_ternary_weights_and_full_precision_ste_gradie
     assert torch.allclose(w.grad, expected_dw, atol=1e-6, rtol=1e-6)
     assert not torch.equal(q.detach(), w.detach())
 
+def test_ternary_linear_backward_matches_dense_autograd():
+    from experts import _TernaryLinear
+
+    torch.manual_seed(23)
+    x0 = torch.randn(5, 4, dtype=torch.float32)
+    weight0 = torch.tensor(
+        [[1.0, 0.0, -0.5, 0.0],
+         [0.0, 0.25, 0.0, -1.0],
+         [-0.75, 0.0, 0.0, 0.5]],
+        dtype=torch.float32,
+    )
+    upstream = torch.randn(5, 3, dtype=torch.float32)
+
+    x_native = x0.clone().requires_grad_(True)
+    w_native = weight0.clone().requires_grad_(True)
+    y_native = _TernaryLinear.apply(x_native, w_native, True)
+    (y_native * upstream).sum().backward()
+
+    x_dense = x0.clone().requires_grad_(True)
+    w_dense = weight0.clone().requires_grad_(True)
+    y_dense = torch.nn.functional.linear(x_dense, w_dense)
+    (y_dense * upstream).sum().backward()
+
+    assert torch.allclose(y_native, y_dense, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(x_native.grad, x_dense.grad, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(w_native.grad, w_dense.grad, atol=1e-6, rtol=1e-6)
+
