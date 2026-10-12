@@ -543,6 +543,12 @@ def main(argv: list[str] | None = None) -> int:
     torch.manual_seed(cfg.seed)
     torch.set_num_threads(cfg.threads)
 
+    # Validate and load training input before allocating the model. In
+    # particular, a missing/invalid --data path must not allocate a full
+    # checkpoint-sized network only to exit with an input error afterward.
+    seqs = None
+    if args.cmd == "train":
+
     model = SmaulBrainModel(cfg)
     opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr, wd=cfg.weight_decay,
                                    beta_m=cfg.beta_m, beta_v=cfg.beta_v,
