@@ -7,7 +7,7 @@ on:
       - "tests/test_data_input.py"
       - ".github/workflows/test-data-input.yml"
   push:
-    branches: [main]
+    branches: ["**"]
     paths:
       - "data_input.py"
       - "tests/test_data_input.py"
