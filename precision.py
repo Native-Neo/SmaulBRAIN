@@ -449,7 +449,13 @@ def _try_scaled_mm(a_q: torch.Tensor, b_q: torch.Tensor, out_dtype: torch.dtype)
 
 
 class _HybridFP8Matmul(torch.autograd.Function):
-    """Linear forward in E4M3, gradients in E5M2 (see module docstring)."""
+    """Causal, stateless FP8 operands with E5M2 row-scaled gradients.
+
+    Activation scales are per token (the last dimension is features), and
+    weight scales are derived from the current weight tensor. No scale depends
+    on neighboring tokens or prior calls, so padding, chunking, checkpoint
+    reload, and streaming cannot change an earlier token's quantization.
+    """
 
     @staticmethod
     def forward(ctx, x, w, bias, in_scaler, wt_scaler, grad_scaler,
@@ -457,66 +463,95 @@ class _HybridFP8Matmul(torch.autograd.Function):
         x32, w32 = x.float(), w.float()
         ctx.out_dtype = out_dtype
         ctx.e5m2_for_grads = bool(e5m2_for_grads)
-        ctx.in_scaler, ctx.wt_scaler, ctx.grad_scaler = in_scaler, wt_scaler, grad_scaler
         ctx.has_bias = bias is not None
         ctx.x_dtype, ctx.w_dtype = x.dtype, w.dtype
         if not (torch.isfinite(x32).all() and torch.isfinite(w32).all()
                 and (bias is None or torch.isfinite(bias.float()).all())):
-            # Poisoned inputs: bypass quantization entirely (loud-safe math).
+            # Poisoned inputs bypass quantization rather than creating FP8 NaNs.
             ctx.fallback = True
             ctx.save_for_backward(x32, w32)
             out = x32 @ w32.t()
             if bias is not None:
                 out = out + bias.float()
             return out.to(out_dtype)
+
         ctx.fallback = False
-        in_scale = in_scaler.update(_amax(x32))
-        wt_scale = wt_scaler.update(_amax(w32))
-        x_q = _quantize_to_fp8(x32, in_scale, E4M3_DTYPE, E4M3_MAX)
-        w_q = _quantize_to_fp8(w32, wt_scale, E4M3_DTYPE, E4M3_MAX)
-        ctx.save_for_backward(x_q, w_q,
-                              torch.tensor(in_scale), torch.tensor(wt_scale))
-        native = _try_scaled_mm(x_q, w_q, torch.float32)
-        if native is not None:
-            out = native / (in_scale * wt_scale)
-        else:
-            out = _dequantize_from_fp8(x_q, in_scale) @ _dequantize_from_fp8(w_q, wt_scale).t()
+        # Quantize each token independently. A single scale over [B,T,K]
+        # leaks information across tokens and breaks full-vs-streaming parity.
+        flat_x = x32.reshape(-1, x32.shape[-1])
+        x_amax = flat_x.abs().amax(dim=-1, keepdim=True)
+        x_scale = torch.where(
+            x_amax > 0,
+            (E4M3_MAX * 0.9) / x_amax.clamp_min(1e-12),
+            torch.ones_like(x_amax),
+        )
+        x_q = (flat_x * x_scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3_DTYPE)
+        x_scale_saved = x_scale.reshape(*x32.shape[:-1], 1)
+
+        # The weight scale is stateless and independent of the input batch.
+        w_amax = w32.detach().abs().amax()
+        w_scale = torch.where(
+            w_amax > 0,
+            (E4M3_MAX * 0.9) / w_amax.clamp_min(1e-12),
+            torch.ones_like(w_amax),
+        )
+        w_q = (w32 * w_scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3_DTYPE)
+        ctx.save_for_backward(x_q.reshape(x32.shape), w_q, x_scale_saved, w_scale)
+
+        # Per-token activation scales differ, so use dequantized FP32 operands
+        # for the portable matmul instead of a single-scale FP8 GEMM.
+        x_dq = x_q.float() / x_scale
+        w_dq = w_q.float() / w_scale
+        out = (x_dq @ w_dq.t()).reshape(*x32.shape[:-1], w32.shape[0])
         if bias is not None:
             out = out + bias.float()
         return out.to(out_dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
-        x_q, w_q, in_scale_t, wt_scale_t = ctx.saved_tensors
-        in_scale, wt_scale = float(in_scale_t), float(wt_scale_t)
+        saved = ctx.saved_tensors
         g32 = grad_output.float()
         grad_input = grad_weight = grad_bias = None
-        if ctx.fallback or not torch.isfinite(g32).all():
-            # Fallback path, or poisoned grads: standard FP32 grads, or zeros
-            # when the incoming gradient itself is non-finite (skip, loudly safe).
+        if ctx.fallback:
+            x32, w32 = saved
             if not torch.isfinite(g32).all():
-                dev = grad_output.device
-                x_shape = list(x_q.shape)
-                w_shape = list(w_q.shape)
-                grad_input = torch.zeros(x_shape, device=dev, dtype=ctx.x_dtype)
-                grad_weight = torch.zeros(w_shape, device=dev, dtype=ctx.w_dtype)
+                grad_input = torch.zeros_like(x32, dtype=ctx.x_dtype)
+                grad_weight = torch.zeros_like(w32, dtype=ctx.w_dtype)
                 if ctx.has_bias:
-                    grad_bias = torch.zeros(w_shape[0], device=dev, dtype=ctx.w_dtype)
+                    grad_bias = torch.zeros(w32.shape[0], device=g32.device,
+                                            dtype=ctx.w_dtype)
                 return grad_input, grad_weight, grad_bias, None, None, None, None, None
-            x32, w32 = x_q, w_q  # fallback saved plain tensors under these names
             grad_input = (g32 @ w32).to(ctx.x_dtype)
             grad_weight = g32.reshape(-1, g32.shape[-1]).t() @ x32.reshape(-1, x32.shape[-1])
             if ctx.has_bias:
                 grad_bias = g32.reshape(-1, g32.shape[-1]).sum(dim=0)
             return grad_input, grad_weight, grad_bias, None, None, None, None, None
-        g_scale = ctx.grad_scaler.update(_amax(g32))
+
+        x_q, w_q, x_scale, w_scale = saved
+        if not torch.isfinite(g32).all():
+            grad_input = torch.zeros_like(x_q, dtype=ctx.x_dtype)
+            grad_weight = torch.zeros_like(w_q, dtype=ctx.w_dtype)
+            if ctx.has_bias:
+                grad_bias = torch.zeros(w_q.shape[0], device=g32.device,
+                                        dtype=ctx.w_dtype)
+            return grad_input, grad_weight, grad_bias, None, None, None, None, None
+
+        x_dq = x_q.float() / x_scale
+        w_dq = w_q.float() / w_scale
+        flat_g = g32.reshape(-1, g32.shape[-1])
+        # Keep the E5M2 gradient operand format, but scale each token
+        # independently so extra padded rows cannot alter valid-token grads.
         if ctx.e5m2_for_grads:
-            g_q = _quantize_to_fp8(g32, g_scale, E5M2_DTYPE, E5M2_MAX)
-        else:  # pragma: no cover - opt-out path for ablation studies
-            g_q = _quantize_to_fp8(g32, g_scale, E4M3_DTYPE, E4M3_MAX)
-        g_dq = _dequantize_from_fp8(g_q, g_scale)
-        x_dq = _dequantize_from_fp8(x_q, in_scale)
-        w_dq = _dequantize_from_fp8(w_q, wt_scale)
+            g_amax = flat_g.abs().amax(dim=-1, keepdim=True)
+            g_scale = torch.where(
+                g_amax > 0,
+                (E5M2_MAX * 0.9) / g_amax.clamp_min(1e-12),
+                torch.ones_like(g_amax),
+            )
+            g_q = (flat_g * g_scale).clamp(-E5M2_MAX, E5M2_MAX).to(E5M2_DTYPE)
+            g_dq = (g_q.float() / g_scale).reshape(g32.shape)
+        else:  # pragma: no cover - ablation path
+            g_dq = g32
         g2d = g_dq.reshape(-1, g_dq.shape[-1])
         x2d = x_dq.reshape(-1, x_dq.shape[-1])
         grad_input = (g2d @ w_dq).reshape(x_dq.shape).to(ctx.x_dtype)
