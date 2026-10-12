@@ -151,7 +151,7 @@ def test_csv_budget_does_not_emit_a_partial_structured_row(tmp_path: Path) -> No
     root = tmp_path / "dataset"
     root.mkdir()
     (root / "rows.csv").write_text(
-        "text\\nthis row is much larger than the budget\\n",
+        "text\nthis row is much larger than the budget\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="no usable text"):
