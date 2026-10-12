@@ -122,6 +122,9 @@ def test_growth_save_load_keeps_topology_consistent(tmp_path):
     import growth as growth_mod
     m, opt, cfg = _model()
     try:
+        # Growing the pool must not silently downgrade the router's
+        # execution policy (HybridFP8Linear on the default model).
+        router_projection_type = type(m.router.proj)
         # Grow two clones; pool and router move in lockstep.
         new_ids = growth_mod.grow_topk_clones(
             m.pool, m.router, cfg.d_model, cfg.expert_hidden,
@@ -129,6 +132,7 @@ def test_growth_save_load_keeps_topology_consistent(tmp_path):
             fp8_tile=cfg.fp8_tile, max_experts=8,
             optim_state=opt.router_state)
         assert len(new_ids) == 2
+        assert type(m.router.proj) is router_projection_type
         assert len(m.pool) == m.router.num_experts == cfg.num_experts + 2
         m.cfg.num_experts = len(m.pool)
         assert m.router.usage_counts.shape[0] == len(m.pool)
@@ -147,6 +151,7 @@ def test_growth_save_load_keeps_topology_consistent(tmp_path):
         try:
             man = load_model(d, m2, opt2)
             assert len(man["expert_ids"]) == len(m.pool)
+            assert type(m2.router.proj) is type(m.router.proj)
             assert m2.router.num_experts == len(m2.pool) == len(m.pool)
             assert m2.param_counts()["expert_count"] == len(m.pool)
             assert torch.equal(m2.forward_infer(ids)["logits"], a)
