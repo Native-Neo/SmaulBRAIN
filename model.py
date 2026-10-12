@@ -144,8 +144,11 @@ class SmaulBrainModel(nn.Module):
                 self._profile_times["router_s"] += time.perf_counter() - started
                 started = time.perf_counter()
             prov = self._train_provider if train else self._eval_provider
-            y = self.pool.forward(x, plan.top_ids, plan.top_weights,
-                                  plan.dropped, prov, step=step)
+            y = self.pool.forward(
+                x, plan.top_ids, plan.top_weights, plan.dropped, prov,
+                step=step,
+                ternary_backward=(train and self.cfg.ternary_backward),
+            )
             if prof:
                 self._profile_times["expert_s"] += time.perf_counter() - started
                 started = time.perf_counter()
