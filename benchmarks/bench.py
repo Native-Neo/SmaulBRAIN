@@ -56,19 +56,31 @@ def main():
     ap.add_argument("--allow-large", action="store_true",
                     help="Explicitly bypass --max-params; this does not guarantee sufficient RAM")
     args = ap.parse_args()
-    if args.steps < 1 or args.batch_size < 1:
-        ap.error("--steps and --batch-size must be >= 1")
+    for name in ("steps", "batch_size", "d_model", "experts", "top_k",
+                 "expert_hidden", "context_length", "min_depth", "max_depth",
+                 "threads"):
+        if getattr(args, name) < 1:
+            ap.error(f"--{name.replace('_', '-')} must be >= 1")
     if args.max_params < 0:
         ap.error("--max-params must be >= 0")
+    if args.min_depth > args.max_depth:
+        ap.error("--min-depth must be <= --max-depth")
+    if args.top_k > args.experts:
+        ap.error("--top-k must be <= --experts")
     torch.manual_seed(0)
+    try:
+        cfg = SmaulBrainConfig(
+            d_model=args.d_model, n_heads=4 if args.d_model % 4 == 0 else 1,
+            num_experts=args.experts, top_k=args.top_k,
+            expert_hidden=args.expert_hidden, min_depth=args.min_depth,
+            max_depth=args.max_depth, context_length=args.context_length,
+            threads=args.threads, paging_method=args.mode,
+        )
+    except (AssertionError, ValueError, TypeError) as exc:
+        ap.error(f"invalid benchmark configuration: {exc}")
+    # Validate first so invalid thread counts/configurations produce a useful
+    # argparse error rather than a low-level PyTorch traceback.
     torch.set_num_threads(args.threads)
-    cfg = SmaulBrainConfig(
-        d_model=args.d_model, n_heads=4 if args.d_model % 4 == 0 else 1,
-        num_experts=args.experts, top_k=args.top_k,
-        expert_hidden=args.expert_hidden, min_depth=args.min_depth,
-        max_depth=args.max_depth, context_length=args.context_length,
-        threads=args.threads, paging_method=args.mode,
-    )
     estimate = cfg.total_params()
     if args.max_params and estimate > args.max_params and not args.allow_large:
         ap.error(
