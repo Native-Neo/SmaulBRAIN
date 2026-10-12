@@ -168,6 +168,20 @@ The planned setup includes:
 
 The exact formats can change depending on the hardware and the part of the model.
 
+
+### Experimental ternary backward kernel
+
+```bash
+python cli.py --dtype fp32 --ternary-qat --ternary-backward train --steps 1 --batch 1
+```
+
+The opt-in kernel skips zero entries while calculating expert linear layers'
+input gradients. Weight gradients and optimizer math remain dense and full
+precision. It currently dispatches only for contiguous CPU FP32 tensors;
+BF16, accelerator, and unsupported inputs use PyTorch's dense fallback.
+The scalar C++ kernel has not yet demonstrated a speedup over optimized BLAS,
+so this flag is experimental and should be benchmarked on the target machine.
+
 ## Architecture
 
 The general structure looks like this:

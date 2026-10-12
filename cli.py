@@ -88,6 +88,7 @@ ARG_TO_CONFIG = {
     "fp8_tile": "fp8_tile",
     "state_dtype": "state_dtype",
     "ternary_qat": "ternary_qat",
+    "ternary_backward": "ternary_backward",
     "threads": "threads",
     "seed": "seed",
     "rmsnorm_eps": "rmsnorm_eps",
@@ -174,6 +175,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Use per-row scaled ternary expert weights in train and inference forward passes.")
     p.add_argument("--no-ternary-qat", action="store_false", default=None, dest="ternary_qat",
                     help="Disable ternary expert QAT (default: off).")
+    p.add_argument("--ternary-backward", action="store_true", default=None,
+                   dest="ternary_backward",
+                   help="Experimental zero-skipping CPU FP32 dX kernel; requires --ternary-qat.")
+    p.add_argument("--no-ternary-backward", action="store_false", default=None,
+                   dest="ternary_backward",
+                   help="Disable the experimental ternary backward kernel.")
     p.add_argument("--context-length", type=int, default=None, help="Training context (default: tiny=128, full=1024). Checkpoint wins on resume.")
     p.add_argument("--attention-chunk-size", type=int, default=None, dest="attention_chunk_size",
                    help="Causal linear-attention training chunk size (default: 256). "
