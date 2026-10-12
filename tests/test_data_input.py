@@ -57,6 +57,25 @@ def test_directory_serializes_jsonl_records_as_text(tmp_path: Path) -> None:
     assert '"answer":"4"' in text
 
 
+def test_directory_serializes_parquet_rows_as_text(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    root = tmp_path / "dataset"
+    root.mkdir()
+    pq.write_table(
+        pa.table({"question": ["2+2"], "answer": ["4"]}),
+        root / "part-000.parquet",
+    )
+
+    seqs, kind = load_training_sequences(root, context_length=128)
+
+    assert kind == "directory"
+    text = _joined(seqs).decode("utf-8")
+    assert '"question":"2+2"' in text
+    assert '"answer":"4"' in text
+
+
 def test_directory_ignores_hidden_and_unsupported_files(tmp_path: Path) -> None:
     root = tmp_path / "dataset"
     root.mkdir()
