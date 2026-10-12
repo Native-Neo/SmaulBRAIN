@@ -172,10 +172,11 @@ def load_training_sequences(
         files = [path]
 
     raw = bytearray()
+    per_file_budget = max(1, max_bytes // len(files)) if is_directory else max_bytes
     for file_index, file_path in enumerate(files):
         if file_index and raw and raw[-1] not in b"\r\n\t " and len(raw) < max_bytes:
             raw.extend(b"\n")
-        remaining = max_bytes - len(raw)
+        remaining = min(max_bytes - len(raw), per_file_budget)
         if remaining <= 0:
             break
         for chunk in _iter_file_text(file_path, remaining):
@@ -186,10 +187,18 @@ def load_training_sequences(
             break
 
     stride = context_length + 1
-    seqs = [
-        list(raw[offset:offset + stride])
-        for offset in range(0, len(raw) - 1, stride)
-    ][:max_sequences]
+    total_sequences = len(range(0, len(raw) - 1, stride))
+    if is_directory and total_sequences > max_sequences:
+        if max_sequences == 1:
+            offsets = [0]
+        else:
+            offsets = [
+                (index * (total_sequences - 1)) // (max_sequences - 1) * stride
+                for index in range(max_sequences)
+            ]
+    else:
+        offsets = list(range(0, len(raw) - 1, stride))[:max_sequences]
+    seqs = [list(raw[offset:offset + stride]) for offset in offsets]
     if not seqs:
         raise ValueError(f"dataset contains no usable text: {path}")
     return seqs, ("directory" if is_directory else "file")
