@@ -110,6 +110,30 @@ def test_inference_identical_after_reload(tmp_path):
     m.pager.close(); m2.pager.close()
 
 
+def test_load_clears_runtime_only_state_from_previous_model_use(tmp_path):
+    d = str(tmp_path / "c")
+    source, _ = _trained(d)
+    target = SmaulBrainModel(source.cfg)
+    # Simulate a model that has already served a stream and populated caches.
+    target._conv_hist = torch.ones(1, 2, target.cfg.d_model)
+    target._leaves["stale"] = {"w": torch.ones(1, requires_grad=True)}
+    target._ternary_eval_cache["stale"] = ((0, 1), {})
+    target.pager._ram_tag["stale"] = (0, 1)
+    target.pager._vram_tag["stale"] = (0, 1)
+    target.pager._staged_tag["stale"] = (0, 1)
+
+    load_model(d, target, SmaulOpt(SmaulOptHParams()))
+
+    assert target._conv_hist is None
+    assert target._leaves == {}
+    assert target._ternary_eval_cache == {}
+    assert target.pager._ram_tag == {}
+    assert target.pager._vram_tag == {}
+    assert target.pager._staged_tag == {}
+    source.pager.close()
+    target.pager.close()
+
+
 def test_resume_step_and_saved_config_are_restored(tmp_path):
     d = str(tmp_path / "c")
     m, opt = _trained(d)
