@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 from config import SmaulBrainConfig
 from bytes import PAD_ID
-from experts import ExpertPool, make_expert
+from experts import ExpertPool, make_expert, ternary_qat_weight
 from linear_attention import LinearAttnState
 from paging import ExpertPager
 from recurrent import CausalByteConv, SharedRecurrentBlock
@@ -100,10 +100,15 @@ class SmaulBrainModel(nn.Module):
         leaves = {k: v.detach().to(base[k].dtype).requires_grad_(True)
                   for k, v in base.items()}
         self._leaves.setdefault(expert_id, []).append(leaves)
+        if self.cfg.ternary_qat:
+            return {k: ternary_qat_weight(v) for k, v in leaves.items()}
         return leaves
 
     def _eval_provider(self, expert_id: str) -> dict[str, torch.Tensor]:
-        return self.pager.provider(expert_id)
+        weights = self.pager.provider(expert_id)
+        if self.cfg.ternary_qat:
+            return {k: ternary_qat_weight(v) for k, v in weights.items()}
+        return weights
 
     def _moe_fn(self, train: bool, step: int, keep: torch.Tensor | None = None):
         def fn(x: torch.Tensor):
