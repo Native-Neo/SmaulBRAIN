@@ -258,6 +258,7 @@ class ExpertPool:
         dropped: torch.Tensor,
         provider: WeightProvider,
         step: int = 0,
+        ternary_backward: bool = False,
     ) -> torch.Tensor:
         """Weighted expert combination. x: [N, D] -> [N, D].
 
@@ -299,7 +300,7 @@ class ExpertPool:
             dtype = w["w_gate"].dtype
             rows = mask_slot.any(dim=-1)  # tokens touching this expert
             xs = x[rows].to(dtype)  # [M, D]
-            y = swiglu_forward(xs, w).to(out.dtype)  # [M, D]
+            y = swiglu_forward(xs, w, ternary_backward=ternary_backward).to(out.dtype)  # [M, D]
             weight = mask_slot[rows].float() * top_weights[rows]  # [M, K]
             out[rows] += weight.sum(dim=-1, keepdim=True).to(out.dtype) * y
             rec = self.experts[eid]
