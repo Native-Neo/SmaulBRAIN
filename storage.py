@@ -1431,6 +1431,9 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     allowed_missing = {
         key for key in model_sd
         if key.startswith("router.") or "usage_" in key or "admit_" in key
+        # Older checkpoints predate the optional causal byte convolution.
+        # It is removed below when the saved config says it was disabled.
+        or (key.startswith("byte_conv.") and not saved_cfg.use_byte_conv)
     }
     unexpected_missing = set(incompatible.missing_keys) - allowed_missing
     if unexpected_missing or incompatible.unexpected_keys:
