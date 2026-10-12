@@ -346,10 +346,14 @@ Complete flag reference (same as `python cli.py --help`,
   expert_00001,expert_00002`, `--new-since <step>`, `--data <file>`
   (an explicitly passed but missing/unreadable file aborts with exit 2;
   omitted trains the synthetic demo), `--save-every N` (checkpoint every N
-  steps, 0 = save once at end), `--grow-every N` (growth eval cadence,
+  steps, default 100; 0 = save once at end), `--grow-every N` (growth eval cadence,
   0 = off; omitted falls back to config `grow_every`), `--grow-experts N`
   (grow N experts once at run start, 0 = off), `--grow-loss-below <float>`
   (grow on a new dip below this loss; negative disables).
+  Ctrl+C is graceful: the first press lets the in-flight step finish,
+  checkpoints it, and exits (`interrupted: true` in the result); a second
+  press aborts immediately. Interrupted and end-of-run checkpoints are
+  resumable like any other (`--resume` / `cli.py ... train`).
 * `infer`: `--prompt`, `--max-new`, `--temperature` (0 = greedy),
   `--top-k` (0 = off), `--top-p` (1.0 = off), `--infer-context` (prompt
   window override; default: model `context_length`), `--infer-seed`

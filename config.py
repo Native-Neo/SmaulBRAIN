@@ -49,8 +49,8 @@ class SmaulBrainConfig:
     halt_prior: float = 0.1  # geometric prior p for ponder KL
     ponder_beta: float = 0.01  # weight of ponder KL regularizer
     num_experts: int = 8
-    top_k: int = 2
-    active_experts: int = 2  # alias enforced == top_k at runtime
+    top_k: int = 8
+    active_experts: int = 8  # alias enforced == top_k at runtime
     max_experts: int = 64
     min_experts: int = 64  # pool floor respected by the offline pruner
     expert_hidden: int = 128  # explicit knob; full preset uses 3328 for ~5.12M
@@ -91,7 +91,7 @@ class SmaulBrainConfig:
     # checkpoint's resume_config.json). prune_survival_steps/prune_min_usage
     # are the offline pruner's grace period and dying bar.
     grow_every: int = 20000  # optimizer steps between growth evaluations
-    prune_survival_steps: int = 500  # grace period before an expert may die
+    prune_survival_steps: int = 250  # grace period before an expert may die
     prune_min_usage: float = 1e-4  # usage share below which expert is dying
     max_new_experts: int = 8  # cap per growth event (clone-top-8 strategy)
     # use_byte_conv: causal depthwise conv over byte embeddings in the trunk.

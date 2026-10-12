@@ -78,7 +78,7 @@ def dying_score(
 def find_victims(
     pool,  # ExpertPool (duck-typed)
     step: int,
-    survival_steps: int = 500,
+    survival_steps: int = 250,
     min_experts: int = 1,
     usage_threshold: float = 1e-4,
     redundancy_cos: float = 0.995,

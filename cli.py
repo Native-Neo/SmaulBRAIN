@@ -30,7 +30,7 @@ from config import SmaulBrainConfig
 
 # Tiny defaults are the parser defaults (fast CPU smoke runs: 246K params).
 TINY_DEFAULTS = {
-    "d_model": 64, "n_heads": 4, "num_experts": 8, "top_k": 2,
+    "d_model": 64, "n_heads": 4, "num_experts": 8, "top_k": 8,
     "expert_hidden": 128, "max_experts": 64, "min_experts": 64,
     "max_depth": 3, "min_depth": 1, "context_length": 128,
     "halting_threshold": 0.9, "ram_cache": 8, "vram_cache": 4,
@@ -213,7 +213,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Birth-step cutoff for --mode new.")
     t.add_argument("--data", type=str, default=None,
                    help="Text file or dataset directory (recursive; default: synthetic demo).")
-    t.add_argument("--save-every", type=int, default=0, help="Checkpoint every N steps (0=off).")
+    t.add_argument("--save-every", type=int, default=100,
+                   help="Checkpoint every N steps (default: 100; 0=save once at end).")
     t.add_argument("--profile", action="store_true",
                    help="Report forward/router/expert/backward/optimizer/growth timings and Linux RAM usage.")
     t.add_argument("--grow-every", type=int, default=None, help="Growth eval every N steps (0=off; omitted: config grow_every=20000).")

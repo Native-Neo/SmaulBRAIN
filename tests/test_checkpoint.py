@@ -882,3 +882,45 @@ def test_expert_shape_and_tile_metadata_rejects_lossy_coercion(tmp_path):
         with pytest.raises(ValueError, match="bad tile"):
             _st._validate_expert_parts(tensors, meta, eid, m.cfg)
     m.pager.close()
+
+
+def test_sigint_finishes_step_then_checkpoints(tmp_path):
+    """First Ctrl+C lets the in-flight step finish, then saves and returns."""
+    import signal
+    d = str(tmp_path / "sigint")
+    m, opt, cfg = _resume_model()
+    seqs = _resume_seqs()
+    before = signal.getsignal(signal.SIGINT)
+    fired = {"n": 0}
+
+    def log_fn(s):
+        # Fire once, on the progress line of the first completed step.
+        if s.startswith("[train]") and fired["n"] == 0:
+            fired["n"] = 1
+            signal.raise_signal(signal.SIGINT)
+
+    res = run_training(m, opt, cfg, seqs, steps=4, batch_size=2,
+                       ckpt_dir=d, save_every=0, grow_loss_below=-1.0,
+                       log_fn=log_fn)
+    assert fired["n"] == 1 and res["interrupted"] is True
+    assert res["steps_completed"] == 1  # stopped right after the in-flight step
+    # That step was written to disk and is the resume point.
+    m2, opt2, _ = _resume_model()
+    man = load_model(d, m2, opt2)
+    assert man["step"] == 0 and m2._resume_step == 0
+    # The handler is restored afterwards (no leak into the test runner).
+    assert signal.getsignal(signal.SIGINT) is before
+    m.pager.close()
+    m2.pager.close()
+
+
+def test_uninterrupted_run_leaves_sigint_handler_untouched(tmp_path):
+    """A normal run must not change the caller's SIGINT handler."""
+    import signal
+    before = signal.getsignal(signal.SIGINT)
+    m, opt, cfg = _resume_model()
+    res = run_training(m, opt, cfg, _resume_seqs(), steps=2, batch_size=2,
+                       log_fn=lambda s: None)
+    assert res["interrupted"] is False and res["steps_completed"] == 2
+    assert signal.getsignal(signal.SIGINT) is before
+    m.pager.close()

@@ -283,7 +283,7 @@ def test_cli_maps_every_config_field():
     assert (cfg.fp8_tile, cfg.state_dtype, cfg.rmsnorm_eps) == (32, "fp32", 1e-5)
     # Prune knobs are config-only now (offline pruner reads them); CLI
     # carries no prune flags, defaults still flow through.
-    assert (cfg.prune_survival_steps, cfg.prune_min_usage, cfg.max_new_experts) == (500, 1e-4, 3)
+    assert (cfg.prune_survival_steps, cfg.prune_min_usage, cfg.max_new_experts) == (250, 1e-4, 3)
     assert cfg.grow_every == 50 and cfg.vocab_size == 260
 
 

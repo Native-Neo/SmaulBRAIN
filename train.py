@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import math
 import random
+import signal
 import time
 from collections import deque
 
@@ -603,6 +604,14 @@ def run_training(
         an owned ``random.Random``: dirtying the global torch/python RNG
         between save and resume never perturbs the trajectory, while
         the RNG snapshot still restores the global RNG state itself.
+    Checkpointing: with ``ckpt_dir`` set, ``save_every > 0`` writes a
+    checkpoint every ``save_every`` steps and once more at the end when the
+    final step missed that cadence. ``save_every == 0`` (or ``ckpt_dir=None``)
+    leaves all saving to the caller. Ctrl+C never kills the run mid-step:
+    the first SIGINT only *requests* a stop, so the in-flight step finishes,
+    the checkpoint is written right after it, and the function returns with
+    ``interrupted: True``; a second SIGINT aborts immediately.
+
     Returns history + optional retention report (old_seqs evaluated before
     and after) so continual-learning retention is measured, not claimed.
     """
@@ -692,110 +701,163 @@ def run_training(
 
     run_started = time.perf_counter()
     bytes_processed = 0
+    saved_step: int | None = None  # last step written to ckpt_dir (dedupe)
     events: list[dict] = []  # machine-readable growth ledger
-    for local_step in range(steps):
-        step_started = time.perf_counter()
-        step = start_step + local_step
-        fresh_seqs = [train_seqs[(step * batch_size + i) % n] for i in range(batch_size)]
-        if replay is not None and replay_n > 0:
-            # Past-only sampling: sample BEFORE ingress so the current fresh
-            # batch cannot echo itself inside the same step.
-            replay_batch = replay.sample(replay_n)
-            batch_seqs = fresh_seqs + replay_batch
-            for s in fresh_seqs:
-                replay.add(s)
-        else:
-            batch_seqs = fresh_seqs
-        b = batch_from_seqs(batch_seqs, cfg.context_length)
-        stats = train_step(model, opt, cfg, b[:, : cfg.context_length],
-                           b[:, 1 : cfg.context_length + 1], step, mode=mode,
-                           selected=selected, new_since_step=new_since_step,
-                           profile=profile)
-        stats["step"] = step
-        # Throughput counts valid data bytes only: padded positions are
-        # structural (PAD_ID, masked from the loss), not processed data.
-        step_bytes = int((b[:, : cfg.context_length] != PAD_ID).sum().item())
-        bytes_processed += step_bytes
-        hist.append(stats)
-        # Growth only: training never prunes (pool shrinkage is the manual
-        # offline pruner). Successful growths increment the counter.
-        new_ids: list[str] = []
-        growth_started = time.perf_counter() if profile else 0.0
-        if grow_every and (step + 1) % grow_every == 0:
-            new_ids += grow_batch(step, step * max(1, cfg.max_new_experts))
-        # Loss-triggered growth on the falling edge below the threshold; the
-        # salt offset keeps its seeds distinct from scheduled growth.
-        loss_now = float(stats["loss"])
-        if (grow_loss_below is not None and prev_loss is not None
-                and prev_loss >= grow_loss_below > loss_now):
-            new_ids += grow_batch(step, step * max(1, cfg.max_new_experts) + 7919)
-        prev_loss = loss_now
-        grew = bool(new_ids)
-        if profile:
-            stats["growth_s"] = time.perf_counter() - growth_started
-        if new_ids:
-            events.append({"step": step, "type": "grow", "ids": list(new_ids)})
-        if grew:
-            growth_events += 1
-        # Machine-readable per-step ledger (history entries stay JSON-safe).
-        stats["grew"] = grew
-        stats["new_experts"] = list(new_ids)
-        stats["pruned_experts"] = []
-        if ckpt_dir and save_every and (step + 1) % save_every == 0:
-            save_model(ckpt_dir, model, opt, step,
-                       extra_meta={"scheduler": scheduler_snapshot()})
-            model._resume_step = step
 
-        elapsed = time.perf_counter() - step_started
-        total_elapsed = time.perf_counter() - run_started
-        completed = local_step + 1
-        avg_step = total_elapsed / completed
-        eta = max(0.0, (steps - completed) * avg_step)
-        step_bps = step_bytes / max(elapsed, 1e-12)
-        avg_bps = bytes_processed / max(total_elapsed, 1e-12)
-        # Compact progress display: a visual bar plus the metrics most useful
-        # during a small CPU run. Keep the full metric history in the result.
-        fraction = min(1.0, completed / max(steps, 1))
-        bar_width = 18
-        filled = int(fraction * bar_width)
-        bar = "#" * filled + "-" * (bar_width - filled)
-        eta_seconds = int(round(eta))
-        eta_label = f"{eta_seconds // 60:02d}:{eta_seconds % 60:02d}"
-        line = (
-            f"[train] [{bar}] {fraction:5.1%} {completed:>4}/{steps} "
-            f"| loss {stats['loss']:.4f} | bpb {stats['bpb']:.3f} "
-            f"| acc {stats['acc']:.2%} | {step_bps:,.0f} B/s "
-            f"| ETA {eta_label} | experts {len(model.pool)}"
-        )
-        if profile:
-            line += (
-                f" | fwd {stats['forward_s']:.3f}s"
-                f" route {stats['router_s']:.3f}s"
-                f" expert {stats['expert_s']:.3f}s"
-                f" balance {stats['balance_s']:.3f}s"
-                f" bwd {stats['backward_s']:.3f}s"
-                f" opt {stats['optimizer_s']:.3f}s"
-                f" grow {stats['growth_s']:.3f}s"
-            )
-            rss_kib = avail_kib = None
+    # Ctrl+C: the first press only *requests* a stop, so the in-flight step
+    # finishes; the loop then checkpoints and returns (a second press aborts
+    # immediately). The handler exists only around the loop and is always
+    # restored, so no exit path leaks it into the caller (e.g. a test runner).
+    stop_requested = False
+    sigint_installed = False
+    prev_sigint = None
+
+    def _restore_sigint() -> None:
+        nonlocal sigint_installed
+        if sigint_installed:
+            sigint_installed = False
             try:
-                with open("/proc/self/status", encoding="utf-8") as f:
-                    for row in f:
-                        if row.startswith("VmRSS:"):
-                            rss_kib = int(row.split()[1])
-                            break
-                with open("/proc/meminfo", encoding="utf-8") as f:
-                    for row in f:
-                        if row.startswith("MemAvailable:"):
-                            avail_kib = int(row.split()[1])
-                            break
-            except (OSError, ValueError, IndexError):
+                signal.signal(signal.SIGINT, prev_sigint)
+            except (ValueError, OSError, AttributeError):
                 pass
-            if rss_kib is not None:
-                line += f" | RSS {rss_kib / 1024:.0f} MiB"
-            if avail_kib is not None:
-                line += f" | MemAvailable {avail_kib / 1024:.0f} MiB"
-        log_fn(line)
+
+    def _sigint_handler(signum, frame):
+        nonlocal stop_requested
+        if stop_requested:
+            _restore_sigint()
+            raise KeyboardInterrupt("second Ctrl+C: aborting now")
+        stop_requested = True
+        log_fn("[train] Ctrl+C: finishing the current step, then saving and "
+               "exiting (press Ctrl+C again to abort immediately)")
+
+    try:
+        prev_sigint = signal.signal(signal.SIGINT, _sigint_handler)
+        sigint_installed = True
+    except (ValueError, OSError, AttributeError):
+        pass  # not the main thread: signals stay fatal, nothing to install
+    try:
+        for local_step in range(steps):
+            step_started = time.perf_counter()
+            step = start_step + local_step
+            fresh_seqs = [train_seqs[(step * batch_size + i) % n] for i in range(batch_size)]
+            if replay is not None and replay_n > 0:
+                # Past-only sampling: sample BEFORE ingress so the current fresh
+                # batch cannot echo itself inside the same step.
+                replay_batch = replay.sample(replay_n)
+                batch_seqs = fresh_seqs + replay_batch
+                for s in fresh_seqs:
+                    replay.add(s)
+            else:
+                batch_seqs = fresh_seqs
+            b = batch_from_seqs(batch_seqs, cfg.context_length)
+            stats = train_step(model, opt, cfg, b[:, : cfg.context_length],
+                               b[:, 1 : cfg.context_length + 1], step, mode=mode,
+                               selected=selected, new_since_step=new_since_step,
+                               profile=profile)
+            stats["step"] = step
+            # Throughput counts valid data bytes only: padded positions are
+            # structural (PAD_ID, masked from the loss), not processed data.
+            step_bytes = int((b[:, : cfg.context_length] != PAD_ID).sum().item())
+            bytes_processed += step_bytes
+            hist.append(stats)
+            # Growth only: training never prunes (pool shrinkage is the manual
+            # offline pruner). Successful growths increment the counter.
+            new_ids: list[str] = []
+            growth_started = time.perf_counter() if profile else 0.0
+            if grow_every and (step + 1) % grow_every == 0:
+                new_ids += grow_batch(step, step * max(1, cfg.max_new_experts))
+            # Loss-triggered growth on the falling edge below the threshold; the
+            # salt offset keeps its seeds distinct from scheduled growth.
+            loss_now = float(stats["loss"])
+            if (grow_loss_below is not None and prev_loss is not None
+                    and prev_loss >= grow_loss_below > loss_now):
+                new_ids += grow_batch(step, step * max(1, cfg.max_new_experts) + 7919)
+            prev_loss = loss_now
+            grew = bool(new_ids)
+            if profile:
+                stats["growth_s"] = time.perf_counter() - growth_started
+            if new_ids:
+                events.append({"step": step, "type": "grow", "ids": list(new_ids)})
+            if grew:
+                growth_events += 1
+            # Machine-readable per-step ledger (history entries stay JSON-safe).
+            stats["grew"] = grew
+            stats["new_experts"] = list(new_ids)
+            stats["pruned_experts"] = []
+            if ckpt_dir and save_every and (step + 1) % save_every == 0:
+                save_model(ckpt_dir, model, opt, step,
+                           extra_meta={"scheduler": scheduler_snapshot()})
+                model._resume_step = step
+                saved_step = step
+
+            elapsed = time.perf_counter() - step_started
+            total_elapsed = time.perf_counter() - run_started
+            completed = local_step + 1
+            avg_step = total_elapsed / completed
+            eta = max(0.0, (steps - completed) * avg_step)
+            step_bps = step_bytes / max(elapsed, 1e-12)
+            avg_bps = bytes_processed / max(total_elapsed, 1e-12)
+            # Compact progress display: a visual bar plus the metrics most useful
+            # during a small CPU run. Keep the full metric history in the result.
+            fraction = min(1.0, completed / max(steps, 1))
+            bar_width = 18
+            filled = int(fraction * bar_width)
+            bar = "#" * filled + "-" * (bar_width - filled)
+            eta_seconds = int(round(eta))
+            eta_label = f"{eta_seconds // 60:02d}:{eta_seconds % 60:02d}"
+            line = (
+                f"[train] [{bar}] {fraction:5.1%} {completed:>4}/{steps} "
+                f"| loss {stats['loss']:.4f} | bpb {stats['bpb']:.3f} "
+                f"| acc {stats['acc']:.2%} | {step_bps:,.0f} B/s "
+                f"| ETA {eta_label} | experts {len(model.pool)}"
+            )
+            if profile:
+                line += (
+                    f" | fwd {stats['forward_s']:.3f}s"
+                    f" route {stats['router_s']:.3f}s"
+                    f" expert {stats['expert_s']:.3f}s"
+                    f" balance {stats['balance_s']:.3f}s"
+                    f" bwd {stats['backward_s']:.3f}s"
+                    f" opt {stats['optimizer_s']:.3f}s"
+                    f" grow {stats['growth_s']:.3f}s"
+                )
+                rss_kib = avail_kib = None
+                try:
+                    with open("/proc/self/status", encoding="utf-8") as f:
+                        for row in f:
+                            if row.startswith("VmRSS:"):
+                                rss_kib = int(row.split()[1])
+                                break
+                    with open("/proc/meminfo", encoding="utf-8") as f:
+                        for row in f:
+                            if row.startswith("MemAvailable:"):
+                                avail_kib = int(row.split()[1])
+                                break
+                except (OSError, ValueError, IndexError):
+                    pass
+                if rss_kib is not None:
+                    line += f" | RSS {rss_kib / 1024:.0f} MiB"
+                if avail_kib is not None:
+                    line += f" | MemAvailable {avail_kib / 1024:.0f} MiB"
+            log_fn(line)
+            if stop_requested:
+                # First Ctrl+C landed during this step: it is now complete
+                # (and grown/logged), so checkpoint right here and return.
+                if ckpt_dir and saved_step != step:
+                    save_model(ckpt_dir, model, opt, step,
+                               extra_meta={"scheduler": scheduler_snapshot()})
+                    model._resume_step = step
+                    log_fn(f"[train] checkpoint saved at step {step} -> {ckpt_dir}")
+                break
+    finally:
+        _restore_sigint()
+
+    # End-of-run checkpoint when the final step missed the periodic cadence
+    # (e.g. save_every=100 on a 1050-step run) or the run was interrupted.
+    if ckpt_dir and hist and saved_step != hist[-1]["step"]:
+        save_model(ckpt_dir, model, opt, int(hist[-1]["step"]),
+                   extra_meta={"scheduler": scheduler_snapshot()})
+        model._resume_step = int(hist[-1]["step"])
     total_elapsed = time.perf_counter() - run_started
     if hist:
         model._resume_step = int(hist[-1]["step"])
@@ -808,6 +870,7 @@ def run_training(
         "retention": report,
         "final_loss": hist[-1]["loss"] if hist else None,
         "steps_completed": len(hist),
+        "interrupted": stop_requested,
         "elapsed_seconds": total_elapsed,
         "bytes_processed": bytes_processed,
         "bytes_per_second": bytes_processed / max(total_elapsed, 1e-12),
