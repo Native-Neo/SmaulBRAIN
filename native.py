@@ -781,13 +781,9 @@ def call_ternary_backward_input(
     if reason:
         _note("ternary_backward", False, reason)
         return None
+    # _want_native records fallback reasons and ensures the library is loaded.
+    # Do not count a second fallback for the same rejected dispatch.
     if not _want_native("ternary_backward"):
-        _note("ternary_backward", False, "native dispatch disabled")
-        return None
-    if not ensure_native():
-        _note("ternary_backward", False, _build_failed or "native build unavailable")
-        if native_mode() == "force":
-            raise RuntimeError(LAST_FALLBACK.get("ternary_backward", "native build unavailable"))
         return None
     try:
         rows, out_features = grad_out.shape
