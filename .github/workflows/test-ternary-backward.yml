@@ -1,0 +1,38 @@
+name: Native ternary backward tests
+
+on:
+  pull_request:
+    paths:
+      - "experts.py"
+      - "native.py"
+      - "config.py"
+      - "cli.py"
+      - "kernels_cpp/**"
+      - "tests/test_ternary_backward.py"
+      - ".github/workflows/test-ternary-backward.yml"
+  push:
+    branches: ["**"]
+    paths:
+      - "experts.py"
+      - "native.py"
+      - "config.py"
+      - "cli.py"
+      - "kernels_cpp/**"
+      - "tests/test_ternary_backward.py"
+      - ".github/workflows/test-ternary-backward.yml"
+
+jobs:
+  native-ternary-backward:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Verify native compilation and gradient parity
+        env:
+          SMAUL_NATIVE: force
+        run: python -m pytest -q tests/test_ternary_backward.py
