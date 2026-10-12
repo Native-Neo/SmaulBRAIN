@@ -757,10 +757,11 @@ def call_fp8_dequant(
 def call_ternary_backward_input(
     grad_out: torch.Tensor, weight: torch.Tensor
 ) -> torch.Tensor | None:
-    """Compute dX=dY@W with a zero-skipping native kernel when safe.
+    """Compute dX=dY@W with the native zero-skipping kernel when safe.
 
-    This experimental path is deliberately restricted to contiguous CPU
-    float32 tensors. Unsupported dtypes/devices use the PyTorch GEMM fallback.
+    Native execution is restricted to non-empty contiguous CPU FP32 matrices.
+    Unsupported inputs use the caller's PyTorch GEMM fallback. This function
+    makes no speedup guarantee; use the benchmark on the target CPU.
     """
     reason = ""
     if grad_out.device.type != "cpu" or weight.device.type != "cpu":
@@ -769,6 +770,8 @@ def call_ternary_backward_input(
         reason = "native ternary backward requires float32 tensors"
     elif grad_out.ndim != 2 or weight.ndim != 2:
         reason = "native ternary backward requires 2-D matrices"
+    elif grad_out.shape[0] == 0 or grad_out.shape[1] == 0 or weight.shape[1] == 0:
+        reason = "native ternary backward requires non-empty matrices"
     elif grad_out.shape[1] != weight.shape[0]:
         reason = "ternary backward matrix dimensions do not match"
     elif not grad_out.is_contiguous() or not weight.is_contiguous():
