@@ -1407,14 +1407,29 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
              f"experts dir mismatch: disk {sorted(on_disk)} vs manifest {eids}")
 
     import torch.nn as nn
+    from precision import HybridFP8Linear
     new_experts: dict = {}
     new_order: list[str] = []
     for t, m in parts:
         rec = expert_from_parts(t, m)
         new_experts[rec.expert_id] = rec
         new_order.append(rec.expert_id)
-    dev, dt = model.router.proj.weight.device, model.router.proj.weight.dtype
-    new_proj = nn.Linear(saved_cfg.d_model, len(eids)).to(device=dev, dtype=dt)
+    old_proj = model.router.proj
+    dev, dt = old_proj.weight.device, old_proj.weight.dtype
+    if isinstance(old_proj, HybridFP8Linear):
+        # Preserve the execution class, not just the parameter tensors.
+        # Replacing this layer with nn.Linear keeps state_dict parity but
+        # silently disables the FP8 forward/backward policy after every load.
+        new_proj = HybridFP8Linear(
+            saved_cfg.d_model, len(eids),
+            bias=old_proj.bias is not None,
+            out_dtype=old_proj.out_dtype,
+            e5m2_for_grads=old_proj.e5m2_for_grads,
+        ).to(device=dev, dtype=dt)
+    else:
+        new_proj = nn.Linear(
+            saved_cfg.d_model, len(eids), bias=old_proj.bias is not None
+        ).to(device=dev, dtype=dt)
     with torch.no_grad():
         new_proj.weight.copy_(rw.to(dt))
         new_proj.bias.copy_(rb.to(dt))
