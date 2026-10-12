@@ -41,7 +41,23 @@ def test_backward_flows_with_finite_grads():
     assert torch.isfinite(hy.bias.grad).all()
     assert torch.isfinite(x.grad).all()
     assert x.grad.dtype == torch.bfloat16  # grad matches input dtype
-    assert hy.in_scaler.history and hy.grad_scaler.history  # streams ticked
+    # Scale history is intentionally not mutated: quantization must be
+    # independent of prior calls and checkpoint reconstruction.
+    assert not hy.in_scaler.history and not hy.grad_scaler.history
+
+
+
+def test_forward_is_independent_of_neighbor_tokens_and_call_history():
+    hy, _ = _pair(seed=4)
+    x = torch.randn(1, 32)
+    neighbors = torch.cat([x, torch.full((7, 32), 1e4)], dim=0)
+    with torch.no_grad():
+        alone = hy(x)
+        together = hy(neighbors)[:1]
+        repeated = hy(x)
+    assert torch.equal(alone, together)
+    assert torch.equal(alone, repeated)
+    assert not hy.in_scaler.history and not hy.wt_scaler.history
 
 
 def test_loss_converges_over_ten_steps():
