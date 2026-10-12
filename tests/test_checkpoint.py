@@ -104,6 +104,21 @@ def test_inference_identical_after_reload(tmp_path):
     a = m.forward_infer(ids)["logits"]
     m2 = SmaulBrainModel(m.cfg)
     load_model(d, m2, SmaulOpt(SmaulOptHParams()))
+    # Compare non-tensor execution policy too: a checkpoint can restore every
+    # tensor while silently changing a config switch that changes forward math.
+    assert m.cfg.to_dict() == m2.cfg.to_dict(), (
+        "checkpoint config mismatch: "
+        f"source={m.cfg.to_dict()} restored={m2.cfg.to_dict()}"
+    )
+    # The expert storage bytes are checked below; also verify the exact
+    # materialized weights the pager hands to inference before comparing logits.
+    for eid in m.pool.order:
+        source_weights = m.pager.provider(eid)
+        restored_weights = m2.pager.provider(eid)
+        for name in ("w_gate", "w_up", "w_down"):
+            assert torch.equal(source_weights[name], restored_weights[name]), (
+                f"checkpoint materialized expert mismatch: {eid}/{name}"
+            )
     # Separate serialization correctness from inference/cache correctness:
     # a mismatch here identifies the exact tensor that failed to round-trip.
     a_state, b_state = m.state_dict(), m2.state_dict()
