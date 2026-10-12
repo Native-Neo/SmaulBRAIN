@@ -335,6 +335,48 @@ class SmaulBrainModel(nn.Module):
                 f"state={state_bytes / 1048576:.1f} MiB); reduce B*T, d_model, "
                 "or max_depth"
             )
+        if not training:
+            return
+
+        # Expert leaves are materialized once per active expert, not once per
+        # recurrent depth. Bound the worst-case leaf working set and account
+        # for the checkpoint inputs (the large SwiGLU intermediates themselves
+        # are recomputed, not retained). FP8 weights and factored optimizer
+        # state are already resident by this point; report their footprint in
+        # the failure message but do not double-count them against MemAvailable.
+        active_upper = min(self.cfg.num_experts, batch_tokens * self.cfg.top_k)
+        expert_params = 3 * self.cfg.d_model * self.cfg.expert_hidden
+        expert_leaf_bytes = active_upper * expert_params * dtype_bytes
+        checkpoint_input_bytes = (
+            batch_tokens * self.cfg.top_k * self.cfg.d_model
+            * self.cfg.max_depth * dtype_bytes
+        )
+        transient_bytes = estimated + expert_leaf_bytes + checkpoint_input_bytes
+        static_expert_bytes = self.cfg.num_experts * expert_params * 3
+        # Linux exposes current system headroom after model weights and
+        # optimizer state have been allocated. Keep 35% of that headroom for
+        # the desktop, allocator fragmentation, data batches, and OS activity.
+        try:
+            with open("/proc/meminfo", encoding="ascii") as meminfo:
+                available_kib = next(
+                    int(line.split()[1]) for line in meminfo
+                    if line.startswith("MemAvailable:")
+                )
+            safe_bytes = int(available_kib * 1024 * 0.65)
+        except (OSError, StopIteration, ValueError, IndexError):
+            safe_bytes = None
+        if safe_bytes is not None and transient_bytes > safe_bytes:
+            raise ValueError(
+                "estimated training working set exceeds 65% of currently "
+                "available system memory: "
+                f"retained_activations={estimated / 1048576:.1f} MiB, "
+                f"expert_leaves={expert_leaf_bytes / 1048576:.1f} MiB, "
+                f"checkpoint_inputs={checkpoint_input_bytes / 1048576:.1f} MiB, "
+                f"resident_expert_weights_plus_optimizer_estimate="
+                f"{static_expert_bytes / 1048576:.1f} MiB, "
+                f"safe_budget={safe_bytes / 1048576:.1f} MiB; reduce batch, "
+                "context_length, top_k, or expert_hidden"
+            )
 
     def forward(
         self, ids: torch.Tensor, targets: torch.Tensor | None = None, step: int = 0
