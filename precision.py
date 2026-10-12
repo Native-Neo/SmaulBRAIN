@@ -498,11 +498,17 @@ class _HybridFP8Matmul(torch.autograd.Function):
         w_q = (w32 * w_scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3_DTYPE)
         ctx.save_for_backward(x_q.reshape(x32.shape), w_q, x_scale_saved, w_scale)
 
-        # Per-token activation scales differ, so use dequantized FP32 operands
-        # for the portable matmul instead of a single-scale FP8 GEMM.
-        x_dq = x_q.float() / x_scale
-        w_dq = w_q.float() / w_scale
-        out = (x_dq @ w_dq.t()).reshape(*x32.shape[:-1], w32.shape[0])
+        # Per-token activation scales differ. FP8 GEMM is still valid: the
+        # quantized matrix product is rescaled per output row afterwards.
+        # Older/non-Hopper devices use the portable dequantized FP32 fallback.
+        native_out = _try_scaled_mm(x_q, w_q, torch.float32)
+        if native_out is not None:
+            out2d = native_out / (x_scale * w_scale)
+        else:
+            x_dq = x_q.float() / x_scale
+            w_dq = w_q.float() / w_scale
+            out2d = x_dq @ w_dq.t()
+        out = out2d.reshape(*x32.shape[:-1], w32.shape[0])
         if bias is not None:
             out = out + bias.float()
         return out.to(out_dtype)
