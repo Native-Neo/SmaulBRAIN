@@ -145,6 +145,35 @@ def test_inference_identical_after_reload(tmp_path):
     m.pager.close(); m2.pager.close()
 
 
+def test_load_applies_checkpoint_runtime_module_settings(tmp_path):
+    source_cfg = SmaulBrainConfig(
+        d_model=32, n_heads=4, num_experts=4, top_k=2,
+        expert_hidden=64, max_depth=2, context_length=12,
+        capacity_factor=0.25, rmsnorm_eps=1e-4,
+    )
+    source = SmaulBrainModel(source_cfg)
+    target_cfg = SmaulBrainConfig(
+        d_model=32, n_heads=4, num_experts=4, top_k=2,
+        expert_hidden=64, max_depth=2, context_length=12,
+        capacity_factor=1.5, rmsnorm_eps=1e-6,
+    )
+    target = SmaulBrainModel(target_cfg)
+    try:
+        d = str(tmp_path / "runtime-settings")
+        opt = SmaulOpt(SmaulOptHParams())
+        save_model(d, source, opt, step=0)
+        load_model(d, target, SmaulOpt(SmaulOptHParams()))
+        assert target.cfg.capacity_factor == 0.25
+        assert target.router.capacity_factor == 0.25
+        norms = [module for module in target.modules()
+                 if module.__class__.__name__ == "RMSNorm"]
+        assert norms
+        assert all(module.eps == 1e-4 for module in norms)
+    finally:
+        source.pager.close()
+        target.pager.close()
+
+
 def test_load_clears_runtime_only_state_from_previous_model_use(tmp_path):
     d = str(tmp_path / "c")
     source, _ = _trained(d)
