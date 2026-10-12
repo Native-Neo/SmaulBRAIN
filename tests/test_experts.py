@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 import torch
-from experts import ExpertPool, make_expert
+from experts import ExpertPool, make_expert, ternary_qat_weight
 from growth import grow_expert, grow_topk_clones, recombine_weights, select_parents
 from precision import dequantize_fp8_blockwise
 from routing import SparseRouter
@@ -17,6 +17,72 @@ def _pool(n=3, d=16, h=32, seed=0):
     for _ in range(n):
         pool.add(make_expert(pool.fresh_id(), d, h))
     return pool
+
+
+def test_ternary_qat_uses_scaled_trits_and_ste_backward():
+    w = torch.tensor([[2.0, -1.0, 0.01, -0.01], [0.0, 0.0, 0.0, 0.0]],
+                     requires_grad=True)
+    q = ternary_qat_weight(w)
+    # Quantized forward has only three values per output row, with a zero row safe.
+    row = q[0].detach()
+    vals = torch.unique(torch.round(row / row.abs().max().clamp_min(1e-12), decimals=5))
+    assert set(vals.tolist()).issubset({-1.0, 0.0, 1.0})
+    assert torch.equal(q[1], torch.zeros_like(q[1]))
+    q.sum().backward()
+    assert torch.equal(w.grad, torch.ones_like(w))  # identity STE
+
+
+def test_ternary_qat_config_is_backward_compatible_and_boolean():
+    from config import SmaulBrainConfig
+    assert SmaulBrainConfig().ternary_qat is False
+    assert SmaulBrainConfig.from_dict({"ternary_qat": True}).ternary_qat is True
+    with pytest.raises(ValueError, match="ternary_qat must be a bool"):
+        SmaulBrainConfig.from_dict({"ternary_qat": "yes"})
+
+
+def test_model_ternary_qat_wires_train_and_eval_providers():
+    from config import SmaulBrainConfig
+    from model import SmaulBrainModel
+
+    cfg = SmaulBrainConfig(d_model=32, n_heads=4, num_experts=2, top_k=1,
+                           expert_hidden=32, max_depth=1, context_length=8,
+                           ternary_qat=True)
+    model = SmaulBrainModel(cfg)
+    eid = model.pool.order[0]
+
+    eval_weights = model._eval_provider(eid)
+    for weight in eval_weights.values():
+        for row in weight.float():
+            scale = row.abs().max()
+            normalized = row / scale if scale > 0 else row
+            assert set(torch.unique(torch.round(normalized, decimals=5)).tolist()) <= {
+                -1.0, 0.0, 1.0
+            }
+
+    train_weights = model._train_provider(eid)
+    sum(w.float().sum() for w in train_weights.values()).backward()
+    grads = model.take_expert_grads()
+    assert eid in grads
+    assert all(g is not None and torch.isfinite(g).all() for g in grads[eid].values())
+
+    # Evaluation tensors are cached until the pager invalidates that expert.
+    cached = model._eval_provider(eid)
+    assert model._eval_provider(eid) is cached
+    model.pager.invalidate(eid)
+    assert model._eval_provider(eid) is not cached
+
+    # The no-grad training-provider path must still quantize without leaves.
+    model.clear_expert_grads()
+    with torch.no_grad():
+        no_grad_weights = model._train_provider(eid)
+    assert eid not in model._leaves
+    for weight in no_grad_weights.values():
+        for row in weight.float():
+            scale = row.abs().max()
+            normalized = row / scale if scale > 0 else row
+            assert set(torch.unique(torch.round(normalized, decimals=5)).tolist()) <= {
+                -1.0, 0.0, 1.0
+            }
 
 
 def test_expert_size_explicit_and_512_target():
