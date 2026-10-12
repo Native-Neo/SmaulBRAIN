@@ -22,7 +22,7 @@ def test_directory_reads_nested_text_files_in_sorted_order(tmp_path: Path) -> No
     seqs, kind = load_training_sequences(root, context_length=5)
 
     assert kind == "directory"
-    assert _joined(seqs) == b"FIRSTSECOND"
+    assert _joined(seqs) == b"FIRST\\nSECOND"
 
 
 def test_directory_serializes_jsonl_records_as_text(tmp_path: Path) -> None:
