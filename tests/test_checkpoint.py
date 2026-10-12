@@ -104,6 +104,26 @@ def test_inference_identical_after_reload(tmp_path):
     a = m.forward_infer(ids)["logits"]
     m2 = SmaulBrainModel(m.cfg)
     load_model(d, m2, SmaulOpt(SmaulOptHParams()))
+    # Separate serialization correctness from inference/cache correctness:
+    # a mismatch here identifies the exact tensor that failed to round-trip.
+    a_state, b_state = m.state_dict(), m2.state_dict()
+    for key, value in a_state.items():
+        if key.startswith("router.") and key.rsplit(".", 1)[-1] in {
+            "usage_counts", "admit_counts", "sanitized_counts"
+        }:
+            continue  # runtime counters may legitimately change during inference
+        assert key in b_state, f"missing restored state tensor: {key}"
+        assert torch.equal(value, b_state[key]), f"checkpoint tensor mismatch: {key}"
+    for eid in m.pool.order:
+        for name in ("w_gate", "w_up", "w_down"):
+            assert torch.equal(m.pool.experts[eid].weights_fp8[name].codes,
+                               m2.pool.experts[eid].weights_fp8[name].codes), (
+                f"checkpoint expert codes mismatch: {eid}/{name}"
+            )
+            assert torch.equal(m.pool.experts[eid].weights_fp8[name].scales,
+                               m2.pool.experts[eid].weights_fp8[name].scales), (
+                f"checkpoint expert scales mismatch: {eid}/{name}"
+            )
     torch.manual_seed(0)
     b = m2.forward_infer(ids)["logits"]
     assert torch.equal(a, b)
