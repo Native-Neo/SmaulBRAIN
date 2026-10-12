@@ -39,7 +39,9 @@ def test_training_reuses_one_expert_leaf_dictionary_across_depths():
         assert first is second
         assert len(model._leaves) == 1
         assert all(t.is_leaf and t.requires_grad for t in first.values())
-        model.clear_expert_grads()
+        first["w_gate"].grad = torch.ones_like(first["w_gate"])
+        grads = model.take_expert_grads()
+        assert grads[expert_id]["w_gate"].dtype == first["w_gate"].dtype
         assert model._leaves == {}
     finally:
         model.pager.close()
