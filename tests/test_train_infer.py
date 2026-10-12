@@ -98,7 +98,14 @@ def test_streaming_inference_matches_full_causal_pass():
         out, states = m.forward_infer_step(token.view(1), states)
         parts.append(out["logits"])
     streamed = torch.cat(parts, dim=1)
-    assert torch.allclose(full["logits"], streamed, atol=2e-5, rtol=2e-5)
+    diff = (full["logits"] - streamed).abs()
+    max_abs = float(diff.max().item())
+    max_rel = float((diff / full["logits"].abs().clamp_min(1e-8)).max().item())
+    worst = torch.nonzero(diff == diff.max(), as_tuple=False)[0].tolist()
+    assert torch.allclose(full["logits"], streamed, atol=2e-5, rtol=2e-5), (
+        f"streaming/full logits diverged: max_abs={max_abs:.8g}, "
+        f"max_rel={max_rel:.8g}, worst_index={worst}"
+    )
     m.pager.close()
 
 
