@@ -38,7 +38,16 @@ def _iter_file_text(path: Path, remaining: int) -> Iterator[bytes]:
 
     if suffix == ".jsonl":
         with path.open("rb") as stream:
-            for line in stream:
+            while remaining > 0:
+                # readline(size) bounds memory even when a malicious or
+                # malformed dataset contains a multi-gigabyte single line.
+                line = stream.readline(remaining + 1)
+                if not line:
+                    break
+                if len(line) > remaining and not line.endswith(b"\\n"):
+                    # Do not emit a partial serialized record; structured
+                    # rows must remain intact when the byte budget is reached.
+                    return
                 if not line.strip():
                     continue
                 try:
@@ -47,12 +56,9 @@ def _iter_file_text(path: Path, remaining: int) -> Iterator[bytes]:
                     raise ValueError(f"invalid JSONL row in {path}: {exc}") from exc
                 encoded = _json_bytes(row)
                 if len(encoded) > remaining:
-                    yield encoded[:remaining]
                     return
                 remaining -= len(encoded)
                 yield encoded
-                if remaining <= 0:
-                    return
         return
 
     if suffix == ".json":
@@ -135,6 +141,12 @@ def load_training_sequences(
     inputs are sampled in sorted path order up to max_bytes; files are never
     concatenated as raw binary containers.
     """
+    for name, value in (("context_length", context_length),
+                         ("max_bytes", max_bytes),
+                         ("max_sequences", max_sequences)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive int, got {value!r}")
+
     path = Path(source)
     if not path.exists():
         raise FileNotFoundError(f"dataset path not found: {path}")
