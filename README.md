@@ -30,8 +30,13 @@ python cli.py --ckpt ckpt/demo train --steps 20 --batch 2   # tiny 246K config
 python cli.py --ckpt ckpt/demo infer --prompt "hello" --max-new 32
 python cli.py --ckpt ckpt/demo report                        # param counts
 python pruning.py --ckpt ckpt/demo --rm-worst 0 --dry-run    # pool + floor preview
-python -m pytest tests/ -q                                   # 421 tests
+python -m pytest tests/ -q
+python benchmarks/bench.py --steps 2             # safe tiny-config benchmark                                   # 421 tests
 ```
+
+## Production readiness and benchmarking
+
+SmaulBRAIN remains experimental. See [the production-readiness checklist](docs/PRODUCTION.md) for safe benchmarking, memory limits, checkpoint/resume validation, and release gates. The benchmark defaults to a small model and has a pre-allocation parameter-count guard; this guard is not a guarantee of sufficient RAM.
 
 ## What does SmaulBRAIN do?
 
