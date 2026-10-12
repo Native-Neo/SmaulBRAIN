@@ -40,6 +40,32 @@ def test_ternary_qat_config_is_backward_compatible_and_boolean():
         SmaulBrainConfig.from_dict({"ternary_qat": "yes"})
 
 
+def test_model_ternary_qat_wires_train_and_eval_providers():
+    from config import SmaulBrainConfig
+    from model import SmaulBrainModel
+
+    cfg = SmaulBrainConfig(d_model=32, n_heads=4, num_experts=2, top_k=1,
+                           expert_hidden=32, max_depth=1, context_length=8,
+                           ternary_qat=True)
+    model = SmaulBrainModel(cfg)
+    eid = model.pool.order[0]
+
+    eval_weights = model._eval_provider(eid)
+    for weight in eval_weights.values():
+        for row in weight.float():
+            scale = row.abs().max()
+            normalized = row / scale if scale > 0 else row
+            assert set(torch.unique(torch.round(normalized, decimals=5)).tolist()) <= {
+                -1.0, 0.0, 1.0
+            }
+
+    train_weights = model._train_provider(eid)
+    sum(w.float().sum() for w in train_weights.values()).backward()
+    grads = model.take_expert_grads()
+    assert eid in grads
+    assert all(g is not None and torch.isfinite(g).all() for g in grads[eid].values())
+
+
 def test_expert_size_explicit_and_512_target():
     from config import SmaulBrainConfig, expert_hidden_for_target
     cfg = SmaulBrainConfig(d_model=512, expert_hidden=expert_hidden_for_target(512))
