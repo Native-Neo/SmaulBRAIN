@@ -186,10 +186,9 @@ class SmaulBrainModel(nn.Module):
                 for name, leaf in leaves.items():
                     if leaf.grad is None:
                         continue
-                    # Keep the accumulated gradient alive after dropping the
-                    # leaf reference; float() preserves the optimizer's FP32
-                    # math contract while releasing the original .grad slot.
-                    grads[name] = leaf.grad.detach().float()
+                    # Transfer the gradient reference without an FP32
+                    # duplicate. SmaulOpt performs FP32 math inside the update.
+                    grads[name] = leaf.grad.detach()
                     leaf.grad = None
                 if grads:
                     agg[eid] = grads
