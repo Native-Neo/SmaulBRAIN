@@ -25,6 +25,22 @@ def test_directory_reads_nested_text_files_in_sorted_order(tmp_path: Path) -> No
     assert _joined(seqs) == b"FIRST\nSECOND"
 
 
+def test_directory_samples_sequences_across_files(tmp_path: Path) -> None:
+    root = tmp_path / "corpus"
+    root.mkdir()
+    (root / "a.txt").write_text("A" * 12, encoding="utf-8")
+    (root / "b.txt").write_text("B" * 12, encoding="utf-8")
+
+    seqs, _ = load_training_sequences(
+        root, context_length=5, max_bytes=128, max_sequences=2
+    )
+
+    sample = _joined(seqs)
+    assert len(seqs) == 2
+    assert sample.startswith(b"A")
+    assert sample.endswith(b"B")
+
+
 def test_directory_serializes_jsonl_records_as_text(tmp_path: Path) -> None:
     root = tmp_path / "dataset"
     root.mkdir()
