@@ -757,9 +757,9 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
         cfg_dict["num_experts"] = len(model.pool)
         from config import __version__ as _schema
         cfg_dict["schema_version"] = _schema
-        # Pruning may reduce the pool below the configured floor; checkpoints
-        # must remain constructible while still respecting top_k.
-        cfg_dict["min_experts"] = min(model.cfg.min_experts, len(model.pool))
+        # Preserve the configured growth floor even if pruning has temporarily
+        # reduced the live pool below it. min_experts is a policy threshold,
+        # not a claim about the current number of stored experts.
         extra = extra_meta or {}
         manifest = {
             "step": step,
