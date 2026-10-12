@@ -45,8 +45,12 @@ def init_expert_weights(
 def ternary_qat_weight(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.Tensor:
     """Per-output-row ternary QAT with a straight-through estimator.
 
-    Forward values are {-scale, 0, +scale}; gradients pass through as the
-    identity to the latent compute tensor. Expert storage remains blockwise FP8.
+    Forward values are {-scale, 0, +scale}. In a following linear operation,
+    input gradients therefore use these ternary-valued weights, while the
+    straight-through estimator gives the latent weights dense weight gradients
+    for the optimizer. This changes the backward operands, not the GEMM kernel:
+    PyTorch still executes dense matrix multiplication. Expert storage remains
+    blockwise FP8.
     """
     if w.ndim < 2:
         raise ValueError(f"ternary QAT expects a matrix or higher-rank tensor, got {tuple(w.shape)}")

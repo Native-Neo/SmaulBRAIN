@@ -105,3 +105,30 @@ def test_checkpointed_swiglu_matches_direct_forward_and_gradients():
         assert torch.allclose(
             w_checkpoint[name].grad, w_direct[name].grad, atol=1e-6, rtol=1e-6
         )
+
+def test_ternary_qat_backward_uses_ternary_weights_and_full_precision_ste_gradients():
+    from experts import ternary_qat_weight
+
+    torch.manual_seed(19)
+    x = torch.randn(3, 4, dtype=torch.float32, requires_grad=True)
+    w = torch.tensor(
+        [[-1.0, -0.2, 0.4, 1.2],
+         [0.1, -0.8, 0.7, 0.3],
+         [0.9, -0.4, -0.1, 0.6]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    q = ternary_qat_weight(w, threshold_ratio=0.5)
+    grad_output = torch.randn(3, 3, dtype=torch.float32)
+
+    output = torch.nn.functional.linear(x, q)
+    output.backward(grad_output)
+
+    # Input gradients use the actual ternary forward weights, not latent w.
+    expected_dx = grad_output @ q.detach()
+    # STE preserves the dense weight-gradient estimate for the optimizer.
+    expected_dw = grad_output.T @ x.detach()
+    assert torch.allclose(x.grad, expected_dx, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(w.grad, expected_dw, atol=1e-6, rtol=1e-6)
+    assert not torch.equal(q.detach(), w.detach())
+
