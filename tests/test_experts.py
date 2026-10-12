@@ -403,7 +403,7 @@ def test_release_expert_computation_graphs_and_clear_external_grads():
     out["loss"].backward()
 
     # Before take_expert_grads, leaves exist and hold gradients
-    leaf_tensors = [leaf for copies in m._leaves.values() for c in copies for leaf in c.values()]
+    leaf_tensors = [leaf for leaves in m._leaves.values() for leaf in leaves.values()]
     assert any(l.grad is not None for l in leaf_tensors)
 
     # Calling take_expert_grads clears leaf.grad and releases m._leaves
@@ -483,7 +483,7 @@ def test_grow_expert_commit_failure_restores_exact_topology(monkeypatch):
 
 
 def test_grow_topk_commit_failure_rolls_back_prefix_exactly(monkeypatch):
-    """Growth rollback: mid-commit failure removes prefix, restores cursor."""
+    """Growth rollback: batch router-append failure restores pool and cursor."""
     pool, r = _synced(n=3)
     next_before = pool._next_id
     order = list(pool.order)
@@ -495,15 +495,9 @@ def test_grow_topk_commit_failure_rolls_back_prefix_exactly(monkeypatch):
     opt.router_state["w"] = {"m": m.clone(), "step": 5,
                              "v_row": torch.zeros(3, 1),
                              "v_col": torch.zeros(1, d)}
-    real_add = r.add_expert_row
-    calls = {"n": 0}
-
-    def flaky(init=None):
-        calls["n"] += 1
-        if calls["n"] >= 2:
-            raise RuntimeError("router on fire mid-sweep")
-        return real_add(init=init)
-    monkeypatch.setattr(r, "add_expert_row", flaky)
+    def boom(rows):
+        raise RuntimeError("router on fire during batch append")
+    monkeypatch.setattr(r, "add_expert_rows", boom)
     with pytest.raises(RuntimeError):
         grow_topk_clones(pool, r, 16, 32, step=1, seed=0, k=3,
                          optim_state=opt.router_state)
