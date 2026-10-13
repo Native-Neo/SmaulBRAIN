@@ -347,15 +347,20 @@ class SmaulBrainModel(nn.Module):
 
         # Expert leaves are materialized once per active expert, not once per
         # recurrent depth. Bound the worst-case leaf working set and account
-        # for the checkpoint inputs (the large SwiGLU intermediates themselves
-        # are recomputed, not retained). FP8 weights and factored optimizer
-        # state are already resident by this point; report their footprint in
-        # the failure message but do not double-count them against MemAvailable.
+        # for checkpoint inputs (large SwiGLU intermediates are recomputed).
+        # Ternary QAT now caches one quantized compute-dtype matrix per leaf
+        # until backward/step cleanup; budget that additional copy explicitly.
+        # FP8 weights and optimizer state are already resident by this point.
         active_upper = min(self.cfg.num_experts, batch_tokens * self.cfg.top_k)
         expert_params = 3 * self.cfg.d_model * self.cfg.expert_hidden
         expert_leaf_bytes = active_upper * expert_params * dtype_bytes
         # Autograd retains a same-shaped, same-dtype gradient for each leaf.
         expert_grad_bytes = expert_leaf_bytes
+        # The QAT cache is one same-shaped compute-dtype copy per leaf, reused
+        # by every recurrent-depth invocation and checkpoint recomputation.
+        ternary_qat_cache_bytes = (
+            expert_leaf_bytes if self.cfg.ternary_qat else 0
+        )
         checkpoint_input_bytes = (
             batch_tokens * self.cfg.top_k * self.cfg.d_model
             * self.cfg.max_depth * dtype_bytes
@@ -400,8 +405,8 @@ class SmaulBrainModel(nn.Module):
         )
         transient_bytes = (
             estimated + expert_leaf_bytes + expert_grad_bytes
-            + checkpoint_input_bytes + expert_peak_temp_bytes
-            + pager_cache_bytes
+            + ternary_qat_cache_bytes + checkpoint_input_bytes
+            + expert_peak_temp_bytes + pager_cache_bytes
         )
         # FP8 code (1 B), FP32 block scales (~1/64 B/parameter), BF16 m
         # (2 B), and factored v marginals; 3.1 B/parameter is a rounded-up
@@ -426,6 +431,7 @@ class SmaulBrainModel(nn.Module):
                 f"retained_activations={estimated / 1048576:.1f} MiB, "
                 f"expert_leaves={expert_leaf_bytes / 1048576:.1f} MiB, "
                 f"expert_grads={expert_grad_bytes / 1048576:.1f} MiB, "
+                f"ternary_qat_cache={ternary_qat_cache_bytes / 1048576:.1f} MiB, "
                 f"checkpoint_inputs={checkpoint_input_bytes / 1048576:.1f} MiB, "
                 f"expert_mlp_temp={expert_mlp_temp_bytes / 1048576:.1f} MiB, "
                 f"ternary_qat_projection_temp={qat_projection_temp_bytes / 1048576:.1f} MiB, "
