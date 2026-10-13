@@ -106,6 +106,17 @@ def _iter_file_text(path: Path, remaining: int) -> Iterator[bytes]:
             ) from exc
         try:
             parquet = pq.ParquetFile(path)
+            # A tiny compressed Parquet file can expand dramatically. Check
+            # declared uncompressed row-group sizes before materializing rows.
+            metadata = parquet.metadata
+            uncompressed_bytes = sum(
+                metadata.row_group(index).total_byte_size
+                for index in range(metadata.num_row_groups)
+            )
+            if uncompressed_bytes > remaining:
+                raise ValueError(
+                    f"Parquet uncompressed data exceeds remaining dataset byte budget: {path}"
+                )
             for batch in parquet.iter_batches(batch_size=1):
                 for row in batch.to_pylist():
                     encoded = _json_bytes(row)
