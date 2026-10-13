@@ -61,6 +61,26 @@ def _ternary_values(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.Tens
     return (trits * scale).to(dtype=w.dtype)
 
 
+def _cached_ternary_values(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.Tensor:
+    """Quantize once per immutable training leaf, reusing it across recurrent depth.
+
+    A training leaf is not mutated until its complete backward has finished,
+    and a fresh leaf is created for the next optimizer step. The cache is
+    therefore attached to that leaf rather than held in a process-global map.
+    Tensor versioning guards against accidental in-place changes reusing stale
+    quantized values. This deliberately trades at most one compute-dtype copy
+    per active expert weight for avoiding repeated full-matrix thresholding.
+    """
+    version = w._version
+    cached = getattr(w, "_smaul_ternary_qat_cache", None)
+    if cached is not None and cached[0] == version:
+        return cached[1]
+    with torch.no_grad():
+        quantized = _ternary_values(w, threshold_ratio)
+    w._smaul_ternary_qat_cache = (version, quantized)
+    return quantized
+
+
 def ternary_qat_weight(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.Tensor:
     """Per-output-row ternary QAT with a straight-through estimator.
 
@@ -111,7 +131,7 @@ class _TernaryQATLinear(torch.autograd.Function):
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor, ternary_backward: bool):
         ctx.enabled = bool(ternary_backward)
         ctx.save_for_backward(x, weight)
-        quantized = _ternary_values(weight)
+        quantized = _cached_ternary_values(weight)
         return F.linear(x, quantized)
 
     @staticmethod
@@ -125,8 +145,7 @@ class _TernaryQATLinear(torch.autograd.Function):
             # Recreate only this projection's ternary values. Do not attach
             # another quantization graph: the STE is the explicit grad_weight
             # formula below, while dX uses the true ternary forward operand.
-            with torch.no_grad():
-                quantized = _ternary_values(weight)
+            quantized = _cached_ternary_values(weight)
         if ctx.needs_input_grad[0]:
             if ctx.enabled:
                 grad_input = call_ternary_backward_input(
