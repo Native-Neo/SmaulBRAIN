@@ -156,3 +156,15 @@ def test_csv_budget_does_not_emit_a_partial_structured_row(tmp_path: Path) -> No
     )
     with pytest.raises(ValueError, match="no usable text"):
         load_training_sequences(root, context_length=4, max_bytes=12)
+
+
+
+def test_jsonl_valid_newline_terminated_records_load(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    root.mkdir()
+    (root / "rows.jsonl").write_text(
+        json.dumps({"text": "hello"}) + "\n", encoding="utf-8"
+    )
+    seqs, kind = load_training_sequences(root, context_length=4, max_bytes=256)
+    assert kind == "directory"
+    assert seqs
