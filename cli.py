@@ -215,6 +215,8 @@ def build_parser() -> argparse.ArgumentParser:
     # train
     t = sub.add_parser("train", help="Train / fine-tune (same model, modes differ).")
     t.add_argument("--steps", type=int, default=20, help="Optimizer steps.")
+    t.add_argument("--preflight-only", action="store_true",
+                   help="Validate config/data and report model size without allocating the model.")
     t.add_argument("--batch", type=int, default=2, help="Batch size (sequences).")
     t.add_argument("--mode", type=str, default="entire",
                    choices=["entire", "trunk", "experts", "selected", "new"],
@@ -566,6 +568,39 @@ def main(argv: list[str] | None = None) -> int:
             print("training data source: synthetic demo (no --data given)",
                   file=sys.stderr)
             seqs = _demo_seqs()
+
+    if args.cmd == "train" and args.preflight_only:
+        report = {
+            "preflight": "passed",
+            "model_construction": "skipped",
+            "config": {
+                "d_model": cfg.d_model,
+                "n_heads": cfg.n_heads,
+                "context_length": cfg.context_length,
+                "min_depth": cfg.min_depth,
+                "max_depth": cfg.max_depth,
+                "num_experts": cfg.num_experts,
+                "top_k": cfg.top_k,
+                "expert_hidden": cfg.expert_hidden,
+                "paging_method": cfg.paging_method,
+                "dtype": cfg.dtype,
+                "state_dtype": cfg.state_dtype,
+                "batch": args.batch,
+                "steps": args.steps,
+            },
+            "counts": cfg.describe_counts(),
+            "dataset": {
+                "source": source_kind if args.data else "synthetic demo",
+                "sequences": len(seqs),
+            },
+            "memory_estimate": None,
+            "memory_note": (
+                "No RAM guarantee: parameter counts do not include activations, "
+                "gradients, optimizer state, staging buffers, or checkpoint peaks."
+            ),
+        }
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
 
     model = SmaulBrainModel(cfg)
     opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr, wd=cfg.weight_decay,
