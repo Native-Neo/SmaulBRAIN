@@ -435,12 +435,13 @@ def _self_test() -> None:
     if any(abs(ti[i] - expected_ti[i]) > 1e-6 for i in range(2)):
         raise RuntimeError(f"ternary backward self-test failed: {list(ti)}")
     # Packed ternary forward/backward: codes [+,0;-,+;0,-], scales [2,3,4].
-    packed = (ctypes.c_ubyte * 2)(0x61, 0x20)
+    packed = (ctypes.c_ubyte * 2)(0x61, 0x08)
     scales_t = (ctypes.c_float * 3)(2.0, 3.0, 4.0)
     tx = (ctypes.c_float * 2)(1.0, 2.0)
     ty = (ctypes.c_float * 3)()
     _libs["ternary_linear"].smaul_ternary_linear_forward(
-        tx, packed, scales_t, ty, 1, 2, 3, 0, 1
+        ctypes.cast(tx, ctypes.c_void_p), packed, scales_t,
+        ctypes.cast(ty, ctypes.c_void_p), 1, 2, 3, 0, 1
     )
     expected_ty = (2.0, 3.0, -8.0)
     if any(abs(ty[i] - expected_ty[i]) > 1e-6 for i in range(3)):
@@ -448,7 +449,8 @@ def _self_test() -> None:
     tgo = (ctypes.c_float * 3)(1.0, 2.0, 3.0)
     tdx = (ctypes.c_float * 2)()
     _libs["ternary_linear"].smaul_ternary_linear_backward_input(
-        tgo, packed, scales_t, tdx, 1, 2, 3, 0, 1
+        ctypes.cast(tgo, ctypes.c_void_p), packed, scales_t,
+        ctypes.cast(tdx, ctypes.c_void_p), 1, 2, 3, 0, 1
     )
     if abs(tdx[0] + 4.0) > 1e-6 or abs(tdx[1] + 6.0) > 1e-6:
         raise RuntimeError(f"ternary linear backward self-test failed: {list(tdx)}")
