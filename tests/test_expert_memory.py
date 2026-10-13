@@ -166,7 +166,7 @@ def test_ternary_linear_backward_matches_dense_autograd():
 
 
 
-def test_ternary_qat_custom_linear_recomputes_weights_and_preserves_ste_gradients():
+def test_ternary_qat_custom_linear_preserves_ste_gradients_without_saving_cache():
     from experts import _TernaryQATLinear, ternary_qat_weight
 
     torch.manual_seed(29)
@@ -251,6 +251,47 @@ def test_ternary_qat_projection_temporary_is_in_memory_budget(monkeypatch):
         with pytest.raises(ValueError, match="estimated training working set exceeds 65%") as exc:
             model._check_activation_budget(ids, training=True)
         assert "ternary_qat_projection_temp=" in str(exc.value)
+        assert "ternary_qat_cache=" in str(exc.value)
         assert "expert_mlp_temp=" in str(exc.value)
     finally:
         model.pager.close()
+
+
+
+def test_ternary_qat_reuses_cached_projection_until_leaf_changes(monkeypatch):
+    import experts
+    from experts import _TernaryQATLinear
+
+    original = experts._ternary_values
+    calls = 0
+
+    def counted(weight, threshold_ratio=0.7):
+        nonlocal calls
+        calls += 1
+        return original(weight, threshold_ratio)
+
+    monkeypatch.setattr(experts, "_ternary_values", counted)
+    torch.manual_seed(37)
+    weight = torch.randn(5, 7, requires_grad=True)
+
+    x1 = torch.randn(3, 7, requires_grad=True)
+    _TernaryQATLinear.apply(x1, weight, False).square().sum().backward()
+    assert calls == 1
+    cached = getattr(weight, "_smaul_ternary_qat_cache")
+    assert cached[0] == weight._version
+    assert cached[1].shape == weight.shape
+    assert not cached[1].requires_grad
+
+    # Another recurrent-depth invocation and its backward reuse one Q matrix.
+    x2 = torch.randn(4, 7, requires_grad=True)
+    _TernaryQATLinear.apply(x2, weight, False).square().sum().backward()
+    assert calls == 1
+    assert getattr(weight, "_smaul_ternary_qat_cache")[1].data_ptr() == cached[1].data_ptr()
+
+    # An in-place weight update increments Tensor._version; never return stale Q.
+    with torch.no_grad():
+        weight.add_(0.125)
+    x3 = torch.randn(2, 7, requires_grad=True)
+    _TernaryQATLinear.apply(x3, weight, False).sum().backward()
+    assert calls == 2
+    assert getattr(weight, "_smaul_ternary_qat_cache")[0] == weight._version
