@@ -44,10 +44,10 @@ inline std::uint8_t code_at(const std::uint8_t* packed, std::size_t index) {
 }
 
 template <class Function>
-void parallel_for(std::size_t count, int requested_threads, Function function) {
+void parallel_for(std::size_t count, int requested_threads, Function function,
+                  std::size_t minimum_chunk = 4096) {
     // Avoid thread launch overhead for small matrices. Thread creation here is
     // per native call, so never spawn more workers than there are useful chunks.
-    const std::size_t minimum_chunk = 4096;
     int threads = std::max(1, requested_threads);
     threads = std::min<int>(threads, static_cast<int>(
         std::max<std::size_t>(1, (count + minimum_chunk - 1) / minimum_chunk)));
@@ -128,7 +128,7 @@ void backward_input_impl(const void* grad_out, const std::uint8_t* packed,
                 store_value<BF16>(grad_input, dx_base + d, accum[d]);
             }
         }
-    });
+    }, 1);
 }
 
 }  // namespace
