@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from data_input import load_training_sequences
+from data_input import _iter_file_text, load_training_sequences
 
 
 def _joined(seqs: list[list[int]]) -> bytes:
@@ -151,14 +151,14 @@ def test_jsonl_large_line_is_read_with_a_bounded_budget(tmp_path: Path) -> None:
 
 
 def test_csv_budget_does_not_emit_a_partial_structured_row(tmp_path: Path) -> None:
-    """An oversized CSV file fails rather than emitting a truncated row."""
+    """An oversized CSV record produces no partial training text."""
     root = tmp_path / "dataset"
     root.mkdir()
     (root / "rows.csv").write_text(
         "text\nthis row is much larger than the budget\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="CSV file exceeds remaining dataset byte budget"):
+    with pytest.raises(ValueError, match="no usable text"):
         load_training_sequences(root, context_length=4, max_bytes=12)
 
 
@@ -176,12 +176,112 @@ def test_jsonl_valid_newline_terminated_records_load(tmp_path: Path) -> None:
 
 
 
-def test_parquet_uncompressed_size_is_checked_before_row_materialization(tmp_path: Path) -> None:
-    """Parquet metadata rejects oversized uncompressed data before loading rows."""
+def test_parquet_oversized_row_produces_no_partial_training_text(tmp_path: Path) -> None:
+    """An oversized Parquet record produces no partial training text."""
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     root = tmp_path / "dataset"
     root.mkdir()
     pq.write_table(pa.table({"text": ["x" * 10000]}), root / "large.parquet", compression="gzip")
-    with pytest.raises(ValueError, match="Parquet uncompressed data exceeds remaining dataset byte budget"):
+    with pytest.raises(ValueError, match="no usable text"):
         load_training_sequences(root, context_length=4, max_bytes=64)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+def test_csv_large_file_retains_complete_rows_within_budget(tmp_path: Path, newline) -> None:
+    path = tmp_path / "rows.csv"
+    path.write_bytes((f"text{newline}ok{newline}" + "x" * 10000).encode())
+
+    assert list(_iter_file_text(path, 32)) == [b'{"text":"ok"}\n']
+
+
+def test_csv_output_budget_preserves_complete_rows(tmp_path: Path) -> None:
+    path = tmp_path / "rows.csv"
+    path.write_bytes(b"text\na\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np\n")
+
+    assert list(_iter_file_text(path, 26)) == [b'{"text":"a"}\n', b'{"text":"b"}\n']
+
+
+@pytest.mark.parametrize("tail", [
+    '"quoted\n' + "x" * 10000,
+    "x" * 15 + "\u20ac" * 10000,
+])
+def test_csv_budget_drops_cut_multiline_and_utf8_rows(tmp_path: Path, tail) -> None:
+    path = tmp_path / "rows.csv"
+    path.write_bytes(("text\nok\n" + tail).encode("utf-8"))
+
+    assert list(_iter_file_text(path, 24)) == [b'{"text":"ok"}\n']
+
+
+@pytest.mark.parametrize("ending", ["", "\n"])
+def test_csv_complete_multiline_record_at_eof_loads(tmp_path: Path, ending) -> None:
+    path = tmp_path / "rows.csv"
+    path.write_bytes(('text\n"a\nb"' + ending).encode())
+
+    assert list(_iter_file_text(path, 64)) == [b'{"text":"a\\nb"}\n']
+
+
+def test_csv_still_rejects_malformed_complete_record(tmp_path: Path) -> None:
+    path = tmp_path / "rows.csv"
+    path.write_bytes(b'text\n"unfinished\n')
+
+    with pytest.raises(ValueError, match="invalid CSV row"):
+        list(_iter_file_text(path, 64))
+
+
+@pytest.mark.parametrize("row_group_size", [1, 4])
+def test_parquet_reads_usable_prefix_despite_large_row_groups(tmp_path: Path, row_group_size) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    path = tmp_path / "rows.parquet"
+    pq.write_table(
+        pa.table({"text": ["a", "b", "x" * 10000, "c"]}), path,
+        row_group_size=row_group_size, compression="gzip",
+    )
+
+    assert list(_iter_file_text(path, 26)) == [b'{"text":"a"}\n', b'{"text":"b"}\n']
+
+
+@pytest.mark.parametrize("value", ["x" * 1024, [0] * 1000, {"nested": ["x"] * 100}])
+def test_parquet_allows_python_overhead_for_rows_that_fit_text_budget(tmp_path: Path, value) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    path = tmp_path / "rows.parquet"
+    row = {"value": value}
+    pq.write_table(pa.Table.from_pylist([row]), path)
+    expected = (json.dumps(row, separators=(",", ":")) + "\n").encode()
+
+    assert list(_iter_file_text(path, len(expected))) == [expected]
+
+
+@pytest.mark.parametrize("large_value", [
+    "x" * 10000,
+    ["x"] * 10000,
+    {"nested": ["x"] * 10000},
+])
+def test_parquet_checks_expansion_before_python_materialization(tmp_path: Path, monkeypatch, large_value) -> None:
+    """Oversized strings and nested values must never reach to_pylist()."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    path = tmp_path / "rows.parquet"
+    path.touch()
+    batch = pa.record_batch({"value": [large_value]})
+
+    class GuardedBatch:
+        schema = batch.schema
+
+        def column(self, index):
+            return batch.column(index)
+
+        def to_pylist(self):
+            pytest.fail("oversized values must be checked before Python conversion")
+
+    class FakeParquet:
+        def iter_batches(self, *, batch_size):
+            assert batch_size == 1
+            yield GuardedBatch()
+            pytest.fail("reading must stop after the first oversized row")
+
+    monkeypatch.setattr(pq, "ParquetFile", lambda path: FakeParquet())
+
+    assert list(_iter_file_text(path, 64)) == []

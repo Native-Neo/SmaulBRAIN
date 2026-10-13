@@ -117,9 +117,9 @@ def main():
         # Inference throughput.
         gen_tokens = min(32, max(1, T - 1))
         t0 = time.perf_counter()
-        generate(model, [104, 105], max_new=gen_tokens, temperature=0.0, context=T)
+        generated = generate(model, [104, 105], max_new=gen_tokens, temperature=0.0, context=T)
         infer_dt = time.perf_counter() - t0
-        infer_tps = gen_tokens / max(infer_dt, 1e-12)
+        infer_tps = len(generated["depths"]) / max(infer_dt, 1e-12)
 
         # FP32 vs BF16 expert compute timing (measurement only; not a quality claim).
         from experts import swiglu_forward

@@ -8,9 +8,11 @@ container bytes (for example, Parquet's binary encoding).
 from __future__ import annotations
 
 import csv
+import io
 import json
 import os
 import stat
+import sys
 from pathlib import Path
 from typing import Iterator
 
@@ -22,6 +24,47 @@ _SUPPORTED = {".txt", ".text", ".md", ".jsonl", ".json", ".csv", ".parquet"}
 def _json_bytes(value) -> bytes:
     """Serialize a structured data value as UTF-8 JSON bytes."""
     return (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _parquet_python_size(value, limit: int) -> int:
+    """Conservatively bound scalar expansion without converting it to Python."""
+    import pyarrow as pa
+
+    if not value.is_valid:
+        return sys.getsizeof(None)
+    if pa.types.is_dictionary(value.type):
+        return _parquet_python_size(value.value, limit)
+    if (pa.types.is_string(value.type) or pa.types.is_large_string(value.type)
+            or pa.types.is_binary(value.type) or pa.types.is_large_binary(value.type)
+            or pa.types.is_fixed_size_binary(value.type)):
+        # Python Unicode can use four bytes per character, even for ASCII
+        # prefixes. as_buffer() exposes Arrow storage without making a str.
+        return sys.getsizeof("\U0010ffff") + 4 * value.as_buffer().size
+    if (pa.types.is_list(value.type) or pa.types.is_large_list(value.type)
+            or pa.types.is_fixed_size_list(value.type) or pa.types.is_map(value.type)):
+        children = value.values
+        size = sys.getsizeof([]) + 16 * len(children)
+    elif pa.types.is_struct(value.type):
+        size = sys.getsizeof({}) + sum(
+            128 + sys.getsizeof(field.name) for field in value.type
+        )
+        children = (value[index] for index in range(len(value.type)))
+    elif pa.types.is_integer(value.type) or pa.types.is_boolean(value.type):
+        return sys.getsizeof(2 ** 64)
+    elif pa.types.is_floating(value.type):
+        return sys.getsizeof(0.0)
+    elif pa.types.is_temporal(value.type) or pa.types.is_decimal(value.type):
+        # Fixed-width Python numbers/dates/decimals have bounded expansion.
+        return 128
+    else:
+        raise ValueError(f"cannot bound Python expansion for Parquet type {value.type}")
+    if size > limit:
+        return size
+    for child in children:
+        size += _parquet_python_size(child, limit - size)
+        if size > limit:
+            break
+    return size
 
 
 def _iter_file_text(path: Path, remaining: int) -> Iterator[bytes]:
@@ -80,21 +123,31 @@ def _iter_file_text(path: Path, remaining: int) -> Iterator[bytes]:
         return
 
     if suffix == ".csv":
-        # csv.DictReader can buffer a whole logical record (including quoted
-        # multiline fields). Refuse a file larger than its assigned budget
-        # before the parser can read an unbounded record into memory.
-        if path.stat().st_size > remaining:
-            raise ValueError(f"CSV file exceeds remaining dataset byte budget: {path}")
-        with path.open("r", encoding="utf-8", newline="") as stream:
-            reader = csv.DictReader(stream)
-            for row in reader:
-                encoded = _json_bytes(row)
-                if len(encoded) > remaining:
+        with path.open("rb") as stream:
+            data = stream.read(remaining)
+            truncated = stream.tell() < path.stat().st_size
+        if truncated:
+            # Drop an incomplete physical line, including a cut UTF-8 code
+            # point. strict parsing below also drops cut multiline records.
+            end = max(data.rfind(b"\n"), data.rfind(b"\r")) + 1
+            data = data[:end]
+        with io.StringIO(data.decode("utf-8"), newline="") as stream:
+            reader = csv.DictReader(stream, strict=True)
+            try:
+                for row in reader:
+                    encoded = _json_bytes(row)
+                    if len(encoded) > remaining:
+                        return
+                    remaining -= len(encoded)
+                    yield encoded
+                    if remaining <= 0:
+                        return
+            except csv.Error as exc:
+                # A budget boundary inside a quoted multiline record is an
+                # incomplete row, not a reason to discard preceding rows.
+                if truncated and str(exc) == "unexpected end of data":
                     return
-                remaining -= len(encoded)
-                yield encoded
-                if remaining <= 0:
-                    return
+                raise ValueError(f"invalid CSV row in {path}: {exc}") from exc
         return
 
     if suffix == ".parquet":
@@ -106,26 +159,28 @@ def _iter_file_text(path: Path, remaining: int) -> Iterator[bytes]:
             ) from exc
         try:
             parquet = pq.ParquetFile(path)
-            # A tiny compressed Parquet file can expand dramatically. Check
-            # declared uncompressed row-group sizes before materializing rows.
-            metadata = parquet.metadata
-            uncompressed_bytes = sum(
-                metadata.row_group(index).total_byte_size
-                for index in range(metadata.num_row_groups)
-            )
-            if uncompressed_bytes > remaining:
-                raise ValueError(
-                    f"Parquet uncompressed data exceeds remaining dataset byte budget: {path}"
-                )
-            for batch in parquet.iter_batches(batch_size=128):
-                for row in batch.to_pylist():
-                    encoded = _json_bytes(row)
-                    if len(encoded) > remaining:
+            # Keep Arrow decoding incremental. Row-group storage sizes do not
+            # bound Python objects, particularly nested or dictionary values.
+            for batch in parquet.iter_batches(batch_size=1):
+                # Python containers can be much larger than JSON text. Allow
+                # bounded overhead, capped at the default dataset allocation.
+                memory_limit = min(MAX_DATA_BYTES, max(4096, 64 * remaining))
+                expanded_size = sys.getsizeof({})
+                for index, name in enumerate(batch.schema.names):
+                    expanded_size += 128 + sys.getsizeof(name)
+                    expanded_size += _parquet_python_size(
+                        batch.column(index)[0], memory_limit - expanded_size
+                    )
+                    if expanded_size > memory_limit:
                         return
-                    remaining -= len(encoded)
-                    yield encoded
-                    if remaining <= 0:
-                        return
+                row = batch.to_pylist()[0]
+                encoded = _json_bytes(row)
+                if len(encoded) > remaining:
+                    return
+                remaining -= len(encoded)
+                yield encoded
+                if remaining <= 0:
+                    return
         except (OSError, ValueError) as exc:
             raise ValueError(f"cannot read Parquet dataset {path}: {exc}") from exc
         return

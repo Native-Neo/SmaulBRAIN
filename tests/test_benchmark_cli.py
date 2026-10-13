@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -67,3 +68,28 @@ def test_benchmark_allows_explicit_guard_override():
     assert result.returncode == 0, result.stderr
     assert '"train_tokens_per_s"' in result.stdout
     assert '"peak_rss_mb"' in result.stdout
+
+
+@pytest.mark.parametrize("byte_tokens", [0, 2])
+def test_benchmark_counts_generated_tokens_when_eos_stops_early(monkeypatch, capsys, byte_tokens):
+    """Measure actual continuation steps, including EOS and excluding the prompt."""
+    from types import SimpleNamespace
+
+    from benchmarks import bench
+    from bytes import EOS_ID
+    import infer
+
+    sampled = iter([104] * byte_tokens + [EOS_ID])
+    monkeypatch.setattr(infer, "sample_next", lambda *args, **kwargs: next(sampled))
+    times = iter([0.0, 1.0, 2.0, 4.0])
+    monkeypatch.setattr(bench, "time", SimpleNamespace(perf_counter=lambda: next(times)))
+    monkeypatch.setattr(sys, "argv", [
+        str(BENCH), "--steps", "1", "--d-model", "8", "--experts", "1",
+        "--top-k", "1", "--expert-hidden", "8", "--context-length", "8",
+        "--batch-size", "1", "--threads", "1",
+    ])
+
+    bench.main()
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["infer_tokens_per_s"] == (byte_tokens + 1) / 2.0

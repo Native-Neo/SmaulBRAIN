@@ -89,3 +89,35 @@ def test_config_rejects_numeric_values_too_large_for_finite_float():
     payload["expert_lr"] = huge_integer
     with pytest.raises(ValueError, match="expert_lr must be a finite number"):
         SmaulBrainConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize("maximum", [1, 8, 32, 64, 128])
+def test_from_dict_caps_omitted_pruning_floor_for_legacy_configs(maximum):
+    payload = {"num_experts": 1, "top_k": 1, "max_experts": maximum}
+
+    config = SmaulBrainConfig.from_dict(payload)
+
+    assert config.min_experts == min(SmaulBrainConfig.min_experts, maximum)
+    assert "min_experts" not in payload
+
+
+@pytest.mark.parametrize("minimum", [1, 8, 32])
+def test_from_dict_preserves_explicit_pruning_floor(minimum):
+    config = SmaulBrainConfig.from_dict(
+        {"num_experts": 1, "top_k": 1, "max_experts": 32, "min_experts": minimum}
+    )
+    assert config.min_experts == minimum
+
+
+@pytest.mark.parametrize("minimum", [0, 33, None, True])
+def test_from_dict_rejects_invalid_explicit_pruning_floor(minimum):
+    with pytest.raises(ValueError, match="min_experts"):
+        SmaulBrainConfig.from_dict(
+            {"num_experts": 1, "top_k": 1, "max_experts": 32, "min_experts": minimum}
+        )
+
+
+@pytest.mark.parametrize("maximum", [None, True, "32", 32.0])
+def test_from_dict_keeps_maximum_type_validation_when_floor_is_omitted(maximum):
+    with pytest.raises(ValueError, match="max_experts"):
+        SmaulBrainConfig.from_dict({"max_experts": maximum})

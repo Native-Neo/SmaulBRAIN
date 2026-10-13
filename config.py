@@ -258,6 +258,7 @@ class SmaulBrainConfig:
 
         Compatibility contract:
         - Omitted fields fall back to dataclass defaults (backward compatible).
+          An omitted min_experts is capped at max_experts for older configs.
         - Explicit nulls are rejected (omitted != null; null is never valid).
         - Unknown fields (incl. ``schema_version`` stamped by storage.py,
           whose major is gated there) are tolerated and dropped (forward
@@ -321,6 +322,10 @@ class SmaulBrainConfig:
                 f"config field use_byte_conv must be a bool, got {values['use_byte_conv']!r}"
             )
         try:
+            if "min_experts" not in values:
+                maximum = values.get("max_experts", cls.max_experts)
+                if isinstance(maximum, int) and not isinstance(maximum, bool):
+                    values["min_experts"] = min(cls.min_experts, maximum)
             return cls(**values)
         except (TypeError, AssertionError) as e:
             raise ValueError(f"config has bad field types: {e}") from e
