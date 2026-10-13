@@ -154,7 +154,7 @@ def test_csv_budget_does_not_emit_a_partial_structured_row(tmp_path: Path) -> No
         "text\nthis row is much larger than the budget\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="no usable text"):
+    with pytest.raises(ValueError, match="CSV file exceeds remaining dataset byte budget"):
         load_training_sequences(root, context_length=4, max_bytes=12)
 
 
