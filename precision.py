@@ -177,6 +177,7 @@ def dequantize_fp8_blockwise(t: FP8BlockTensor, dtype: torch.dtype = torch.float
 
 
 def _validate_fp8_row_range(t: FP8BlockTensor, row_start: int, row_end: int) -> None:
+    """Validate the requested row interval against an FP8 block tensor."""
     if t.codes.ndim != 2 or len(t.shape) != 2:
         raise ValueError(
             "row-block operations require a 2-D (rows x cols) FP8BlockTensor, "
@@ -362,6 +363,7 @@ PRECISION_POLICY: dict[str, tuple[str, str]] = {
 
 
 def compute_dtype(name: str, fallback: torch.dtype = torch.bfloat16) -> torch.dtype:
+    """Resolve a supported compute dtype name with a safe fallback."""
     # hybrid_fp8 returns activations in BF16 by default; its arithmetic
     # itself uses E4M3 forward and E5M2 backward quantization.
     table = {"fp8": torch.float8_e4m3fn, "bf16": torch.bfloat16,
@@ -407,6 +409,7 @@ class DelayedScaler:
 
 
 def _amax(x: torch.Tensor) -> float:
+    """Return the maximum absolute finite magnitude of a tensor."""
     with torch.no_grad():
         m = x.detach().float().abs().amax().item()
     return float(m)
@@ -423,6 +426,7 @@ def _quantize_to_fp8(x: torch.Tensor, scale: float, fp8_dtype: torch.dtype,
 
 
 def _dequantize_from_fp8(q: torch.Tensor, scale: float) -> torch.Tensor:
+    """Restore scaled floating-point values from FP8 codes."""
     return q.float() / max(float(scale), 1e-12)
 
 
@@ -515,6 +519,7 @@ class _HybridFP8Matmul(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Compute gradients for inputs, weights, bias, and scaling parameters."""
         saved = ctx.saved_tensors
         g32 = grad_output.float()
         grad_input = grad_weight = grad_bias = None
@@ -607,6 +612,7 @@ class HybridFP8Linear(nn.Module):
         )
 
     def extra_repr(self) -> str:
+        """Describe this layer's dimensions and bias configuration."""
         return (f"in_features={self.in_features}, out_features={self.out_features}, "
                 f"bias={self.bias is not None}, out_dtype={self.out_dtype}")
 
