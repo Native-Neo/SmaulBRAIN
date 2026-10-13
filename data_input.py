@@ -21,6 +21,7 @@ _SUPPORTED = {".txt", ".text", ".md", ".jsonl", ".json", ".csv", ".parquet"}
 
 def _json_bytes(value) -> bytes:
     return (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    """Serialize a structured data value as UTF-8 JSON bytes."""
 
 
 def _iter_file_text(path: Path, remaining: int) -> Iterator[bytes]:
@@ -135,6 +136,7 @@ def _iter_file_text(path: Path, remaining: int) -> Iterator[bytes]:
 
 def _regular_non_symlink(path: Path) -> bool:
     try:
+    """Return whether a path is a regular file or directory without following a symlink."""
         mode = path.lstat().st_mode
     except OSError as exc:
         raise ValueError(f"cannot inspect dataset path {path}: {exc}") from exc
