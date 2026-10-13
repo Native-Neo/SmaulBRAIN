@@ -168,3 +168,14 @@ def test_jsonl_valid_newline_terminated_records_load(tmp_path: Path) -> None:
     seqs, kind = load_training_sequences(root, context_length=4, max_bytes=256)
     assert kind == "directory"
     assert seqs
+
+
+
+def test_parquet_uncompressed_size_is_checked_before_row_materialization(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "dataset"
+    root.mkdir()
+    pq.write_table(pa.table({"text": ["x" * 10000]}), root / "large.parquet", compression="gzip")
+    with pytest.raises(ValueError, match="Parquet uncompressed data exceeds remaining dataset byte budget"):
+        load_training_sequences(root, context_length=4, max_bytes=64)
