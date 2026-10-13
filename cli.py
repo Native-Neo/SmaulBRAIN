@@ -395,7 +395,7 @@ def _safe_ckpt_dir(ckpt_dir: str, allow_outside: bool = False) -> str:
 def load_saved_config(ckpt_dir: str, allow_outside: bool = False) -> SmaulBrainConfig | None:
     """Checkpoint config without building a model (None when no checkpoint)."""
     ckpt_dir = _safe_ckpt_dir(ckpt_dir, allow_outside=allow_outside)
-    from storage import _jailed_path
+    from checkpoint_paths import _jailed_path
     try:
         cfg_path = _jailed_path(ckpt_dir, "config.json")
         man_path = _jailed_path(ckpt_dir, "manifest.json")
