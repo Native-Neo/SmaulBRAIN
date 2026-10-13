@@ -107,6 +107,7 @@ class SmaulBrainConfig:
     def __post_init__(self) -> None:
         # Keep safety checks active under python -O; assert statements alone are stripped.
         def require(condition: bool, message: str) -> None:
+        """Validate model dimensions and runtime settings, including under optimized Python."""
             if not condition:
                 raise AssertionError(message)
 
