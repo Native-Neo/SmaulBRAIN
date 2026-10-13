@@ -1438,6 +1438,14 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     new_admit = torch.tensor(manifest.get("router_admit", [0.0] * len(eids)),
                              dtype=torch.float64, device=dev)
 
+    # Reject extra keys before loading anything: load_state_dict can mutate
+    # matching tensors before reporting unexpected keys.
+    unexpected_trunk = set(trunk) - set(model_sd)
+    if unexpected_trunk:
+        raise ValueError(
+            "checkpoint validation failed: unexpected trunk keys "
+            f"{sorted(unexpected_trunk)}"
+        )
     incompatible = model.load_state_dict(trunk, strict=False)
     # Router tensors and counters are restored from their dedicated files and
     # manifest below. Every other model tensor must have been loaded; silently
