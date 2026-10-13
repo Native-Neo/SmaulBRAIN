@@ -20,8 +20,8 @@ try:
         return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 except ImportError:  # Windows: resource is Unix-only
     def rss_mb():
-        """Return the process peak resident-set size in MiB."""
-        return 0.0
+        """Return None when peak RSS cannot be measured on this platform."""
+        return None
 
 import torch
 from config import SmaulBrainConfig
@@ -147,7 +147,7 @@ def main():
                 },
                 "train_tokens_per_s": round(train_tps, 2),
                 "infer_tokens_per_s": round(infer_tps, 2),
-                "peak_rss_mb": round(rss_mb(), 1),
+                "peak_rss_mb": round(rss_mb(), 1) if rss_mb() is not None else None,
                 "checkpoint_disk_mb": round(disk_mb(ckpt_dir), 3),
                 "param_counts": model.param_counts(),
                 "paging": model.pager.stats.to_dict(),
