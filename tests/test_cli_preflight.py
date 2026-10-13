@@ -27,3 +27,25 @@ def test_missing_training_data_fails_before_model_construction(tmp_path, monkeyp
     assert "error: --data:" in captured.err
     assert "dataset path not found" in captured.err
     assert "model construction happened" not in captured.err
+
+
+
+def test_preflight_reports_config_without_constructing_model(tmp_path, monkeypatch, capsys):
+    import json
+
+    def forbidden_constructor(*args, **kwargs):
+        raise AssertionError("preflight constructed the model")
+
+    monkeypatch.setattr(cli, "SmaulBrainModel", forbidden_constructor)
+    result = main([
+        "--allow-outside-ckpt", "--ckpt", str(tmp_path / "checkpoint"),
+        "train", "--steps", "1", "--preflight-only",
+    ])
+    captured = capsys.readouterr()
+    assert result == 0, captured.err
+    report = json.loads(captured.out)
+    assert report["preflight"] == "passed"
+    assert report["model_construction"] == "skipped"
+    assert report["counts"]["total_params"] > 0
+    assert report["memory_estimate"] is None
+    assert "No RAM guarantee" in report["memory_note"]
