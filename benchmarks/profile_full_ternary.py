@@ -106,7 +106,7 @@ def main() -> int:
             profile_memory=False,
             with_stack=False,
         ) as prof:
-            stats = train_step(model, opt, cfg, x, y, 0)
+            stats = train_step(model, opt, cfg, x, y, 0, profile=True)
         wall_s = time.perf_counter() - started
 
         # Aggregate across shapes for compact, stable CI logs.
