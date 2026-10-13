@@ -70,7 +70,7 @@ ENV_VAR = "SMAUL_NATIVE"
 BUILD_TIMEOUT_VAR = "SMAUL_NATIVE_BUILD_TIMEOUT"
 BUILD_TIMEOUT_DEFAULT = 300
 SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels_cpp")
-LIBS = ("rmsnorm", "linear_attn", "fp8_quant", "ternary_backward")
+LIBS = ("rmsnorm", "linear_attn", "fp8_quant", "ternary_backward", "ternary_linear")
 
 # Required ISA: baseline x86-64 (SSE2) only. The kernels use no AVX/AVX2/
 # AVX-512 intrinsics and are built with ``-march=x86-64``, so they run on any
@@ -101,6 +101,8 @@ COUNTERS: dict[str, int] = {
     "rmsnorm_native": 0, "rmsnorm_fallback": 0,
     "attn_step_native": 0, "attn_step_fallback": 0,
     "ternary_backward_native": 0, "ternary_backward_fallback": 0,
+    "ternary_linear_forward_native": 0, "ternary_linear_forward_fallback": 0,
+    "ternary_linear_backward_native": 0, "ternary_linear_backward_fallback": 0,
 }
 LAST_FALLBACK: dict[str, str] = {}
 
@@ -204,7 +206,7 @@ def native_mode() -> str:
 
 def _build_flags() -> list[str]:
     """Baseline-only flags: portable to Ivy Bridge, no AVX assumptions."""
-    flags = ["-O2", "-std=c++17", "-shared", "-fPIC", "-fno-fast-math"]
+    flags = ["-O2", "-std=c++17", "-shared", "-fPIC", "-fno-fast-math", "-pthread"]
     if platform.machine().lower() in ("x86_64", "amd64"):
         flags += ["-march=x86-64", "-mtune=generic"]
     return flags
@@ -432,6 +434,24 @@ def _self_test() -> None:
     expected_ti = (-3.5, 0.0)
     if any(abs(ti[i] - expected_ti[i]) > 1e-6 for i in range(2)):
         raise RuntimeError(f"ternary backward self-test failed: {list(ti)}")
+    # Packed ternary forward/backward: codes [+,0;-,+;0,-], scales [2,3,4].
+    packed = (ctypes.c_ubyte * 2)(0x61, 0x20)
+    scales_t = (ctypes.c_float * 3)(2.0, 3.0, 4.0)
+    tx = (ctypes.c_float * 2)(1.0, 2.0)
+    ty = (ctypes.c_float * 3)()
+    _libs["ternary_linear"].smaul_ternary_linear_forward(
+        tx, packed, scales_t, ty, 1, 2, 3, 0, 1
+    )
+    expected_ty = (2.0, 3.0, -8.0)
+    if any(abs(ty[i] - expected_ty[i]) > 1e-6 for i in range(3)):
+        raise RuntimeError(f"ternary linear forward self-test failed: {list(ty)}")
+    tgo = (ctypes.c_float * 3)(1.0, 2.0, 3.0)
+    tdx = (ctypes.c_float * 2)()
+    _libs["ternary_linear"].smaul_ternary_linear_backward_input(
+        tgo, packed, scales_t, tdx, 1, 2, 3, 0, 1
+    )
+    if abs(tdx[0] + 4.0) > 1e-6 or abs(tdx[1] + 6.0) > 1e-6:
+        raise RuntimeError(f"ternary linear backward self-test failed: {list(tdx)}")
     # fp8: quantize+dequantize roundtrip stays finite
     wq = (ctypes.c_float * 4)(0.5, -1.0, 2.0, 0.01)
     codes = (ctypes.c_ubyte * 4)()
@@ -468,6 +488,17 @@ def _bind(lib: ctypes.CDLL, name: str) -> None:
             raise RuntimeError("ternary_backward .so missing smaul_ternary_backward_input (ABI?)")
         fn.argtypes = [F, F, F, S, S, S]
         fn.restype = None
+    elif name == "ternary_linear":
+        fwd = getattr(lib, "smaul_ternary_linear_forward", None)
+        bwd = getattr(lib, "smaul_ternary_linear_backward_input", None)
+        if fwd is None or bwd is None:
+            raise RuntimeError("ternary_linear .so missing forward/backward symbols (ABI?)")
+        args = [ctypes.c_void_p, U, F, ctypes.c_void_p,
+                S, S, S, ctypes.c_int, ctypes.c_int]
+        fwd.argtypes = args
+        fwd.restype = None
+        bwd.argtypes = args
+        bwd.restype = None
     elif name == "fp8_quant":
         q = getattr(lib, "smaul_fp8_quant_row_block", None)
         dq = getattr(lib, "smaul_fp8_dequant_row_block", None)
@@ -753,6 +784,102 @@ def call_fp8_dequant(
         if native_mode() == "force":
             raise
         return False
+
+def call_ternary_linear_forward(
+    x: torch.Tensor, packed_codes: torch.Tensor, scales: torch.Tensor
+) -> torch.Tensor | None:
+    """Packed ternary forward: signed additions/subtractions plus row scaling."""
+    op = "ternary_linear_forward"
+    if x.device.type != "cpu" or x.dtype not in (torch.float32, torch.bfloat16):
+        _note(op, False, f"requires CPU FP32/BF16 activations (got {x.device}/{x.dtype})")
+        return None
+    if packed_codes.device.type != "cpu" or packed_codes.dtype != torch.uint8:
+        _note(op, False, "packed ternary codes must be CPU uint8")
+        return None
+    if scales.device.type != "cpu" or scales.dtype != torch.float32:
+        _note(op, False, "ternary row scales must be CPU FP32")
+        return None
+    if x.ndim != 2 or x.shape[0] == 0 or x.shape[1] == 0 or scales.ndim != 1:
+        _note(op, False, "requires non-empty [rows, in_features] and 1-D scales")
+        return None
+    rows, in_features = map(int, x.shape)
+    out_features = int(scales.numel())
+    if out_features == 0 or packed_codes.numel() != (in_features * out_features + 3) // 4:
+        _note(op, False, "packed weight size does not match input/scales")
+        return None
+    if not (x.is_contiguous() and packed_codes.is_contiguous() and scales.is_contiguous()):
+        _note(op, False, "requires contiguous inputs")
+        return None
+    if not _want_native(op):
+        return None
+    try:
+        output = torch.empty((rows, out_features), dtype=x.dtype, device="cpu")
+        _libs["ternary_linear"].smaul_ternary_linear_forward(
+            ctypes.c_void_p(x.data_ptr()), _ptr(packed_codes, ctypes.c_ubyte),
+            _ptr(scales, ctypes.c_float), ctypes.c_void_p(output.data_ptr()),
+            rows, in_features, out_features, int(x.dtype == torch.bfloat16),
+            max(1, int(torch.get_num_threads())),
+        )
+        _note(op, True)
+        return output
+    except Exception as e:
+        _note(op, False, f"{type(e).__name__}: {e}")
+        if native_mode() == "force":
+            raise
+        return None
+
+
+def call_ternary_linear_backward_input(
+    grad_out: torch.Tensor, packed_codes: torch.Tensor,
+    scales: torch.Tensor, in_features: int,
+) -> torch.Tensor | None:
+    """Packed ternary dX: scale each upstream value once, then add/subtract."""
+    op = "ternary_linear_backward"
+    if grad_out.device.type != "cpu" or grad_out.dtype not in (torch.float32, torch.bfloat16):
+        _note(op, False, f"requires CPU FP32/BF16 gradients (got {grad_out.device}/{grad_out.dtype})")
+        return None
+    if packed_codes.device.type != "cpu" or packed_codes.dtype != torch.uint8:
+        _note(op, False, "packed ternary codes must be CPU uint8")
+        return None
+    if scales.device.type != "cpu" or scales.dtype != torch.float32:
+        _note(op, False, "ternary row scales must be CPU FP32")
+        return None
+    if grad_out.ndim != 2 or grad_out.shape[0] == 0 or grad_out.shape[1] == 0:
+        _note(op, False, "grad_out must be a non-empty 2-D matrix")
+        return None
+    rows, out_features = map(int, grad_out.shape)
+    try:
+        in_features = int(in_features)
+    except (TypeError, ValueError, OverflowError):
+        _note(op, False, "invalid in_features")
+        return None
+    if in_features <= 0 or scales.ndim != 1 or scales.numel() != out_features:
+        _note(op, False, "input dimension or row scales do not match")
+        return None
+    if packed_codes.numel() != (in_features * out_features + 3) // 4:
+        _note(op, False, "packed weight size does not match gradient/scales")
+        return None
+    if not (grad_out.is_contiguous() and packed_codes.is_contiguous() and scales.is_contiguous()):
+        _note(op, False, "requires contiguous inputs")
+        return None
+    if not _want_native(op):
+        return None
+    try:
+        grad_input = torch.empty((rows, in_features), dtype=grad_out.dtype, device="cpu")
+        _libs["ternary_linear"].smaul_ternary_linear_backward_input(
+            ctypes.c_void_p(grad_out.data_ptr()), _ptr(packed_codes, ctypes.c_ubyte),
+            _ptr(scales, ctypes.c_float), ctypes.c_void_p(grad_input.data_ptr()),
+            rows, in_features, out_features, int(grad_out.dtype == torch.bfloat16),
+            max(1, int(torch.get_num_threads())),
+        )
+        _note(op, True)
+        return grad_input
+    except Exception as e:
+        _note(op, False, f"{type(e).__name__}: {e}")
+        if native_mode() == "force":
+            raise
+        return None
+
 
 def call_ternary_backward_input(
     grad_out: torch.Tensor, weight: torch.Tensor
