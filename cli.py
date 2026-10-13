@@ -48,6 +48,10 @@ FULL_DEFAULTS = {
 SHAPE_FIELDS = ("vocab_size", "d_model", "n_heads", "expert_hidden",
                 "top_k", "dtype")
 
+# Lazy injection seam for tests/tools. Keep the model module unloaded during
+# preflight so low-memory users can inspect a config without importing torch.
+SmaulBrainModel = None
+
 # Maps SmaulBrainConfig field -> argparse dest holding the CLI override.
 # `expert_hidden` is set via --expert-size (dest expert_size).
 ARG_TO_CONFIG = {
@@ -473,11 +477,6 @@ def _demo_seqs(n: int = 64, length: int = 40) -> list[list[int]]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    from infer import generate
-    from model import SmaulBrainModel
-    from smaulopt import SmaulOpt, SmaulOptHParams
-    from storage import load_model, save_model
-
     args = build_parser().parse_args(argv)
     try:
         args.ckpt = _safe_ckpt_dir(args.ckpt,
@@ -527,23 +526,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.batch is not None and int(args.batch) < 1:
             print(f"error: --batch must be >= 1, got {args.batch!r}", file=sys.stderr)
             return 2
-
-    import torch
-    # NNPACK can repeatedly emit a C++ warning on older CPUs that cannot
-    # initialize its kernels. Disable it on CPUs below AVX2 and use PyTorch's
-    # normal fallback kernels instead of flooding the training log.
-    nnpack = getattr(torch.backends, "nnpack", None)
-    cpu_backend = getattr(torch.backends, "cpu", None)
-    get_capability = getattr(cpu_backend, "get_cpu_capability", None)
-    cpu_capability = get_capability() if callable(get_capability) else "DEFAULT"
-    if (nnpack is not None and callable(getattr(nnpack, "set_flags", None))
-            and cpu_capability not in {"AVX2", "AVX512"}):
-        nnpack.set_flags(False)
-        if callable(getattr(nnpack, "is_available", None)) and nnpack.is_available():
-            print("[cpu] NNPACK disabled for this CPU; using fallback kernels.",
-                  file=sys.stderr)
-    torch.manual_seed(cfg.seed)
-    torch.set_num_threads(cfg.threads)
 
     # Validate and load training input before allocating the model. In
     # particular, a missing/invalid --data path must not allocate a full
@@ -602,7 +584,31 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0
 
-    model = SmaulBrainModel(cfg)
+    # Heavy runtime modules are loaded only after preflight/data validation.
+    import torch
+    from smaulopt import SmaulOpt, SmaulOptHParams
+    from storage import load_model, save_model
+
+    # NNPACK can repeatedly emit a C++ warning on older CPUs that cannot
+    # initialize its kernels. Disable it on CPUs below AVX2 and use PyTorch's
+    # normal fallback kernels instead of flooding the training log.
+    nnpack = getattr(torch.backends, "nnpack", None)
+    cpu_backend = getattr(torch.backends, "cpu", None)
+    get_capability = getattr(cpu_backend, "get_cpu_capability", None)
+    cpu_capability = get_capability() if callable(get_capability) else "DEFAULT"
+    if (nnpack is not None and callable(getattr(nnpack, "set_flags", None))
+            and cpu_capability not in {"AVX2", "AVX512"}):
+        nnpack.set_flags(False)
+        if callable(getattr(nnpack, "is_available", None)) and nnpack.is_available():
+            print("[cpu] NNPACK disabled for this CPU; using fallback kernels.",
+                  file=sys.stderr)
+    torch.manual_seed(cfg.seed)
+    torch.set_num_threads(cfg.threads)
+
+    model_cls = SmaulBrainModel
+    if model_cls is None:
+        from model import SmaulBrainModel as model_cls
+    model = model_cls(cfg)
     opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr, wd=cfg.weight_decay,
                                    beta_m=cfg.beta_m, beta_v=cfg.beta_v,
                                    eps=cfg.epsilon, clip=cfg.grad_clip,
@@ -715,6 +721,7 @@ def main(argv: list[str] | None = None) -> int:
         # loader here must not repeat that work (double disk reads).
         from storage import make_disk_loader
         model.pager.load_from_disk = make_disk_loader(args.ckpt)
+        from infer import generate
         res = generate(model, encode_text(args.prompt), max_new=args.max_new,
                        temperature=args.temperature,
                        top_k=0 if getattr(args, "sampler_top_k", None) is None
