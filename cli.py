@@ -108,6 +108,7 @@ def _cfg_default(name: str):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser and its subcommands."""
     p = argparse.ArgumentParser(prog="smaulbrain",
                                 description="SmaulBRAIN recurrent byte-level MoE LM")
     p.add_argument("--vocab-size", type=int, default=None, dest="vocab_size",
@@ -115,7 +116,6 @@ def build_parser() -> argparse.ArgumentParser:
                         "bos/eos/pad/sep). Padding is always PAD_ID (never byte 0). "
                         "On resume an explicit mismatch aborts; else checkpoint wins.")
     p.add_argument("--d-model", type=int, default=None, help="Shared trunk width (default: tiny=64, full=512).")
-    """Build the command-line parser and its subcommands."""
     p.add_argument("--n-heads", type=int, default=None, help="Linear-attention heads (default: tiny=4).")
     p.add_argument("--experts", type=int, default=None, dest="num_experts",
                     help="Initial dynamic expert count (default: tiny=8, full=64). "
@@ -271,10 +271,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def config_from_args(args: argparse.Namespace) -> SmaulBrainConfig:
+    """Build a validated model configuration from parsed CLI options."""
     preset = FULL_DEFAULTS if getattr(args, "full", False) else TINY_DEFAULTS
 
     def pick(cli_value, key: str):
-    """Build a validated model configuration from parsed CLI options."""
         # Flags default to None, so an explicitly passed value (even one
         # equal to a tiny default) always wins; otherwise the preset applies.
         return cli_value if cli_value is not None else preset[key]
@@ -473,13 +473,14 @@ def resolve_train_grow_every(args: argparse.Namespace, cfg: SmaulBrainConfig) ->
 
 
 def _demo_seqs(n: int = 64, length: int = 40) -> list[list[int]]:
+    """Create deterministic synthetic byte-token sequences for demo training."""
     import random
     rng = random.Random(0)
     return [[rng.randrange(256) for _ in range(length)] for _ in range(n)]
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Create deterministic synthetic byte-token sequences for demo training."""
+    """Validate command inputs and execute the selected SmaulBRAIN command."""
     args = build_parser().parse_args(argv)
     try:
         args.ckpt = _safe_ckpt_dir(args.ckpt,
