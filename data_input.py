@@ -80,12 +80,16 @@ def _iter_file_text(path: Path, remaining: int) -> Iterator[bytes]:
         return
 
     if suffix == ".csv":
+        # csv.DictReader can buffer a whole logical record (including quoted
+        # multiline fields). Refuse a file larger than its assigned budget
+        # before the parser can read an unbounded record into memory.
+        if path.stat().st_size > remaining:
+            raise ValueError(f"CSV file exceeds remaining dataset byte budget: {path}")
         with path.open("r", encoding="utf-8", newline="") as stream:
             reader = csv.DictReader(stream)
             for row in reader:
                 encoded = _json_bytes(row)
                 if len(encoded) > remaining:
-                    return
                     return
                 remaining -= len(encoded)
                 yield encoded
@@ -102,11 +106,10 @@ def _iter_file_text(path: Path, remaining: int) -> Iterator[bytes]:
             ) from exc
         try:
             parquet = pq.ParquetFile(path)
-            for batch in parquet.iter_batches(batch_size=128):
+            for batch in parquet.iter_batches(batch_size=1):
                 for row in batch.to_pylist():
                     encoded = _json_bytes(row)
                     if len(encoded) > remaining:
-                        return
                         return
                     remaining -= len(encoded)
                     yield encoded
