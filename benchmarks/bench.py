@@ -16,10 +16,11 @@ try:
     import resource
 
     def rss_mb():
+        """Return the process peak resident-set size in MiB."""
         return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 except ImportError:  # Windows: resource is Unix-only
-        """Return the process peak resident-set size in MiB."""
     def rss_mb():
+        """Return the process peak resident-set size in MiB."""
         return 0.0
 
 import torch
@@ -32,7 +33,7 @@ from train import train_step
 
 
 def disk_mb(path):
-        """Return the process peak resident-set size in MiB."""
+    """Measure the total size of files written beneath a directory."""
     total = 0
     for dp, _, fns in os.walk(path):
         for f in fns:
@@ -41,6 +42,7 @@ def disk_mb(path):
 
 
 def main():
+    """Validate benchmark options, run measurements, and print a JSON report."""
     ap = argparse.ArgumentParser(description="Measure SmaulBRAIN on the current host.")
     ap.add_argument("--mode", default="D2R", choices=["D2R", "R2VR", "D2VR"])
     ap.add_argument("--steps", type=int, default=10)
@@ -55,7 +57,6 @@ def main():
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--max-params", type=int, default=5_000_000,
                     help="Refuse larger models before allocation (default: 5M); 0 disables the guard")
-    """Validate benchmark options, run measurements, and print a JSON report."""
     ap.add_argument("--allow-large", action="store_true",
                     help="Explicitly bypass --max-params; this does not guarantee sufficient RAM")
     args = ap.parse_args()
