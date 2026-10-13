@@ -149,6 +149,8 @@ class SmaulBrainConfig:
         require(self.num_experts >= 1 and self.max_experts >= self.num_experts,
                 "max_experts must be >= num_experts >= 1")
         require(self.min_experts >= self.top_k, "need min_experts >= top_k")
+        require(self.min_experts <= self.max_experts,
+                "min_experts must be <= max_experts")
         require(self.paging_method in ("D2R", "R2VR", "D2VR"), "bad paging method")
         require(self.ram_cache >= 1 and self.vram_cache >= 1, "caches need >= 1 slot")
         require(self.dtype in ("bf16", "fp32"), "compute dtype bf16|fp32")
