@@ -73,3 +73,15 @@ def test_config_rejects_invalid_runtime_values(kwargs):
 def test_config_rejects_pruning_floor_above_maximum_pool():
     with pytest.raises(AssertionError, match="min_experts must be <= max_experts"):
         SmaulBrainConfig(num_experts=4, top_k=2, min_experts=65, max_experts=64)
+
+
+
+def test_config_rejects_numeric_values_too_large_for_finite_float():
+    huge_integer = 10 ** 1000
+    with pytest.raises(AssertionError, match="expert_lr must be a finite number"):
+        SmaulBrainConfig(expert_lr=huge_integer)
+
+    payload = SmaulBrainConfig().to_dict()
+    payload["expert_lr"] = huge_integer
+    with pytest.raises(ValueError, match="expert_lr must be a finite number"):
+        SmaulBrainConfig.from_dict(payload)
