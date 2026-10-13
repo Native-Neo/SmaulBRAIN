@@ -10,6 +10,19 @@ SmaulBRAIN is still an experimental research project. Passing CI verifies tested
 4. Watch system memory and swap/zram during a representative training step, not just model construction. Peak memory includes activations, gradients, optimizer state, temporary dequantized expert weights, paging caches, and checkpoint serialization.
 5. Do not assume disk paging makes training memory-bounded: active experts, staging buffers, gradients, and optimizer state can still occupy RAM.
 
+## Allocation-free training preflight
+
+Before allocating the model, validate the checkpoint configuration and training
+input and inspect the exact parameter/configuration report:
+
+```bash
+python cli.py --ckpt checkpoints/smaulbrain train --preflight-only --data ./dataset
+```
+
+Omit `--data` to preflight the synthetic demo input. This checks configuration
+and dataset loading without constructing the model. It is **not** a memory
+estimator and does not replace a short real training run on the target machine.
+
 ## Safe benchmark workflow
 
 The benchmark defaults to a small model and refuses configurations above 5 million estimated parameters before allocating the model:
