@@ -132,8 +132,12 @@ class SmaulBrainConfig:
         )
         for field in float_fields:
             value = getattr(self, field)
-            require(isinstance(value, (int, float)) and not isinstance(value, bool)
-                    and math.isfinite(value),
+            try:
+                finite = (isinstance(value, (int, float))
+                          and not isinstance(value, bool) and math.isfinite(value))
+            except (OverflowError, TypeError):
+                finite = False
+            require(finite,
                     f"{field} must be a finite number (not bool), got {value!r}")
 
         require(self.d_model >= 1, "d_model must be >= 1")
@@ -360,7 +364,14 @@ class SmaulBrainConfig:
         for _f in _float_fields:
             if _f in values:
                 _v = values[_f]
-                if not (isinstance(_v, (int, float)) and not isinstance(_v, bool) and math.isfinite(_v)):
+                try:
+                    _finite = (
+                        isinstance(_v, (int, float))
+                        and not isinstance(_v, bool) and math.isfinite(_v)
+                    )
+                except (OverflowError, TypeError):
+                    _finite = False
+                if not _finite:
                     raise ValueError(
                         f"config field {_f} must be a finite number (not bool), got {_v!r}"
                     )
