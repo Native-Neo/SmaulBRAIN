@@ -272,10 +272,12 @@ class SparseRouter(nn.Module):
         return (self.num_experts * (frac * mean_prob).sum()).to(probs.dtype)
 
     def usage_share(self) -> torch.Tensor:
+        """Return normalized usage proportions for the current expert pool."""
         total = self.usage_counts.sum().clamp_min(1.0)
         return (self.usage_counts / total).float()
 
     def reset_stats(self) -> None:
+        """Clear accumulated routing and capacity statistics."""
         self.usage_counts.zero_()
         self.admit_counts.zero_()
         self.sanitized_counts.zero_()
