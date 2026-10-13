@@ -67,3 +67,9 @@ def test_config_validation_survives_python_optimized_mode():
 def test_config_rejects_invalid_runtime_values(kwargs):
     with pytest.raises(AssertionError):
         SmaulBrainConfig(**kwargs)
+
+
+
+def test_config_rejects_pruning_floor_above_maximum_pool():
+    with pytest.raises(AssertionError, match="min_experts must be <= max_experts"):
+        SmaulBrainConfig(num_experts=4, top_k=2, min_experts=65, max_experts=64)
