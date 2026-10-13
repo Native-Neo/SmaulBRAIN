@@ -11,10 +11,12 @@ from cli import main
 
 
 def test_missing_training_data_fails_before_model_construction(tmp_path, monkeypatch, capsys):
+    """Missing training data produces a CLI error before any model is constructed."""
     missing = tmp_path / "does-not-exist"
     ckpt = tmp_path / "checkpoint"
 
     def forbidden_constructor(*args, **kwargs):
+        """Fail if the CLI constructs a model before validating training data."""
         raise AssertionError("model construction happened before data validation")
 
     monkeypatch.setattr(model, "SmaulBrainModel", forbidden_constructor)
@@ -32,9 +34,11 @@ def test_missing_training_data_fails_before_model_construction(tmp_path, monkeyp
 
 
 def test_preflight_reports_config_without_constructing_model(tmp_path, monkeypatch, capsys):
+    """Preflight reports configuration and parameter counts without building a model."""
     import json
 
     def forbidden_constructor(*args, **kwargs):
+        """Fail if preflight attempts to construct a model."""
         raise AssertionError("preflight constructed the model")
 
     monkeypatch.setattr(cli, "SmaulBrainModel", forbidden_constructor)

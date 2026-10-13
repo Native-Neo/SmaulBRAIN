@@ -44,6 +44,7 @@ def test_from_dict_rejects_active_experts_that_only_match_after_truncation():
 
 
 def test_config_validation_survives_python_optimized_mode():
+    """Invalid model dimensions remain rejected when Python disables assertions."""
     import subprocess
     import sys
     from pathlib import Path
@@ -65,18 +66,21 @@ def test_config_validation_survives_python_optimized_mode():
     {"use_byte_conv": 1},
 ])
 def test_config_rejects_invalid_runtime_values(kwargs):
+    """Runtime settings reject non-finite values, invalid ranges, and flag conflicts."""
     with pytest.raises(AssertionError):
         SmaulBrainConfig(**kwargs)
 
 
 
 def test_config_rejects_pruning_floor_above_maximum_pool():
+    """The pruning floor cannot exceed the maximum expert pool size."""
     with pytest.raises(AssertionError, match="min_experts must be <= max_experts"):
         SmaulBrainConfig(num_experts=4, top_k=2, min_experts=65, max_experts=64)
 
 
 
 def test_config_rejects_numeric_values_too_large_for_finite_float():
+    """Construction and deserialization reject integers that overflow float checks."""
     huge_integer = 10 ** 1000
     with pytest.raises(AssertionError, match="expert_lr must be a finite number"):
         SmaulBrainConfig(expert_lr=huge_integer)

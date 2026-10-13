@@ -89,6 +89,7 @@ def test_cli_train_then_infer_then_quantize(tmp_path):
 
 
 def test_streaming_inference_matches_full_causal_pass():
+    """Streaming matches full-pass logits within tolerance and picks the same tokens."""
     m, _, _ = _model()
     ids = torch.tensor([[10, 20, 30, 40, 50, 60]])
     full, _ = m.forward_infer_stateful(ids)

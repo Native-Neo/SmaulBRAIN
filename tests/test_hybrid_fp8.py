@@ -32,6 +32,7 @@ def test_forward_matches_bf16_linear():
 
 
 def test_backward_flows_with_finite_grads():
+    """FP8 backward produces finite gradients without mutating scale history."""
     hy, _ = _pair()
     x = torch.randn(8, 32, dtype=torch.bfloat16, requires_grad=True)
     loss = hy(x).float().pow(2).mean()
@@ -48,6 +49,7 @@ def test_backward_flows_with_finite_grads():
 
 
 def test_forward_is_independent_of_neighbor_tokens_and_call_history():
+    """A token's FP8 output stays identical across neighbors and repeated calls."""
     hy, _ = _pair(seed=4)
     x = torch.randn(1, 32)
     neighbors = torch.cat([x, torch.full((7, 32), 1e4)], dim=0)

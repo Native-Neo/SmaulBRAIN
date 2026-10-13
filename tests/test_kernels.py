@@ -101,6 +101,7 @@ def test_cpu_capability_label_sane():
 
 
 def test_native_self_test_passes_after_build():
+    """All four native kernels build, load, and pass the numerical self-test."""
     native._libs.clear()
     native._build_failed = None
     try:

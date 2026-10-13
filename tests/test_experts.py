@@ -391,6 +391,7 @@ def test_step_expert_avoids_optim_state_for_no_grad_leaves():
 
 
 def test_release_expert_computation_graphs_and_clear_external_grads():
+    """Taking expert gradients releases model leaves and clears external leaf grads."""
     from config import SmaulBrainConfig
     from model import SmaulBrainModel
 
@@ -496,6 +497,7 @@ def test_grow_topk_commit_failure_rolls_back_prefix_exactly(monkeypatch):
                              "v_row": torch.zeros(3, 1),
                              "v_col": torch.zeros(1, d)}
     def boom(rows):
+        """Inject a router batch-append failure to exercise growth rollback."""
         raise RuntimeError("router on fire during batch append")
     monkeypatch.setattr(r, "add_expert_rows", boom)
     with pytest.raises(RuntimeError):
@@ -609,6 +611,7 @@ def test_growth_pads_zero_row_optimizer_state_from_empty_pool():
 
 
 def test_step_expert_row_slice_keeps_full_optimizer_state_shape():
+    """A sliced expert gradient retains full-sized momentum and variance tensors."""
     from experts import make_expert
     from smaulopt import SmaulOpt, SmaulOptHParams
     from train import _GradOnly

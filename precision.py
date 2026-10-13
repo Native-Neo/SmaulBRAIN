@@ -464,6 +464,7 @@ class _HybridFP8Matmul(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w, bias, in_scaler, wt_scaler, grad_scaler,
                 out_dtype, e5m2_for_grads):
+        """Apply stateless E4M3 matmul with per-token input scales and optional bias."""
         x32, w32 = x.float(), w.float()
         ctx.out_dtype = out_dtype
         ctx.e5m2_for_grads = bool(e5m2_for_grads)

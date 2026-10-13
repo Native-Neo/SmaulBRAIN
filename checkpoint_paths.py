@@ -8,6 +8,7 @@ import os
 
 
 def _require(cond: bool, msg: str) -> None:
+    """Raise ValueError with checkpoint context when a validation condition fails."""
     if not cond:
         raise ValueError(f"checkpoint validation failed: {msg}")
 

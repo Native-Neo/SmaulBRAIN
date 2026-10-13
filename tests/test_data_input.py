@@ -118,6 +118,7 @@ def test_single_file_preserves_raw_text_bytes(tmp_path: Path) -> None:
     ],
 )
 def test_loader_rejects_invalid_limits(tmp_path: Path, kwargs, message) -> None:
+    """Dataset limits must be positive integers and reject boolean values."""
     path = tmp_path / "sample.txt"
     path.write_text("some data", encoding="utf-8")
     context_length = kwargs.pop("context_length", 4)
@@ -126,6 +127,7 @@ def test_loader_rejects_invalid_limits(tmp_path: Path, kwargs, message) -> None:
 
 
 def test_jsonl_budget_never_emits_a_partial_oversized_record(tmp_path: Path) -> None:
+    """A JSONL record exceeding the byte budget yields no partial training text."""
     root = tmp_path / "dataset"
     root.mkdir()
     (root / "rows.jsonl").write_text(
@@ -137,6 +139,7 @@ def test_jsonl_budget_never_emits_a_partial_oversized_record(tmp_path: Path) -> 
 
 
 def test_jsonl_large_line_is_read_with_a_bounded_budget(tmp_path: Path) -> None:
+    """A large JSONL line is rejected within the configured dataset byte budget."""
     root = tmp_path / "dataset"
     root.mkdir()
     # Directory mode uses the configured byte budget rather than file size;
@@ -148,6 +151,7 @@ def test_jsonl_large_line_is_read_with_a_bounded_budget(tmp_path: Path) -> None:
 
 
 def test_csv_budget_does_not_emit_a_partial_structured_row(tmp_path: Path) -> None:
+    """An oversized CSV file fails rather than emitting a truncated row."""
     root = tmp_path / "dataset"
     root.mkdir()
     (root / "rows.csv").write_text(
@@ -160,6 +164,7 @@ def test_csv_budget_does_not_emit_a_partial_structured_row(tmp_path: Path) -> No
 
 
 def test_jsonl_valid_newline_terminated_records_load(tmp_path: Path) -> None:
+    """Complete JSONL records within the byte budget produce training sequences."""
     root = tmp_path / "dataset"
     root.mkdir()
     (root / "rows.jsonl").write_text(
@@ -172,6 +177,7 @@ def test_jsonl_valid_newline_terminated_records_load(tmp_path: Path) -> None:
 
 
 def test_parquet_uncompressed_size_is_checked_before_row_materialization(tmp_path: Path) -> None:
+    """Parquet metadata rejects oversized uncompressed data before loading rows."""
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     root = tmp_path / "dataset"

@@ -97,6 +97,7 @@ def test_no_temp_files_left_behind(tmp_path):
 
 
 def test_inference_identical_after_reload(tmp_path):
+    """Checkpoint reload preserves configuration, weights, and exact inference logits."""
     d = str(tmp_path / "c")
     m, _ = _trained(d)
     ids = torch.randint(0, 256, (1, 12))
@@ -150,6 +151,7 @@ def test_inference_identical_after_reload(tmp_path):
 
 
 def test_load_applies_checkpoint_runtime_module_settings(tmp_path):
+    """Loading applies saved router capacity and RMSNorm epsilon to live modules."""
     source_cfg = SmaulBrainConfig(
         d_model=32, n_heads=4, num_experts=4, top_k=2,
         expert_hidden=64, max_depth=2, context_length=12,
@@ -179,6 +181,7 @@ def test_load_applies_checkpoint_runtime_module_settings(tmp_path):
 
 
 def test_load_clears_runtime_only_state_from_previous_model_use(tmp_path):
+    """Loading clears stale convolution history, expert leaves, and pager cache tags."""
     d = str(tmp_path / "c")
     source, _ = _trained(d)
     target = SmaulBrainModel(source.cfg)

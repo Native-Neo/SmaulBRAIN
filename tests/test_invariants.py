@@ -119,6 +119,7 @@ def test_save_load_roundtrip_preserves_inference_outputs(tmp_path):
 
 
 def test_growth_save_load_keeps_topology_consistent(tmp_path):
+    """Growth and reload preserve pool topology, router type, and inference logits."""
     import growth as growth_mod
     m, opt, cfg = _model()
     try:

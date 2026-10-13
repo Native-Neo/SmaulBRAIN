@@ -14,6 +14,7 @@ BENCH = ROOT / "benchmarks" / "bench.py"
 
 
 def run_bench(*args: str) -> subprocess.CompletedProcess[str]:
+    """Run the benchmark CLI with a timeout and capture its output and exit code."""
     env = os.environ.copy()
     env["PYTHONFAULTHANDLER"] = "1"
     return subprocess.run(
@@ -39,6 +40,7 @@ def run_bench(*args: str) -> subprocess.CompletedProcess[str]:
     ],
 )
 def test_benchmark_rejects_invalid_arguments_cleanly(args, message):
+    """Invalid benchmark options report an argparse error without a traceback."""
     result = run_bench(*args)
     assert result.returncode == 2, result.stderr
     assert message in result.stderr
@@ -46,6 +48,7 @@ def test_benchmark_rejects_invalid_arguments_cleanly(args, message):
 
 
 def test_benchmark_parameter_guard_refuses_before_model_allocation():
+    """The parameter limit rejects an oversized model before allocation."""
     result = run_bench("--max-params", "1")
     assert result.returncode == 2
     assert "exceeds --max-params=1" in result.stderr
@@ -53,6 +56,7 @@ def test_benchmark_parameter_guard_refuses_before_model_allocation():
 
 
 def test_benchmark_allows_explicit_guard_override():
+    """An explicit limit override lets a tiny benchmark finish and report metrics."""
     # The guard is bypassed explicitly; use tiny dimensions so this remains a
     # real end-to-end smoke test rather than a memory-intensive benchmark.
     result = run_bench(
