@@ -44,7 +44,7 @@ def _iter_file_text(path: Path, remaining: int) -> Iterator[bytes]:
                 line = stream.readline(remaining + 1)
                 if not line:
                     break
-                if len(line) > remaining and not line.endswith(b"\\n"):
+                if len(line) > remaining and not line.endswith(b"\n"):
                     # Do not emit a partial serialized record; structured
                     # rows must remain intact when the byte budget is reached.
                     return
