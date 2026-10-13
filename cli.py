@@ -182,7 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Disable ternary expert QAT (default: off).")
     p.add_argument("--ternary-backward", action="store_true", default=None,
                    dest="ternary_backward",
-                   help="Use the native zero-skipping CPU FP32 input-gradient kernel; requires --ternary-qat.")
+                   help="Use native zero-skipping dX when eligible (CPU FP32 only); BF16 falls back to PyTorch.")
     p.add_argument("--no-ternary-backward", action="store_false", default=None,
                    dest="ternary_backward",
                    help="Disable the native ternary-aware input-gradient kernel.")
@@ -696,6 +696,17 @@ def main(argv: list[str] | None = None) -> int:
                           "elapsed_seconds": round(res["elapsed_seconds"], 3),
                           "bytes_processed": res["bytes_processed"],
                           "bytes_per_second": round(res["bytes_per_second"], 2)}, indent=2))
+        if cfg.ternary_backward:
+            from native import COUNTERS as _native_counters, LAST_FALLBACK as _native_fallbacks
+            native_n = _native_counters["ternary_backward_native"]
+            fallback_n = _native_counters["ternary_backward_fallback"]
+            reason = _native_fallbacks.get("ternary_backward")
+            detail = f"; last fallback reason: {reason}" if fallback_n and reason else ""
+            print(
+                f"[native] ternary_backward: native={native_n}, "
+                f"fallback={fallback_n}{detail}",
+                file=sys.stderr,
+            )
         if args.save_every == 0:
             save_model(args.ckpt, model, opt, int(getattr(model, "_resume_step", -1)),
                        extra_meta={"scheduler": res["scheduler"]})

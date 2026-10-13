@@ -14,7 +14,7 @@ from experts import _swiglu_tensors, swiglu_forward
 from model import SmaulBrainModel
 
 
-def _tiny_model(dtype="bf16"):
+def _tiny_model(dtype="bf16", ternary_qat=False):
     cfg = SmaulBrainConfig(
         d_model=16,
         n_heads=4,
@@ -29,6 +29,7 @@ def _tiny_model(dtype="bf16"):
         vram_cache=1,
         use_byte_conv=False,
         dtype=dtype,
+        ternary_qat=ternary_qat,
     )
     return SmaulBrainModel(cfg)
 
@@ -50,6 +51,10 @@ def test_training_budget_includes_retained_expert_gradients(
         ) as exc:
             model._check_activation_budget(ids, training=True)
         assert "expert_grads=" in str(exc.value)
+        assert "expert_mlp_temp=" in str(exc.value)
+        assert "expert_dequant_temp=" in str(exc.value)
+        assert "expert_peak_temp=" in str(exc.value)
+        assert "pager_cache=" in str(exc.value)
         model._check_activation_budget(ids, training=False)
 
         monkeypatch.setattr(
@@ -159,3 +164,93 @@ def test_ternary_linear_backward_matches_dense_autograd():
     assert torch.allclose(x_native.grad, x_dense.grad, atol=1e-6, rtol=1e-6)
     assert torch.allclose(w_native.grad, w_dense.grad, atol=1e-6, rtol=1e-6)
 
+
+
+def test_ternary_qat_custom_linear_recomputes_weights_and_preserves_ste_gradients():
+    from experts import _TernaryQATLinear, ternary_qat_weight
+
+    torch.manual_seed(29)
+    x0 = torch.randn(5, 4, dtype=torch.float32)
+    w0 = torch.randn(3, 4, dtype=torch.float32)
+    upstream = torch.randn(5, 3, dtype=torch.float32)
+
+    x_ref = x0.clone().requires_grad_(True)
+    w_ref = w0.clone().requires_grad_(True)
+    reference = torch.nn.functional.linear(x_ref, ternary_qat_weight(w_ref))
+    (reference * upstream).sum().backward()
+
+    x = x0.clone().requires_grad_(True)
+    w = w0.clone().requires_grad_(True)
+    saved_ptrs = []
+    def pack_saved(tensor):
+        saved_ptrs.append(tensor.data_ptr())
+        return tensor
+    with torch.autograd.graph.saved_tensors_hooks(pack_saved, lambda tensor: tensor):
+        result = _TernaryQATLinear.apply(x, w, False)
+    (result * upstream).sum().backward()
+
+    assert torch.allclose(result, reference, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(x.grad, x_ref.grad, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(w.grad, w_ref.grad, atol=1e-6, rtol=1e-6)
+    # The custom op retains the input and latent weight, never a third
+    # full-size tensor holding the ternary-transformed weight.
+    assert saved_ptrs == [x.data_ptr(), w.data_ptr()]
+
+
+def test_ternary_qat_checkpointed_swiglu_preserves_gradients():
+    from experts import swiglu_forward, ternary_qat_weight
+
+    torch.manual_seed(31)
+    x0 = torch.randn(3, 4, dtype=torch.float32)
+    values = {
+        "w_gate": torch.randn(6, 4),
+        "w_up": torch.randn(6, 4),
+        "w_down": torch.randn(4, 6),
+    }
+    x_ref = x0.clone().requires_grad_(True)
+    w_ref = {name: value.clone().requires_grad_(True) for name, value in values.items()}
+    ref_gate = torch.nn.functional.linear(x_ref, ternary_qat_weight(w_ref["w_gate"]))
+    ref_up = torch.nn.functional.linear(x_ref, ternary_qat_weight(w_ref["w_up"]))
+    ref = torch.nn.functional.linear(
+        torch.nn.functional.silu(ref_gate) * ref_up,
+        ternary_qat_weight(w_ref["w_down"]),
+    )
+    x = x0.clone().requires_grad_(True)
+    w = {name: value.clone().requires_grad_(True) for name, value in values.items()}
+    got = swiglu_forward(x, w, ternary_qat=True)
+    assert torch.allclose(got, ref, atol=1e-6, rtol=1e-6)
+    upstream = torch.randn_like(ref)
+    (got * upstream).sum().backward()
+    (ref * upstream).sum().backward()
+    assert torch.allclose(x.grad, x_ref.grad, atol=1e-5, rtol=1e-5)
+    for name in w:
+        assert torch.allclose(w[name].grad, w_ref[name].grad, atol=1e-5, rtol=1e-5)
+
+
+def test_ternary_backward_reports_bf16_native_fallback():
+    from experts import _TernaryQATLinear
+    import native
+
+    native.reset_counters()
+    x = torch.randn(2, 4, dtype=torch.bfloat16, requires_grad=True)
+    w = torch.randn(3, 4, dtype=torch.bfloat16, requires_grad=True)
+    _TernaryQATLinear.apply(x, w, True).float().sum().backward()
+    assert native.COUNTERS["ternary_backward_fallback"] > 0
+    reason = native.LAST_FALLBACK["ternary_backward"]
+    assert "float32" in reason
+    assert "bfloat16" in reason
+
+
+def test_ternary_qat_projection_temporary_is_in_memory_budget(monkeypatch):
+    model = _tiny_model(ternary_qat=True)
+    try:
+        ids = torch.zeros(1, 8, dtype=torch.long)
+        monkeypatch.setattr(
+            "builtins.open", mock_open(read_data="MemAvailable: 48 kB\\n")
+        )
+        with pytest.raises(ValueError, match="estimated training working set exceeds 65%") as exc:
+            model._check_activation_budget(ids, training=True)
+        assert "ternary_qat_projection_temp=" in str(exc.value)
+        assert "expert_mlp_temp=" in str(exc.value)
+    finally:
+        model.pager.close()

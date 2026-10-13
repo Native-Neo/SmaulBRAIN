@@ -98,8 +98,8 @@ class SmaulBrainModel(nn.Module):
     def _train_provider(self, expert_id: str) -> dict[str, torch.Tensor]:
         base = self.pager.provider(expert_id)
         if not torch.is_grad_enabled():
-            if self.cfg.ternary_qat:
-                return {k: ternary_qat_weight(v) for k, v in base.items()}
+            # The training dispatch applies QAT inside its custom linear op;
+            # returning raw cache tensors avoids a redundant pre-quantization.
             return base
         leaves = self._leaves.get(expert_id)
         if leaves is None:
@@ -108,8 +108,10 @@ class SmaulBrainModel(nn.Module):
                 for k, v in base.items()
             }
             self._leaves[expert_id] = leaves
-        if self.cfg.ternary_qat:
-            return {k: ternary_qat_weight(v) for k, v in leaves.items()}
+        # Keep the latent leaf weights here. Training's ternary-aware
+        # custom linear creates temporary ternary matrices per projection and
+        # recomputes them during backward; transforming here would retain one
+        # full copy per active expert per recurrent depth.
         return leaves
 
     def _eval_provider(self, expert_id: str) -> dict[str, torch.Tensor]:
@@ -148,6 +150,7 @@ class SmaulBrainModel(nn.Module):
                 x, plan.top_ids, plan.top_weights, plan.dropped, prov,
                 step=step,
                 ternary_backward=(train and self.cfg.ternary_backward),
+                ternary_qat=(train and self.cfg.ternary_qat),
             )
             if prof:
                 self._profile_times["expert_s"] += time.perf_counter() - started
@@ -309,11 +312,11 @@ class SmaulBrainModel(nn.Module):
         """Guard retained activations and available memory before training.
 
         The 256 MiB activation estimate covers retained hidden/logit/CE tensors
-        and FP32 attention states. Expert SwiGLU intermediates are checkpointed
-        and recomputed during backward; the working-set check additionally
-        budgets one leaf-weight copy and its gradient buffer per potentially
-        active expert and the checkpoint inputs. Expert FP8 storage and
-        optimizer state are already resident when this method runs.
+        and FP32 attention states. The separate working-set check budgets leaf
+        weights and gradients for potentially active experts, checkpoint inputs,
+        one expert's SwiGLU/QAT temporary peak, a cold-page dequantization peak,
+        and the pager's maximum compute-weight cache. FP8 storage and optimizer
+        state are already resident when this method runs.
         """
         batch_tokens = ids.shape[0] * ids.shape[1]
         dtype_bytes = 2 if self.cfg.dtype == "bf16" else 4
@@ -357,9 +360,53 @@ class SmaulBrainModel(nn.Module):
             batch_tokens * self.cfg.top_k * self.cfg.d_model
             * self.cfg.max_depth * dtype_bytes
         )
-        transient_bytes = (estimated + expert_leaf_bytes + expert_grad_bytes
-                           + checkpoint_input_bytes)
-        static_expert_bytes = self.cfg.num_experts * expert_params * 3
+        # Checkpointing drops expert intermediates from the forward graph,
+        # but a recomputed SwiGLU still needs gate, up, SiLU(gate), and their
+        # product live during a projection. Use every input token as a safe
+        # upper bound for one expert's temporary activation working set.
+        expert_mlp_temp_bytes = (
+            4 * batch_tokens * self.cfg.expert_hidden * dtype_bytes
+        )
+        # Ternary QAT materializes one projection at a time and recomputes it
+        # during backward. Budget a conservative peak for its FP32 values and
+        # boolean masks; do not multiply this by depth or expert count.
+        qat_projection_temp_bytes = (
+            self.cfg.d_model * self.cfg.expert_hidden * 24
+            if self.cfg.ternary_qat else 0
+        )
+        # D2R warms at most ram_cache dequantized expert tensors; R2VR/D2VR
+        # hold compute tensors in the VRAM cache (CPU-backed on CPU-only
+        # hosts). On a worst-case cold-to-warm transition these are additional
+        # to the active leaf/gradient working set; overlapping active entries
+        # make this a conservative upper bound.
+        cache_slots = (
+            self.cfg.ram_cache if self.cfg.paging_method == "D2R"
+            else self.cfg.vram_cache
+        )
+        cache_uses_host_ram = (
+            self.cfg.paging_method == "D2R" or not torch.cuda.is_available()
+        )
+        pager_cache_bytes = (
+            cache_slots * expert_params * dtype_bytes if cache_uses_host_ram else 0
+        )
+        # A cold page briefly holds FP32 dequantized weights and the converted
+        # compute-dtype tensors together. This host-side load peak happens
+        # before that expert's SwiGLU work, so take the maximum rather than
+        # add mutually exclusive loading and projection peaks.
+        expert_dequant_temp_bytes = expert_params * (4 + dtype_bytes)
+        expert_peak_temp_bytes = max(
+            expert_dequant_temp_bytes,
+            expert_mlp_temp_bytes + qat_projection_temp_bytes,
+        )
+        transient_bytes = (
+            estimated + expert_leaf_bytes + expert_grad_bytes
+            + checkpoint_input_bytes + expert_peak_temp_bytes
+            + pager_cache_bytes
+        )
+        # FP8 code (1 B), FP32 block scales (~1/64 B/parameter), BF16 m
+        # (2 B), and factored v marginals; 3.1 B/parameter is a rounded-up
+        # static accounting estimate for the currently resident expert pool.
+        static_expert_bytes = self.cfg.num_experts * expert_params * 3.1
         # Linux exposes current system headroom after model weights and
         # optimizer state have been allocated. Keep 35% of that headroom for
         # the desktop, allocator fragmentation, data batches, and OS activity.
@@ -380,6 +427,11 @@ class SmaulBrainModel(nn.Module):
                 f"expert_leaves={expert_leaf_bytes / 1048576:.1f} MiB, "
                 f"expert_grads={expert_grad_bytes / 1048576:.1f} MiB, "
                 f"checkpoint_inputs={checkpoint_input_bytes / 1048576:.1f} MiB, "
+                f"expert_mlp_temp={expert_mlp_temp_bytes / 1048576:.1f} MiB, "
+                f"ternary_qat_projection_temp={qat_projection_temp_bytes / 1048576:.1f} MiB, "
+                f"expert_dequant_temp={expert_dequant_temp_bytes / 1048576:.1f} MiB, "
+                f"expert_peak_temp={expert_peak_temp_bytes / 1048576:.1f} MiB, "
+                f"pager_cache={pager_cache_bytes / 1048576:.1f} MiB, "
                 f"resident_expert_weights_plus_optimizer_estimate="
                 f"{static_expert_bytes / 1048576:.1f} MiB, "
                 f"safe_budget={safe_bytes / 1048576:.1f} MiB; reduce batch, "

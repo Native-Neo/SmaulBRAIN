@@ -71,18 +71,16 @@ def test_model_ternary_qat_wires_train_and_eval_providers():
     model.pager.invalidate(eid)
     assert model._eval_provider(eid) is not cached
 
-    # The no-grad training-provider path must still quantize without leaves.
+    # No-grad training dispatch returns the cache tensors directly; the
+    # ternary-aware linear owns quantization, so no whole-expert QAT copy is
+    # needed before the projections run.
     model.clear_expert_grads()
+    base_weights = model.pager.provider(eid)
     with torch.no_grad():
         no_grad_weights = model._train_provider(eid)
     assert eid not in model._leaves
-    for weight in no_grad_weights.values():
-        for row in weight.float():
-            scale = row.abs().max()
-            normalized = row / scale if scale > 0 else row
-            assert set(torch.unique(torch.round(normalized, decimals=5)).tolist()) <= {
-                -1.0, 0.0, 1.0
-            }
+    assert all(no_grad_weights[name].data_ptr() == base_weights[name].data_ptr()
+               for name in base_weights)
 
 
 def test_expert_size_explicit_and_512_target():

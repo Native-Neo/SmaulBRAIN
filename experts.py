@@ -44,16 +44,8 @@ def init_expert_weights(
             "w_down": rand(d_model, expert_hidden)}
 
 
-def ternary_qat_weight(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.Tensor:
-    """Per-output-row ternary QAT with a straight-through estimator.
-
-    Forward values are {-scale, 0, +scale}. In a following linear operation,
-    input gradients therefore use these ternary-valued weights, while the
-    straight-through estimator gives the latent weights dense weight gradients
-    for the optimizer. This changes the backward operands, not the GEMM kernel:
-    PyTorch still executes dense matrix multiplication. Expert storage remains
-    blockwise FP8.
-    """
+def _ternary_values(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.Tensor:
+    """Build the scaled ternary values without an STE/autograd graph."""
     if w.ndim < 2:
         raise ValueError(f"ternary QAT expects a matrix or higher-rank tensor, got {tuple(w.shape)}")
     if not 0.0 <= threshold_ratio < 1.0:
@@ -66,9 +58,18 @@ def ternary_qat_weight(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.T
     nonzero = trits != 0
     count = nonzero.sum(dim=-1, keepdim=True).clamp_min(1)
     scale = (w32.abs() * nonzero).sum(dim=-1, keepdim=True) / count
-    quantized = (trits * scale).to(dtype=w.dtype)
-    return quantized.detach() + (w - w.detach())
+    return (trits * scale).to(dtype=w.dtype)
 
+
+def ternary_qat_weight(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.Tensor:
+    """Per-output-row ternary QAT with a straight-through estimator.
+
+    This helper is useful for inference and reference tests. Training uses
+    _TernaryQATLinear so the ternary matrix is temporary and is recomputed
+    during backward instead of being retained once per recurrent depth.
+    """
+    quantized = _ternary_values(w, threshold_ratio)
+    return quantized.detach() + (w - w.detach())
 
 class _TernaryLinear(torch.autograd.Function):
     """Linear autograd with an optional zero-skipping ternary dX kernel."""
@@ -99,31 +100,83 @@ class _TernaryLinear(torch.autograd.Function):
         return grad_input, grad_weight, None
 
 
+class _TernaryQATLinear(torch.autograd.Function):
+    """Ternary forward with STE weight gradients and recomputed ternary dX weights.
+
+    Only the latent expert weight and input are saved for backward. The
+    transformed ternary matrix exists only while each projection executes.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, ternary_backward: bool):
+        ctx.enabled = bool(ternary_backward)
+        ctx.save_for_backward(x, weight)
+        quantized = _ternary_values(weight)
+        return F.linear(x, quantized)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        x, weight = ctx.saved_tensors
+        grad_out_2d = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
+        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        grad_input = None
+        grad_weight = None
+        if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
+            # Recreate only this projection's ternary values. Do not attach
+            # another quantization graph: the STE is the explicit grad_weight
+            # formula below, while dX uses the true ternary forward operand.
+            with torch.no_grad():
+                quantized = _ternary_values(weight)
+        if ctx.needs_input_grad[0]:
+            if ctx.enabled:
+                grad_input = call_ternary_backward_input(
+                    grad_out_2d, quantized.contiguous()
+                )
+            if grad_input is None:
+                grad_input = grad_out_2d @ quantized
+            grad_input = grad_input.reshape_as(x)
+        if ctx.needs_input_grad[1]:
+            grad_weight = grad_out_2d.transpose(0, 1) @ x_2d
+        return grad_input, grad_weight, None
+
+
 def _linear(x: torch.Tensor, weight: torch.Tensor, ternary_backward: bool):
     if ternary_backward:
         return _TernaryLinear.apply(x, weight, True)
     return F.linear(x, weight)
 
 
+def _qat_linear(
+    x: torch.Tensor, weight: torch.Tensor, ternary_backward: bool
+) -> torch.Tensor:
+    return _TernaryQATLinear.apply(x, weight, ternary_backward)
+
+
 def _swiglu_tensors(
     x: torch.Tensor, w_gate: torch.Tensor, w_up: torch.Tensor,
     w_down: torch.Tensor, ternary_backward: bool = False,
+    ternary_qat: bool = False,
 ) -> torch.Tensor:
     """Tensor-only SwiGLU core, suitable for activation checkpointing."""
-    gate = _linear(x, w_gate, ternary_backward)
-    up = _linear(x, w_up, ternary_backward)
-    return _linear(F.silu(gate) * up, w_down, ternary_backward)
+    linear = _qat_linear if ternary_qat else _linear
+    gate = linear(x, w_gate, ternary_backward)
+    up = linear(x, w_up, ternary_backward)
+    return linear(F.silu(gate) * up, w_down, ternary_backward)
 
 
 def swiglu_forward(
-    x: torch.Tensor, w: dict[str, torch.Tensor], ternary_backward: bool = False
+    x: torch.Tensor, w: dict[str, torch.Tensor], ternary_backward: bool = False,
+    ternary_qat: bool = False,
 ) -> torch.Tensor:
-    """SwiGLU with optional ternary-aware dX and activation checkpointing.
+    """SwiGLU with checkpointed intermediates and memory-bounded ternary QAT.
 
-    The native kernel is currently CPU float32-only. Unsupported inputs fall
-    back to PyTorch GEMM. The STE weight gradient and optimizer remain dense.
+    QAT linear layers save their latent weights and recompute ternary values
+    for dX during backward, so quantized matrix copies are not retained
+    across recurrent depths. The native dX kernel is CPU-FP32-only; other
+    dtypes use the PyTorch matmul fallback.
     """
-    args = (x, w["w_gate"], w["w_up"], w["w_down"], ternary_backward)
+    args = (x, w["w_gate"], w["w_up"], w["w_down"],
+            ternary_backward, ternary_qat)
     if torch.is_grad_enabled() and any(t.requires_grad for t in args[:4]):
         return checkpoint(_swiglu_tensors, *args, use_reentrant=False)
     return _swiglu_tensors(*args)
@@ -259,6 +312,7 @@ class ExpertPool:
         provider: WeightProvider,
         step: int = 0,
         ternary_backward: bool = False,
+        ternary_qat: bool = False,
     ) -> torch.Tensor:
         """Weighted expert combination. x: [N, D] -> [N, D].
 
@@ -300,7 +354,10 @@ class ExpertPool:
             dtype = w["w_gate"].dtype
             rows = mask_slot.any(dim=-1)  # tokens touching this expert
             xs = x[rows].to(dtype)  # [M, D]
-            y = swiglu_forward(xs, w, ternary_backward=ternary_backward).to(out.dtype)  # [M, D]
+            y = swiglu_forward(
+                xs, w, ternary_backward=ternary_backward,
+                ternary_qat=ternary_qat,
+            ).to(out.dtype)  # [M, D]
             weight = mask_slot[rows].float() * top_weights[rows]  # [M, K]
             out[rows] += weight.sum(dim=-1, keepdim=True).to(out.dtype) * y
             rec = self.experts[eid]
