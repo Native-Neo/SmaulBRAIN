@@ -46,6 +46,8 @@ import random
 import shutil
 import tempfile
 
+from checkpoint_paths import _jailed_path
+
 import torch
 from safetensors.torch import load_file as _sf_load
 from safetensors.torch import save_file as _sf_save
@@ -954,59 +956,6 @@ def _require_eid(eid: str) -> None:
     _require("/" not in eid and "\\" not in eid, f"bad expert id {eid!r}")
     _require(eid not in (".", "..") and not eid.startswith("."),
              f"bad expert id {eid!r}")
-
-
-def _jailed_path(ckpt_dir: str, rel: str) -> str:
-    """Join rel under ckpt_dir and refuse jail escapes (.., absolute, symlink).
-
-    Returns the absolute jailed path. Raises ValueError on traversal.
-    Both the lexical path and its realpath (symlink-resolved) must stay
-    inside the checkpoint dir; existing symlinks anywhere along the path
-    are refused.
-    """
-    _require(isinstance(rel, str) and rel != "" and "\x00" not in rel,
-             f"bad checkpoint rel {rel!r}")
-    _require(not os.path.isabs(rel), f"bad checkpoint rel {rel!r}")
-    parts = rel.split("/")
-    _require(all(part not in ("", ".", "..") for part in parts),
-             f"bad checkpoint rel traversal {rel!r}")
-    base = os.path.realpath(os.path.abspath(ckpt_dir))
-    p = os.path.abspath(os.path.join(ckpt_dir, rel))
-    _require(p == base or p.startswith(base + os.sep),
-             f"checkpoint path escapes dir: {rel!r}")
-    # Refuse symlinks at every existing component, including intermediate
-    # directories such as experts/ that resolve back inside the checkpoint.
-    try:
-        current = os.path.abspath(ckpt_dir)
-        if os.path.lexists(current) and os.path.islink(current):
-            raise ValueError(
-                f"checkpoint validation failed: refusing symlink checkpoint root {ckpt_dir!r}"
-            )
-        for part in parts:
-            current = os.path.join(current, part)
-            if os.path.lexists(current) and os.path.islink(current):
-                raise ValueError(
-                    f"checkpoint validation failed: refusing symlink component {part!r} in {rel!r}"
-                )
-        r = os.path.realpath(p)
-    except OSError as e:
-        raise ValueError(
-            f"checkpoint validation failed: unreadable path {rel!r}: {e}"
-        ) from e
-    _require(r == base or r.startswith(base + os.sep),
-             f"checkpoint path escapes dir via symlink: {rel!r}")
-    # If the leaf itself exists as a symlink, refuse even when its target
-    # happens to stay inside (opaque-archive hygiene).
-    try:
-        if os.path.lexists(p) and os.path.islink(p):
-            raise ValueError(
-                f"checkpoint validation failed: refusing symlink {rel!r}"
-            )
-    except OSError as e:
-        raise ValueError(
-            f"checkpoint validation failed: unreadable path {rel!r}: {e}"
-        ) from e
-    return p
 
 
 def _is_num(x) -> bool:
