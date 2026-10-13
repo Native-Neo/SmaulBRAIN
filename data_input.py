@@ -75,7 +75,6 @@ def _iter_file_text(path: Path, remaining: int) -> Iterator[bytes]:
             encoded = _json_bytes(row)
             if len(encoded) > remaining:
                 return
-                return
             remaining -= len(encoded)
             yield encoded
         return
@@ -118,7 +117,7 @@ def _iter_file_text(path: Path, remaining: int) -> Iterator[bytes]:
                 raise ValueError(
                     f"Parquet uncompressed data exceeds remaining dataset byte budget: {path}"
                 )
-            for batch in parquet.iter_batches(batch_size=1):
+            for batch in parquet.iter_batches(batch_size=128):
                 for row in batch.to_pylist():
                     encoded = _json_bytes(row)
                     if len(encoded) > remaining:
