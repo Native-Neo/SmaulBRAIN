@@ -53,6 +53,7 @@ DEFAULT_PROMPT_ID = 10
 
 
 def _check_ids(ids: list[int], vocab_size: int, what: str) -> None:
+    """Validate token IDs against the model vocabulary."""
     for i in ids:
         if isinstance(i, bool) or not isinstance(i, int):
             raise ValueError(
@@ -68,6 +69,7 @@ def _check_ids(ids: list[int], vocab_size: int, what: str) -> None:
 
 
 def _check_sampler(temperature: float, top_k: int = 0, top_p: float = 1.0) -> None:
+    """Validate temperature, top-k, and top-p sampling options."""
     import math
     if (isinstance(temperature, bool) or not isinstance(temperature, (int, float))
             or not math.isfinite(temperature) or temperature < 0):
@@ -81,6 +83,7 @@ def _check_sampler(temperature: float, top_k: int = 0, top_p: float = 1.0) -> No
 
 
 def _check_logits(logits: torch.Tensor, vocab_size: int) -> None:
+    """Reject logits with an invalid shape or non-finite values."""
     if not isinstance(logits, torch.Tensor):
         raise ValueError(f"logits must be a Tensor, got {type(logits).__name__}")
     if logits.ndim < 1:
@@ -245,17 +248,22 @@ def generate(
             out, attn_states = model.forward_infer_step(x, attn_states)
 
         text_parts.append(decoder.flush())
-        if was_training:
-            model.train()
         return {"ids": ids, "text": "".join(text_parts), "depths": depths,
                 "paging": model.pager.stats.to_dict()}
 
     finally:
-        model.train(was_training)
+        # Use the public mode methods instead of train(bool), so lightweight
+        # model adapters and test doubles need only implement train()/eval().
+        if was_training:
+            model.train()
+        else:
+            model.eval()
 
 def encode_prompt(text: str) -> list[int]:
+    """Encode prompt text into byte-token IDs."""
     return encode_text(text)
 
 
 def decode_ids(ids: list[int]) -> str:
+    """Decode byte-token IDs into text."""
     return decode_text(ids)

@@ -272,24 +272,42 @@ class SparseRouter(nn.Module):
         return (self.num_experts * (frac * mean_prob).sum()).to(probs.dtype)
 
     def usage_share(self) -> torch.Tensor:
+        """Return normalized usage proportions for the current expert pool."""
         total = self.usage_counts.sum().clamp_min(1.0)
         return (self.usage_counts / total).float()
 
     def reset_stats(self) -> None:
+        """Clear accumulated routing and capacity statistics."""
         self.usage_counts.zero_()
         self.admit_counts.zero_()
         self.sanitized_counts.zero_()
 
     # -- dynamic topology: router rows follow expert ids --
-    def _proj_like(self, out_features: int) -> nn.Linear:
-        """Fresh Linear on the router's device/dtype (topology must follow)."""
+    def _proj_like(self, out_features: int) -> nn.Module:
+        """Resize the router projection without changing its execution policy."""
+        from precision import HybridFP8Linear
+
+        old = self.proj
+        if isinstance(old, HybridFP8Linear):
+            # Growth/pruning changes only the number of expert rows. Replacing
+            # this layer with nn.Linear would silently disable hybrid-FP8
+            # execution and make training diverge after growth or checkpoint
+            # restore, even when every copied parameter remains identical.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                return HybridFP8Linear(
+                    self.d_model, out_features,
+                    bias=old.bias is not None,
+                    out_dtype=old.out_dtype,
+                    e5m2_for_grads=old.e5m2_for_grads,
+                ).to(device=old.weight.device, dtype=old.weight.dtype)
         if out_features == 0:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 return nn.Linear(self.d_model, out_features).to(
-                    device=self.proj.weight.device, dtype=self.proj.weight.dtype)
+                    device=old.weight.device, dtype=old.weight.dtype)
         return nn.Linear(self.d_model, out_features).to(
-            device=self.proj.weight.device, dtype=self.proj.weight.dtype)
+            device=old.weight.device, dtype=old.weight.dtype)
 
     def add_expert_rows(self, initializers: list[torch.Tensor | None]) -> list[int]:
         """Append multiple rows with one allocation/copy of the existing router."""

@@ -89,6 +89,7 @@ def test_cli_train_then_infer_then_quantize(tmp_path):
 
 
 def test_streaming_inference_matches_full_causal_pass():
+    """Streaming matches full-pass logits within tolerance and picks the same tokens."""
     m, _, _ = _model()
     ids = torch.tensor([[10, 20, 30, 40, 50, 60]])
     full, _ = m.forward_infer_stateful(ids)
@@ -98,7 +99,21 @@ def test_streaming_inference_matches_full_causal_pass():
         out, states = m.forward_infer_step(token.view(1), states)
         parts.append(out["logits"])
     streamed = torch.cat(parts, dim=1)
-    assert torch.allclose(full["logits"], streamed, atol=2e-5, rtol=2e-5)
+    diff = (full["logits"] - streamed).abs()
+    max_abs = float(diff.max().item())
+    max_rel = float((diff / full["logits"].abs().clamp_min(1e-8)).max().item())
+    worst = torch.nonzero(diff == diff.max(), as_tuple=False)[0].tolist()
+    # The recurrent step and chunked prefix-sum paths use different FP32
+    # reduction orders. With BF16 logits, a boundary value can therefore
+    # round one BF16 ULP apart (observed maximum: 3.0517578e-05). Permit
+    # that single-ULP absolute difference without hiding larger drift.
+    assert torch.allclose(full["logits"], streamed, atol=3.2e-5, rtol=2e-5), (
+        f"streaming/full logits diverged: max_abs={max_abs:.8g}, "
+        f"max_rel={max_rel:.8g}, worst_index={worst}"
+    )
+    assert torch.equal(full["logits"].argmax(dim=-1), streamed.argmax(dim=-1)), (
+        "streaming/full inference selected different next-token logits"
+    )
     m.pager.close()
 
 

@@ -48,6 +48,10 @@ FULL_DEFAULTS = {
 SHAPE_FIELDS = ("vocab_size", "d_model", "n_heads", "expert_hidden",
                 "top_k", "dtype")
 
+# Lazy injection seam for tests/tools. Keep the model module unloaded during
+# preflight so low-memory users can inspect a config without importing torch.
+SmaulBrainModel = None
+
 # Maps SmaulBrainConfig field -> argparse dest holding the CLI override.
 # `expert_hidden` is set via --expert-size (dest expert_size).
 ARG_TO_CONFIG = {
@@ -104,6 +108,7 @@ def _cfg_default(name: str):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser and its subcommands."""
     p = argparse.ArgumentParser(prog="smaulbrain",
                                 description="SmaulBRAIN recurrent byte-level MoE LM")
     p.add_argument("--vocab-size", type=int, default=None, dest="vocab_size",
@@ -215,6 +220,8 @@ def build_parser() -> argparse.ArgumentParser:
     # train
     t = sub.add_parser("train", help="Train / fine-tune (same model, modes differ).")
     t.add_argument("--steps", type=int, default=20, help="Optimizer steps.")
+    t.add_argument("--preflight-only", action="store_true",
+                   help="Validate config/data and report model size without allocating the model.")
     t.add_argument("--batch", type=int, default=2, help="Batch size (sequences).")
     t.add_argument("--mode", type=str, default="entire",
                    choices=["entire", "trunk", "experts", "selected", "new"],
@@ -264,6 +271,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def config_from_args(args: argparse.Namespace) -> SmaulBrainConfig:
+    """Build a validated model configuration from parsed CLI options."""
     preset = FULL_DEFAULTS if getattr(args, "full", False) else TINY_DEFAULTS
 
     def pick(cli_value, key: str):
@@ -389,7 +397,7 @@ def _safe_ckpt_dir(ckpt_dir: str, allow_outside: bool = False) -> str:
 def load_saved_config(ckpt_dir: str, allow_outside: bool = False) -> SmaulBrainConfig | None:
     """Checkpoint config without building a model (None when no checkpoint)."""
     ckpt_dir = _safe_ckpt_dir(ckpt_dir, allow_outside=allow_outside)
-    from storage import _jailed_path
+    from checkpoint_paths import _jailed_path
     try:
         cfg_path = _jailed_path(ckpt_dir, "config.json")
         man_path = _jailed_path(ckpt_dir, "manifest.json")
@@ -465,17 +473,14 @@ def resolve_train_grow_every(args: argparse.Namespace, cfg: SmaulBrainConfig) ->
 
 
 def _demo_seqs(n: int = 64, length: int = 40) -> list[list[int]]:
+    """Create deterministic synthetic byte-token sequences for demo training."""
     import random
     rng = random.Random(0)
     return [[rng.randrange(256) for _ in range(length)] for _ in range(n)]
 
 
 def main(argv: list[str] | None = None) -> int:
-    from infer import generate
-    from model import SmaulBrainModel
-    from smaulopt import SmaulOpt, SmaulOptHParams
-    from storage import load_model, save_model
-
+    """Validate command inputs and execute the selected SmaulBRAIN command."""
     args = build_parser().parse_args(argv)
     try:
         args.ckpt = _safe_ckpt_dir(args.ckpt,
@@ -526,41 +531,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: --batch must be >= 1, got {args.batch!r}", file=sys.stderr)
             return 2
 
-    import torch
-    # NNPACK can repeatedly emit a C++ warning on older CPUs that cannot
-    # initialize its kernels. Disable it on CPUs below AVX2 and use PyTorch's
-    # normal fallback kernels instead of flooding the training log.
-    nnpack = getattr(torch.backends, "nnpack", None)
-    cpu_backend = getattr(torch.backends, "cpu", None)
-    get_capability = getattr(cpu_backend, "get_cpu_capability", None)
-    cpu_capability = get_capability() if callable(get_capability) else "DEFAULT"
-    if (nnpack is not None and callable(getattr(nnpack, "set_flags", None))
-            and cpu_capability not in {"AVX2", "AVX512"}):
-        nnpack.set_flags(False)
-        if callable(getattr(nnpack, "is_available", None)) and nnpack.is_available():
-            print("[cpu] NNPACK disabled for this CPU; using fallback kernels.",
-                  file=sys.stderr)
-    torch.manual_seed(cfg.seed)
-    torch.set_num_threads(cfg.threads)
-
-    model = SmaulBrainModel(cfg)
-    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr, wd=cfg.weight_decay,
-                                   beta_m=cfg.beta_m, beta_v=cfg.beta_v,
-                                   eps=cfg.epsilon, clip=cfg.grad_clip,
-                                   state_dtype=cfg.state_dtype))
-    if has_ckpt:
-        load_model(args.ckpt, model, opt)
-        # Checkpoint is authoritative for runtime config; re-apply the
-        # process knobs whose explicit CLI values win over the checkpoint.
-        for knob in ("threads", "seed"):
-            if getattr(args, knob, None) is not None:
-                setattr(model.cfg, knob, getattr(args, knob))
-        # The checkpoint is authoritative for all runtime configuration that
-        # does not change tensor shapes; use it for the resumed run.
-        cfg = model.cfg
-
+    # Validate and load training input before allocating the model. In
+    # particular, a missing/invalid --data path must not allocate a full
+    # checkpoint-sized network only to exit with an input error afterward.
+    seqs = None
     if args.cmd == "train":
-        from train import run_training
         if args.data:
             from data_input import load_training_sequences
             try:
@@ -579,6 +554,82 @@ def main(argv: list[str] | None = None) -> int:
             print("training data source: synthetic demo (no --data given)",
                   file=sys.stderr)
             seqs = _demo_seqs()
+
+    if args.cmd == "train" and args.preflight_only:
+        report = {
+            "preflight": "passed",
+            "model_construction": "skipped",
+            "config": {
+                "d_model": cfg.d_model,
+                "n_heads": cfg.n_heads,
+                "context_length": cfg.context_length,
+                "min_depth": cfg.min_depth,
+                "max_depth": cfg.max_depth,
+                "num_experts": cfg.num_experts,
+                "top_k": cfg.top_k,
+                "expert_hidden": cfg.expert_hidden,
+                "paging_method": cfg.paging_method,
+                "dtype": cfg.dtype,
+                "state_dtype": cfg.state_dtype,
+                "batch": args.batch,
+                "steps": args.steps,
+            },
+            "counts": cfg.describe_counts(),
+            "dataset": {
+                "source": source_kind if args.data else "synthetic demo",
+                "sequences": len(seqs),
+            },
+            "memory_estimate": None,
+            "memory_note": (
+                "No RAM guarantee: parameter counts do not include activations, "
+                "gradients, optimizer state, staging buffers, or checkpoint peaks."
+            ),
+        }
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+
+    # Heavy runtime modules are loaded only after preflight/data validation.
+    import torch
+    from smaulopt import SmaulOpt, SmaulOptHParams
+    from storage import load_model, save_model
+
+    # NNPACK can repeatedly emit a C++ warning on older CPUs that cannot
+    # initialize its kernels. Disable it on CPUs below AVX2 and use PyTorch's
+    # normal fallback kernels instead of flooding the training log.
+    nnpack = getattr(torch.backends, "nnpack", None)
+    cpu_backend = getattr(torch.backends, "cpu", None)
+    get_capability = getattr(cpu_backend, "get_cpu_capability", None)
+    cpu_capability = get_capability() if callable(get_capability) else "DEFAULT"
+    if (nnpack is not None and callable(getattr(nnpack, "set_flags", None))
+            and cpu_capability not in {"AVX2", "AVX512"}):
+        nnpack.set_flags(False)
+        if callable(getattr(nnpack, "is_available", None)) and nnpack.is_available():
+            print("[cpu] NNPACK disabled for this CPU; using fallback kernels.",
+                  file=sys.stderr)
+    torch.manual_seed(cfg.seed)
+    torch.set_num_threads(cfg.threads)
+
+    model_cls = SmaulBrainModel
+    if model_cls is None:
+        from model import SmaulBrainModel as model_cls
+    model = model_cls(cfg)
+    opt = SmaulOpt(SmaulOptHParams(lr=cfg.expert_lr, wd=cfg.weight_decay,
+                                   beta_m=cfg.beta_m, beta_v=cfg.beta_v,
+                                   eps=cfg.epsilon, clip=cfg.grad_clip,
+                                   state_dtype=cfg.state_dtype))
+    if has_ckpt:
+        load_model(args.ckpt, model, opt)
+        # Checkpoint is authoritative for runtime config; re-apply the
+        # process knobs whose explicit CLI values win over the checkpoint.
+        for knob in ("threads", "seed"):
+            if getattr(args, knob, None) is not None:
+                setattr(model.cfg, knob, getattr(args, knob))
+        # The checkpoint is authoritative for all runtime configuration that
+        # does not change tensor shapes; use it for the resumed run.
+        cfg = model.cfg
+
+    if args.cmd == "train":
+        from train import run_training
         grow_every = resolve_train_grow_every(args, cfg)
         cfg.grow_every = grow_every
         grow_n = int(getattr(args, "grow_experts", 0) or 0)
@@ -674,6 +725,7 @@ def main(argv: list[str] | None = None) -> int:
         # loader here must not repeat that work (double disk reads).
         from storage import make_disk_loader
         model.pager.load_from_disk = make_disk_loader(args.ckpt)
+        from infer import generate
         res = generate(model, encode_text(args.prompt), max_new=args.max_new,
                        temperature=args.temperature,
                        top_k=0 if getattr(args, "sampler_top_k", None) is None

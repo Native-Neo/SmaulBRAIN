@@ -46,6 +46,8 @@ import random
 import shutil
 import tempfile
 
+from checkpoint_paths import _jailed_path
+
 import torch
 from safetensors.torch import load_file as _sf_load
 from safetensors.torch import save_file as _sf_save
@@ -757,9 +759,9 @@ def save_model(ckpt_dir: str, model, opt, step: int, extra_meta: dict | None = N
         cfg_dict["num_experts"] = len(model.pool)
         from config import __version__ as _schema
         cfg_dict["schema_version"] = _schema
-        # Pruning may reduce the pool below the configured floor; checkpoints
-        # must remain constructible while still respecting top_k.
-        cfg_dict["min_experts"] = min(model.cfg.min_experts, len(model.pool))
+        # Preserve the configured growth floor even if pruning has temporarily
+        # reduced the live pool below it. min_experts is a policy threshold,
+        # not a claim about the current number of stored experts.
         extra = extra_meta or {}
         manifest = {
             "step": step,
@@ -954,59 +956,6 @@ def _require_eid(eid: str) -> None:
     _require("/" not in eid and "\\" not in eid, f"bad expert id {eid!r}")
     _require(eid not in (".", "..") and not eid.startswith("."),
              f"bad expert id {eid!r}")
-
-
-def _jailed_path(ckpt_dir: str, rel: str) -> str:
-    """Join rel under ckpt_dir and refuse jail escapes (.., absolute, symlink).
-
-    Returns the absolute jailed path. Raises ValueError on traversal.
-    Both the lexical path and its realpath (symlink-resolved) must stay
-    inside the checkpoint dir; existing symlinks anywhere along the path
-    are refused.
-    """
-    _require(isinstance(rel, str) and rel != "" and "\x00" not in rel,
-             f"bad checkpoint rel {rel!r}")
-    _require(not os.path.isabs(rel), f"bad checkpoint rel {rel!r}")
-    parts = rel.split("/")
-    _require(all(part not in ("", ".", "..") for part in parts),
-             f"bad checkpoint rel traversal {rel!r}")
-    base = os.path.realpath(os.path.abspath(ckpt_dir))
-    p = os.path.abspath(os.path.join(ckpt_dir, rel))
-    _require(p == base or p.startswith(base + os.sep),
-             f"checkpoint path escapes dir: {rel!r}")
-    # Refuse symlinks at every existing component, including intermediate
-    # directories such as experts/ that resolve back inside the checkpoint.
-    try:
-        current = os.path.abspath(ckpt_dir)
-        if os.path.lexists(current) and os.path.islink(current):
-            raise ValueError(
-                f"checkpoint validation failed: refusing symlink checkpoint root {ckpt_dir!r}"
-            )
-        for part in parts:
-            current = os.path.join(current, part)
-            if os.path.lexists(current) and os.path.islink(current):
-                raise ValueError(
-                    f"checkpoint validation failed: refusing symlink component {part!r} in {rel!r}"
-                )
-        r = os.path.realpath(p)
-    except OSError as e:
-        raise ValueError(
-            f"checkpoint validation failed: unreadable path {rel!r}: {e}"
-        ) from e
-    _require(r == base or r.startswith(base + os.sep),
-             f"checkpoint path escapes dir via symlink: {rel!r}")
-    # If the leaf itself exists as a symlink, refuse even when its target
-    # happens to stay inside (opaque-archive hygiene).
-    try:
-        if os.path.lexists(p) and os.path.islink(p):
-            raise ValueError(
-                f"checkpoint validation failed: refusing symlink {rel!r}"
-            )
-    except OSError as e:
-        raise ValueError(
-            f"checkpoint validation failed: unreadable path {rel!r}: {e}"
-        ) from e
-    return p
 
 
 def _is_num(x) -> bool:
@@ -1407,14 +1356,29 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
              f"experts dir mismatch: disk {sorted(on_disk)} vs manifest {eids}")
 
     import torch.nn as nn
+    from precision import HybridFP8Linear
     new_experts: dict = {}
     new_order: list[str] = []
     for t, m in parts:
         rec = expert_from_parts(t, m)
         new_experts[rec.expert_id] = rec
         new_order.append(rec.expert_id)
-    dev, dt = model.router.proj.weight.device, model.router.proj.weight.dtype
-    new_proj = nn.Linear(saved_cfg.d_model, len(eids)).to(device=dev, dtype=dt)
+    old_proj = model.router.proj
+    dev, dt = old_proj.weight.device, old_proj.weight.dtype
+    if isinstance(old_proj, HybridFP8Linear):
+        # Preserve the execution class, not just the parameter tensors.
+        # Replacing this layer with nn.Linear keeps state_dict parity but
+        # silently disables the FP8 forward/backward policy after every load.
+        new_proj = HybridFP8Linear(
+            saved_cfg.d_model, len(eids),
+            bias=old_proj.bias is not None,
+            out_dtype=old_proj.out_dtype,
+            e5m2_for_grads=old_proj.e5m2_for_grads,
+        ).to(device=dev, dtype=dt)
+    else:
+        new_proj = nn.Linear(
+            saved_cfg.d_model, len(eids), bias=old_proj.bias is not None
+        ).to(device=dev, dtype=dt)
     with torch.no_grad():
         new_proj.weight.copy_(rw.to(dt))
         new_proj.bias.copy_(rb.to(dt))
@@ -1423,7 +1387,33 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     new_admit = torch.tensor(manifest.get("router_admit", [0.0] * len(eids)),
                              dtype=torch.float64, device=dev)
 
-    model.load_state_dict(trunk, strict=False)
+    # Reject extra keys before loading anything: load_state_dict can mutate
+    # matching tensors before reporting unexpected keys.
+    unexpected_trunk = set(trunk) - set(model_sd)
+    if unexpected_trunk:
+        raise ValueError(
+            "checkpoint validation failed: unexpected trunk keys "
+            f"{sorted(unexpected_trunk)}"
+        )
+    incompatible = model.load_state_dict(trunk, strict=False)
+    # Router tensors and counters are restored from their dedicated files and
+    # manifest below. Every other model tensor must have been loaded; silently
+    # ignoring a renamed/missing trunk key can produce a valid-looking but
+    # behaviorally different checkpoint.
+    allowed_missing = {
+        key for key in model_sd
+        if key.startswith("router.") or "usage_" in key or "admit_" in key
+        # Older checkpoints predate the optional causal byte convolution.
+        # It is removed below when the saved config says it was disabled.
+        or (key.startswith("byte_conv.") and not saved_cfg.use_byte_conv)
+    }
+    unexpected_missing = set(incompatible.missing_keys) - allowed_missing
+    if unexpected_missing or incompatible.unexpected_keys:
+        raise ValueError(
+            "checkpoint validation failed: trunk state did not load cleanly; "
+            f"missing={sorted(unexpected_missing)}, "
+            f"unexpected={sorted(incompatible.unexpected_keys)}"
+        )
     model.pool.experts = new_experts
     model.pool.order = new_order
     model.pool._next_id = int(next_id)
@@ -1432,6 +1422,14 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     model.router.register_buffer("usage_counts", new_usage)
     model.router.register_buffer("admit_counts", new_admit)
     model.cfg = saved_cfg
+    # Config is checkpoint-authoritative, so synchronize runtime attributes
+    # that are not represented by tensors. Merely replacing model.cfg leaves
+    # constructor-time module settings active and silently changes inference.
+    model.router.capacity_factor = saved_cfg.capacity_factor
+    from rmsnorm import RMSNorm
+    for module in model.modules():
+        if isinstance(module, RMSNorm):
+            module.eps = saved_cfg.rmsnorm_eps
     # Presence follows the checkpoint: byte-conv became default-on after
     # checkpoints without it, so a conv-built model loading a pre-conv
     # checkpoint must drop the module (strict=False silently skipped the
@@ -1475,6 +1473,13 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     model.pager.ram.clear()
     model.pager.vram.clear()
     model.pager.ram_records.clear()
+    # Tags and runtime-only inference/training state belong to the old model
+    # generation too. Clear them together with their payloads so loading into
+    # a previously-used model cannot retain stale cache or stream state.
+    for attr in ("_ram_tag", "_vram_tag", "_staged_tag"):
+        buf = getattr(model.pager, attr, None)
+        if buf is not None:
+            buf.clear()
     for attr in ("_forgotten", "_versions", "_prefetched"):
         buf = getattr(model.pager, attr, None)
         if buf is not None:
@@ -1485,5 +1490,13 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
             buf.clear()
     if model.cfg.paging_method == "R2VR":
         model.pager.warm_ram()
+    # These are deliberately runtime-only and never checkpointed. Restoring
+    # a checkpoint starts a fresh stream and fresh autograd leaf generation.
+    if hasattr(model, "_conv_hist"):
+        model._conv_hist = None
+    for attr in ("_leaves", "_ternary_eval_cache"):
+        cache = getattr(model, attr, None)
+        if cache is not None:
+            cache.clear()
     model._resume_step = int(step)
     return manifest

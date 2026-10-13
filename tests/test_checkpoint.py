@@ -97,6 +97,7 @@ def test_no_temp_files_left_behind(tmp_path):
 
 
 def test_inference_identical_after_reload(tmp_path):
+    """Checkpoint reload preserves configuration, weights, and exact inference logits."""
     d = str(tmp_path / "c")
     m, _ = _trained(d)
     ids = torch.randint(0, 256, (1, 12))
@@ -104,10 +105,104 @@ def test_inference_identical_after_reload(tmp_path):
     a = m.forward_infer(ids)["logits"]
     m2 = SmaulBrainModel(m.cfg)
     load_model(d, m2, SmaulOpt(SmaulOptHParams()))
+    assert type(m2.router.proj) is type(m.router.proj), (
+        "checkpoint load changed router projection execution class: "
+        f"{type(m.router.proj).__name__} -> {type(m2.router.proj).__name__}"
+    )
+    # Compare non-tensor execution policy too: a checkpoint can restore every
+    # tensor while silently changing a config switch that changes forward math.
+    assert m.cfg.to_dict() == m2.cfg.to_dict(), (
+        "checkpoint config mismatch: "
+        f"source={m.cfg.to_dict()} restored={m2.cfg.to_dict()}"
+    )
+    # The expert storage bytes are checked below; also verify the exact
+    # materialized weights the pager hands to inference before comparing logits.
+    for eid in m.pool.order:
+        source_weights = m.pager.provider(eid)
+        restored_weights = m2.pager.provider(eid)
+        for name in ("w_gate", "w_up", "w_down"):
+            assert torch.equal(source_weights[name], restored_weights[name]), (
+                f"checkpoint materialized expert mismatch: {eid}/{name}"
+            )
+    # Separate serialization correctness from inference/cache correctness:
+    # a mismatch here identifies the exact tensor that failed to round-trip.
+    a_state, b_state = m.state_dict(), m2.state_dict()
+    for key, value in a_state.items():
+        if key.startswith("router.") and key.rsplit(".", 1)[-1] in {
+            "usage_counts", "admit_counts", "sanitized_counts"
+        }:
+            continue  # runtime counters may legitimately change during inference
+        assert key in b_state, f"missing restored state tensor: {key}"
+        assert torch.equal(value, b_state[key]), f"checkpoint tensor mismatch: {key}"
+    for eid in m.pool.order:
+        for name in ("w_gate", "w_up", "w_down"):
+            assert torch.equal(m.pool.experts[eid].weights_fp8[name].codes,
+                               m2.pool.experts[eid].weights_fp8[name].codes), (
+                f"checkpoint expert codes mismatch: {eid}/{name}"
+            )
+            assert torch.equal(m.pool.experts[eid].weights_fp8[name].scales,
+                               m2.pool.experts[eid].weights_fp8[name].scales), (
+                f"checkpoint expert scales mismatch: {eid}/{name}"
+            )
     torch.manual_seed(0)
     b = m2.forward_infer(ids)["logits"]
     assert torch.equal(a, b)
     m.pager.close(); m2.pager.close()
+
+
+def test_load_applies_checkpoint_runtime_module_settings(tmp_path):
+    """Loading applies saved router capacity and RMSNorm epsilon to live modules."""
+    source_cfg = SmaulBrainConfig(
+        d_model=32, n_heads=4, num_experts=4, top_k=2,
+        expert_hidden=64, max_depth=2, context_length=12,
+        capacity_factor=0.25, rmsnorm_eps=1e-4,
+    )
+    source = SmaulBrainModel(source_cfg)
+    target_cfg = SmaulBrainConfig(
+        d_model=32, n_heads=4, num_experts=4, top_k=2,
+        expert_hidden=64, max_depth=2, context_length=12,
+        capacity_factor=1.5, rmsnorm_eps=1e-6,
+    )
+    target = SmaulBrainModel(target_cfg)
+    try:
+        d = str(tmp_path / "runtime-settings")
+        opt = SmaulOpt(SmaulOptHParams())
+        save_model(d, source, opt, step=0)
+        load_model(d, target, SmaulOpt(SmaulOptHParams()))
+        assert target.cfg.capacity_factor == 0.25
+        assert target.router.capacity_factor == 0.25
+        norms = [module for module in target.modules()
+                 if module.__class__.__name__ == "RMSNorm"]
+        assert norms
+        assert all(module.eps == 1e-4 for module in norms)
+    finally:
+        source.pager.close()
+        target.pager.close()
+
+
+def test_load_clears_runtime_only_state_from_previous_model_use(tmp_path):
+    """Loading clears stale convolution history, expert leaves, and pager cache tags."""
+    d = str(tmp_path / "c")
+    source, _ = _trained(d)
+    target = SmaulBrainModel(source.cfg)
+    # Simulate a model that has already served a stream and populated caches.
+    target._conv_hist = torch.ones(1, 2, target.cfg.d_model)
+    target._leaves["stale"] = {"w": torch.ones(1, requires_grad=True)}
+    target._ternary_eval_cache["stale"] = ((0, 1), {})
+    target.pager._ram_tag["stale"] = (0, 1)
+    target.pager._vram_tag["stale"] = (0, 1)
+    target.pager._staged_tag["stale"] = (0, 1)
+
+    load_model(d, target, SmaulOpt(SmaulOptHParams()))
+
+    assert target._conv_hist is None
+    assert target._leaves == {}
+    assert target._ternary_eval_cache == {}
+    assert target.pager._ram_tag == {}
+    assert target.pager._vram_tag == {}
+    assert target.pager._staged_tag == {}
+    source.pager.close()
+    target.pager.close()
 
 
 def test_resume_step_and_saved_config_are_restored(tmp_path):

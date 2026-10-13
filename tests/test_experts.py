@@ -391,6 +391,7 @@ def test_step_expert_avoids_optim_state_for_no_grad_leaves():
 
 
 def test_release_expert_computation_graphs_and_clear_external_grads():
+    """Taking expert gradients releases model leaves and clears external leaf grads."""
     from config import SmaulBrainConfig
     from model import SmaulBrainModel
 
@@ -403,7 +404,7 @@ def test_release_expert_computation_graphs_and_clear_external_grads():
     out["loss"].backward()
 
     # Before take_expert_grads, leaves exist and hold gradients
-    leaf_tensors = [leaf for copies in m._leaves.values() for c in copies for leaf in c.values()]
+    leaf_tensors = [leaf for leaves in m._leaves.values() for leaf in leaves.values()]
     assert any(l.grad is not None for l in leaf_tensors)
 
     # Calling take_expert_grads clears leaf.grad and releases m._leaves
@@ -483,7 +484,7 @@ def test_grow_expert_commit_failure_restores_exact_topology(monkeypatch):
 
 
 def test_grow_topk_commit_failure_rolls_back_prefix_exactly(monkeypatch):
-    """Growth rollback: mid-commit failure removes prefix, restores cursor."""
+    """Growth rollback: batch router-append failure restores pool and cursor."""
     pool, r = _synced(n=3)
     next_before = pool._next_id
     order = list(pool.order)
@@ -495,15 +496,10 @@ def test_grow_topk_commit_failure_rolls_back_prefix_exactly(monkeypatch):
     opt.router_state["w"] = {"m": m.clone(), "step": 5,
                              "v_row": torch.zeros(3, 1),
                              "v_col": torch.zeros(1, d)}
-    real_add = r.add_expert_row
-    calls = {"n": 0}
-
-    def flaky(init=None):
-        calls["n"] += 1
-        if calls["n"] >= 2:
-            raise RuntimeError("router on fire mid-sweep")
-        return real_add(init=init)
-    monkeypatch.setattr(r, "add_expert_row", flaky)
+    def boom(rows):
+        """Inject a router batch-append failure to exercise growth rollback."""
+        raise RuntimeError("router on fire during batch append")
+    monkeypatch.setattr(r, "add_expert_rows", boom)
     with pytest.raises(RuntimeError):
         grow_topk_clones(pool, r, 16, 32, step=1, seed=0, k=3,
                          optim_state=opt.router_state)
@@ -615,13 +611,14 @@ def test_growth_pads_zero_row_optimizer_state_from_empty_pool():
 
 
 def test_step_expert_row_slice_keeps_full_optimizer_state_shape():
+    """A sliced expert gradient retains full-sized momentum and variance tensors."""
     from experts import make_expert
     from smaulopt import SmaulOpt, SmaulOptHParams
     from train import _GradOnly
 
     rec = make_expert("expert_00000", 32, 64, fp8_tile=64)
     rec.optim_state = {}
-    opt = SmaulOpt(SmaulOptHParams(lr=0.01))
+    opt = SmaulOpt(SmaulOptHParams(lr=0.01, factor_v=False))
     # A gradient containing only the selected rows is a supported input.
     compute = {"w_gate": _GradOnly(torch.randn(8, 32))}
     opt.step_expert(rec, compute, 1.0, lr=0.01, row_range=(8, 16))
