@@ -105,6 +105,86 @@ class SmaulBrainConfig:
     cosine_decay_steps: int = 0
 
     def __post_init__(self) -> None:
+        # Keep safety checks active under python -O; assert statements alone are stripped.
+        def require(condition: bool, message: str) -> None:
+            if not condition:
+                raise AssertionError(message)
+
+        int_fields = (
+            "d_model", "n_heads", "vocab_size", "num_experts", "top_k",
+            "max_experts", "min_experts", "expert_hidden", "context_length",
+            "attention_chunk_size", "ram_cache", "vram_cache", "fp8_tile",
+            "threads", "seed", "grow_every", "prune_survival_steps",
+            "max_new_experts", "cosine_decay_steps", "min_depth", "max_depth",
+        )
+        for field in int_fields:
+            value = getattr(self, field)
+            require(isinstance(value, int) and not isinstance(value, bool),
+                    f"{field} must be an int (not bool), got {value!r}")
+
+        float_fields = (
+            "halting_threshold", "halt_prior", "ponder_beta",
+            "moe_balance_weight", "capacity_factor", "expert_lr",
+            "trunk_lr_mult", "router_lr_mult", "router_lr_mult_new",
+            "new_routing_bias", "weight_decay", "grad_clip", "beta_m",
+            "beta_v", "epsilon", "rmsnorm_eps", "prune_min_usage",
+            "lookahead_weight", "boundary_weight",
+        )
+        for field in float_fields:
+            value = getattr(self, field)
+            require(isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value),
+                    f"{field} must be a finite number (not bool), got {value!r}")
+
+        require(self.d_model >= 1, "d_model must be >= 1")
+        require(self.n_heads >= 1, "n_heads must be >= 1")
+        require(self.d_model % self.n_heads == 0, "d_model must split over heads")
+        require(self.vocab_size >= total_vocab(),
+                f"vocab_size must be >= {total_vocab()} (bytes + specials)")
+        require(1 <= self.min_depth <= self.max_depth, "need 1 <= min <= max depth")
+        require(0.0 < self.halting_threshold < 1.0, "halting threshold in (0,1)")
+        require(0.0 < self.halt_prior < 1.0, "halt prior in (0,1)")
+        require(self.ponder_beta >= 0, "ponder beta must be non-negative")
+        require(1 <= self.top_k <= self.num_experts, "need 1 <= top_k <= experts")
+        require(self.num_experts >= 1 and self.max_experts >= self.num_experts,
+                "max_experts must be >= num_experts >= 1")
+        require(self.min_experts >= self.top_k, "need min_experts >= top_k")
+        require(self.paging_method in ("D2R", "R2VR", "D2VR"), "bad paging method")
+        require(self.ram_cache >= 1 and self.vram_cache >= 1, "caches need >= 1 slot")
+        require(self.dtype in ("bf16", "fp32"), "compute dtype bf16|fp32")
+        require(self.state_dtype in ("bf16", "fp32"), "state dtype bf16|fp32")
+        require(isinstance(self.ternary_qat, bool), "ternary_qat must be a bool")
+        require(isinstance(self.ternary_backward, bool), "ternary_backward must be a bool")
+        require(not self.ternary_backward or self.ternary_qat,
+                "ternary_backward requires ternary_qat=True")
+        require(self.expert_hidden >= 8, "expert hidden dim too small")
+        require(self.attention_chunk_size >= 1, "attention chunk size must be positive")
+        require(self.capacity_factor > 0, "capacity factor must be positive")
+        require(self.moe_balance_weight >= 0, "balance weight must be non-negative")
+        require(self.expert_lr > 0, "expert LR must be positive")
+        require(self.trunk_lr_mult > 0, "trunk LR multiplier must be positive")
+        require(self.router_lr_mult > 0, "router LR multiplier must be positive")
+        require(self.router_lr_mult_new >= 0, "router new-mode LR multiplier must be non-negative")
+        require(self.new_routing_bias >= 0, "new routing bias must be non-negative")
+        require(self.weight_decay >= 0, "weight decay must be non-negative")
+        require(self.grad_clip >= 0, "grad clip must be non-negative")
+        require(0.0 <= self.beta_m < 1.0, "beta_m in [0, 1)")
+        require(0.0 <= self.beta_v < 1.0, "beta_v in [0, 1)")
+        require(self.epsilon > 0, "epsilon must be positive")
+        require(self.fp8_tile >= 8, "FP8 tile too small")
+        require(self.threads >= 1, "need at least 1 thread")
+        require(self.context_length >= 2, "context must fit input + target")
+        require(self.rmsnorm_eps > 0, "rmsnorm eps must be positive")
+        require(self.grow_every >= 0, "grow_every must be non-negative (0 disables)")
+        require(self.prune_survival_steps >= 1, "need a positive prune grace period")
+        require(self.prune_min_usage >= 0, "prune usage threshold must be non-negative")
+        require(self.max_new_experts >= 1, "need at least 1 new expert per growth")
+        require(self.lookahead_weight >= 0, "lookahead weight must be non-negative")
+        require(self.boundary_weight >= 0, "boundary weight must be non-negative")
+        require(self.cosine_decay_steps >= 0, "cosine horizon must be non-negative (0 disables)")
+        require(isinstance(self.use_byte_conv, bool),
+                f"use_byte_conv must be a bool, got {self.use_byte_conv!r}")
+
         for _f in ("d_model", "n_heads", "vocab_size", "num_experts", "top_k",
                    "max_experts", "min_experts", "expert_hidden", "context_length",
                    "attention_chunk_size", "ram_cache", "vram_cache", "fp8_tile",
