@@ -105,9 +105,10 @@ class SmaulBrainConfig:
     cosine_decay_steps: int = 0
 
     def __post_init__(self) -> None:
+        """Validate model dimensions and runtime settings, including under optimized Python."""
         # Keep safety checks active under python -O; assert statements alone are stripped.
         def require(condition: bool, message: str) -> None:
-        """Validate model dimensions and runtime settings, including under optimized Python."""
+            """Raise a configuration error when a required invariant is false."""
             if not condition:
                 raise AssertionError(message)
 
@@ -312,6 +313,7 @@ class SmaulBrainConfig:
         return self.shared_params() + self.router_params() + min(self.top_k, self.num_experts) * self.per_expert_params
 
     def to_dict(self) -> dict:
+        """Return the configuration as a JSON-serializable dictionary."""
         return asdict(self)
 
     @classmethod
