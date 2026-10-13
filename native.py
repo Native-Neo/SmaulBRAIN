@@ -767,7 +767,10 @@ def call_ternary_backward_input(
     if grad_out.device.type != "cpu" or weight.device.type != "cpu":
         reason = "native ternary backward requires CPU tensors"
     elif grad_out.dtype != torch.float32 or weight.dtype != torch.float32:
-        reason = "native ternary backward requires float32 tensors"
+        reason = (
+            "native ternary backward requires float32 tensors "
+            f"(got grad_out={grad_out.dtype}, weight={weight.dtype})"
+        )
     elif grad_out.ndim != 2 or weight.ndim != 2:
         reason = "native ternary backward requires 2-D matrices"
     elif grad_out.shape[0] == 0 or grad_out.shape[1] == 0 or weight.shape[1] == 0:
