@@ -40,3 +40,30 @@ def test_from_dict_rejects_active_experts_that_only_match_after_truncation():
     payload["active_experts"] = 2.5
     with pytest.raises(ValueError, match="active_experts"):
         SmaulBrainConfig.from_dict(payload)
+
+
+
+def test_config_validation_survives_python_optimized_mode():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "-O", "-c",
+         "from config import SmaulBrainConfig; SmaulBrainConfig(d_model=0)"],
+        cwd=root, text=True, capture_output=True, check=False, timeout=30,
+    )
+    assert result.returncode != 0
+    assert "d_model must be >= 1" in result.stderr
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"expert_lr": float("nan")},
+    {"weight_decay": -1.0},
+    {"ternary_backward": True},
+    {"use_byte_conv": 1},
+])
+def test_config_rejects_invalid_runtime_values(kwargs):
+    with pytest.raises(AssertionError):
+        SmaulBrainConfig(**kwargs)
