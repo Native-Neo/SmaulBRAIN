@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
+#include <limits>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -41,6 +43,24 @@ inline std::uint8_t code_at(const std::uint8_t* packed, std::size_t index) {
     return static_cast<std::uint8_t>(
         (packed[index >> 2] >> ((index & 3u) * 2u)) & 0x3u
     );
+}
+
+inline float e4m3_to_f32(std::uint8_t c) {
+    const int sign = (c & 0x80u) ? -1 : 1;
+    const int e = (c >> 3) & 0x0F;
+    const int m = c & 0x07;
+    if (e == 0) return static_cast<float>(sign) * std::ldexp(static_cast<float>(m), -9);
+    if (e == 15 && m == 7) return std::numeric_limits<float>::quiet_NaN();
+    return static_cast<float>(sign) * std::ldexp(1.0f + static_cast<float>(m) / 8.0f, e - 7);
+}
+
+inline float round_bf16(float value) {
+    std::uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    bits += 0x7FFFu + ((bits >> 16) & 1u);
+    bits &= 0xFFFF0000u;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
 }
 
 template <class Function>
@@ -150,4 +170,62 @@ extern "C" void smaul_ternary_linear_input_grad(
             grad_input[cell] = sum;
         }
     });
+}
+
+
+// Convert blockwise FP8 E4M3 weights directly to packed row-scaled ternary
+// codes. The FP8 values are decoded one scalar at a time; no dense FP32/BF16
+// weight matrix is created. The flattened 2-bit stream uses 00=zero,
+// 01=positive, 10=negative. Row scales preserve the existing ternary-QAT rule.
+extern "C" void smaul_fp8_to_packed_ternary(
+    const std::uint8_t* fp8_codes, const float* fp8_block_scales,
+    std::uint8_t* packed, float* ternary_row_scales,
+    std::size_t rows, std::size_t cols, std::size_t tile,
+    float threshold_ratio, int round_to_bf16
+) {
+    if (!fp8_codes || !fp8_block_scales || !packed || !ternary_row_scales ||
+        rows == 0 || cols == 0 || tile == 0 ||
+        !std::isfinite(threshold_ratio) || threshold_ratio < 0.0f ||
+        threshold_ratio >= 1.0f) {
+        return;
+    }
+    const std::size_t nblocks = (cols + tile - 1) / tile;
+    const std::size_t total = rows * cols;
+    const std::size_t packed_bytes = (total + 3) / 4;
+    std::memset(packed, 0, packed_bytes);
+
+    for (std::size_t r = 0; r < rows; ++r) {
+        float abs_sum = 0.0f;
+        for (std::size_t c = 0; c < cols; ++c) {
+            const float block_scale = fp8_block_scales[r * nblocks + c / tile];
+            float value = e4m3_to_f32(fp8_codes[r * cols + c]) * block_scale;
+            if (round_to_bf16) value = round_bf16(value);
+            abs_sum += std::fabs(value);
+        }
+        const float threshold = (abs_sum / static_cast<float>(cols)) * threshold_ratio;
+        float selected_abs_sum = 0.0f;
+        std::size_t selected_count = 0;
+        for (std::size_t c = 0; c < cols; ++c) {
+            const float block_scale = fp8_block_scales[r * nblocks + c / tile];
+            float value = e4m3_to_f32(fp8_codes[r * cols + c]) * block_scale;
+            if (round_to_bf16) value = round_bf16(value);
+            if (value > threshold || value < -threshold) {
+                selected_abs_sum += std::fabs(value);
+                ++selected_count;
+            }
+        }
+        const float row_scale = selected_count
+            ? selected_abs_sum / static_cast<float>(selected_count) : 0.0f;
+        ternary_row_scales[r] = row_scale;
+        for (std::size_t c = 0; c < cols; ++c) {
+            const std::size_t index = r * cols + c;
+            const float block_scale = fp8_block_scales[r * nblocks + c / tile];
+            float value = e4m3_to_f32(fp8_codes[index]) * block_scale;
+            if (round_to_bf16) value = round_bf16(value);
+            const std::uint8_t trit = value > threshold ? 1u
+                : (value < -threshold ? 2u : 0u);
+            packed[index >> 2] |= static_cast<std::uint8_t>(
+                trit << ((index & 3u) * 2u));
+        }
+    }
 }
