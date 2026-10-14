@@ -323,6 +323,7 @@ def config_from_args(args: argparse.Namespace) -> SmaulBrainConfig:
         fp8_tile=pick_cfg(getattr(args, "fp8_tile", None), "fp8_tile"),
         state_dtype=pick_cfg(getattr(args, "state_dtype", None), "state_dtype"),
         ternary_qat=pick_cfg(getattr(args, "ternary_qat", None), "ternary_qat"),
+        full_ternary_qat=pick_cfg(getattr(args, "full_ternary_qat", None), "full_ternary_qat"),
         threads=pick_cfg(getattr(args, "threads", None), "threads"),
         seed=pick_cfg(getattr(args, "seed", None), "seed"),
         rmsnorm_eps=pick_cfg(getattr(args, "rmsnorm_eps", None), "rmsnorm_eps"),
