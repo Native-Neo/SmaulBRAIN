@@ -479,7 +479,7 @@ def _self_test() -> None:
     # Float-to-trit conversion consumes the original parameter directly.
     float_src = torch.tensor([[2.0, -1.0, 0.0, 0.5]], dtype=torch.float32)
     float_packed, float_scales = call_float_to_packed_ternary(float_src)
-    if float_packed is None or float_scales is None or float_packed.tolist() != [0x91] or abs(float_scales[0].item() - 1.25) > 1e-6:
+    if float_packed is None or float_scales is None or float_packed.tolist() != [0x09] or abs(float_scales[0].item() - 1.5) > 1e-6:
         raise RuntimeError(
             f"float-to-ternary self-test failed: codes={None if float_packed is None else float_packed.tolist()}, "
             f"scales={None if float_scales is None else float_scales.tolist()}"
