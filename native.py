@@ -70,7 +70,7 @@ ENV_VAR = "SMAUL_NATIVE"
 BUILD_TIMEOUT_VAR = "SMAUL_NATIVE_BUILD_TIMEOUT"
 BUILD_TIMEOUT_DEFAULT = 300
 SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels_cpp")
-LIBS = ("rmsnorm", "linear_attn", "fp8_quant", "ternary_backward", "ternary_linear")
+LIBS = ("rmsnorm", "linear_attn", "fp8_quant", "ternary_linear")
 
 # Required ISA: baseline x86-64 (SSE2) only. The kernels use no AVX/AVX2/
 # AVX-512 intrinsics and are built with ``-march=x86-64``, so they run on any
@@ -100,9 +100,7 @@ COUNTERS: dict[str, int] = {
     "fp8_dequant_native": 0, "fp8_dequant_fallback": 0,
     "rmsnorm_native": 0, "rmsnorm_fallback": 0,
     "attn_step_native": 0, "attn_step_fallback": 0,
-    "ternary_backward_native": 0, "ternary_backward_fallback": 0,
     "ternary_linear_forward_native": 0, "ternary_linear_forward_fallback": 0,
-    "ternary_linear_backward_native": 0, "ternary_linear_backward_fallback": 0,
 }
 LAST_FALLBACK: dict[str, str] = {}
 
@@ -426,15 +424,7 @@ def _self_test() -> None:
     _libs["linear_attn"].smaul_linear_attn_step_buf(S, z, q, k, v, yo, sc, Dh, 1e-6)
     if not all(_m.isfinite(yo[i]) for i in range(Dh)):
         raise RuntimeError(f"linear_attn self-test failed: {list(yo)}")
-    # ternary backward: exact parity on a tiny sparse weight matrix
-    tg = (ctypes.c_float * 4)(1.0, 2.0, -1.0, 3.0)
-    tw = (ctypes.c_float * 6)(1.0, 0.0, -2.0, 0.0, 0.5, 0.0)
-    ti = (ctypes.c_float * 4)()
-    _libs["ternary_backward"].smaul_ternary_backward_input(tg, tw, ti, 1, 2, 3)
-    expected_ti = (-3.5, 0.0)
-    if any(abs(ti[i] - expected_ti[i]) > 1e-6 for i in range(2)):
-        raise RuntimeError(f"ternary backward self-test failed: {list(ti)}")
-    # Packed ternary forward/backward: codes [+,0;-,+;0,-], scales [2,3,4].
+    # Packed ternary forward: codes [+,0;-,+;0,-], scales [2,3,4].
     packed = (ctypes.c_ubyte * 2)(0x61, 0x08)
     scales_t = (ctypes.c_float * 3)(2.0, 3.0, 4.0)
     tx = (ctypes.c_float * 2)(1.0, 2.0)
@@ -446,14 +436,6 @@ def _self_test() -> None:
     expected_ty = (2.0, 3.0, -8.0)
     if any(abs(ty[i] - expected_ty[i]) > 1e-6 for i in range(3)):
         raise RuntimeError(f"ternary linear forward self-test failed: {list(ty)}")
-    tgo = (ctypes.c_float * 3)(1.0, 2.0, 3.0)
-    tdx = (ctypes.c_float * 2)()
-    _libs["ternary_linear"].smaul_ternary_linear_backward_input(
-        ctypes.cast(tgo, ctypes.c_void_p), packed, scales_t,
-        ctypes.cast(tdx, ctypes.c_void_p), 1, 2, 3, 0, 1
-    )
-    if abs(tdx[0] + 4.0) > 1e-6 or abs(tdx[1] + 6.0) > 1e-6:
-        raise RuntimeError(f"ternary linear backward self-test failed: {list(tdx)}")
     # fp8: quantize+dequantize roundtrip stays finite
     wq = (ctypes.c_float * 4)(0.5, -1.0, 2.0, 0.01)
     codes = (ctypes.c_ubyte * 4)()
@@ -484,23 +466,13 @@ def _bind(lib: ctypes.CDLL, name: str) -> None:
             raise RuntimeError("linear_attn .so missing smaul_linear_attn_step_buf (ABI?)")
         fn.argtypes = [F, F, F, F, F, F, F, S, ctypes.c_float]
         fn.restype = None
-    elif name == "ternary_backward":
-        fn = getattr(lib, "smaul_ternary_backward_input", None)
-        if fn is None:
-            raise RuntimeError("ternary_backward .so missing smaul_ternary_backward_input (ABI?)")
-        fn.argtypes = [F, F, F, S, S, S]
-        fn.restype = None
     elif name == "ternary_linear":
         fwd = getattr(lib, "smaul_ternary_linear_forward", None)
-        bwd = getattr(lib, "smaul_ternary_linear_backward_input", None)
-        if fwd is None or bwd is None:
-            raise RuntimeError("ternary_linear .so missing forward/backward symbols (ABI?)")
-        args = [ctypes.c_void_p, U, F, ctypes.c_void_p,
-                S, S, S, ctypes.c_int, ctypes.c_int]
-        fwd.argtypes = args
+        if fwd is None:
+            raise RuntimeError("ternary_linear .so missing smaul_ternary_linear_forward (ABI?)")
+        fwd.argtypes = [ctypes.c_void_p, U, F, ctypes.c_void_p,
+                        S, S, S, ctypes.c_int, ctypes.c_int]
         fwd.restype = None
-        bwd.argtypes = args
-        bwd.restype = None
     elif name == "fp8_quant":
         q = getattr(lib, "smaul_fp8_quant_row_block", None)
         dq = getattr(lib, "smaul_fp8_dequant_row_block", None)
@@ -829,107 +801,3 @@ def call_ternary_linear_forward(
         if native_mode() == "force":
             raise
         return None
-
-
-def call_ternary_linear_backward_input(
-    grad_out: torch.Tensor, packed_codes: torch.Tensor,
-    scales: torch.Tensor, in_features: int,
-) -> torch.Tensor | None:
-    """Packed ternary dX: scale each upstream value once, then add/subtract."""
-    op = "ternary_linear_backward"
-    if grad_out.device.type != "cpu" or grad_out.dtype not in (torch.float32, torch.bfloat16):
-        _note(op, False, f"requires CPU FP32/BF16 gradients (got {grad_out.device}/{grad_out.dtype})")
-        return None
-    if packed_codes.device.type != "cpu" or packed_codes.dtype != torch.uint8:
-        _note(op, False, "packed ternary codes must be CPU uint8")
-        return None
-    if scales.device.type != "cpu" or scales.dtype != torch.float32:
-        _note(op, False, "ternary row scales must be CPU FP32")
-        return None
-    if grad_out.ndim != 2 or grad_out.shape[0] == 0 or grad_out.shape[1] == 0:
-        _note(op, False, "grad_out must be a non-empty 2-D matrix")
-        return None
-    rows, out_features = map(int, grad_out.shape)
-    try:
-        in_features = int(in_features)
-    except (TypeError, ValueError, OverflowError):
-        _note(op, False, "invalid in_features")
-        return None
-    if in_features <= 0 or scales.ndim != 1 or scales.numel() != out_features:
-        _note(op, False, "input dimension or row scales do not match")
-        return None
-    if packed_codes.numel() != (in_features * out_features + 3) // 4:
-        _note(op, False, "packed weight size does not match gradient/scales")
-        return None
-    if not (grad_out.is_contiguous() and packed_codes.is_contiguous() and scales.is_contiguous()):
-        _note(op, False, "requires contiguous inputs")
-        return None
-    if not _want_native(op):
-        return None
-    try:
-        grad_input = torch.empty((rows, in_features), dtype=grad_out.dtype, device="cpu")
-        _libs["ternary_linear"].smaul_ternary_linear_backward_input(
-            ctypes.c_void_p(grad_out.data_ptr()), _ptr(packed_codes, ctypes.c_ubyte),
-            _ptr(scales, ctypes.c_float), ctypes.c_void_p(grad_input.data_ptr()),
-            rows, in_features, out_features, int(grad_out.dtype == torch.bfloat16),
-            max(1, int(torch.get_num_threads())),
-        )
-        _note(op, True)
-        return grad_input
-    except Exception as e:
-        _note(op, False, f"{type(e).__name__}: {e}")
-        if native_mode() == "force":
-            raise
-        return None
-
-
-def call_ternary_backward_input(
-    grad_out: torch.Tensor, weight: torch.Tensor
-) -> torch.Tensor | None:
-    """Compute dX=dY@W with the native zero-skipping kernel when safe.
-
-    Native execution is restricted to non-empty contiguous CPU FP32 matrices.
-    Unsupported inputs use the caller's PyTorch GEMM fallback. This function
-    makes no speedup guarantee; use the benchmark on the target CPU.
-    """
-    reason = ""
-    if grad_out.device.type != "cpu" or weight.device.type != "cpu":
-        reason = "native ternary backward requires CPU tensors"
-    elif grad_out.dtype != torch.float32 or weight.dtype != torch.float32:
-        reason = (
-            "native ternary backward requires float32 tensors "
-            f"(got grad_out={grad_out.dtype}, weight={weight.dtype})"
-        )
-    elif grad_out.ndim != 2 or weight.ndim != 2:
-        reason = "native ternary backward requires 2-D matrices"
-    elif grad_out.shape[0] == 0 or grad_out.shape[1] == 0 or weight.shape[1] == 0:
-        reason = "native ternary backward requires non-empty matrices"
-    elif grad_out.shape[1] != weight.shape[0]:
-        reason = "ternary backward matrix dimensions do not match"
-    elif not grad_out.is_contiguous() or not weight.is_contiguous():
-        reason = "native ternary backward requires contiguous tensors"
-    elif not torch.isfinite(grad_out).all() or not torch.isfinite(weight).all():
-        reason = "native ternary backward requires finite tensors"
-    if reason:
-        _note("ternary_backward", False, reason)
-        return None
-    # _want_native records fallback reasons and ensures the library is loaded.
-    # Do not count a second fallback for the same rejected dispatch.
-    if not _want_native("ternary_backward"):
-        return None
-    try:
-        rows, out_features = grad_out.shape
-        in_features = weight.shape[1]
-        result = torch.empty((rows, in_features), dtype=torch.float32)
-        _libs["ternary_backward"].smaul_ternary_backward_input(
-            _ptr(grad_out, ctypes.c_float), _ptr(weight, ctypes.c_float),
-            _ptr(result, ctypes.c_float), rows, in_features, out_features,
-        )
-        _note("ternary_backward", True)
-        return result
-    except Exception as e:
-        _note("ternary_backward", False, f"{type(e).__name__}: {e}")
-        if native_mode() == "force":
-            raise
-        return None
-
