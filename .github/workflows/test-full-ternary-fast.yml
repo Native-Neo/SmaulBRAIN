@@ -64,6 +64,7 @@ jobs:
         run: >-
           python -m pytest -q
           tests/test_native.py::test_ternary_input_grad_uses_packed_add_sub
+          tests/test_native.py::test_fp8_to_packed_ternary_matches_reference_without_dense_output
           tests/test_native.py::test_float_to_packed_ternary_matches_reference_without_dense_output
           tests/test_native.py::test_fp8_to_packed_ternary_matches_reference_without_dense_output
           tests/test_full_ternary.py
