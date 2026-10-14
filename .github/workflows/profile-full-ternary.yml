@@ -12,6 +12,8 @@ on:
       - "smaulopt.py"
       - "native.py"
       - "config.py"
+      - "kernels_cpp/**"
+      - "tests/test_expert_memory.py"
   push:
     branches: ["**"]
     paths:
@@ -23,6 +25,8 @@ on:
       - "smaulopt.py"
       - "native.py"
       - "config.py"
+      - "kernels_cpp/**"
+      - "tests/test_expert_memory.py"
 
 permissions:
   contents: read
