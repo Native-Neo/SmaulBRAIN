@@ -397,7 +397,12 @@ class SmaulBrainModel(nn.Module):
         # ordinary mode the pager yields dense compute weights and training
         # makes one dense leaf per active expert; full ternary instead reads
         # FP8 storage straight into packed trits and creates no dense leaves.
-        active_upper = min(self.cfg.num_experts, batch_tokens * self.cfg.top_k)
+        # The union is across every recurrent depth: each depth routes the
+        # whole batch again and may touch a different expert set.
+        active_upper = min(
+            self.cfg.num_experts,
+            batch_tokens * self.cfg.top_k * self.cfg.max_depth,
+        )
         expert_params = 3 * self.cfg.d_model * self.cfg.expert_hidden
         direct_ternary = self.cfg.full_ternary_qat
         expert_leaf_bytes = (
