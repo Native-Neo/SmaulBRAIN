@@ -173,6 +173,62 @@ extern "C" void smaul_ternary_linear_input_grad(
 }
 
 
+// Convert dense floating-point master parameters to packed ternary codes
+// directly. No same-shape quantized weight tensor is created.
+template <bool BF16>
+static void float_to_packed_ternary_impl(
+    const void* weights, std::uint8_t* packed, float* row_scales,
+    std::size_t rows, std::size_t cols, float threshold_ratio
+) {
+    const std::size_t total = rows * cols;
+    std::memset(packed, 0, (total + 3) / 4);
+    for (std::size_t r = 0; r < rows; ++r) {
+        float abs_sum = 0.0f;
+        for (std::size_t col = 0; col < cols; ++col)
+            abs_sum += std::fabs(load_value<BF16>(weights, r * cols + col));
+        const float threshold =
+            (abs_sum / static_cast<float>(cols)) * threshold_ratio;
+        float chosen_sum = 0.0f;
+        std::size_t chosen_count = 0;
+        for (std::size_t col = 0; col < cols; ++col) {
+            const float value = load_value<BF16>(weights, r * cols + col);
+            if (value > threshold || value < -threshold) {
+                chosen_sum += std::fabs(value);
+                ++chosen_count;
+            }
+        }
+        float scale = chosen_count
+            ? chosen_sum / static_cast<float>(chosen_count) : 0.0f;
+        if (BF16) scale = round_bf16(scale);
+        row_scales[r] = scale;
+        for (std::size_t col = 0; col < cols; ++col) {
+            const std::size_t index = r * cols + col;
+            const float value = load_value<BF16>(weights, index);
+            const std::uint8_t code = value > threshold ? 1u
+                : (value < -threshold ? 2u : 0u);
+            packed[index >> 2] |= static_cast<std::uint8_t>(
+                code << ((index & 3u) * 2u));
+        }
+    }
+}
+
+extern "C" void smaul_float_to_packed_ternary(
+    const void* weights, std::uint8_t* packed, float* row_scales,
+    std::size_t rows, std::size_t cols, float threshold_ratio,
+    int is_bfloat16
+) {
+    if (!weights || !packed || !row_scales || rows == 0 || cols == 0 ||
+        !std::isfinite(threshold_ratio) || threshold_ratio < 0.0f ||
+        threshold_ratio >= 1.0f) return;
+    if (is_bfloat16) {
+        float_to_packed_ternary_impl<true>(
+            weights, packed, row_scales, rows, cols, threshold_ratio);
+    } else {
+        float_to_packed_ternary_impl<false>(
+            weights, packed, row_scales, rows, cols, threshold_ratio);
+    }
+}
+
 // Convert blockwise FP8 E4M3 weights directly to packed row-scaled ternary
 // codes. The FP8 values are decoded one scalar at a time; no dense FP32/BF16
 // weight matrix is created. The flattened 2-bit stream uses 00=zero,
