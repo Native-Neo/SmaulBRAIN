@@ -149,7 +149,6 @@ class SmaulBrainModel(nn.Module):
             y = self.pool.forward(
                 x, plan.top_ids, plan.top_weights, plan.dropped, prov,
                 step=step,
-                ternary_backward=(train and self.cfg.ternary_backward),
                 ternary_qat=(train and self.cfg.ternary_qat),
             )
             if prof:
