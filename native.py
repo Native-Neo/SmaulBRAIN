@@ -104,6 +104,7 @@ COUNTERS: dict[str, int] = {
     "ternary_linear_input_grad_native": 0, "ternary_linear_input_grad_fallback": 0,
     "fp8_to_ternary_native": 0, "fp8_to_ternary_fallback": 0,
     "fp8_factored_update_native": 0, "fp8_factored_update_fallback": 0,
+    "fp8_clone_native": 0, "fp8_clone_fallback": 0,
 }
 LAST_FALLBACK: dict[str, str] = {}
 
@@ -474,6 +475,18 @@ def _self_test() -> None:
     if opt_status != 1 or abs(opt_activity[0]) > 1e-6:
         raise RuntimeError(f"low-memory FP8 optimizer self-test failed: status={opt_status}, activity={opt_activity[0]}")
 
+    # Direct FP8 clone update stays encoded and uses no dense weight buffer.
+    clone_src = (ctypes.c_ubyte * 4)(0x38, 0xC0, 0x30, 0xB0)
+    clone_src_scales = (ctypes.c_float * 2)(1.0, 1.0)
+    clone_dst = (ctypes.c_ubyte * 4)()
+    clone_dst_scales = (ctypes.c_float * 2)()
+    clone_status = _libs["ternary_linear"].smaul_fp8_clone_perturb(
+        clone_src, clone_src_scales, clone_dst, clone_dst_scales,
+        2, 2, 2, 0.0, 1234567,
+    )
+    if clone_status != 1 or not all(_m.isfinite(clone_dst_scales[i]) and clone_dst_scales[i] > 0 for i in range(2)):
+        raise RuntimeError(f"direct FP8 clone self-test failed: status={clone_status}, scales={list(clone_dst_scales)}")
+
     # fp8: quantize+dequantize roundtrip stays finite
     wq = (ctypes.c_float * 4)(0.5, -1.0, 2.0, 0.01)
     codes = (ctypes.c_ubyte * 4)()
@@ -509,8 +522,9 @@ def _bind(lib: ctypes.CDLL, name: str) -> None:
         bwd = getattr(lib, "smaul_ternary_linear_input_grad", None)
         convert = getattr(lib, "smaul_fp8_to_packed_ternary", None)
         update = getattr(lib, "smaul_fp8_factored_update", None)
-        if fwd is None or bwd is None or convert is None or update is None:
-            raise RuntimeError("ternary_linear .so missing a packed ternary or low-memory FP8 optimizer symbol (ABI?)")
+        clone = getattr(lib, "smaul_fp8_clone_perturb", None)
+        if fwd is None or bwd is None or convert is None or update is None or clone is None:
+            raise RuntimeError("ternary_linear .so missing a packed ternary, low-memory optimizer, or clone symbol (ABI?)")
         fwd.argtypes = [ctypes.c_void_p, U, F, ctypes.c_void_p,
                         S, S, S, ctypes.c_int, ctypes.c_int]
         fwd.restype = None
@@ -525,6 +539,8 @@ def _bind(lib: ctypes.CDLL, name: str) -> None:
             ctypes.c_float, ctypes.c_float, ctypes.c_float, F,
         ]
         update.restype = ctypes.c_int
+        clone.argtypes = [U, F, U, F, S, S, S, ctypes.c_float, ctypes.c_uint64]
+        clone.restype = ctypes.c_int
     elif name == "fp8_quant":
         q = getattr(lib, "smaul_fp8_quant_row_block", None)
         dq = getattr(lib, "smaul_fp8_dequant_row_block", None)
@@ -884,6 +900,60 @@ def call_fp8_factored_ternary_update(
             return None
         _note(op, True)
         return float(activity.item())
+    except Exception as e:
+        _note(op, False, f"{type(e).__name__}: {e}")
+        if native_mode() == "force":
+            raise
+        return None
+
+
+def call_fp8_clone_perturb(
+    fp8_tensor, perturb: float, seed: int
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Clone a blockwise FP8 tensor with per-element relative perturbation.
+
+    Both input and output stay encoded as E4M3 codes + FP32 block scales.
+    Native scratch is one tile; no dense FP32/BF16 weight matrix is created.
+    """
+    op = "fp8_clone"
+    try:
+        codes, block_scales = fp8_tensor.codes, fp8_tensor.scales
+        rows, cols = map(int, fp8_tensor.shape)
+        tile = int(fp8_tensor.tile)
+        magnitude = float(perturb)
+    except Exception:
+        _note(op, False, "expected a 2-D FP8BlockTensor")
+        return None
+    if (len(fp8_tensor.shape) != 2 or rows < 1 or cols < 1 or tile < 1
+            or tuple(codes.shape) != (rows, cols)
+            or tuple(block_scales.shape) != (rows, (cols + tile - 1) // tile)):
+        _note(op, False, "invalid FP8 shape or block-scale layout")
+        return None
+    if (codes.device.type != "cpu" or block_scales.device.type != "cpu"
+            or codes.dtype != torch.uint8 or block_scales.dtype != torch.float32
+            or not codes.is_contiguous() or not block_scales.is_contiguous()):
+        _note(op, False, "requires contiguous CPU FP8 codes and FP32 scales")
+        return None
+    if (isinstance(seed, bool) or not isinstance(seed, int)
+            or not 0 <= seed <= 0xFFFFFFFFFFFFFFFF
+            or not math.isfinite(magnitude) or not 0.0 <= magnitude < 1.0):
+        _note(op, False, "seed must be uint64 and perturb must be finite in [0,1)")
+        return None
+    if not _want_native(op):
+        return None
+    try:
+        out_codes = torch.empty_like(codes)
+        out_scales = torch.empty_like(block_scales)
+        status = _libs["ternary_linear"].smaul_fp8_clone_perturb(
+            _ptr(codes, ctypes.c_ubyte), _ptr(block_scales, ctypes.c_float),
+            _ptr(out_codes, ctypes.c_ubyte), _ptr(out_scales, ctypes.c_float),
+            rows, cols, tile, magnitude, seed,
+        )
+        if status != 1:
+            _note(op, False, "native FP8 clone rejected the input")
+            return None
+        _note(op, True)
+        return out_codes, out_scales
     except Exception as e:
         _note(op, False, f"{type(e).__name__}: {e}")
         if native_mode() == "force":
