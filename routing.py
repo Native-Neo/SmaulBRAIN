@@ -286,8 +286,21 @@ class SparseRouter(nn.Module):
     def _proj_like(self, out_features: int) -> nn.Module:
         """Resize the router projection without changing its execution policy."""
         from precision import HybridFP8Linear
+        from ternary import TernaryQATLinear
 
         old = self.proj
+        if isinstance(old, TernaryQATLinear):
+            # Preserve ternary-QAT wrapping when dynamic growth/pruning changes
+            # the router's output width. Replacing it with nn.Linear would
+            # silently re-enable dense router weights for newly added experts.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                raw = nn.Linear(
+                    self.d_model, out_features, bias=old.bias is not None
+                ).to(device=old.weight.device, dtype=old.weight.dtype)
+            new = TernaryQATLinear(raw)
+            new.out_dtype = old.out_dtype
+            return new
         if isinstance(old, HybridFP8Linear):
             # Growth/pruning changes only the number of expert rows. Replacing
             # this layer with nn.Linear would silently disable hybrid-FP8
