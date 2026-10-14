@@ -295,3 +295,58 @@ def test_ternary_qat_reuses_cached_projection_until_leaf_changes(monkeypatch):
     _TernaryQATLinear.apply(x3, weight, False).sum().backward()
     assert calls == 2
     assert getattr(weight, "_smaul_ternary_qat_cache")[0] == weight._version
+
+
+
+@pytest.mark.parametrize("dtype, atol", [
+    (torch.float32, 5e-4),
+    (torch.bfloat16, 3e-2),
+])
+def test_packed_native_ternary_qat_matches_reference_forward_and_gradients(dtype, atol):
+    import native
+    from experts import _TernaryQATLinear, ternary_qat_weight
+
+    native.reset_counters()
+    assert native.ensure_native(), native.status()
+
+    torch.manual_seed(41)
+    x0 = torch.randn(3, 7, dtype=dtype)
+    w0 = torch.randn(5, 7, dtype=dtype)
+    upstream = torch.randn(3, 5, dtype=dtype)
+
+    x_ref = x0.clone().requires_grad_(True)
+    w_ref = w0.clone().requires_grad_(True)
+    y_ref = torch.nn.functional.linear(x_ref, ternary_qat_weight(w_ref))
+    (y_ref * upstream).sum().backward()
+
+    x = x0.clone().requires_grad_(True)
+    w = w0.clone().requires_grad_(True)
+    y = _TernaryQATLinear.apply(x, w, True)
+    (y * upstream).sum().backward()
+
+    assert torch.allclose(y, y_ref, atol=atol, rtol=atol)
+    assert torch.allclose(x.grad, x_ref.grad, atol=atol, rtol=atol)
+    assert torch.allclose(w.grad, w_ref.grad, atol=atol, rtol=atol)
+    assert native.COUNTERS["ternary_linear_forward_native"] > 0
+    assert native.COUNTERS["ternary_linear_backward_native"] > 0
+
+
+def test_packed_ternary_codes_cross_row_boundaries_without_padding():
+    from experts import _cached_packed_ternary_values, _ternary_values
+
+    weight = torch.tensor([
+        [2.0, 0.0, -2.0],
+        [-1.0, 1.0, 0.0],
+    ], dtype=torch.float32, requires_grad=True)
+    packed, scales = _cached_packed_ternary_values(weight, threshold_ratio=0.0)
+    # Decode enough of the packed stream to verify flattened row-major order.
+    decoded = []
+    for index in range(weight.numel()):
+        decoded.append((int(packed[index // 4]) >> ((index % 4) * 2)) & 3)
+    q = _ternary_values(weight, threshold_ratio=0.0)
+    expected = [
+        1 if value > 0 else 2 if value < 0 else 0
+        for value in q.detach().reshape(-1).tolist()
+    ]
+    assert decoded == expected
+    assert torch.allclose(scales, q.detach().abs().amax(dim=-1))
