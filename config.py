@@ -83,6 +83,7 @@ class SmaulBrainConfig:
     fp8_tile: int = 64  # block size for FP8 per-block scaling
     state_dtype: str = "bf16"  # optimizer state storage: bf16 | fp32
     ternary_qat: bool = False  # scaled ternary expert forward with STE; FP8 remains stored
+    full_ternary_qat: bool = False  # ternary-QAT every model layer plus the expert pool
     threads: int = 2
     seed: int = 0
     rmsnorm_eps: float = 1e-6
@@ -161,6 +162,7 @@ class SmaulBrainConfig:
         require(self.dtype in ("bf16", "fp32"), "compute dtype bf16|fp32")
         require(self.state_dtype in ("bf16", "fp32"), "state dtype bf16|fp32")
         require(isinstance(self.ternary_qat, bool), "ternary_qat must be a bool")
+        require(isinstance(self.full_ternary_qat, bool), "full_ternary_qat must be a bool")
         require(self.expert_hidden >= 8, "expert hidden dim too small")
         require(self.attention_chunk_size >= 1, "attention chunk size must be positive")
         require(self.capacity_factor > 0, "capacity factor must be positive")
@@ -313,6 +315,8 @@ class SmaulBrainConfig:
                     )
         if "ternary_qat" in values and not isinstance(values["ternary_qat"], bool):
             raise ValueError("config field ternary_qat must be a bool")
+        if "full_ternary_qat" in values and not isinstance(values["full_ternary_qat"], bool):
+            raise ValueError("config field full_ternary_qat must be a bool")
         if "use_byte_conv" in values and not isinstance(values["use_byte_conv"], bool):
             raise ValueError(
                 f"config field use_byte_conv must be a bool, got {values['use_byte_conv']!r}"
