@@ -584,6 +584,11 @@ class SmaulBrainModel(nn.Module):
             with torch.inference_mode():
                 return self.forward(ids, targets=None, step=step)
         self._check_ids(ids, "ids")
+        if self.cfg.full_ternary_qat and self._ternary_expert_grads:
+            raise RuntimeError(
+                "unconsumed packed-expert gradients from prior forward; "
+                "call take_expert_grads() or zero_grad() before running forward again"
+            )
         if targets is not None:
             self._check_ids(targets, "targets")
             if targets.ndim != 2:
