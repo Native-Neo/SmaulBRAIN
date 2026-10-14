@@ -20,7 +20,8 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from native import call_ternary_linear_forward, call_ternary_linear_input_grad
+from native import (call_ternary_linear_forward, call_ternary_linear_input_grad,
+                    call_fp8_to_packed_ternary)
 from torch.utils.checkpoint import checkpoint
 
 from precision import FP8BlockTensor, dequantize_fp8_blockwise, quantize_fp8_blockwise
@@ -192,6 +193,119 @@ class _TernaryQATLinear(torch.autograd.Function):
         return grad_input, grad_weight
 
 
+@dataclass
+class PackedTernaryMatrix:
+    """Packed signed trits and one FP32 scale per output row; never a dense weight."""
+    packed_codes: torch.Tensor
+    row_scales: torch.Tensor
+    shape: tuple[int, int]
+
+
+@dataclass
+class TernaryDirectExpertWeights:
+    """Expert view whose effective weights remain in packed 2-bit form."""
+    expert_id: str
+    matrices: dict[str, PackedTernaryMatrix]
+    compute_dtype: torch.dtype
+    grad_sink: Callable[[str, str, torch.Tensor], None] | None = None
+    tokens: dict[str, torch.Tensor] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.grad_sink is not None:
+            # A scalar autograd edge ensures backward runs even when the trunk
+            # input is frozen. Actual matrix gradients are sent to grad_sink.
+            self.tokens = {
+                name: torch.zeros((), dtype=torch.float32, requires_grad=True)
+                for name in ("w_gate", "w_up", "w_down")
+            }
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cpu")
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.compute_dtype
+
+
+class _PackedTernaryLinear(torch.autograd.Function):
+    """Linear operation over packed trits; it never builds a dense weight matrix."""
+
+    @staticmethod
+    def forward(ctx, x, token, packed_codes, row_scales,
+                grad_sink, expert_id, weight_name, in_features, out_features):
+        if x.device.type != "cpu" or x.dtype not in (torch.float32, torch.bfloat16):
+            raise RuntimeError(
+                "full ternary no-dequant expert kernels currently require CPU FP32/BF16 activations"
+            )
+        x2 = x.reshape(-1, x.shape[-1]).contiguous()
+        output = call_ternary_linear_forward(x2, packed_codes, row_scales)
+        if output is None:
+            raise RuntimeError(
+                "full ternary no-dequant path requires the native packed kernel; "
+                "refusing to materialize dense FP32/BF16 expert weights as a fallback"
+            )
+        ctx.save_for_backward(x, token)
+        ctx.packed_codes = packed_codes
+        ctx.row_scales = row_scales
+        ctx.grad_sink = grad_sink
+        ctx.expert_id = expert_id
+        ctx.weight_name = weight_name
+        ctx.in_features = int(in_features)
+        ctx.out_features = int(out_features)
+        return output.reshape(*x.shape[:-1], int(out_features))
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, token = ctx.saved_tensors
+        grad_input = None
+        grad_out2 = grad_out.reshape(-1, ctx.out_features).contiguous()
+        x2 = x.reshape(-1, ctx.in_features).contiguous()
+        if ctx.needs_input_grad[0]:
+            # Fold the per-row magnitude into dY; the native inner loop is
+            # then only signed additions/subtractions and skips zero trits.
+            grad_scaled = (
+                grad_out2.float() * ctx.row_scales.reshape(1, -1)
+            ).contiguous()
+            grad_input2 = call_ternary_linear_input_grad(
+                grad_scaled, ctx.packed_codes, ctx.in_features
+            )
+            if grad_input2 is None:
+                raise RuntimeError(
+                    "full ternary no-dequant backward requires the native packed input-gradient kernel; "
+                    "refusing a dense-weight fallback"
+                )
+            grad_input = grad_input2.reshape_as(x).to(dtype=x.dtype)
+        if ctx.grad_sink is not None:
+            # STE weight gradient; only the gradient matrix is dense. The
+            # effective weight itself remains packed and is never expanded.
+            grad_weight = grad_out2.float().transpose(0, 1) @ x2.float()
+            ctx.grad_sink(ctx.expert_id, ctx.weight_name, grad_weight)
+        # token supplies a graph edge for weight-only expert training while
+        # the exact matrix gradient travels through grad_sink.
+        return grad_input, torch.zeros_like(token), None, None, None, None, None, None, None
+
+
+def _direct_ternary_linear(
+    x: torch.Tensor, weights: TernaryDirectExpertWeights, name: str
+) -> torch.Tensor:
+    matrix = weights.matrices[name]
+    token = weights.tokens[name] if weights.grad_sink is not None else torch.zeros(())
+    return _PackedTernaryLinear.apply(
+        x, token, matrix.packed_codes, matrix.row_scales,
+        weights.grad_sink, weights.expert_id, name,
+        matrix.shape[1], matrix.shape[0],
+    )
+
+
+def _swiglu_direct_ternary(
+    x: torch.Tensor, weights: TernaryDirectExpertWeights
+) -> torch.Tensor:
+    gate = _direct_ternary_linear(x, weights, "w_gate")
+    up = _direct_ternary_linear(x, weights, "w_up")
+    return _direct_ternary_linear(F.silu(gate) * up, weights, "w_down")
+
+
 def _qat_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return _TernaryQATLinear.apply(x, weight)
 
@@ -208,14 +322,15 @@ def _swiglu_tensors(
 
 
 def swiglu_forward(
-    x: torch.Tensor, w: dict[str, torch.Tensor], ternary_qat: bool = False,
+    x: torch.Tensor,
+    w: dict[str, torch.Tensor] | TernaryDirectExpertWeights,
+    ternary_qat: bool = False,
 ) -> torch.Tensor:
-    """SwiGLU with checkpointed intermediates and memory-bounded ternary QAT.
-
-    The optional native path accelerates only the packed ternary forward.
-    Gradient propagation uses ordinary tensor matmul and the STE; there is no
-    custom low-bit gradient kernel.
-    """
+    """SwiGLU over either ordinary tensors or directly packed ternary weights."""
+    if isinstance(w, TernaryDirectExpertWeights):
+        if torch.is_grad_enabled() and (x.requires_grad or w.grad_sink is not None):
+            return checkpoint(_swiglu_direct_ternary, x, w, use_reentrant=False)
+        return _swiglu_direct_ternary(x, w)
     args = (x, w["w_gate"], w["w_up"], w["w_down"], ternary_qat)
     if torch.is_grad_enabled() and any(t.requires_grad for t in args[:4]):
         return checkpoint(_swiglu_tensors, *args, use_reentrant=False)
@@ -243,6 +358,46 @@ class ExpertRecord:
     optim_state: dict = field(default_factory=dict)
     version: int = 0
 
+
+    def direct_ternary_weights(
+        self,
+        compute_dtype: torch.dtype,
+        grad_sink: Callable[[str, str, torch.Tensor], None] | None = None,
+        threshold_ratio: float = 0.7,
+    ) -> TernaryDirectExpertWeights:
+        """Prepare/reuse packed ternary codes directly from FP8 bytes.
+
+        The conversion kernel decodes FP8 values scalarly inside native code
+        and writes packed trits. It never materializes a decoded weight matrix.
+        """
+        round_bf16 = compute_dtype == torch.bfloat16
+        cache = getattr(self, "_smaul_direct_ternary_cache", None)
+        key = (self.version, round_bf16, float(threshold_ratio))
+        if cache is None or cache[0] != key:
+            matrices: dict[str, PackedTernaryMatrix] = {}
+            for name in ("w_gate", "w_up", "w_down"):
+                source = self.weights_fp8[name]
+                result = call_fp8_to_packed_ternary(
+                    source, threshold_ratio=threshold_ratio,
+                    round_to_bf16=round_bf16,
+                )
+                if result is None:
+                    raise RuntimeError(
+                        "full ternary no-dequant mode requires the native FP8-to-trit "
+                        "kernel; it will not decode weights into a dense FP32/BF16 tensor"
+                    )
+                packed, row_scales = result
+                matrices[name] = PackedTernaryMatrix(
+                    packed_codes=packed, row_scales=row_scales,
+                    shape=(int(source.shape[0]), int(source.shape[1])),
+                )
+            self._smaul_direct_ternary_cache = (key, matrices)
+        else:
+            matrices = cache[1]
+        return TernaryDirectExpertWeights(
+            expert_id=self.expert_id, matrices=matrices,
+            compute_dtype=compute_dtype, grad_sink=grad_sink,
+        )
 
     @property
     def param_count(self) -> int:
@@ -385,12 +540,17 @@ class ExpertPool:
                 continue
             eid = self.order[rid]
             w = provider(eid)
-            # The pager caches on its own device (CPU RAM / simulated VRAM);
-            # the trunk may live elsewhere (e.g. CUDA). Follow the
-            # activations with a copy, never by mutating the cache entry.
-            if w["w_gate"].device != x.device:
-                w = {k: v.to(x.device) for k, v in w.items()}
-            dtype = w["w_gate"].dtype
+            if isinstance(w, TernaryDirectExpertWeights):
+                if x.device.type != "cpu":
+                    raise RuntimeError(
+                        "full ternary no-dequant expert path currently supports CPU execution only"
+                    )
+                dtype = w.compute_dtype
+            else:
+                # The normal FP8 paging path caches compute tensors by device.
+                if w["w_gate"].device != x.device:
+                    w = {k: v.to(x.device) for k, v in w.items()}
+                dtype = w["w_gate"].dtype
             rows = mask_slot.any(dim=-1)  # tokens touching this expert
             xs = x[rows].to(dtype)  # [M, D]
             y = swiglu_forward(xs, w, ternary_qat=ternary_qat).to(out.dtype)  # [M, D]
