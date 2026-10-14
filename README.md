@@ -905,10 +905,12 @@ covered by `tests/test_hybrid_fp8.py` and `tests/test_precision.py`.
 
 Enable the experimental path with `--full-ternary-qat`. The expert runtime
 reads the stored E4M3 codes and FP32 block scales directly and creates 2-bit
-packed trits in a native CPU kernel. The expert's FP8 values are decoded one
-scalar at a time inside that kernel; **no full FP32/BF16 expert weight matrix
-is materialized**. Forward and input-gradient projections consume the packed
-trits directly, and zero trits contribute nothing.
+packed trits in a native CPU kernel. The FP8 values are inspected one scalar
+at a time to decide each trit; **no full FP32/BF16 expert weight matrix is
+materialized**. Shared linear layers also pack directly from their original
+master parameters without creating a same-size floating-point ternary matrix.
+Forward and input-gradient projections consume packed trits directly, and
+zero trits contribute nothing.
 
 The expert optimizer likewise updates/requantizes the stored FP8 codes
 in-place one tile at a time; it does not create a dense floating-point copy
