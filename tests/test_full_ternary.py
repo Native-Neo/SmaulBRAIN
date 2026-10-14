@@ -17,6 +17,7 @@ import smaulopt as smaulopt_module
 import growth as growth_module
 from smaulopt import SmaulOpt, SmaulOptHParams
 from train import train_step
+from storage import save_model, load_model
 from types import SimpleNamespace
 from copy import deepcopy
 from precision import HybridFP8Linear
@@ -268,3 +269,38 @@ def test_full_ternary_train_step_routes_to_no_dequant_optimizer(monkeypatch):
         assert all(state["step"] >= 1 for state in record.optim_state.values())
     assert model.pager.resident_counts() == {"ram": 0, "vram": 0, "ram_staged": 0}
     model.pager.close()
+
+
+def test_full_ternary_r2vr_checkpoint_resume_never_dequantizes(monkeypatch, tmp_path):
+    """Saving/restoring in R2VR must not trigger ordinary dense pager warmup."""
+    monkeypatch.setenv("SMAUL_NATIVE", "1")
+    cfg = _tiny_full_ternary_config("R2VR")
+    model = SmaulBrainModel(cfg)
+    opt = SmaulOpt(SmaulOptHParams(
+        lr=cfg.expert_lr, beta_m=cfg.beta_m, beta_v=cfg.beta_v,
+        eps=cfg.epsilon, wd=cfg.weight_decay, clip=cfg.grad_clip,
+        state_dtype=cfg.state_dtype,
+    ))
+    ckpt = str(tmp_path / "full-ternary-r2vr")
+    save_model(ckpt, model, opt, step=0)
+    model.pager.close()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("full ternary checkpoint restore must not dense-dequantize experts")
+
+    monkeypatch.setattr(ExpertRecord, "dequantize", forbidden)
+    restored = SmaulBrainModel(cfg)
+    restored_opt = SmaulOpt()
+    load_model(ckpt, restored, restored_opt)
+
+    assert isinstance(restored.router.proj, TernaryQATLinear)
+    assert restored.pager.resident_counts() == {"ram": 0, "vram": 0, "ram_staged": 0}
+    ids = torch.randint(0, 256, (1, 4))
+    targets = torch.randint(0, 256, (1, 4))
+    result = restored(ids, targets, step=1)
+    assert torch.isfinite(result["loss"])
+    result["loss"].backward()
+    grads = restored.take_expert_grads()
+    assert grads
+    assert restored.pager.resident_counts() == {"ram": 0, "vram": 0, "ram_staged": 0}
+    restored.pager.close()
