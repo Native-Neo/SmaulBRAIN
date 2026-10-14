@@ -4,6 +4,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -92,3 +93,12 @@ def test_ternary_qat_quantizes_each_matrix_row_to_three_levels():
     assert set(levels.tolist()).issubset({-1.0, 0.0, 1.0})
     q.sum().backward()
     assert torch.equal(weight.grad, torch.ones_like(weight))
+
+
+
+def test_full_ternary_qat_config_roundtrip_and_type_validation():
+    config = _tiny_full_ternary_config()
+    restored = SmaulBrainConfig.from_dict(config.to_dict())
+    assert restored.full_ternary_qat is True
+    with pytest.raises(ValueError, match="full_ternary_qat must be a bool"):
+        SmaulBrainConfig.from_dict({"full_ternary_qat": "yes"})
