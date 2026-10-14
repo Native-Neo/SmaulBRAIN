@@ -913,14 +913,14 @@ class SmaulBrainModel(nn.Module):
                 "16M-element head budget (chunk T)"
             )
         self._check_activation_budget(ids, training=False)
-        if self.cfg.full_ternary_qat:
-            clear_ternary_qat_caches(self)
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, _T = ids.shape
-        # Fresh stream: reset conv carryover BEFORE convolving, so the prompt
-        # never mixes with a previous stream's tail (and the prompt tail is
-        # retained for subsequent single-step calls instead of being dropped).
+        # Fresh stream: reset derived packed weights and conv carryover. Reusing
+        # supplied attention states means we are continuing the same stream,
+        # so keep packed shared-linear weights cached between tokens.
         if attn_states is None:
+            if self.cfg.full_ternary_qat:
+                clear_ternary_qat_caches(self)
             attn_states = self.new_infer_state(B)
         emb = self.embed(ids)
         if self.byte_conv is not None:
