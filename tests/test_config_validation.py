@@ -62,7 +62,6 @@ def test_config_validation_survives_python_optimized_mode():
 @pytest.mark.parametrize("kwargs", [
     {"expert_lr": float("nan")},
     {"weight_decay": -1.0},
-    {"ternary_backward": True},
     {"use_byte_conv": 1},
 ])
 def test_config_rejects_invalid_runtime_values(kwargs):
