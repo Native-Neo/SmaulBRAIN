@@ -140,12 +140,12 @@ def linear_attn_forward(
             RuntimeWarning, stacklevel=2,
         )
     B, H, T, Dh = q.shape
-    # Cube transients are B*H*Tc*Dh^2*4B EACH for updates and prefix_S (x2
-    # total): refuse absurd Dh before allocating hundreds of MB per chunk.
-    if 2 * B * H * min(chunk_size, max(T, 1)) * Dh * Dh * 4 > 256 * 1024 * 1024:
+    # Per-chunk working set is the [B,H,Tc,Tc] score block (x2 for its
+    # masked copy); no [Tc,Dh,Dh] cube is ever formed.
+    if 2 * B * H * min(chunk_size, max(T, 1)) ** 2 * 4 > 256 * 1024 * 1024:
         raise ValueError(
             f"linear-attention working set B={B} H={H} Tc={min(chunk_size, max(T, 1))} "
-            f"Dh={Dh} exceeds 256MB cube budget (reduce chunk_size or Dh)"
+            "exceeds 256MB working-set budget (reduce chunk_size)"
         )
     if state is None:
         state = LinearAttnState.zeros(B, H, Dh, device=q.device)
@@ -174,20 +174,24 @@ def linear_attn_forward(
         kf = kf * m
         vf = vf * m
 
+    # Chunkwise-parallel form: intra-chunk causal scores + carried (S, z).
+    # Autograd keeps only [B,H,Tc,Tc] blocks and one [B,H,Dh,Dh] state per
+    # chunk, never a per-token [Dh,Dh] state (that cube dominated backward).
     chunks: list[torch.Tensor] = []
+    causal = torch.tril(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device))
     for start in range(0, T, chunk_size):
         end = min(start + chunk_size, T)
+        c = end - start
         kc = kf[:, :, start:end, :]
         vc = vf[:, :, start:end, :]
         qc = qf[:, :, start:end, :]
-        updates = kc.unsqueeze(-1) * vc.unsqueeze(-2)
-        prefix_S = updates.cumsum(dim=2) + S.unsqueeze(2)
-        prefix_z = kc.cumsum(dim=2) + z.unsqueeze(2)
-        num = torch.einsum("bhcd,bhcde->bhce", qc, prefix_S)
-        den = (qc * prefix_z).sum(dim=-1, keepdim=True).clamp_min(eps)
+        A = (qc @ kc.transpose(-1, -2)).masked_fill(~causal[:c, :c], 0.0)
+        num = A @ vc + qc @ S
+        den = (A.sum(dim=-1, keepdim=True)
+               + (qc * z.unsqueeze(2)).sum(dim=-1, keepdim=True)).clamp_min(eps)
         chunks.append((num / den).to(v.dtype).transpose(1, 2))
-        S = prefix_S[:, :, -1]
-        z = prefix_z[:, :, -1]
+        S = S + kc.transpose(-1, -2) @ vc
+        z = z + kc.sum(dim=2)
 
     out = torch.cat(chunks, dim=1)
     return out, LinearAttnState(S=S, z=z)
