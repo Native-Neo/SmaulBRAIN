@@ -77,7 +77,9 @@ class SmaulBrainModel(nn.Module):
                                  vram_cache=config.vram_cache,
                                  compute_dtype=(torch.bfloat16 if config.dtype == "bf16"
                                                 else torch.float32))
-        if config.paging_method == "R2VR":
+        if config.paging_method == "R2VR" and not config.full_ternary_qat:
+            # Full ternary reads the stored FP8 code stream directly. Warming
+            # the normal pager would materialize every expert as dense BF16/FP32.
             self.pager.warm_ram()
         # Trunk linears/embeddings run in the compute dtype (precision policy:
         # BF16 activations; RMSNorm weights intentionally stay FP32).
