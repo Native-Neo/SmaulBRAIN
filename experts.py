@@ -20,7 +20,7 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from native import call_ternary_backward_input
+from native import (call_ternary_backward_input, call_ternary_linear_forward,\n                     call_ternary_linear_backward_input)
 from torch.utils.checkpoint import checkpoint
 
 from precision import FP8BlockTensor, dequantize_fp8_blockwise, quantize_fp8_blockwise
@@ -91,6 +91,51 @@ def ternary_qat_weight(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.T
     quantized = _ternary_values(w, threshold_ratio)
     return quantized.detach() + (w - w.detach())
 
+def _cached_packed_ternary_values(
+    w: torch.Tensor, threshold_ratio: float = 0.7
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return 2-bit packed trits and rounded per-row scales, cached on a stable leaf.
+
+    Four values share one byte: 00=zero, 01=positive, 10=negative.
+    The packed stream is flattened across row boundaries, which keeps the
+    format correct for any row width, including dimensions not divisible by 4.
+    Quantization first follows the reference BF16/FP32 rounding exactly, then
+    derives codes/scales from those representable ternary values.
+    """
+    version = w._version
+    cached = getattr(w, "_smaul_packed_ternary_qat_cache", None)
+    if cached is not None and cached[0] == version:
+        return cached[1], cached[2]
+
+    with torch.no_grad():
+        quantized = _ternary_values(w, threshold_ratio)
+        codes = torch.where(
+            quantized > 0,
+            torch.ones_like(quantized, dtype=torch.int16),
+            torch.where(
+                quantized < 0,
+                torch.full_like(quantized, 2, dtype=torch.int16),
+                torch.zeros_like(quantized, dtype=torch.int16),
+            ),
+        ).reshape(-1)
+        padding = (-codes.numel()) % 4
+        if padding:
+            codes = F.pad(codes, (0, padding), value=0)
+        groups = codes.reshape(-1, 4)
+        packed = (
+            groups[:, 0]
+            | (groups[:, 1] << 2)
+            | (groups[:, 2] << 4)
+            | (groups[:, 3] << 6)
+        ).to(torch.uint8).contiguous()
+        # Q values are already rounded to the compute dtype by _ternary_values.
+        # Recovering the magnitude here matches the reference for BF16 scales.
+        scales = quantized.abs().amax(dim=-1).to(torch.float32).contiguous()
+
+    w._smaul_packed_ternary_qat_cache = (version, packed, scales)
+    return packed, scales
+
+
 class _TernaryLinear(torch.autograd.Function):
     """Linear autograd with an optional zero-skipping ternary dX kernel."""
 
@@ -130,7 +175,22 @@ class _TernaryQATLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor, ternary_backward: bool):
         ctx.enabled = bool(ternary_backward)
+        ctx.packed_native = False
         ctx.save_for_backward(x, weight)
+        if (ctx.enabled and x.device.type == "cpu"
+                and weight.device.type == "cpu"
+                and x.dtype in (torch.float32, torch.bfloat16)
+                and weight.dtype in (torch.float32, torch.bfloat16)):
+            packed, scales = _cached_packed_ternary_values(weight)
+            x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+            native_output = call_ternary_linear_forward(x_2d, packed, scales)
+            if native_output is not None:
+                ctx.packed_native = True
+                return native_output.reshape(*x.shape[:-1], weight.shape[0])
+            # Native is not available for this host. Do not retain the packed
+            # cache in addition to the dense reference representation.
+            if hasattr(weight, "_smaul_packed_ternary_qat_cache"):
+                delattr(weight, "_smaul_packed_ternary_qat_cache")
         quantized = _cached_ternary_values(weight)
         return F.linear(x, quantized)
 
@@ -141,19 +201,27 @@ class _TernaryQATLinear(torch.autograd.Function):
         x_2d = x.reshape(-1, x.shape[-1]).contiguous()
         grad_input = None
         grad_weight = None
-        if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
-            # Recreate only this projection's ternary values. Do not attach
-            # another quantization graph: the STE is the explicit grad_weight
-            # formula below, while dX uses the true ternary forward operand.
-            quantized = _cached_ternary_values(weight)
+        quantized = None
+        packed = scales = None
+        if ctx.needs_input_grad[0] and ctx.packed_native:
+            packed, scales = _cached_packed_ternary_values(weight)
         if ctx.needs_input_grad[0]:
-            if ctx.enabled:
-                grad_input = call_ternary_backward_input(
-                    grad_out_2d, quantized.contiguous()
+            if ctx.packed_native:
+                grad_input = call_ternary_linear_backward_input(
+                    grad_out_2d, packed, scales, int(weight.shape[1])
                 )
             if grad_input is None:
-                grad_input = grad_out_2d @ quantized
+                # Reference fallback (including unsupported native hosts).
+                quantized = _cached_ternary_values(weight)
+                if ctx.enabled and quantized.dtype == torch.float32:
+                    grad_input = call_ternary_backward_input(
+                        grad_out_2d, quantized.contiguous()
+                    )
+                if grad_input is None:
+                    grad_input = grad_out_2d @ quantized
             grad_input = grad_input.reshape_as(x)
+        elif ctx.needs_input_grad[1]:
+            # For STE dW only, the quantized matrix is unnecessary.
         if ctx.needs_input_grad[1]:
             grad_weight = grad_out_2d.transpose(0, 1) @ x_2d
         return grad_input, grad_weight, None
