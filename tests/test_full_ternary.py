@@ -303,13 +303,14 @@ def test_full_ternary_r2vr_checkpoint_resume_never_dequantizes(monkeypatch, tmp_
     restored.pager.close()
 
 
-def test_full_ternary_packed_expert_cache_is_bounded_to_one_forward(monkeypatch):
+def test_full_ternary_packed_expert_cache_obeys_inference_lru_limit(monkeypatch):
     """Routing to a new expert evicts old packed codes instead of pooling caches."""
     monkeypatch.setenv("SMAUL_NATIVE", "1")
     model = SmaulBrainModel(_tiny_full_ternary_config())
+    model.cfg.ram_cache = 1
     first_id, second_id = model.pool.order
 
-    ids = torch.randint(0, 256, (1, 4))
+    ids = torch.randint(0, 256, (1, 1))
     with torch.no_grad():
         model.router.proj.weight.zero_()
         model.router.proj.bias.copy_(torch.tensor([5.0, -5.0]))
