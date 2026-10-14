@@ -531,3 +531,15 @@ def test_both_paths_exercised_all_ops(monkeypatch):
     t_ref = quantize_fp8_blockwise(w, tile=64)
     assert torch.equal(t_nat.codes, t_ref.codes)
     assert torch.equal(t_nat.scales, t_ref.scales)
+
+
+
+def test_ternary_input_grad_uses_packed_add_sub(force_native):
+    # Packed rows represent [[+1, 0], [-1, +1], [0, -1]].
+    packed = torch.tensor([0x61, 0x08], dtype=torch.uint8)
+    # Scales have already been folded into dY by the Python wrapper.
+    grad_scaled = torch.tensor([[2.0, 6.0, 12.0]], dtype=torch.float32)
+    dx = native.call_ternary_linear_input_grad(grad_scaled, packed, in_features=2)
+    assert dx is not None
+    assert torch.allclose(dx, torch.tensor([[-4.0, -6.0]]), atol=1e-6)
+    assert native.COUNTERS["ternary_linear_input_grad_native"] == 1
