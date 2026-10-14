@@ -397,3 +397,57 @@ extern "C" int smaul_fp8_factored_update(
         beta_m, beta_v, lr, wd, eps, update_clip, grad_multiplier,
         mean_abs_update);
 }
+
+
+static inline std::uint64_t smaul_splitmix64(std::uint64_t value) {
+    value += 0x9E3779B97F4A7C15ULL;
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
+    return value ^ (value >> 31);
+}
+
+extern "C" int smaul_fp8_clone_perturb(
+    const std::uint8_t* source_codes, const float* source_scales,
+    std::uint8_t* output_codes, float* output_scales,
+    std::size_t rows, std::size_t cols, std::size_t tile,
+    float perturb, std::uint64_t seed
+) {
+    if (!source_codes || !source_scales || !output_codes || !output_scales ||
+        rows == 0 || cols == 0 || tile == 0 ||
+        !std::isfinite(perturb) || perturb < 0.0f || perturb >= 1.0f) {
+        return 0;
+    }
+    const std::size_t nblocks = (cols + tile - 1) / tile;
+    for (std::size_t r = 0; r < rows; ++r) {
+        for (std::size_t b = 0; b < nblocks; ++b) {
+            const std::size_t c0 = b * tile;
+            const std::size_t c1 = std::min(cols, c0 + tile);
+            const float source_scale = source_scales[r * nblocks + b];
+            float amax = 1e-12f;
+            for (std::size_t col = c0; col < c1; ++col) {
+                const std::size_t index = r * cols + col;
+                const float source = e4m3_to_f32(source_codes[index]) * source_scale;
+                const std::uint64_t random_bits = smaul_splitmix64(
+                    seed ^ (static_cast<std::uint64_t>(index) * 0xD6E8FEB86659FD93ULL)
+                );
+                const float sign = (random_bits >> 63) ? 1.0f : -1.0f;
+                const float updated = source * (1.0f + perturb * sign);
+                if (!std::isfinite(updated)) return 0;
+                amax = std::max(amax, std::fabs(updated));
+            }
+            const float scale = amax / 448.0f;
+            output_scales[r * nblocks + b] = scale;
+            for (std::size_t col = c0; col < c1; ++col) {
+                const std::size_t index = r * cols + col;
+                const float source = e4m3_to_f32(source_codes[index]) * source_scale;
+                const std::uint64_t random_bits = smaul_splitmix64(
+                    seed ^ (static_cast<std::uint64_t>(index) * 0xD6E8FEB86659FD93ULL)
+                );
+                const float sign = (random_bits >> 63) ? 1.0f : -1.0f;
+                const float updated = source * (1.0f + perturb * sign);
+                output_codes[index] = f32_to_e4m3(updated / scale);
+            }
+        }
+    }
+    return 1;
+}
