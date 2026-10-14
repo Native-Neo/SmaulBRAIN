@@ -74,7 +74,6 @@ def main() -> int:
         state_dtype="bf16",
         threads=threads,
         ternary_qat=True,
-        ternary_backward=True,
     )
 
     print(
@@ -85,7 +84,6 @@ def main() -> int:
     print(
         "Profile shape: batch=2, context=1024, experts=64, top_k=8, "
         "hidden=3328, depth=1..3, dtype=bf16, ternary_qat=true, "
-        "ternary_backward=true",
         flush=True,
     )
 
@@ -126,15 +124,9 @@ def main() -> int:
             for item in averages[:40]
         ]
         native = {
-            "ternary_backward_native": int(COUNTERS.get("ternary_backward_native", 0)),
-            "ternary_backward_fallback": int(COUNTERS.get("ternary_backward_fallback", 0)),
             "ternary_linear_forward_native": int(COUNTERS.get("ternary_linear_forward_native", 0)),
             "ternary_linear_forward_fallback": int(COUNTERS.get("ternary_linear_forward_fallback", 0)),
-            "ternary_linear_backward_native": int(COUNTERS.get("ternary_linear_backward_native", 0)),
-            "ternary_linear_backward_fallback": int(COUNTERS.get("ternary_linear_backward_fallback", 0)),
-            "last_fallback_reason": LAST_FALLBACK.get("ternary_backward"),
             "last_packed_forward_fallback": LAST_FALLBACK.get("ternary_linear_forward"),
-            "last_packed_backward_fallback": LAST_FALLBACK.get("ternary_linear_backward"),
         }
         report = {
             "host": {
@@ -156,7 +148,6 @@ def main() -> int:
                 "max_depth": cfg.max_depth,
                 "dtype": cfg.dtype,
                 "ternary_qat": cfg.ternary_qat,
-                "ternary_backward": cfg.ternary_backward,
             },
             "step": {
                 "wall_seconds_including_profiler": round(wall_s, 3),
