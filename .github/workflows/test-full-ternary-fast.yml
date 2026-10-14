@@ -7,6 +7,8 @@ on:
       - "ternary.py"
       - "experts.py"
       - "model.py"
+      - "routing.py"
+      - "growth.py"
       - "native.py"
       - "smaulopt.py"
       - "train.py"
@@ -22,6 +24,8 @@ on:
       - "ternary.py"
       - "experts.py"
       - "model.py"
+      - "routing.py"
+      - "growth.py"
       - "native.py"
       - "smaulopt.py"
       - "train.py"
@@ -53,7 +57,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
       - name: Compile changed Python modules
-        run: python -m py_compile ternary.py experts.py model.py native.py smaulopt.py train.py config.py cli.py
+        run: python -m py_compile ternary.py experts.py model.py native.py smaulopt.py train.py growth.py routing.py config.py cli.py
       - name: Run focused native and full-model ternary tests
         env:
           PYTHONFAULTHANDLER: "1"
