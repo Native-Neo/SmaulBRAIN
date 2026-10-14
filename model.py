@@ -614,6 +614,25 @@ class SmaulBrainModel(nn.Module):
                 f"B*T*V={ids.shape[0] * ids.shape[1] * self.cfg.vocab_size} exceeds "
                 "16M-element head budget (logits [B,T,V] transient; chunk T)"
             )
+        if self.cfg.full_ternary_qat:
+            batch_tokens = int(ids.shape[0] * ids.shape[1])
+            active_upper = min(
+                self.cfg.num_experts,
+                batch_tokens * self.cfg.top_k * self.cfg.max_depth,
+            )
+            if targets is not None:
+                # Release prior-step caches before the available-memory guard
+                # and retain this step's complete expert union through backward.
+                self._clear_direct_ternary_caches()
+                self._direct_ternary_cache_limit = max(1, active_upper)
+            else:
+                # Keep an LRU across inference tokens/chunks; current-chunk
+                # experts are cached together so recurrent depth doesn't
+                # repeatedly re-encode the same matrix.
+                self._direct_ternary_cache_limit = max(
+                    1, int(self.cfg.ram_cache), active_upper
+                )
+                self._trim_direct_ternary_caches()
         self._check_activation_budget(ids, training=targets is not None)
         if self._leaves:
             raise RuntimeError(
@@ -622,24 +641,6 @@ class SmaulBrainModel(nn.Module):
             )
         self._last_step = step
         if self.cfg.full_ternary_qat:
-            batch_tokens = int(ids.shape[0] * ids.shape[1])
-            if targets is not None:
-                # Bound cache to all experts that could participate across
-                # recurrent depth; no active expert is evicted mid-backward.
-                self._clear_direct_ternary_caches()
-                self._direct_ternary_cache_limit = max(
-                    1, min(self.cfg.num_experts,
-                           batch_tokens * self.cfg.top_k * self.cfg.max_depth)
-                )
-            else:
-                # Keep a small LRU across inference tokens/chunks to avoid
-                # re-encoding the same expert every decoding step.
-                self._direct_ternary_cache_limit = max(
-                    1, int(self.cfg.ram_cache),
-                    min(self.cfg.num_experts,
-                        batch_tokens * self.cfg.top_k * self.cfg.max_depth),
-                )
-                self._trim_direct_ternary_caches()
             clear_ternary_qat_caches(self)
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
