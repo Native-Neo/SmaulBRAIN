@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 import time
 import threading
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -105,19 +106,59 @@ class SmaulBrainModel(nn.Module):
         # autograd kernels; only gradient matrices are dense, never the weights.
         self._ternary_expert_grads: dict[str, dict[str, torch.Tensor]] = {}
         self._ternary_grad_lock = threading.Lock()
-        # Keep packed expert codes bounded to one batch's expert union. The
-        # record cache reuses codes across recurrent depth, then is evicted at
-        # the next forward instead of growing with the lifetime of the model.
+        # LRU tracks persistent inference caches. Training clears this cache
+        # per step and raises its limit to the union of possible active experts
+        # so recurrent depth/checkpoint recomputation reuses each packed matrix.
         self._direct_ternary_cached_ids: set[str] = set()
+        self._direct_ternary_cache_order: OrderedDict[str, None] = OrderedDict()
+        self._direct_ternary_cache_limit = max(1, int(config.ram_cache))
         self._last_step: int = 0
 
+    def _evict_direct_ternary_cache(self, expert_id: str) -> None:
+        self._direct_ternary_cache_order.pop(expert_id, None)
+        self._direct_ternary_cached_ids.discard(expert_id)
+        rec = self.pool.experts.get(expert_id)
+        if rec is not None and hasattr(rec, "_smaul_direct_ternary_cache"):
+            delattr(rec, "_smaul_direct_ternary_cache")
+
+    def _prepare_direct_ternary_cache(self, expert_id: str) -> None:
+        """Make room before conversion, preserving recently-used packed weights."""
+        if expert_id in self._direct_ternary_cache_order:
+            self._direct_ternary_cache_order.move_to_end(expert_id)
+            return
+        while len(self._direct_ternary_cache_order) >= self._direct_ternary_cache_limit:
+            oldest = next(iter(self._direct_ternary_cache_order))
+            self._evict_direct_ternary_cache(oldest)
+
+    def _remember_direct_ternary_cache(self, expert_id: str) -> None:
+        self._direct_ternary_cached_ids.add(expert_id)
+        self._direct_ternary_cache_order[expert_id] = None
+        self._direct_ternary_cache_order.move_to_end(expert_id)
+
+    def _trim_direct_ternary_caches(self) -> None:
+        while len(self._direct_ternary_cache_order) > self._direct_ternary_cache_limit:
+            oldest = next(iter(self._direct_ternary_cache_order))
+            self._evict_direct_ternary_cache(oldest)
+
     def _clear_direct_ternary_caches(self) -> None:
-        """Evict packed expert matrices from the previous forward pass."""
-        for expert_id in self._direct_ternary_cached_ids:
-            rec = self.pool.experts.get(expert_id)
-            if rec is not None and hasattr(rec, "_smaul_direct_ternary_cache"):
-                delattr(rec, "_smaul_direct_ternary_cache")
-        self._direct_ternary_cached_ids.clear()
+        """Release all record-held packed matrices without touching live FP8 weights."""
+        for expert_id in list(self._direct_ternary_cache_order):
+            self._evict_direct_ternary_cache(expert_id)
+        # Defensive cleanup if a caller/test left the tracking structures apart.
+        for expert_id in list(self._direct_ternary_cached_ids):
+            self._evict_direct_ternary_cache(expert_id)
+
+    def _direct_ternary_weights(self, expert_id: str, rec, compute_dtype, grad_sink):
+        self._prepare_direct_ternary_cache(expert_id)
+        try:
+            weights = rec.direct_ternary_weights(compute_dtype, grad_sink=grad_sink)
+        except Exception:
+            if not hasattr(rec, "_smaul_direct_ternary_cache"):
+                self._evict_direct_ternary_cache(expert_id)
+            raise
+        if expert_id not in self._direct_ternary_cache_order:
+            self._remember_direct_ternary_cache(expert_id)
+        return weights
 
     # -- MoE wiring --
     def _accumulate_ternary_expert_grad(
@@ -139,9 +180,7 @@ class SmaulBrainModel(nn.Module):
             compute_dtype = (torch.bfloat16 if self.cfg.dtype == "bf16"
                              else torch.float32)
             sink = self._accumulate_ternary_expert_grad if torch.is_grad_enabled() else None
-            weights = rec.direct_ternary_weights(compute_dtype, grad_sink=sink)
-            self._direct_ternary_cached_ids.add(expert_id)
-            return weights
+            return self._direct_ternary_weights(expert_id, rec, compute_dtype, sink)
         base = self.pager.provider(expert_id)
         if not torch.is_grad_enabled():
             # The training dispatch applies QAT inside its custom linear op;
@@ -167,9 +206,9 @@ class SmaulBrainModel(nn.Module):
                 raise KeyError(f"expert {expert_id!r} is missing from the live pool")
             compute_dtype = (torch.bfloat16 if self.cfg.dtype == "bf16"
                              else torch.float32)
-            weights = rec.direct_ternary_weights(compute_dtype, grad_sink=None)
-            self._direct_ternary_cached_ids.add(expert_id)
-            return weights
+            return self._direct_ternary_weights(
+                expert_id, rec, compute_dtype, grad_sink=None
+            )
         if not self.cfg.ternary_qat:
             return self.pager.provider(expert_id)
         rec = self.pool.experts.get(expert_id)
@@ -583,7 +622,24 @@ class SmaulBrainModel(nn.Module):
             )
         self._last_step = step
         if self.cfg.full_ternary_qat:
-            self._clear_direct_ternary_caches()
+            batch_tokens = int(ids.shape[0] * ids.shape[1])
+            if targets is not None:
+                # Bound cache to all experts that could participate across
+                # recurrent depth; no active expert is evicted mid-backward.
+                self._clear_direct_ternary_caches()
+                self._direct_ternary_cache_limit = max(
+                    1, min(self.cfg.num_experts,
+                           batch_tokens * self.cfg.top_k * self.cfg.max_depth)
+                )
+            else:
+                # Keep a small LRU across inference tokens/chunks to avoid
+                # re-encoding the same expert every decoding step.
+                self._direct_ternary_cache_limit = max(
+                    1, int(self.cfg.ram_cache),
+                    min(self.cfg.num_experts,
+                        batch_tokens * self.cfg.top_k * self.cfg.max_depth),
+                )
+                self._trim_direct_ternary_caches()
             clear_ternary_qat_caches(self)
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
@@ -722,7 +778,14 @@ class SmaulBrainModel(nn.Module):
             )
         self._check_activation_budget(ids, training=False)
         if self.cfg.full_ternary_qat:
-            self._clear_direct_ternary_caches()
+            active_upper = min(
+                self.cfg.num_experts,
+                int(ids.shape[0] * ids.shape[1]) * self.cfg.top_k * self.cfg.max_depth,
+            )
+            self._direct_ternary_cache_limit = max(
+                1, int(self.cfg.ram_cache), active_upper
+            )
+            self._trim_direct_ternary_caches()
             clear_ternary_qat_caches(self)
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
