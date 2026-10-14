@@ -128,7 +128,13 @@ def main() -> int:
         native = {
             "ternary_backward_native": int(COUNTERS.get("ternary_backward_native", 0)),
             "ternary_backward_fallback": int(COUNTERS.get("ternary_backward_fallback", 0)),
+            "ternary_linear_forward_native": int(COUNTERS.get("ternary_linear_forward_native", 0)),
+            "ternary_linear_forward_fallback": int(COUNTERS.get("ternary_linear_forward_fallback", 0)),
+            "ternary_linear_backward_native": int(COUNTERS.get("ternary_linear_backward_native", 0)),
+            "ternary_linear_backward_fallback": int(COUNTERS.get("ternary_linear_backward_fallback", 0)),
             "last_fallback_reason": LAST_FALLBACK.get("ternary_backward"),
+            "last_packed_forward_fallback": LAST_FALLBACK.get("ternary_linear_forward"),
+            "last_packed_backward_fallback": LAST_FALLBACK.get("ternary_linear_backward"),
         }
         report = {
             "host": {
