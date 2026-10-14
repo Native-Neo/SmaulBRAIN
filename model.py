@@ -631,12 +631,10 @@ class SmaulBrainModel(nn.Module):
                 self._clear_direct_ternary_caches()
                 self._direct_ternary_cache_limit = max(1, active_upper)
             else:
-                # Keep an LRU across inference tokens/chunks; current-chunk
-                # experts are cached together so recurrent depth doesn't
-                # repeatedly re-encode the same matrix.
-                self._direct_ternary_cache_limit = max(
-                    1, int(self.cfg.ram_cache), active_upper
-                )
+                # Inference is not checkpointed, so evicting a trit matrix and
+                # rebuilding it later is safe. Honor the configured cache cap
+                # even for a large input chunk that can route to every expert.
+                self._direct_ternary_cache_limit = max(1, int(self.cfg.ram_cache))
                 self._trim_direct_ternary_caches()
         self._check_activation_budget(ids, training=targets is not None)
         if self._leaves:
@@ -912,6 +910,11 @@ class SmaulBrainModel(nn.Module):
                 f"B*T*V={ids.shape[0] * ids.shape[1] * self.cfg.vocab_size} exceeds "
                 "16M-element head budget (chunk T)"
             )
+        if self.cfg.full_ternary_qat:
+            # Enforce the inference LRU limit before the memory guard, not
+            # after a potentially expensive activation allocation.
+            self._direct_ternary_cache_limit = max(1, int(self.cfg.ram_cache))
+            self._trim_direct_ternary_caches()
         self._check_activation_budget(ids, training=False)
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, _T = ids.shape
