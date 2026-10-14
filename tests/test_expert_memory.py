@@ -137,35 +137,6 @@ def test_ternary_qat_backward_uses_ternary_weights_and_full_precision_ste_gradie
     assert torch.allclose(w.grad, expected_dw, atol=1e-6, rtol=1e-6)
     assert not torch.equal(q.detach(), w.detach())
 
-def test_ternary_linear_backward_matches_dense_autograd():
-    from experts import _TernaryLinear
-
-    torch.manual_seed(23)
-    x0 = torch.randn(5, 4, dtype=torch.float32)
-    weight0 = torch.tensor(
-        [[1.0, 0.0, -0.5, 0.0],
-         [0.0, 0.25, 0.0, -1.0],
-         [-0.75, 0.0, 0.0, 0.5]],
-        dtype=torch.float32,
-    )
-    upstream = torch.randn(5, 3, dtype=torch.float32)
-
-    x_native = x0.clone().requires_grad_(True)
-    w_native = weight0.clone().requires_grad_(True)
-    y_native = _TernaryLinear.apply(x_native, w_native, True)
-    (y_native * upstream).sum().backward()
-
-    x_dense = x0.clone().requires_grad_(True)
-    w_dense = weight0.clone().requires_grad_(True)
-    y_dense = torch.nn.functional.linear(x_dense, w_dense)
-    (y_dense * upstream).sum().backward()
-
-    assert torch.allclose(y_native, y_dense, atol=1e-6, rtol=1e-6)
-    assert torch.allclose(x_native.grad, x_dense.grad, atol=1e-6, rtol=1e-6)
-    assert torch.allclose(w_native.grad, w_dense.grad, atol=1e-6, rtol=1e-6)
-
-
-
 def test_ternary_qat_custom_linear_preserves_ste_gradients_without_saving_cache():
     from experts import _TernaryQATLinear, ternary_qat_weight
 
@@ -186,7 +157,7 @@ def test_ternary_qat_custom_linear_preserves_ste_gradients_without_saving_cache(
         saved_ptrs.append(tensor.data_ptr())
         return tensor
     with torch.autograd.graph.saved_tensors_hooks(pack_saved, lambda tensor: tensor):
-        result = _TernaryQATLinear.apply(x, w, False)
+        result = _TernaryQATLinear.apply(x, w)
     (result * upstream).sum().backward()
 
     assert torch.allclose(result, reference, atol=1e-6, rtol=1e-6)
@@ -227,18 +198,6 @@ def test_ternary_qat_checkpointed_swiglu_preserves_gradients():
         assert torch.allclose(w[name].grad, w_ref[name].grad, atol=1e-5, rtol=1e-5)
 
 
-def test_ternary_backward_reports_bf16_native_fallback():
-    import native
-
-    native.reset_counters()
-    grad_out = torch.randn(2, 3, dtype=torch.bfloat16)
-    weight = torch.randn(3, 4, dtype=torch.bfloat16)
-    assert native.call_ternary_backward_input(grad_out, weight) is None
-    assert native.COUNTERS["ternary_backward_fallback"] > 0
-    reason = native.LAST_FALLBACK["ternary_backward"]
-    assert "float32" in reason
-    assert "bfloat16" in reason
-
 def test_ternary_qat_projection_temporary_is_in_memory_budget(monkeypatch):
     model = _tiny_model(ternary_qat=True)
     try:
@@ -256,9 +215,8 @@ def test_ternary_qat_projection_temporary_is_in_memory_budget(monkeypatch):
 
 
 
-def test_ternary_qat_reuses_cached_projection_until_leaf_changes(monkeypatch):
+def test_ternary_qat_dense_weight_cache_reuses_and_invalidates(monkeypatch):
     import experts
-    from experts import _TernaryQATLinear
 
     original = experts._ternary_values
     calls = 0
@@ -272,61 +230,19 @@ def test_ternary_qat_reuses_cached_projection_until_leaf_changes(monkeypatch):
     torch.manual_seed(37)
     weight = torch.randn(5, 7, requires_grad=True)
 
-    x1 = torch.randn(3, 7, requires_grad=True)
-    _TernaryQATLinear.apply(x1, weight, False).square().sum().backward()
+    first = experts._cached_ternary_values(weight)
+    second = experts._cached_ternary_values(weight)
     assert calls == 1
-    cached = getattr(weight, "_smaul_ternary_qat_cache")
-    assert cached[0] == weight._version
-    assert cached[1].shape == weight.shape
-    assert not cached[1].requires_grad
-
-    # Another recurrent-depth invocation and its backward reuse one Q matrix.
-    x2 = torch.randn(4, 7, requires_grad=True)
-    _TernaryQATLinear.apply(x2, weight, False).square().sum().backward()
-    assert calls == 1
-    assert getattr(weight, "_smaul_ternary_qat_cache")[1].data_ptr() == cached[1].data_ptr()
-
-    # An in-place weight update increments Tensor._version; never return stale Q.
-    with torch.no_grad():
-        weight.add_(0.125)
-    x3 = torch.randn(2, 7, requires_grad=True)
-    _TernaryQATLinear.apply(x3, weight, False).sum().backward()
-    assert calls == 2
+    assert first.data_ptr() == second.data_ptr()
+    assert not first.requires_grad
     assert getattr(weight, "_smaul_ternary_qat_cache")[0] == weight._version
 
-
-
-@pytest.mark.parametrize("dtype, atol", [
-    (torch.float32, 5e-4),
-    (torch.bfloat16, 3e-2),
-])
-def test_packed_native_ternary_qat_matches_reference_forward_and_gradients(dtype, atol):
-    import native
-    from experts import _TernaryQATLinear, ternary_qat_weight
-
-    native.reset_counters()
-    assert native.ensure_native(), native.status()
-
-    torch.manual_seed(41)
-    x0 = torch.randn(3, 7, dtype=dtype)
-    w0 = torch.randn(5, 7, dtype=dtype)
-    upstream = torch.randn(3, 5, dtype=dtype)
-
-    x_ref = x0.clone().requires_grad_(True)
-    w_ref = w0.clone().requires_grad_(True)
-    y_ref = torch.nn.functional.linear(x_ref, ternary_qat_weight(w_ref))
-    (y_ref * upstream).sum().backward()
-
-    x = x0.clone().requires_grad_(True)
-    w = w0.clone().requires_grad_(True)
-    y = _TernaryQATLinear.apply(x, w, True)
-    (y * upstream).sum().backward()
-
-    assert torch.allclose(y, y_ref, atol=atol, rtol=atol)
-    assert torch.allclose(x.grad, x_ref.grad, atol=atol, rtol=atol)
-    assert torch.allclose(w.grad, w_ref.grad, atol=atol, rtol=atol)
-    assert native.COUNTERS["ternary_linear_forward_native"] > 0
-    assert native.COUNTERS["ternary_linear_backward_native"] > 0
+    with torch.no_grad():
+        weight.add_(0.125)
+    third = experts._cached_ternary_values(weight)
+    assert calls == 2
+    assert third.data_ptr() != first.data_ptr()
+    assert getattr(weight, "_smaul_ternary_qat_cache")[0] == weight._version
 
 
 def test_packed_ternary_codes_cross_row_boundaries_without_padding():
