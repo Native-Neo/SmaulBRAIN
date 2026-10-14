@@ -214,8 +214,11 @@ extern "C" void smaul_fp8_to_packed_ternary(
                 ++selected_count;
             }
         }
-        const float row_scale = selected_count
+        float row_scale = selected_count
             ? selected_abs_sum / static_cast<float>(selected_count) : 0.0f;
+        // Python QAT casts every scaled trit back to the compute dtype before
+        // extracting its row scale. Mirror BF16 rounding at this boundary.
+        if (round_to_bf16) row_scale = round_bf16(row_scale);
         ternary_row_scales[r] = row_scale;
         for (std::size_t c = 0; c < cols; ++c) {
             const std::size_t index = r * cols + c;
