@@ -16,6 +16,7 @@ import native
 import smaulopt as smaulopt_module
 import growth as growth_module
 from smaulopt import SmaulOpt, SmaulOptHParams
+from train import train_step
 from types import SimpleNamespace
 from copy import deepcopy
 from precision import HybridFP8Linear
@@ -236,3 +237,34 @@ def test_full_ternary_growth_clones_fp8_without_dense_dequant_and_keeps_router_q
     for name in ("w_gate", "w_up", "w_down"):
         assert child.weights_fp8[name].codes.dtype == torch.uint8
         assert torch.isfinite(child.weights_fp8[name].scales).all()
+
+
+def test_full_ternary_train_step_routes_to_no_dequant_optimizer(monkeypatch):
+    """End-to-end train_step must use packed ternary compute and direct FP8 updates."""
+    monkeypatch.setenv("SMAUL_NATIVE", "1")
+    native.reset_counters()
+    model = SmaulBrainModel(_tiny_full_ternary_config())
+    opt = SmaulOpt(SmaulOptHParams(
+        lr=model.cfg.expert_lr,
+        beta_m=model.cfg.beta_m,
+        beta_v=model.cfg.beta_v,
+        eps=model.cfg.epsilon,
+        wd=model.cfg.weight_decay,
+        clip=model.cfg.grad_clip,
+        state_dtype=model.cfg.state_dtype,
+    ))
+    ids = torch.randint(0, 256, (1, 4))
+    targets = torch.randint(0, 256, (1, 4))
+    result = train_step(model, opt, model.cfg, ids, targets, step=0, mode="entire")
+
+    assert torch.isfinite(torch.tensor(result["loss"]))
+    assert result["stepped_experts"]
+    assert native.COUNTERS["fp8_to_ternary_native"] >= 1
+    assert native.COUNTERS["ternary_linear_forward_native"] >= 3
+    assert native.COUNTERS["fp8_factored_update_native"] >= 3
+    for expert_id in result["stepped_experts"]:
+        record = model.pool.experts[expert_id]
+        assert not hasattr(record, "_smaul_direct_ternary_cache")
+        assert all(state["step"] >= 1 for state in record.optim_state.values())
+    assert model.pager.resident_counts() == {"ram": 0, "vram": 0, "ram_staged": 0}
+    model.pager.close()
