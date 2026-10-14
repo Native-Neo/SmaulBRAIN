@@ -519,6 +519,11 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
             # the EMA activity signal is not (EMA can be exactly 0.0).
             if int(getattr(rec, "version", 0)) != _ver_before:
                 model.pager.invalidate(eid)
+                if cfg.full_ternary_qat:
+                    # The native optimizer already dropped the record's packed
+                    # tensor; clear its LRU slot too so the tracker cannot keep
+                    # a phantom entry that reduces cache capacity after training.
+                    model._evict_direct_ternary_cache(eid)
                 stepped.append(eid)
             # The optimizer has consumed this expert's gradients; release
             # their final references before moving to the next expert.
