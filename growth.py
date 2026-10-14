@@ -15,8 +15,9 @@ import math
 
 import torch
 
-from experts import ExpertPool, init_expert_optim_state, make_expert
-from precision import dequantize_fp8_blockwise
+from experts import ExpertPool, ExpertRecord, init_expert_optim_state, make_expert
+from native import call_fp8_clone_perturb
+from precision import FP8BlockTensor, dequantize_fp8_blockwise
 
 _EXPERT_WEIGHTS = ("w_gate", "w_up", "w_down")
 
@@ -287,6 +288,7 @@ def grow_topk_clones(
     fp8_tile: int = 64,
     max_experts: int | None = None,
     optim_state: dict | None = None,
+    direct_no_dequant: bool = False,
 ) -> list[str]:
     """Clone the top-k experts by contribution, mutating every clone.
 
@@ -343,17 +345,47 @@ def grow_topk_clones(
             u_draw = torch.empty(())
             u_draw.uniform_(0.0, 1.0, generator=gen)
             u = min_pct + (max_pct - min_pct) * u_draw.item()
-            w = {n: dequantize_fp8_blockwise(par.weights_fp8[n], torch.float32)
-                 for n in _EXPERT_WEIGHTS}
-            for n in w:
-                signs = torch.empty_like(w[n]).uniform_(-1.0, 1.0, generator=gen)
-                signs = torch.where(signs >= 0,
-                                    torch.ones((), dtype=w[n].dtype),
-                                    -torch.ones((), dtype=w[n].dtype))
-                w[n] = w[n] * (1.0 + u * signs)
-            rec = make_expert(eid, d_model, expert_hidden, weights=w, birth_step=step,
-                              parents=[par.expert_id], source="clone-mutated",
-                              fp8_tile=fp8_tile)
+            if direct_no_dequant:
+                # Decode/requantize scalar-by-scalar inside native code. A
+                # clone never needs a dense floating-point parent/child matrix.
+                child_weights: dict[str, FP8BlockTensor] = {}
+                for n in _EXPERT_WEIGHTS:
+                    sign_seed = int(torch.randint(
+                        0, (1 << 63) - 1, (), generator=gen,
+                        dtype=torch.int64,
+                    ).item())
+                    cloned = call_fp8_clone_perturb(
+                        par.weights_fp8[n], perturb=u, seed=sign_seed
+                    )
+                    if cloned is None:
+                        raise RuntimeError(
+                            "full_ternary_qat no-dequant growth requires the native "
+                            "FP8 clone kernel; refusing a dense FP32/BF16 fallback"
+                        )
+                    codes, scales = cloned
+                    source = par.weights_fp8[n]
+                    child_weights[n] = FP8BlockTensor(
+                        codes=codes, scales=scales,
+                        shape=tuple(source.shape), tile=source.tile,
+                    )
+                rec = ExpertRecord(
+                    expert_id=eid, d_model=d_model, expert_hidden=expert_hidden,
+                    weights_fp8=child_weights, birth_step=step,
+                    parents=[par.expert_id], source="clone-mutated",
+                )
+                rec.optim_state = init_expert_optim_state(rec)
+            else:
+                w = {n: dequantize_fp8_blockwise(par.weights_fp8[n], torch.float32)
+                     for n in _EXPERT_WEIGHTS}
+                for n in w:
+                    signs = torch.empty_like(w[n]).uniform_(-1.0, 1.0, generator=gen)
+                    signs = torch.where(signs >= 0,
+                                        torch.ones((), dtype=w[n].dtype),
+                                        -torch.ones((), dtype=w[n].dtype))
+                    w[n] = w[n] * (1.0 + u * signs)
+                rec = make_expert(eid, d_model, expert_hidden, weights=w, birth_step=step,
+                                  parents=[par.expert_id], source="clone-mutated",
+                                  fp8_tile=fp8_tile)
             with torch.no_grad():
                 parent_row = router.proj.weight[pool.index_of(par.expert_id)].detach().clone()
             built.append((rec, parent_row))
