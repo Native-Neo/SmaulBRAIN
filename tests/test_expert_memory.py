@@ -228,18 +228,16 @@ def test_ternary_qat_checkpointed_swiglu_preserves_gradients():
 
 
 def test_ternary_backward_reports_bf16_native_fallback():
-    from experts import _TernaryQATLinear
     import native
 
     native.reset_counters()
-    x = torch.randn(2, 4, dtype=torch.bfloat16, requires_grad=True)
-    w = torch.randn(3, 4, dtype=torch.bfloat16, requires_grad=True)
-    _TernaryQATLinear.apply(x, w, True).float().sum().backward()
+    grad_out = torch.randn(2, 3, dtype=torch.bfloat16)
+    weight = torch.randn(3, 4, dtype=torch.bfloat16)
+    assert native.call_ternary_backward_input(grad_out, weight) is None
     assert native.COUNTERS["ternary_backward_fallback"] > 0
     reason = native.LAST_FALLBACK["ternary_backward"]
     assert "float32" in reason
     assert "bfloat16" in reason
-
 
 def test_ternary_qat_projection_temporary_is_in_memory_budget(monkeypatch):
     model = _tiny_model(ternary_qat=True)
