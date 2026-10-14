@@ -1357,6 +1357,7 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
 
     import torch.nn as nn
     from precision import HybridFP8Linear
+    from ternary import TernaryQATLinear, enable_full_ternary_qat
     new_experts: dict = {}
     new_order: list[str] = []
     for t, m in parts:
@@ -1365,7 +1366,18 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         new_order.append(rec.expert_id)
     old_proj = model.router.proj
     dev, dt = old_proj.weight.device, old_proj.weight.dtype
-    if isinstance(old_proj, HybridFP8Linear):
+    if saved_cfg.full_ternary_qat:
+        # Preserve the ternary execution wrapper after restoring its separately
+        # serialized router tensors. A plain Linear has the same state-dict
+        # keys but would silently bypass packed ternary execution on resume.
+        with __import__("warnings").catch_warnings():
+            __import__("warnings").simplefilter("ignore")
+            raw_proj = nn.Linear(
+                saved_cfg.d_model, len(eids), bias=old_proj.bias is not None
+            ).to(device=dev, dtype=dt)
+        new_proj = TernaryQATLinear(raw_proj)
+        new_proj.out_dtype = getattr(old_proj, "out_dtype", dt)
+    elif isinstance(old_proj, HybridFP8Linear):
         # Preserve the execution class, not just the parameter tensors.
         # Replacing this layer with nn.Linear keeps state_dict parity but
         # silently disables the FP8 forward/backward policy after every load.
@@ -1396,6 +1408,11 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
             f"{sorted(unexpected_trunk)}"
         )
     incompatible = model.load_state_dict(trunk, strict=False)
+    if saved_cfg.full_ternary_qat:
+        # A caller may have constructed the destination from a non-ternary
+        # config before reading the checkpoint. Wrap the just-restored trunk
+        # parameters in-place before exposing the loaded model.
+        enable_full_ternary_qat(model)
     # Router tensors and counters are restored from their dedicated files and
     # manifest below. Every other model tensor must have been loaded; silently
     # ignoring a renamed/missing trunk key can produce a valid-looking but
@@ -1488,7 +1505,9 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         buf = getattr(model.pager, attr, None)
         if buf is not None:
             buf.clear()
-    if model.cfg.paging_method == "R2VR":
+    if model.cfg.paging_method == "R2VR" and not model.cfg.full_ternary_qat:
+        # Packed ternary providers read encoded FP8 records directly. Warming
+        # the ordinary pager here would dequantize every expert on resume.
         model.pager.warm_ram()
     # These are deliberately runtime-only and never checkpointed. Restoring
     # a checkpoint starts a fresh stream and fresh autograd leaf generation.
