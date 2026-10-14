@@ -23,6 +23,8 @@ on:
       - "experts.py"
       - "model.py"
       - "native.py"
+      - "smaulopt.py"
+      - "train.py"
       - "config.py"
       - "cli.py"
       - "kernels_cpp/**"
