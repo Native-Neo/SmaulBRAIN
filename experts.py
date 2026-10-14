@@ -154,12 +154,11 @@ def _cached_direct_packed_ternary_values(
 
 
 class _TernaryQATLinear(torch.autograd.Function):
-    """Ternary-weight forward with ordinary PyTorch-style gradients.
+    """Ternary-weight forward with straight-through weight gradients.
 
-    The CPU forward can consume packed trits directly. Backward deliberately
-    uses regular tensor matrix multiplication only: no custom ternary dX
-    kernel, zero-skipping gradient path, or extra backward dispatcher.
-    The straight-through estimator is retained for the latent weight gradient.
+    Native CPU forward and input-gradient kernels consume packed trits directly.
+    The STE weight gradient is dense FP32 matrix multiplication. Dense
+    effective-weight fallbacks are allowed only when require_packed is false.
     """
 
     @staticmethod
