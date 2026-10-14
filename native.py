@@ -102,6 +102,7 @@ COUNTERS: dict[str, int] = {
     "attn_step_native": 0, "attn_step_fallback": 0,
     "ternary_linear_forward_native": 0, "ternary_linear_forward_fallback": 0,
     "ternary_linear_input_grad_native": 0, "ternary_linear_input_grad_fallback": 0,
+    "fp8_to_ternary_native": 0, "fp8_to_ternary_fallback": 0,
 }
 LAST_FALLBACK: dict[str, str] = {}
 
@@ -445,6 +446,16 @@ def _self_test() -> None:
     )
     if abs(gx[0] - (-1.0)) > 1e-6 or abs(gx[1] - (-1.0)) > 1e-6:
         raise RuntimeError(f"ternary input-gradient self-test failed: {list(gx)}")
+    # Direct FP8-to-ternary conversion must not allocate a decoded weight matrix.
+    f8_codes = (ctypes.c_ubyte * 4)(0x38, 0xC0, 0x30, 0xB0)  # [1,-2; 0.5,-0.5]
+    f8_scales = (ctypes.c_float * 2)(1.0, 1.0)
+    packed_f8 = (ctypes.c_ubyte * 1)()
+    row_scales_f8 = (ctypes.c_float * 2)()
+    _libs["ternary_linear"].smaul_fp8_to_packed_ternary(
+        f8_codes, f8_scales, packed_f8, row_scales_f8, 2, 2, 2, 0.7, 0
+    )
+    if packed_f8[0] != 0x98 or abs(row_scales_f8[0] - 2.0) > 1e-6 or abs(row_scales_f8[1] - 0.5) > 1e-6:
+        raise RuntimeError(f"FP8-to-ternary self-test failed: code={packed_f8[0]:#x}, scales={list(row_scales_f8)}")
     # fp8: quantize+dequantize roundtrip stays finite
     wq = (ctypes.c_float * 4)(0.5, -1.0, 2.0, 0.01)
     codes = (ctypes.c_ubyte * 4)()
@@ -478,13 +489,16 @@ def _bind(lib: ctypes.CDLL, name: str) -> None:
     elif name == "ternary_linear":
         fwd = getattr(lib, "smaul_ternary_linear_forward", None)
         bwd = getattr(lib, "smaul_ternary_linear_input_grad", None)
-        if fwd is None or bwd is None:
-            raise RuntimeError("ternary_linear .so missing forward/input-gradient symbols (ABI?)")
+        convert = getattr(lib, "smaul_fp8_to_packed_ternary", None)
+        if fwd is None or bwd is None or convert is None:
+            raise RuntimeError("ternary_linear .so missing forward/input-gradient/FP8-conversion symbols (ABI?)")
         fwd.argtypes = [ctypes.c_void_p, U, F, ctypes.c_void_p,
                         S, S, S, ctypes.c_int, ctypes.c_int]
         fwd.restype = None
         bwd.argtypes = [F, U, F, S, S, S, ctypes.c_int]
         bwd.restype = None
+        convert.argtypes = [U, F, U, F, S, S, S, ctypes.c_float, ctypes.c_int]
+        convert.restype = None
     elif name == "fp8_quant":
         q = getattr(lib, "smaul_fp8_quant_row_block", None)
         dq = getattr(lib, "smaul_fp8_dequant_row_block", None)
@@ -770,6 +784,62 @@ def call_fp8_dequant(
         if native_mode() == "force":
             raise
         return False
+
+def call_fp8_to_packed_ternary(
+    fp8_tensor, threshold_ratio: float = 0.7, round_to_bf16: bool = False
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Convert E4M3 bytes directly to packed trits without dense weight dequantization.
+
+    Returns (packed_codes, row_scales) on CPU, or None if the required native
+    kernel is unavailable. Full-ternary mode must not replace this with a dense
+    FP32/BF16 fallback.
+    """
+    op = "fp8_to_ternary"
+    try:
+        codes, block_scales = fp8_tensor.codes, fp8_tensor.scales
+        rows, cols = map(int, fp8_tensor.shape)
+        tile = int(fp8_tensor.tile)
+        ratio = float(threshold_ratio)
+    except Exception:
+        _note(op, False, "expected a 2-D FP8BlockTensor")
+        return None
+    if (codes.device.type != "cpu" or block_scales.device.type != "cpu"
+            or codes.dtype != torch.uint8 or block_scales.dtype != torch.float32):
+        _note(op, False, "requires CPU uint8 FP8 codes and FP32 block scales")
+        return None
+    if (len(fp8_tensor.shape) != 2 or rows < 1 or cols < 1 or tile < 1
+            or tuple(codes.shape) != (rows, cols)
+            or tuple(block_scales.shape) != (rows, (cols + tile - 1) // tile)):
+        _note(op, False, "invalid FP8 shape or block-scale layout")
+        return None
+    if (not math.isfinite(ratio) or not 0.0 <= ratio < 1.0
+            or not isinstance(round_to_bf16, bool)):
+        _note(op, False, "threshold_ratio must be finite in [0,1); round_to_bf16 must be bool")
+        return None
+    if not (codes.is_contiguous() and block_scales.is_contiguous()):
+        _note(op, False, "requires contiguous FP8 codes and scales")
+        return None
+    if not _valid_ptr(codes) or not _valid_ptr(block_scales):
+        _note(op, False, "null FP8 storage")
+        return None
+    if not _want_native(op):
+        return None
+    try:
+        packed = torch.empty(((rows * cols + 3) // 4,), dtype=torch.uint8)
+        scales = torch.empty((rows,), dtype=torch.float32)
+        _libs["ternary_linear"].smaul_fp8_to_packed_ternary(
+            _ptr(codes, ctypes.c_ubyte), _ptr(block_scales, ctypes.c_float),
+            _ptr(packed, ctypes.c_ubyte), _ptr(scales, ctypes.c_float),
+            rows, cols, tile, ratio, int(round_to_bf16),
+        )
+        _note(op, True)
+        return packed, scales
+    except Exception as e:
+        _note(op, False, f"{type(e).__name__}: {e}")
+        if native_mode() == "force":
+            raise
+        return None
+
 
 def call_ternary_linear_forward(
     x: torch.Tensor, packed_codes: torch.Tensor, scales: torch.Tensor
