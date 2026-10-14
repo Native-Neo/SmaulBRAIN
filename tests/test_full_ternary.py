@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from config import SmaulBrainConfig
+import experts as experts_module
 from experts import ExpertRecord, make_expert, ternary_qat_weight
 from model import SmaulBrainModel
 import native
@@ -115,6 +116,11 @@ def test_full_ternary_qat_config_roundtrip_and_type_validation():
 def test_full_ternary_expert_forward_backward_never_calls_dense_dequantize(
     monkeypatch, paging_method,
 ):
+    def forbidden_dense(*_args, **_kwargs):
+        raise AssertionError("full_ternary_qat must not materialize dense ternary weight matrices")
+
+    monkeypatch.setattr(experts_module, "_cached_ternary_values", forbidden_dense)
+    monkeypatch.setattr(experts_module, "_cached_packed_ternary_values", forbidden_dense)
     """No paging mode may route full ternary through dense expert dequantization."""
     def forbidden(*_args, **_kwargs):
         raise AssertionError("full_ternary_qat must not dequantize an expert matrix")
