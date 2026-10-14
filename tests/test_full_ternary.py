@@ -346,3 +346,18 @@ def test_full_ternary_stream_reuses_packed_shared_linear_weights(monkeypatch):
     assert native.COUNTERS["float_to_ternary_native"] == packed_count
     model._clear_direct_ternary_caches()
     model.pager.close()
+
+
+def test_full_ternary_requires_consuming_expert_gradients_between_forwards(monkeypatch):
+    """Packed-weight side-channel grads must not silently leak into a new step."""
+    monkeypatch.setenv("SMAUL_NATIVE", "1")
+    model = SmaulBrainModel(_tiny_full_ternary_config())
+    ids = torch.randint(0, 256, (1, 4))
+    targets = torch.randint(0, 256, (1, 4))
+    model(ids, targets, step=0)["loss"].backward()
+    assert model._ternary_expert_grads
+    with pytest.raises(RuntimeError, match="unconsumed packed-expert gradients"):
+        model(ids, targets, step=1)
+    model.zero_grad()
+    assert not model._ternary_expert_grads
+    model.pager.close()
