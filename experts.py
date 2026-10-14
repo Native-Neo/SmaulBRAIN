@@ -201,7 +201,7 @@ def swiglu_forward(
 
     The optional native path accelerates only the packed ternary forward.
     Gradient propagation uses ordinary tensor matmul and the STE; there is no
-    custom/native ternary-backward kernel.
+    custom low-bit gradient kernel.
     """
     args = (x, w["w_gate"], w["w_up"], w["w_down"], ternary_qat)
     if torch.is_grad_enabled() and any(t.requires_grad for t in args[:4]):
