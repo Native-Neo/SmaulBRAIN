@@ -301,3 +301,30 @@ def test_full_ternary_r2vr_checkpoint_resume_never_dequantizes(monkeypatch, tmp_
     assert grads
     assert restored.pager.resident_counts() == {"ram": 0, "vram": 0, "ram_staged": 0}
     restored.pager.close()
+
+
+def test_full_ternary_packed_expert_cache_is_bounded_to_one_forward(monkeypatch):
+    """Routing to a new expert evicts old packed codes instead of pooling caches."""
+    monkeypatch.setenv("SMAUL_NATIVE", "1")
+    model = SmaulBrainModel(_tiny_full_ternary_config())
+    first_id, second_id = model.pool.order
+
+    ids = torch.randint(0, 256, (1, 4))
+    with torch.no_grad():
+        model.router.proj.weight.zero_()
+        model.router.proj.bias.copy_(torch.tensor([5.0, -5.0]))
+        model(ids, targets=None, step=0)
+
+    assert model._direct_ternary_cached_ids == {first_id}
+    assert hasattr(model.pool.experts[first_id], "_smaul_direct_ternary_cache")
+    assert not hasattr(model.pool.experts[second_id], "_smaul_direct_ternary_cache")
+
+    with torch.no_grad():
+        model.router.proj.bias.copy_(torch.tensor([-5.0, 5.0]))
+        model(ids, targets=None, step=1)
+
+    assert model._direct_ternary_cached_ids == {second_id}
+    assert not hasattr(model.pool.experts[first_id], "_smaul_direct_ternary_cache")
+    assert hasattr(model.pool.experts[second_id], "_smaul_direct_ternary_cache")
+    model._clear_direct_ternary_caches()
+    model.pager.close()
