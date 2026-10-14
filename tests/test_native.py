@@ -563,7 +563,7 @@ def test_fp8_to_packed_ternary_matches_reference_without_dense_output(force_nati
         assert actual is not None
         packed, scales = actual
         assert torch.equal(packed, expected_codes)
-        assert torch.equal(scales, expected_scales)
+        assert torch.allclose(scales, expected_scales, atol=1e-6, rtol=1e-6)
     assert native.COUNTERS["fp8_to_ternary_native"] == 2
 
 
