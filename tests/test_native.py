@@ -265,7 +265,7 @@ def test_stale_so_rebuilds_in_place(monkeypatch, tmp_path):
     native.reset_counters()
     try:
         assert native.ensure_native()  # rebuilds stale .so in the same call
-        assert set(native._libs) == {"rmsnorm", "linear_attn", "fp8_quant", "ternary_backward"}
+        assert set(native._libs) == {"rmsnorm", "linear_attn", "fp8_quant", "ternary_backward", "ternary_linear"}
         assert native._verify_baseline_isa(stale)
         # The file on disk is now a real kernel, not the stale placeholder.
         nm = subprocess.run(["nm", "-D", stale], capture_output=True,
