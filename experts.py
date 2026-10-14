@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from native import (call_ternary_linear_forward, call_ternary_linear_input_grad,
-                    call_fp8_to_packed_ternary)
+                    call_fp8_to_packed_ternary, call_float_to_packed_ternary)
 from torch.utils.checkpoint import checkpoint
 
 from precision import FP8BlockTensor, dequantize_fp8_blockwise, quantize_fp8_blockwise
@@ -147,20 +147,29 @@ class _TernaryQATLinear(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, weight: torch.Tensor):
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, require_packed: bool):
         ctx.save_for_backward(x, weight)
+        ctx.require_packed = bool(require_packed)
         if (x.device.type == "cpu" and weight.device.type == "cpu"
                 and x.dtype in (torch.float32, torch.bfloat16)
-                and weight.dtype in (torch.float32, torch.bfloat16)):
-            packed, scales = _cached_packed_ternary_values(weight)
+                and weight.dtype in (torch.float32, torch.bfloat16)
+                and weight.is_contiguous()):
+            # Convert each original weight value directly into its 2-bit code.
+            # This avoids building the dense scaled-ternary matrix in Python.
+            converted = call_float_to_packed_ternary(weight)
             x_2d = x.reshape(-1, x.shape[-1]).contiguous()
-            native_output = call_ternary_linear_forward(x_2d, packed, scales)
-            if native_output is not None:
-                return native_output.reshape(*x.shape[:-1], weight.shape[0])
-            # The packed path is unavailable: avoid retaining an unused packed
-            # representation alongside the dense fallback.
-            if hasattr(weight, "_smaul_packed_ternary_qat_cache"):
-                delattr(weight, "_smaul_packed_ternary_qat_cache")
+            if converted is not None:
+                packed, scales = converted
+                native_output = call_ternary_linear_forward(x_2d, packed, scales)
+                if native_output is not None:
+                    return native_output.reshape(*x.shape[:-1], weight.shape[0])
+        if ctx.require_packed:
+            raise RuntimeError(
+                "full_ternary_qat requires native packed ternary linear kernels; "
+                "refusing to materialize a dense floating-point ternary weight matrix"
+            )
+        # Compatibility path for expert-only ternary-QAT when direct packing
+        # is unavailable. Strict full-model mode never enters this fallback.
         quantized = _cached_ternary_values(weight)
         return F.linear(x, quantized)
 
@@ -190,7 +199,7 @@ class _TernaryQATLinear(torch.autograd.Function):
             grad_out_2d = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
             x_2d = x.reshape(-1, x.shape[-1]).contiguous()
             grad_weight = grad_out_2d.transpose(0, 1) @ x_2d
-        return grad_input, grad_weight
+        return grad_input, grad_weight, None
 
 
 @dataclass
@@ -307,7 +316,7 @@ def _swiglu_direct_ternary(
 
 
 def _qat_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return _TernaryQATLinear.apply(x, weight)
+    return _TernaryQATLinear.apply(x, weight, False)
 
 
 def _swiglu_tensors(
