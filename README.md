@@ -177,7 +177,7 @@ The exact formats can change depending on the hardware and the part of the model
 ### Native ternary-aware backward path
 
 ```bash
-python cli.py --dtype fp32 --ternary-qat --ternary-backward train --steps 1 --batch 1
+python cli.py --dtype fp32 --ternary-qat train --steps 1 --batch 1
 ```
 
 This opt-in native path skips exact-zero weight entries when computing expert
