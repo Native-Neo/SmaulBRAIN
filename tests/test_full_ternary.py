@@ -9,8 +9,12 @@ import torch
 import torch.nn as nn
 
 from config import SmaulBrainConfig
-from experts import ternary_qat_weight
+from experts import ExpertRecord, make_expert, ternary_qat_weight
 from model import SmaulBrainModel
+import native
+import smaulopt as smaulopt_module
+from smaulopt import SmaulOpt
+from types import SimpleNamespace
 from precision import HybridFP8Linear
 from rmsnorm import RMSNorm
 from ternary import (
@@ -102,3 +106,50 @@ def test_full_ternary_qat_config_roundtrip_and_type_validation():
     assert restored.full_ternary_qat is True
     with pytest.raises(ValueError, match="full_ternary_qat must be a bool"):
         SmaulBrainConfig.from_dict({"full_ternary_qat": "yes"})
+
+
+def test_full_ternary_expert_forward_backward_never_calls_dense_dequantize(monkeypatch):
+    """Full ternary must fail the test if the old FP8->dense expert path is reached."""
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("full_ternary_qat must not dequantize an expert matrix")
+
+    monkeypatch.setattr(ExpertRecord, "dequantize", forbidden)
+    monkeypatch.setenv("SMAUL_NATIVE", "1")
+    native.reset_counters()
+    model = SmaulBrainModel(_tiny_full_ternary_config())
+    ids = torch.randint(0, 256, (1, 4))
+    targets = torch.randint(0, 256, (1, 4))
+    result = model(ids, targets, step=0)
+    assert torch.isfinite(result["loss"])
+    result["loss"].backward()
+    grads = model.take_expert_grads()
+    assert grads
+    assert native.COUNTERS["fp8_to_ternary_native"] >= 1
+    assert native.COUNTERS["ternary_linear_forward_native"] >= 3
+
+
+def test_full_ternary_expert_optimizer_never_dense_dequantizes(monkeypatch):
+    """The expert optimizer updates FP8 codes tile-by-tile with no dense weight decode."""
+    monkeypatch.setenv("SMAUL_NATIVE", "1")
+    native.reset_counters()
+    record = make_expert("expert_00000", d_model=8, expert_hidden=16, fp8_tile=8)
+    compute = {
+        "w_gate": SimpleNamespace(grad=torch.randn(16, 8).mul_(0.001).contiguous()),
+        "w_up": SimpleNamespace(grad=torch.randn(16, 8).mul_(0.001).contiguous()),
+        "w_down": SimpleNamespace(grad=torch.randn(8, 16).mul_(0.001).contiguous()),
+    }
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("direct expert optimizer must not materialize FP32 weights")
+
+    monkeypatch.setattr(smaulopt_module, "dequantize_fp8_blockwise", forbidden)
+    monkeypatch.setattr(smaulopt_module, "quantize_fp8_blockwise", forbidden)
+    opt = SmaulOpt()
+    opt.step_expert(record, compute, 1.0, 1e-3, ternary_direct=True)
+
+    assert native.COUNTERS["fp8_factored_update_native"] == 3
+    for name in ("w_gate", "w_up", "w_down"):
+        assert record.optim_state[name]["step"] == 1
+        assert compute[name].grad is None
+        assert torch.isfinite(record.weights_fp8[name].scales).all()
+    assert record.version == 1
