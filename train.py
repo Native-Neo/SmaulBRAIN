@@ -707,6 +707,7 @@ def run_training(
             seed=seed + salt, k=count,
             fp8_tile=cfg.fp8_tile, max_experts=cfg.max_experts,
             optim_state=opt.router_state,
+            direct_no_dequant=cfg.full_ternary_qat,
         )
         for eid in new_ids:
             log_fn(f"[grow] step={step} new={eid} pool={len(model.pool)}")
