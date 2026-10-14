@@ -262,13 +262,21 @@ extern "C" void smaul_fp8_to_packed_ternary(
         float selected_abs_sum = 0.0f;
         std::size_t selected_count = 0;
         for (std::size_t c = 0; c < cols; ++c) {
+            const std::size_t index = r * cols + c;
             const float block_scale = fp8_block_scales[r * nblocks + c / tile];
-            float value = e4m3_to_f32(fp8_codes[r * cols + c]) * block_scale;
+            float value = e4m3_to_f32(fp8_codes[index]) * block_scale;
             if (round_to_bf16) value = round_bf16(value);
-            if (value > threshold || value < -threshold) {
+            const bool selected = value > threshold || value < -threshold;
+            if (selected) {
                 selected_abs_sum += std::fabs(value);
                 ++selected_count;
             }
+            // Trit signs do not depend on the eventual row magnitude, so pack
+            // them during this pass. Avoid a third full scan of each weight.
+            const std::uint8_t trit = value > threshold ? 1u
+                : (value < -threshold ? 2u : 0u);
+            packed[index >> 2] |= static_cast<std::uint8_t>(
+                trit << ((index & 3u) * 2u));
         }
         float row_scale = selected_count
             ? selected_abs_sum / static_cast<float>(selected_count) : 0.0f;
@@ -276,16 +284,6 @@ extern "C" void smaul_fp8_to_packed_ternary(
         // extracting its row scale. Mirror BF16 rounding at this boundary.
         if (round_to_bf16) row_scale = round_bf16(row_scale);
         ternary_row_scales[r] = row_scale;
-        for (std::size_t c = 0; c < cols; ++c) {
-            const std::size_t index = r * cols + c;
-            const float block_scale = fp8_block_scales[r * nblocks + c / tile];
-            float value = e4m3_to_f32(fp8_codes[index]) * block_scale;
-            if (round_to_bf16) value = round_bf16(value);
-            const std::uint8_t trit = value > threshold ? 1u
-                : (value < -threshold ? 2u : 0u);
-            packed[index >> 2] |= static_cast<std::uint8_t>(
-                trit << ((index & 3u) * 2u));
-        }
     }
 }
 
