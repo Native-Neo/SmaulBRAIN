@@ -693,6 +693,11 @@ class SmaulOpt:
             compute[name].grad = None
 
         record.version = getattr(record, "version", 0) + 1
+        # Backward is complete and the stored FP8 bytes have changed. Release
+        # the old packed-trit cache now instead of holding it during the next
+        # direct FP8->trit rebuild.
+        if hasattr(record, "_smaul_direct_ternary_cache"):
+            delattr(record, "_smaul_direct_ternary_cache")
         record.grad_activity = (
             0.9 * record.grad_activity + 0.1 * (activity / max(1, len(names)))
         )
