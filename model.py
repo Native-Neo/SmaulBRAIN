@@ -105,7 +105,19 @@ class SmaulBrainModel(nn.Module):
         # autograd kernels; only gradient matrices are dense, never the weights.
         self._ternary_expert_grads: dict[str, dict[str, torch.Tensor]] = {}
         self._ternary_grad_lock = threading.Lock()
+        # Keep packed expert codes bounded to one batch's expert union. The
+        # record cache reuses codes across recurrent depth, then is evicted at
+        # the next forward instead of growing with the lifetime of the model.
+        self._direct_ternary_cached_ids: set[str] = set()
         self._last_step: int = 0
+
+    def _clear_direct_ternary_caches(self) -> None:
+        """Evict packed expert matrices from the previous forward pass."""
+        for expert_id in self._direct_ternary_cached_ids:
+            rec = self.pool.experts.get(expert_id)
+            if rec is not None and hasattr(rec, "_smaul_direct_ternary_cache"):
+                delattr(rec, "_smaul_direct_ternary_cache")
+        self._direct_ternary_cached_ids.clear()
 
     # -- MoE wiring --
     def _accumulate_ternary_expert_grad(
@@ -127,7 +139,9 @@ class SmaulBrainModel(nn.Module):
             compute_dtype = (torch.bfloat16 if self.cfg.dtype == "bf16"
                              else torch.float32)
             sink = self._accumulate_ternary_expert_grad if torch.is_grad_enabled() else None
-            return rec.direct_ternary_weights(compute_dtype, grad_sink=sink)
+            weights = rec.direct_ternary_weights(compute_dtype, grad_sink=sink)
+            self._direct_ternary_cached_ids.add(expert_id)
+            return weights
         base = self.pager.provider(expert_id)
         if not torch.is_grad_enabled():
             # The training dispatch applies QAT inside its custom linear op;
@@ -153,7 +167,9 @@ class SmaulBrainModel(nn.Module):
                 raise KeyError(f"expert {expert_id!r} is missing from the live pool")
             compute_dtype = (torch.bfloat16 if self.cfg.dtype == "bf16"
                              else torch.float32)
-            return rec.direct_ternary_weights(compute_dtype, grad_sink=None)
+            weights = rec.direct_ternary_weights(compute_dtype, grad_sink=None)
+            self._direct_ternary_cached_ids.add(expert_id)
+            return weights
         if not self.cfg.ternary_qat:
             return self.pager.provider(expert_id)
         rec = self.pool.experts.get(expert_id)
@@ -567,6 +583,7 @@ class SmaulBrainModel(nn.Module):
             )
         self._last_step = step
         if self.cfg.full_ternary_qat:
+            self._clear_direct_ternary_caches()
             clear_ternary_qat_caches(self)
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
@@ -705,6 +722,7 @@ class SmaulBrainModel(nn.Module):
             )
         self._check_activation_budget(ids, training=False)
         if self.cfg.full_ternary_qat:
+            self._clear_direct_ternary_caches()
             clear_ternary_qat_caches(self)
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
