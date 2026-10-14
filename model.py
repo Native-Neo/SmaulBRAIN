@@ -360,11 +360,11 @@ class SmaulBrainModel(nn.Module):
         """Guard retained activations and available memory before training.
 
         The 256 MiB activation estimate covers retained hidden/logit/CE tensors
-        and FP32 attention states. The separate working-set check budgets leaf
-        weights and gradients for potentially active experts, checkpoint inputs,
-        one expert's SwiGLU/QAT temporary peak, a cold-page dequantization peak,
-        and the pager's maximum compute-weight cache. FP8 storage and optimizer
-        state are already resident when this method runs.
+        and FP32 attention states. The separate working-set check budgets the
+        actual active-expert gradient representation, checkpoint inputs, SwiGLU
+        temporaries, and only the dense leaf/pager/dequant buffers used by the
+        selected execution mode. FP8 storage and optimizer state are already
+        resident when this method runs.
         """
         batch_tokens = ids.shape[0] * ids.shape[1]
         dtype_bytes = 2 if self.cfg.dtype == "bf16" else 4
@@ -393,22 +393,40 @@ class SmaulBrainModel(nn.Module):
         if not training:
             return
 
-        # Expert leaves are materialized once per active expert, not once per
-        # recurrent depth. Bound the worst-case leaf working set and account
-        # for checkpoint inputs (large SwiGLU intermediates are recomputed).
-        # Ternary QAT now caches one quantized compute-dtype matrix per leaf
-        # until backward/step cleanup; budget that additional copy explicitly.
-        # FP8 weights and optimizer state are already resident by this point.
+        # At most active_upper experts can be addressed by this batch. In
+        # ordinary mode the pager yields dense compute weights and training
+        # makes one dense leaf per active expert; full ternary instead reads
+        # FP8 storage straight into packed trits and creates no dense leaves.
         active_upper = min(self.cfg.num_experts, batch_tokens * self.cfg.top_k)
         expert_params = 3 * self.cfg.d_model * self.cfg.expert_hidden
-        expert_leaf_bytes = active_upper * expert_params * dtype_bytes
-        # Autograd retains a same-shaped, same-dtype gradient for each leaf.
-        expert_grad_bytes = expert_leaf_bytes
-        # The QAT cache is one same-shaped compute-dtype copy per leaf, reused
-        # by every recurrent-depth invocation and checkpoint recomputation.
-        ternary_qat_cache_bytes = (
-            expert_leaf_bytes if (self.cfg.ternary_qat or self.cfg.full_ternary_qat) else 0
+        direct_ternary = self.cfg.full_ternary_qat
+        expert_leaf_bytes = (
+            0 if direct_ternary else active_upper * expert_params * dtype_bytes
         )
+        # Direct ternary STE captures only gradients, still dense FP32. The
+        # ordinary path stores leaf gradients in its compute dtype.
+        expert_grad_bytes = active_upper * expert_params * (
+            4 if direct_ternary else dtype_bytes
+        )
+        if direct_ternary:
+            # Per active expert: four trits per code byte plus one FP32 row
+            # scale per output row. Matrices are packed separately, so round
+            # each matrix's byte count up independently.
+            d, h = self.cfg.d_model, self.cfg.expert_hidden
+            packed_codes = (
+                (h * d + 3) // 4
+                + (h * d + 3) // 4
+                + (d * h + 3) // 4
+            )
+            row_scale_bytes = 4 * (2 * h + d)
+            ternary_qat_cache_bytes = active_upper * (
+                packed_codes + row_scale_bytes
+            )
+        elif self.cfg.ternary_qat:
+            # Expert-only QAT retains one compute-dtype quantized matrix copy.
+            ternary_qat_cache_bytes = expert_leaf_bytes
+        else:
+            ternary_qat_cache_bytes = 0
         checkpoint_input_bytes = (
             batch_tokens * self.cfg.top_k * self.cfg.d_model
             * self.cfg.max_depth * dtype_bytes
@@ -420,12 +438,12 @@ class SmaulBrainModel(nn.Module):
         expert_mlp_temp_bytes = (
             4 * batch_tokens * self.cfg.expert_hidden * dtype_bytes
         )
-        # Ternary QAT materializes one projection at a time and recomputes it
-        # during backward. Budget a conservative peak for its FP32 values and
-        # boolean masks; do not multiply this by depth or expert count.
+        # Expert-only QAT still forms a dense ternary projection temporary.
+        # Full-ternary mode uses packed codes for both expert and shared
+        # linear projections, so do not reserve the former full-matrix buffer.
         qat_projection_temp_bytes = (
             self.cfg.d_model * self.cfg.expert_hidden * 24
-            if (self.cfg.ternary_qat or self.cfg.full_ternary_qat) else 0
+            if self.cfg.ternary_qat and not direct_ternary else 0
         )
         # D2R warms at most ram_cache dequantized expert tensors; R2VR/D2VR
         # hold compute tensors in the VRAM cache (CPU-backed on CPU-only
@@ -440,13 +458,15 @@ class SmaulBrainModel(nn.Module):
             self.cfg.paging_method == "D2R" or not torch.cuda.is_available()
         )
         pager_cache_bytes = (
-            cache_slots * expert_params * dtype_bytes if cache_uses_host_ram else 0
+            cache_slots * expert_params * dtype_bytes
+            if cache_uses_host_ram and not direct_ternary else 0
         )
-        # A cold page briefly holds FP32 dequantized weights and the converted
-        # compute-dtype tensors together. This host-side load peak happens
-        # before that expert's SwiGLU work, so take the maximum rather than
-        # add mutually exclusive loading and projection peaks.
-        expert_dequant_temp_bytes = expert_params * (4 + dtype_bytes)
+        # Normal paging briefly holds FP32-dequantized and compute-dtype
+        # expert weights together. Direct ternary reads encoded FP8 scalars
+        # into a packed trit cache, never a full dense weight temporary.
+        expert_dequant_temp_bytes = (
+            expert_params * (4 + dtype_bytes) if not direct_ternary else 0
+        )
         expert_peak_temp_bytes = max(
             expert_dequant_temp_bytes,
             expert_mlp_temp_bytes + qat_projection_temp_bytes,
