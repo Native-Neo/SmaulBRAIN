@@ -1408,11 +1408,6 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
             f"{sorted(unexpected_trunk)}"
         )
     incompatible = model.load_state_dict(trunk, strict=False)
-    if saved_cfg.full_ternary_qat:
-        # A caller may have constructed the destination from a non-ternary
-        # config before reading the checkpoint. Wrap the just-restored trunk
-        # parameters in-place before exposing the loaded model.
-        enable_full_ternary_qat(model)
     # Router tensors and counters are restored from their dedicated files and
     # manifest below. Every other model tensor must have been loaded; silently
     # ignoring a renamed/missing trunk key can produce a valid-looking but
@@ -1431,6 +1426,11 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
             f"missing={sorted(unexpected_missing)}, "
             f"unexpected={sorted(incompatible.unexpected_keys)}"
         )
+    if saved_cfg.full_ternary_qat:
+        # Commit the architecture transform only after every checkpoint part
+        # has passed validation. A corrupt checkpoint must not leave a wrapper
+        # mutation behind on the caller's live model.
+        enable_full_ternary_qat(model)
     model.pool.experts = new_experts
     model.pool.order = new_order
     model.pool._next_id = int(next_id)
