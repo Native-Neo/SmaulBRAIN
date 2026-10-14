@@ -188,10 +188,27 @@ accelerator, non-contiguous, and unsupported inputs use PyTorch's dense
 fallback. The native implementation is covered by a dispatch-and-gradient
 parity test and is built with baseline x86-64 flags.
 
-This path is not enabled by default, and no general speedup is promised:
-zero-skipping scalar loops can lose to optimized BLAS depending on matrix size
-and sparsity. Benchmark on the target CPU before enabling it for production
-training workloads.
+### Full-model ternary QAT (experimental)
+
+```bash
+python cli.py --dtype fp32 --full-ternary-qat train --data ./data/corpus --steps 1
+```
+
+The new `--full-ternary-qat` flag applies scaled ternary quantization-aware
+training to the model's learned affine weights and gains: embedding rows,
+recurrent attention projections, router and output heads, byte convolution,
+RMSNorm gains, and routed expert weights. Floating-point master parameters
+remain trainable through a straight-through estimator. Activations, gradients,
+loss, recurrent state, and SmaulOpt remain FP32/BF16; this is **not** an
+all-ternary optimizer or a claim that all training arithmetic is addition-only.
+
+On CPU, the custom expert input-gradient kernel can fold row scales into the
+upstream gradient once and use packed `{-1, 0, +1}` signs for additions and
+subtractions. The weight-gradient calculation still uses dense matrix
+multiplication. On accelerators, operations unsupported by the native CPU
+kernel retain the PyTorch dense fallback, so ternary values alone do not
+guarantee a faster GPU training run. The feature is opt-in and should be
+validated with the small correctness tests before any full-size benchmark.
 
 ## Architecture
 
