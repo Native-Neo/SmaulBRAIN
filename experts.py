@@ -150,6 +150,8 @@ class _TernaryQATLinear(torch.autograd.Function):
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor, require_packed: bool):
         ctx.save_for_backward(x, weight)
         ctx.require_packed = bool(require_packed)
+        ctx.packed_codes = None
+        ctx.packed_scales = None
         if (x.device.type == "cpu" and weight.device.type == "cpu"
                 and x.dtype in (torch.float32, torch.bfloat16)
                 and weight.dtype in (torch.float32, torch.bfloat16)
@@ -162,6 +164,8 @@ class _TernaryQATLinear(torch.autograd.Function):
                 packed, scales = converted
                 native_output = call_ternary_linear_forward(x_2d, packed, scales)
                 if native_output is not None:
+                    ctx.packed_codes = packed
+                    ctx.packed_scales = scales
                     return native_output.reshape(*x.shape[:-1], weight.shape[0])
         if ctx.require_packed:
             raise RuntimeError(
@@ -184,14 +188,22 @@ class _TernaryQATLinear(torch.autograd.Function):
             # then use packed signs for an add/sub-only inner loop.
             # The native path is CPU-only; unsupported cases keep dense fallback.
             grad_input_native = None
-            if x.device.type == "cpu" and weight.device.type == "cpu":
+            packed = ctx.packed_codes
+            scales = ctx.packed_scales
+            if packed is None and x.device.type == "cpu" and weight.device.type == "cpu":
                 packed, scales = _cached_packed_ternary_values(weight)
+            if packed is not None and x.device.type == "cpu" and weight.device.type == "cpu":
                 scaled_grad = (grad_out_2d.float() * scales.reshape(1, -1)).contiguous()
                 grad_input_native = call_ternary_linear_input_grad(
                     scaled_grad, packed, int(weight.shape[1])
                 )
             if grad_input_native is not None:
                 grad_input = grad_input_native.reshape_as(x).to(dtype=x.dtype)
+            elif ctx.require_packed:
+                raise RuntimeError(
+                    "full_ternary_qat backward requires the packed ternary input-gradient kernel; "
+                    "refusing a dense-weight fallback"
+                )
             else:
                 quantized = _cached_ternary_values(weight)
                 grad_input = (grad_out_2d.float() @ quantized.float()).reshape_as(x).to(dtype=x.dtype)
