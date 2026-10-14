@@ -37,10 +37,10 @@ concurrency:
 
 jobs:
   profile-full-cpu:
-    # This experiment uses the tiny correctness tests; do not start the
-    # full 2x1024-token/64-expert training profile on every code push here.
-    # Keep the full profile enabled for main and other branches.
-    if: github.ref != 'refs/heads/experiment/full-ternary-qat' && github.head_ref != 'experiment/full-ternary-qat' && github.ref != 'refs/heads/experiment/full-ternary-no-dequant' && github.head_ref != 'experiment/full-ternary-no-dequant'
+    # A full-size profile can be expensive. Run it only when explicitly
+    # dispatched from the Actions UI; pushes and PRs use the fast correctness
+    # workflow and full regression suite instead.
+    if: github.event_name == 'workflow_dispatch'
     name: Full (512-wide, 64 experts) ternary-QAT training profile
     runs-on: ubuntu-latest
     timeout-minutes: 60
