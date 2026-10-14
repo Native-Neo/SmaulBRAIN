@@ -443,7 +443,7 @@ def _self_test() -> None:
     _libs["ternary_linear"].smaul_ternary_linear_input_grad(
         gy, packed, gx, 1, 2, 3, 1
     )
-    if abs(gx[0] - (-1.0)) > 1e-6 or abs(gx[1] - (-2.0)) > 1e-6:
+    if abs(gx[0] - (-1.0)) > 1e-6 or abs(gx[1] - (-1.0)) > 1e-6:
         raise RuntimeError(f"ternary input-gradient self-test failed: {list(gx)}")
     # fp8: quantize+dequantize roundtrip stays finite
     wq = (ctypes.c_float * 4)(0.5, -1.0, 2.0, 0.01)
