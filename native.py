@@ -105,6 +105,7 @@ COUNTERS: dict[str, int] = {
     "fp8_to_ternary_native": 0, "fp8_to_ternary_fallback": 0,
     "fp8_factored_update_native": 0, "fp8_factored_update_fallback": 0,
     "fp8_clone_native": 0, "fp8_clone_fallback": 0,
+    "float_to_ternary_native": 0, "float_to_ternary_fallback": 0,
 }
 LAST_FALLBACK: dict[str, str] = {}
 
@@ -475,6 +476,14 @@ def _self_test() -> None:
     if opt_status != 1 or abs(opt_activity[0]) > 1e-6:
         raise RuntimeError(f"low-memory FP8 optimizer self-test failed: status={opt_status}, activity={opt_activity[0]}")
 
+    # Float-to-trit conversion consumes the original parameter directly.
+    float_src = torch.tensor([[2.0, -1.0, 0.0, 0.5]], dtype=torch.float32)
+    float_packed, float_scales = call_float_to_packed_ternary(float_src)
+    if float_packed is None or float_scales is None or float_packed.tolist() != [0x91] or abs(float_scales[0].item() - 1.25) > 1e-6:
+        raise RuntimeError(
+            f"float-to-ternary self-test failed: codes={None if float_packed is None else float_packed.tolist()}, "
+            f"scales={None if float_scales is None else float_scales.tolist()}"
+        )
     # Direct FP8 clone update stays encoded and uses no dense weight buffer.
     clone_src = (ctypes.c_ubyte * 4)(0x38, 0xC0, 0x30, 0xB0)
     clone_src_scales = (ctypes.c_float * 2)(1.0, 1.0)
@@ -523,8 +532,9 @@ def _bind(lib: ctypes.CDLL, name: str) -> None:
         convert = getattr(lib, "smaul_fp8_to_packed_ternary", None)
         update = getattr(lib, "smaul_fp8_factored_update", None)
         clone = getattr(lib, "smaul_fp8_clone_perturb", None)
-        if fwd is None or bwd is None or convert is None or update is None or clone is None:
-            raise RuntimeError("ternary_linear .so missing a packed ternary, low-memory optimizer, or clone symbol (ABI?)")
+        float_convert = getattr(lib, "smaul_float_to_packed_ternary", None)
+        if fwd is None or bwd is None or convert is None or update is None or clone is None or float_convert is None:
+            raise RuntimeError("ternary_linear .so missing a packed ternary, low-memory optimizer, clone, or float-conversion symbol (ABI?)")
         fwd.argtypes = [ctypes.c_void_p, U, F, ctypes.c_void_p,
                         S, S, S, ctypes.c_int, ctypes.c_int]
         fwd.restype = None
@@ -541,6 +551,8 @@ def _bind(lib: ctypes.CDLL, name: str) -> None:
         update.restype = ctypes.c_int
         clone.argtypes = [U, F, U, F, S, S, S, ctypes.c_float, ctypes.c_uint64]
         clone.restype = ctypes.c_int
+        float_convert.argtypes = [ctypes.c_void_p, U, F, S, S, ctypes.c_float, ctypes.c_int]
+        float_convert.restype = None
     elif name == "fp8_quant":
         q = getattr(lib, "smaul_fp8_quant_row_block", None)
         dq = getattr(lib, "smaul_fp8_dequant_row_block", None)
@@ -900,6 +912,44 @@ def call_fp8_factored_ternary_update(
             return None
         _note(op, True)
         return float(activity.item())
+    except Exception as e:
+        _note(op, False, f"{type(e).__name__}: {e}")
+        if native_mode() == "force":
+            raise
+        return None
+
+
+def call_float_to_packed_ternary(
+    weights: torch.Tensor, threshold_ratio: float = 0.7
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Pack rows of a CPU FP32/BF16 tensor directly into 2-bit ternary codes.
+
+    Unlike _cached_packed_ternary_values, this does not create a same-shape
+    floating-point tensor of ternary weights even temporarily.
+    """
+    op = "float_to_ternary"
+    if (weights.device.type != "cpu" or weights.dtype not in (torch.float32, torch.bfloat16)
+            or weights.ndim != 2 or weights.shape[0] == 0 or weights.shape[1] == 0
+            or not weights.is_contiguous()):
+        _note(op, False, "requires non-empty contiguous CPU FP32/BF16 matrix")
+        return None
+    if (isinstance(threshold_ratio, bool) or not isinstance(threshold_ratio, (int, float))
+            or not math.isfinite(threshold_ratio) or not 0.0 <= threshold_ratio < 1.0):
+        _note(op, False, "threshold ratio must be finite and in [0,1)")
+        return None
+    if not _want_native(op):
+        return None
+    try:
+        rows, cols = map(int, weights.shape)
+        packed = torch.empty(((rows * cols + 3) // 4,), dtype=torch.uint8)
+        scales = torch.empty((rows,), dtype=torch.float32)
+        _libs["ternary_linear"].smaul_float_to_packed_ternary(
+            ctypes.c_void_p(weights.data_ptr()), _ptr(packed, ctypes.c_ubyte),
+            _ptr(scales, ctypes.c_float), rows, cols, float(threshold_ratio),
+            int(weights.dtype == torch.bfloat16),
+        )
+        _note(op, True)
+        return packed, scales
     except Exception as e:
         _note(op, False, f"{type(e).__name__}: {e}")
         if native_mode() == "force":
