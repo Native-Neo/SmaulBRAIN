@@ -57,7 +57,7 @@ class TernaryQATEmbedding(nn.Module):
         self.weight = source.weight
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        selected = self.weight[ids]
+        selected = self.weight[ids.long()]
         quantized = ternary_qat_weight(selected)
         if self.padding_idx is not None:
             quantized = quantized.masked_fill((ids == self.padding_idx).unsqueeze(-1), 0)
