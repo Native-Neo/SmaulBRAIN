@@ -13,6 +13,7 @@ from experts import ExpertRecord, make_expert, ternary_qat_weight
 from model import SmaulBrainModel
 import native
 import smaulopt as smaulopt_module
+import growth as growth_module
 from smaulopt import SmaulOpt, SmaulOptHParams
 from types import SimpleNamespace
 from copy import deepcopy
@@ -201,3 +202,31 @@ def test_direct_no_dequant_optimizer_matches_fp8_reference_update(monkeypatch):
                 reference_record.optim_state[name][moment],
                 atol=2e-6, rtol=2e-4,
             ), f"{name}.{moment}"
+
+
+def test_full_ternary_growth_clones_fp8_without_dense_dequant_and_keeps_router_qat(monkeypatch):
+    """Training growth uses the direct FP8 clone kernel, never dense parent weights."""
+    monkeypatch.setenv("SMAUL_NATIVE", "1")
+    model = SmaulBrainModel(_tiny_full_ternary_config())
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("full_ternary_qat growth must not dequantize expert weights")
+
+    monkeypatch.setattr(ExpertRecord, "dequantize", forbidden)
+    monkeypatch.setattr(growth_module, "dequantize_fp8_blockwise", forbidden)
+    old_count = len(model.pool)
+    new_ids = growth_module.grow_topk_clones(
+        model.pool, model.router, model.cfg.d_model, model.cfg.expert_hidden,
+        step=1, seed=42, k=1, fp8_tile=model.cfg.fp8_tile,
+        max_experts=model.cfg.max_experts, direct_no_dequant=True,
+    )
+    assert len(new_ids) == 1
+    assert len(model.pool) == old_count + 1
+    assert model.router.num_experts == old_count + 1
+    assert isinstance(model.router.proj, TernaryQATLinear)
+    child = model.pool.experts[new_ids[0]]
+    assert child.source == "clone-mutated"
+    assert child.parents
+    for name in ("w_gate", "w_up", "w_down"):
+        assert child.weights_fp8[name].codes.dtype == torch.uint8
+        assert torch.isfinite(child.weights_fp8[name].scales).all()
