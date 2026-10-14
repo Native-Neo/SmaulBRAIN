@@ -1518,5 +1518,10 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         cache = getattr(model, attr, None)
         if cache is not None:
             cache.clear()
+    if model.cfg.full_ternary_qat:
+        # Loading copies new master parameters into existing objects; packed
+        # trunk caches are derived data and must never survive a checkpoint swap.
+        from ternary import clear_ternary_qat_caches
+        clear_ternary_qat_caches(model)
     model._resume_step = int(step)
     return manifest
