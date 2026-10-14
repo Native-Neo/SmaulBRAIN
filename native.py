@@ -101,6 +101,7 @@ COUNTERS: dict[str, int] = {
     "rmsnorm_native": 0, "rmsnorm_fallback": 0,
     "attn_step_native": 0, "attn_step_fallback": 0,
     "ternary_linear_forward_native": 0, "ternary_linear_forward_fallback": 0,
+    "ternary_linear_input_grad_native": 0, "ternary_linear_input_grad_fallback": 0,
 }
 LAST_FALLBACK: dict[str, str] = {}
 
@@ -436,6 +437,14 @@ def _self_test() -> None:
     expected_ty = (2.0, 3.0, -8.0)
     if any(abs(ty[i] - expected_ty[i]) > 1e-6 for i in range(3)):
         raise RuntimeError(f"ternary linear forward self-test failed: {list(ty)}")
+    # Input-gradient smoke test using the same packed ternary matrix.
+    gy = (ctypes.c_float * 3)(1.0, 2.0, 3.0)
+    gx = (ctypes.c_float * 2)()
+    _libs["ternary_linear"].smaul_ternary_linear_input_grad(
+        gy, packed, gx, 1, 2, 3, 1
+    )
+    if abs(gx[0] - (-1.0)) > 1e-6 or abs(gx[1] - (-2.0)) > 1e-6:
+        raise RuntimeError(f"ternary input-gradient self-test failed: {list(gx)}")
     # fp8: quantize+dequantize roundtrip stays finite
     wq = (ctypes.c_float * 4)(0.5, -1.0, 2.0, 0.01)
     codes = (ctypes.c_ubyte * 4)()
@@ -468,11 +477,14 @@ def _bind(lib: ctypes.CDLL, name: str) -> None:
         fn.restype = None
     elif name == "ternary_linear":
         fwd = getattr(lib, "smaul_ternary_linear_forward", None)
-        if fwd is None:
-            raise RuntimeError("ternary_linear .so missing smaul_ternary_linear_forward (ABI?)")
+        bwd = getattr(lib, "smaul_ternary_linear_input_grad", None)
+        if fwd is None or bwd is None:
+            raise RuntimeError("ternary_linear .so missing forward/input-gradient symbols (ABI?)")
         fwd.argtypes = [ctypes.c_void_p, U, F, ctypes.c_void_p,
                         S, S, S, ctypes.c_int, ctypes.c_int]
         fwd.restype = None
+        bwd.argtypes = [F, U, F, S, S, S, ctypes.c_int]
+        bwd.restype = None
     elif name == "fp8_quant":
         q = getattr(lib, "smaul_fp8_quant_row_block", None)
         dq = getattr(lib, "smaul_fp8_dequant_row_block", None)
@@ -792,6 +804,54 @@ def call_ternary_linear_forward(
             ctypes.c_void_p(x.data_ptr()), _ptr(packed_codes, ctypes.c_ubyte),
             _ptr(scales, ctypes.c_float), ctypes.c_void_p(output.data_ptr()),
             rows, in_features, out_features, int(x.dtype == torch.bfloat16),
+            max(1, int(torch.get_num_threads())),
+        )
+        _note(op, True)
+        return output
+    except Exception as e:
+        _note(op, False, f"{type(e).__name__}: {e}")
+        if native_mode() == "force":
+            raise
+        return None
+
+
+def call_ternary_linear_input_grad(
+    grad_scaled: torch.Tensor, packed_codes: torch.Tensor, in_features: int
+) -> torch.Tensor | None:
+    """Compute dX with packed ternary weights using signed adds/subtracts.
+
+    grad_scaled already includes each output feature's ternary row scale. The
+    native inner loop therefore performs no floating-point multiply.
+    Returns CPU FP32 [rows, in_features], or None to request dense fallback.
+    """
+    op = "ternary_linear_input_grad"
+    if grad_scaled.device.type != "cpu" or grad_scaled.dtype != torch.float32:
+        _note(op, False, "requires CPU FP32 scaled gradients")
+        return None
+    if packed_codes.device.type != "cpu" or packed_codes.dtype != torch.uint8:
+        _note(op, False, "packed ternary codes must be CPU uint8")
+        return None
+    if (grad_scaled.ndim != 2 or grad_scaled.shape[0] == 0
+            or grad_scaled.shape[1] == 0):
+        _note(op, False, "requires non-empty [rows, out_features] gradients")
+        return None
+    if isinstance(in_features, bool) or not isinstance(in_features, int) or in_features < 1:
+        _note(op, False, "in_features must be a positive int")
+        return None
+    rows, out_features = map(int, grad_scaled.shape)
+    if packed_codes.numel() != (in_features * out_features + 3) // 4:
+        _note(op, False, "packed weight size does not match gradient/in_features")
+        return None
+    if not (grad_scaled.is_contiguous() and packed_codes.is_contiguous()):
+        _note(op, False, "requires contiguous inputs")
+        return None
+    if not _want_native(op):
+        return None
+    try:
+        output = torch.empty((rows, in_features), dtype=torch.float32, device="cpu")
+        _libs["ternary_linear"].smaul_ternary_linear_input_grad(
+            _ptr(grad_scaled, ctypes.c_float), _ptr(packed_codes, ctypes.c_ubyte),
+            _ptr(output, ctypes.c_float), rows, in_features, out_features,
             max(1, int(torch.get_num_threads())),
         )
         _note(op, True)
