@@ -137,6 +137,22 @@ def _cached_packed_ternary_values(
     return packed, scales
 
 
+def _cached_direct_packed_ternary_values(
+    w: torch.Tensor, threshold_ratio: float = 0.7
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Cache packed trits directly from master weights without a dense Q tensor."""
+    version = w._version
+    cached = getattr(w, "_smaul_direct_packed_ternary_qat_cache", None)
+    if cached is not None and cached[0] == version:
+        return cached[1], cached[2]
+    converted = call_float_to_packed_ternary(w, threshold_ratio)
+    if converted is None:
+        return None
+    packed, scales = converted
+    w._smaul_direct_packed_ternary_qat_cache = (version, packed, scales)
+    return packed, scales
+
+
 class _TernaryQATLinear(torch.autograd.Function):
     """Ternary-weight forward with ordinary PyTorch-style gradients.
 
@@ -159,7 +175,7 @@ class _TernaryQATLinear(torch.autograd.Function):
                 and weight.is_contiguous()):
             # Convert each original weight value directly into its 2-bit code.
             # This avoids building the dense scaled-ternary matrix in Python.
-            converted = call_float_to_packed_ternary(weight)
+            converted = _cached_direct_packed_ternary_values(weight)
             x_2d = x.reshape(-1, x.shape[-1]).contiguous()
             if converted is not None:
                 packed, scales = converted
