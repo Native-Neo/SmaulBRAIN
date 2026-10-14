@@ -107,7 +107,7 @@ def test_native_self_test_passes_after_build():
     try:
         assert native.ensure_native()  # builds with baseline flags if needed
         native._self_test()  # raises on any kernel mismatch
-        assert set(native._libs) == {"rmsnorm", "linear_attn", "fp8_quant", "ternary_backward"}
+        assert set(native._libs) == {"rmsnorm", "linear_attn", "fp8_quant", "ternary_linear"}
     finally:
         pass  # keep the warm cache for the remaining tests
 

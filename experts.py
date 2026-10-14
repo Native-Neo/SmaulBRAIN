@@ -20,7 +20,7 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from native import call_ternary_backward_input
+from native import call_ternary_linear_forward
 from torch.utils.checkpoint import checkpoint
 
 from precision import FP8BlockTensor, dequantize_fp8_blockwise, quantize_fp8_blockwise
@@ -61,122 +61,149 @@ def _ternary_values(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.Tens
     return (trits * scale).to(dtype=w.dtype)
 
 
+def _cached_ternary_values(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.Tensor:
+    """Quantize once per immutable training leaf, reusing it across recurrent depth.
+
+    A training leaf is not mutated until its complete backward has finished,
+    and a fresh leaf is created for the next optimizer step. The cache is
+    therefore attached to that leaf rather than held in a process-global map.
+    Tensor versioning guards against accidental in-place changes reusing stale
+    quantized values. This deliberately trades at most one compute-dtype copy
+    per active expert weight for avoiding repeated full-matrix thresholding.
+    """
+    version = w._version
+    cached = getattr(w, "_smaul_ternary_qat_cache", None)
+    if cached is not None and cached[0] == version:
+        return cached[1]
+    with torch.no_grad():
+        quantized = _ternary_values(w, threshold_ratio)
+    w._smaul_ternary_qat_cache = (version, quantized)
+    return quantized
+
+
 def ternary_qat_weight(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.Tensor:
     """Per-output-row ternary QAT with a straight-through estimator.
 
     This helper is useful for inference and reference tests. Training uses
-    _TernaryQATLinear so the ternary matrix is temporary and is recomputed
-    during backward instead of being retained once per recurrent depth.
+    _TernaryQATLinear to keep latent weights and activations in its explicit
+    autograd save set; cached quantized values serve its ordinary matmul gradients.
     """
     quantized = _ternary_values(w, threshold_ratio)
     return quantized.detach() + (w - w.detach())
 
-class _TernaryLinear(torch.autograd.Function):
-    """Linear autograd with an optional zero-skipping ternary dX kernel."""
+def _cached_packed_ternary_values(
+    w: torch.Tensor, threshold_ratio: float = 0.7
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return 2-bit packed trits and rounded per-row scales, cached on a stable leaf.
 
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, enabled: bool):
-        ctx.enabled = bool(enabled)
-        ctx.save_for_backward(x, weight)
-        return F.linear(x, weight)
+    Four values share one byte: 00=zero, 01=positive, 10=negative.
+    The packed stream is flattened across row boundaries, which keeps the
+    format correct for any row width, including dimensions not divisible by 4.
+    Quantization first follows the reference BF16/FP32 rounding exactly, then
+    derives codes/scales from those representable ternary values.
+    """
+    version = w._version
+    cached = getattr(w, "_smaul_packed_ternary_qat_cache", None)
+    if cached is not None and cached[0] == version:
+        return cached[1], cached[2]
 
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        x, weight = ctx.saved_tensors
-        grad_out_2d = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
-        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
-        grad_input = None
-        if ctx.needs_input_grad[0]:
-            if ctx.enabled:
-                grad_input = call_ternary_backward_input(
-                    grad_out_2d, weight.contiguous()
-                )
-            if grad_input is None:
-                grad_input = grad_out_2d @ weight
-            grad_input = grad_input.reshape_as(x)
-        grad_weight = None
-        if ctx.needs_input_grad[1]:
-            grad_weight = grad_out_2d.transpose(0, 1) @ x_2d
-        return grad_input, grad_weight, None
+    with torch.no_grad():
+        quantized = _ternary_values(w, threshold_ratio)
+        codes = torch.where(
+            quantized > 0,
+            torch.ones_like(quantized, dtype=torch.int16),
+            torch.where(
+                quantized < 0,
+                torch.full_like(quantized, 2, dtype=torch.int16),
+                torch.zeros_like(quantized, dtype=torch.int16),
+            ),
+        ).reshape(-1)
+        padding = (-codes.numel()) % 4
+        if padding:
+            codes = F.pad(codes, (0, padding), value=0)
+        groups = codes.reshape(-1, 4)
+        packed = (
+            groups[:, 0]
+            | (groups[:, 1] << 2)
+            | (groups[:, 2] << 4)
+            | (groups[:, 3] << 6)
+        ).to(torch.uint8).contiguous()
+        # Q values are already rounded to the compute dtype by _ternary_values.
+        # Recovering the magnitude here matches the reference for BF16 scales.
+        scales = quantized.abs().amax(dim=-1).to(torch.float32).contiguous()
+
+    w._smaul_packed_ternary_qat_cache = (version, packed, scales)
+    return packed, scales
 
 
 class _TernaryQATLinear(torch.autograd.Function):
-    """Ternary forward with STE weight gradients and recomputed ternary dX weights.
+    """Ternary-weight forward with ordinary PyTorch-style gradients.
 
-    Only the latent expert weight and input are saved for backward. The
-    transformed ternary matrix exists only while each projection executes.
+    The CPU forward can consume packed trits directly. Backward deliberately
+    uses regular tensor matrix multiplication only: no custom ternary dX
+    kernel, zero-skipping gradient path, or extra backward dispatcher.
+    The straight-through estimator is retained for the latent weight gradient.
     """
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, ternary_backward: bool):
-        ctx.enabled = bool(ternary_backward)
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor):
         ctx.save_for_backward(x, weight)
-        quantized = _ternary_values(weight)
+        if (x.device.type == "cpu" and weight.device.type == "cpu"
+                and x.dtype in (torch.float32, torch.bfloat16)
+                and weight.dtype in (torch.float32, torch.bfloat16)):
+            packed, scales = _cached_packed_ternary_values(weight)
+            x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+            native_output = call_ternary_linear_forward(x_2d, packed, scales)
+            if native_output is not None:
+                return native_output.reshape(*x.shape[:-1], weight.shape[0])
+            # The packed path is unavailable: avoid retaining an unused packed
+            # representation alongside the dense fallback.
+            if hasattr(weight, "_smaul_packed_ternary_qat_cache"):
+                delattr(weight, "_smaul_packed_ternary_qat_cache")
+        quantized = _cached_ternary_values(weight)
         return F.linear(x, quantized)
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         x, weight = ctx.saved_tensors
-        grad_out_2d = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
-        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
         grad_input = None
         grad_weight = None
-        if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
-            # Recreate only this projection's ternary values. Do not attach
-            # another quantization graph: the STE is the explicit grad_weight
-            # formula below, while dX uses the true ternary forward operand.
-            with torch.no_grad():
-                quantized = _ternary_values(weight)
         if ctx.needs_input_grad[0]:
-            if ctx.enabled:
-                grad_input = call_ternary_backward_input(
-                    grad_out_2d, quantized.contiguous()
-                )
-            if grad_input is None:
-                grad_input = grad_out_2d @ quantized
-            grad_input = grad_input.reshape_as(x)
+            quantized = _cached_ternary_values(weight)
+            grad_out_2d = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
+            grad_input = (grad_out_2d @ quantized).reshape_as(x)
         if ctx.needs_input_grad[1]:
+            grad_out_2d = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
+            x_2d = x.reshape(-1, x.shape[-1]).contiguous()
             grad_weight = grad_out_2d.transpose(0, 1) @ x_2d
-        return grad_input, grad_weight, None
+        return grad_input, grad_weight
 
 
-def _linear(x: torch.Tensor, weight: torch.Tensor, ternary_backward: bool):
-    if ternary_backward:
-        return _TernaryLinear.apply(x, weight, True)
-    return F.linear(x, weight)
-
-
-def _qat_linear(
-    x: torch.Tensor, weight: torch.Tensor, ternary_backward: bool
-) -> torch.Tensor:
-    return _TernaryQATLinear.apply(x, weight, ternary_backward)
+def _qat_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return _TernaryQATLinear.apply(x, weight)
 
 
 def _swiglu_tensors(
     x: torch.Tensor, w_gate: torch.Tensor, w_up: torch.Tensor,
-    w_down: torch.Tensor, ternary_backward: bool = False,
-    ternary_qat: bool = False,
+    w_down: torch.Tensor, ternary_qat: bool = False,
 ) -> torch.Tensor:
     """Tensor-only SwiGLU core, suitable for activation checkpointing."""
-    linear = _qat_linear if ternary_qat else _linear
-    gate = linear(x, w_gate, ternary_backward)
-    up = linear(x, w_up, ternary_backward)
-    return linear(F.silu(gate) * up, w_down, ternary_backward)
+    linear = _qat_linear if ternary_qat else F.linear
+    gate = linear(x, w_gate)
+    up = linear(x, w_up)
+    return linear(F.silu(gate) * up, w_down)
 
 
 def swiglu_forward(
-    x: torch.Tensor, w: dict[str, torch.Tensor], ternary_backward: bool = False,
-    ternary_qat: bool = False,
+    x: torch.Tensor, w: dict[str, torch.Tensor], ternary_qat: bool = False,
 ) -> torch.Tensor:
     """SwiGLU with checkpointed intermediates and memory-bounded ternary QAT.
 
-    QAT linear layers save their latent weights and recompute ternary values
-    for dX during backward, so quantized matrix copies are not retained
-    across recurrent depths. The native dX kernel is CPU-FP32-only; other
-    dtypes use the PyTorch matmul fallback.
+    The optional native path accelerates only the packed ternary forward.
+    Gradient propagation uses ordinary tensor matmul and the STE; there is no
+    custom low-bit gradient kernel.
     """
-    args = (x, w["w_gate"], w["w_up"], w["w_down"],
-            ternary_backward, ternary_qat)
+    args = (x, w["w_gate"], w["w_up"], w["w_down"], ternary_qat)
     if torch.is_grad_enabled() and any(t.requires_grad for t in args[:4]):
         return checkpoint(_swiglu_tensors, *args, use_reentrant=False)
     return _swiglu_tensors(*args)
@@ -311,7 +338,6 @@ class ExpertPool:
         dropped: torch.Tensor,
         provider: WeightProvider,
         step: int = 0,
-        ternary_backward: bool = False,
         ternary_qat: bool = False,
     ) -> torch.Tensor:
         """Weighted expert combination. x: [N, D] -> [N, D].
@@ -354,10 +380,7 @@ class ExpertPool:
             dtype = w["w_gate"].dtype
             rows = mask_slot.any(dim=-1)  # tokens touching this expert
             xs = x[rows].to(dtype)  # [M, D]
-            y = swiglu_forward(
-                xs, w, ternary_backward=ternary_backward,
-                ternary_qat=ternary_qat,
-            ).to(out.dtype)  # [M, D]
+            y = swiglu_forward(xs, w, ternary_qat=ternary_qat).to(out.dtype)  # [M, D]
             weight = mask_slot[rows].float() * top_weights[rows]  # [M, K]
             out[rows] += weight.sum(dim=-1, keepdim=True).to(out.dtype) * y
             rec = self.experts[eid]

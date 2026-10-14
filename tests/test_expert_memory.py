@@ -137,36 +137,7 @@ def test_ternary_qat_backward_uses_ternary_weights_and_full_precision_ste_gradie
     assert torch.allclose(w.grad, expected_dw, atol=1e-6, rtol=1e-6)
     assert not torch.equal(q.detach(), w.detach())
 
-def test_ternary_linear_backward_matches_dense_autograd():
-    from experts import _TernaryLinear
-
-    torch.manual_seed(23)
-    x0 = torch.randn(5, 4, dtype=torch.float32)
-    weight0 = torch.tensor(
-        [[1.0, 0.0, -0.5, 0.0],
-         [0.0, 0.25, 0.0, -1.0],
-         [-0.75, 0.0, 0.0, 0.5]],
-        dtype=torch.float32,
-    )
-    upstream = torch.randn(5, 3, dtype=torch.float32)
-
-    x_native = x0.clone().requires_grad_(True)
-    w_native = weight0.clone().requires_grad_(True)
-    y_native = _TernaryLinear.apply(x_native, w_native, True)
-    (y_native * upstream).sum().backward()
-
-    x_dense = x0.clone().requires_grad_(True)
-    w_dense = weight0.clone().requires_grad_(True)
-    y_dense = torch.nn.functional.linear(x_dense, w_dense)
-    (y_dense * upstream).sum().backward()
-
-    assert torch.allclose(y_native, y_dense, atol=1e-6, rtol=1e-6)
-    assert torch.allclose(x_native.grad, x_dense.grad, atol=1e-6, rtol=1e-6)
-    assert torch.allclose(w_native.grad, w_dense.grad, atol=1e-6, rtol=1e-6)
-
-
-
-def test_ternary_qat_custom_linear_recomputes_weights_and_preserves_ste_gradients():
+def test_ternary_qat_custom_linear_preserves_ste_gradients_without_saving_cache():
     from experts import _TernaryQATLinear, ternary_qat_weight
 
     torch.manual_seed(29)
@@ -186,7 +157,7 @@ def test_ternary_qat_custom_linear_recomputes_weights_and_preserves_ste_gradient
         saved_ptrs.append(tensor.data_ptr())
         return tensor
     with torch.autograd.graph.saved_tensors_hooks(pack_saved, lambda tensor: tensor):
-        result = _TernaryQATLinear.apply(x, w, False)
+        result = _TernaryQATLinear.apply(x, w)
     (result * upstream).sum().backward()
 
     assert torch.allclose(result, reference, atol=1e-6, rtol=1e-6)
@@ -227,20 +198,6 @@ def test_ternary_qat_checkpointed_swiglu_preserves_gradients():
         assert torch.allclose(w[name].grad, w_ref[name].grad, atol=1e-5, rtol=1e-5)
 
 
-def test_ternary_backward_reports_bf16_native_fallback():
-    from experts import _TernaryQATLinear
-    import native
-
-    native.reset_counters()
-    x = torch.randn(2, 4, dtype=torch.bfloat16, requires_grad=True)
-    w = torch.randn(3, 4, dtype=torch.bfloat16, requires_grad=True)
-    _TernaryQATLinear.apply(x, w, True).float().sum().backward()
-    assert native.COUNTERS["ternary_backward_fallback"] > 0
-    reason = native.LAST_FALLBACK["ternary_backward"]
-    assert "float32" in reason
-    assert "bfloat16" in reason
-
-
 def test_ternary_qat_projection_temporary_is_in_memory_budget(monkeypatch):
     model = _tiny_model(ternary_qat=True)
     try:
@@ -251,6 +208,59 @@ def test_ternary_qat_projection_temporary_is_in_memory_budget(monkeypatch):
         with pytest.raises(ValueError, match="estimated training working set exceeds 65%") as exc:
             model._check_activation_budget(ids, training=True)
         assert "ternary_qat_projection_temp=" in str(exc.value)
+        assert "ternary_qat_cache=" in str(exc.value)
         assert "expert_mlp_temp=" in str(exc.value)
     finally:
         model.pager.close()
+
+
+
+def test_ternary_qat_dense_weight_cache_reuses_and_invalidates(monkeypatch):
+    import experts
+
+    original = experts._ternary_values
+    calls = 0
+
+    def counted(weight, threshold_ratio=0.7):
+        nonlocal calls
+        calls += 1
+        return original(weight, threshold_ratio)
+
+    monkeypatch.setattr(experts, "_ternary_values", counted)
+    torch.manual_seed(37)
+    weight = torch.randn(5, 7, requires_grad=True)
+
+    first = experts._cached_ternary_values(weight)
+    second = experts._cached_ternary_values(weight)
+    assert calls == 1
+    assert first.data_ptr() == second.data_ptr()
+    assert not first.requires_grad
+    assert getattr(weight, "_smaul_ternary_qat_cache")[0] == weight._version
+
+    with torch.no_grad():
+        weight.add_(0.125)
+    third = experts._cached_ternary_values(weight)
+    assert calls == 2
+    assert third.data_ptr() != first.data_ptr()
+    assert getattr(weight, "_smaul_ternary_qat_cache")[0] == weight._version
+
+
+def test_packed_ternary_codes_cross_row_boundaries_without_padding():
+    from experts import _cached_packed_ternary_values, _ternary_values
+
+    weight = torch.tensor([
+        [2.0, 0.0, -2.0],
+        [-1.0, 1.0, 0.0],
+    ], dtype=torch.float32, requires_grad=True)
+    packed, scales = _cached_packed_ternary_values(weight, threshold_ratio=0.0)
+    # Decode enough of the packed stream to verify flattened row-major order.
+    decoded = []
+    for index in range(weight.numel()):
+        decoded.append((int(packed[index // 4]) >> ((index % 4) * 2)) & 3)
+    q = _ternary_values(weight, threshold_ratio=0.0)
+    expected = [
+        1 if value > 0 else 2 if value < 0 else 0
+        for value in q.detach().reshape(-1).tolist()
+    ]
+    assert decoded == expected
+    assert torch.allclose(scales, q.detach().abs().amax(dim=-1))
