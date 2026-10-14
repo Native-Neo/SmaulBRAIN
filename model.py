@@ -787,7 +787,11 @@ class SmaulBrainModel(nn.Module):
                 1, int(self.cfg.ram_cache), active_upper
             )
             self._trim_direct_ternary_caches()
-            clear_ternary_qat_caches(self)
+            # Inference weights are immutable during a stream. Keep the
+            # shared trunk's packed linear caches across token steps, clearing
+            # them only at the beginning of a fresh stream.
+            if attn_states is None:
+                clear_ternary_qat_caches(self)
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
         emb = self.embed(ids)
