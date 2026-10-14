@@ -98,39 +98,6 @@ void forward_impl(const void* x, const std::uint8_t* packed,
     });
 }
 
-template <bool BF16>
-void backward_input_impl(const void* grad_out, const std::uint8_t* packed,
-                         const float* scales, void* grad_input,
-                         std::size_t rows, std::size_t in_features,
-                         std::size_t out_features, int threads) {
-    parallel_for(rows, threads, [&](std::size_t begin, std::size_t end) {
-        std::vector<float> accum(in_features);
-        for (std::size_t row = begin; row < end; ++row) {
-            std::fill(accum.begin(), accum.end(), 0.0f);
-            const std::size_t go_base = row * out_features;
-            for (std::size_t out = 0; out < out_features; ++out) {
-                // Fold the row scale into the upstream gradient once. Each
-                // nonzero ternary weight then contributes only +/- additions.
-                const float scaled_grad =
-                    load_value<BF16>(grad_out, go_base + out) * scales[out];
-                const std::size_t weight_base = out * in_features;
-                for (std::size_t d = 0; d < in_features; ++d) {
-                    const std::uint8_t code = code_at(packed, weight_base + d);
-                    if (code == 1u) {
-                        accum[d] += scaled_grad;
-                    } else if (code == 2u) {
-                        accum[d] -= scaled_grad;
-                    }
-                }
-            }
-            const std::size_t dx_base = row * in_features;
-            for (std::size_t d = 0; d < in_features; ++d) {
-                store_value<BF16>(grad_input, dx_base + d, accum[d]);
-            }
-        }
-    }, 1);
-}
-
 }  // namespace
 
 extern "C" void smaul_ternary_linear_forward(
@@ -148,23 +115,5 @@ extern "C" void smaul_ternary_linear_forward(
     } else {
         forward_impl<false>(x, packed, scales, y, rows, in_features,
                             out_features, threads);
-    }
-}
-
-extern "C" void smaul_ternary_linear_backward_input(
-    const void* grad_out, const std::uint8_t* packed, const float* scales,
-    void* grad_input, std::size_t rows, std::size_t in_features,
-    std::size_t out_features, int is_bfloat16, int threads
-) {
-    if (!grad_out || !packed || !scales || !grad_input || rows == 0 ||
-        in_features == 0 || out_features == 0) {
-        return;
-    }
-    if (is_bfloat16) {
-        backward_input_impl<true>(grad_out, packed, scales, grad_input, rows,
-                                  in_features, out_features, threads);
-    } else {
-        backward_input_impl<false>(grad_out, packed, scales, grad_input, rows,
-                                   in_features, out_features, threads);
     }
 }
