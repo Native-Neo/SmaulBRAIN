@@ -147,8 +147,9 @@ class _TernaryQATLinear(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, require_packed: bool):
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, require_packed: bool = False):
         ctx.save_for_backward(x, weight)
+        ctx.input_count = len(ctx.needs_input_grad)
         ctx.require_packed = bool(require_packed)
         ctx.packed_codes = None
         ctx.packed_scales = None
@@ -211,7 +212,7 @@ class _TernaryQATLinear(torch.autograd.Function):
             grad_out_2d = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
             x_2d = x.reshape(-1, x.shape[-1]).contiguous()
             grad_weight = grad_out_2d.transpose(0, 1) @ x_2d
-        return grad_input, grad_weight, None
+        return (grad_input, grad_weight, None)[:ctx.input_count]
 
 
 @dataclass
