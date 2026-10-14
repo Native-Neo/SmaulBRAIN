@@ -20,7 +20,7 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from native import call_ternary_linear_forward
+from native import call_ternary_linear_forward, call_ternary_linear_input_grad
 from torch.utils.checkpoint import checkpoint
 
 from precision import FP8BlockTensor, dequantize_fp8_blockwise, quantize_fp8_blockwise
@@ -169,9 +169,22 @@ class _TernaryQATLinear(torch.autograd.Function):
         grad_input = None
         grad_weight = None
         if ctx.needs_input_grad[0]:
-            quantized = _cached_ternary_values(weight)
             grad_out_2d = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
-            grad_input = (grad_out_2d @ quantized).reshape_as(x)
+            # dX = dY @ Wq. Fold each ternary output-row scale into dY once,
+            # then use packed signs for an add/sub-only inner loop.
+            # The native path is CPU-only; unsupported cases keep dense fallback.
+            grad_input_native = None
+            if x.device.type == "cpu" and weight.device.type == "cpu":
+                packed, scales = _cached_packed_ternary_values(weight)
+                scaled_grad = (grad_out_2d.float() * scales.reshape(1, -1)).contiguous()
+                grad_input_native = call_ternary_linear_input_grad(
+                    scaled_grad, packed, int(weight.shape[1])
+                )
+            if grad_input_native is not None:
+                grad_input = grad_input_native.reshape_as(x).to(dtype=x.dtype)
+            else:
+                quantized = _cached_ternary_values(weight)
+                grad_input = (grad_out_2d.float() @ quantized.float()).reshape_as(x).to(dtype=x.dtype)
         if ctx.needs_input_grad[1]:
             grad_out_2d = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
             x_2d = x.reshape(-1, x.shape[-1]).contiguous()
