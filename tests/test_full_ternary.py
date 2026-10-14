@@ -329,3 +329,20 @@ def test_full_ternary_packed_expert_cache_obeys_inference_lru_limit(monkeypatch)
     assert hasattr(model.pool.experts[second_id], "_smaul_direct_ternary_cache")
     model._clear_direct_ternary_caches()
     model.pager.close()
+
+
+def test_full_ternary_stream_reuses_packed_shared_linear_weights(monkeypatch):
+    """Streaming decode packs unchanged trunk linears once, not once per token."""
+    monkeypatch.setenv("SMAUL_NATIVE", "1")
+    native.reset_counters()
+    model = SmaulBrainModel(_tiny_full_ternary_config())
+    prompt = torch.randint(0, 256, (1, 2))
+    _, states = model.forward_infer_stateful(prompt)
+    packed_count = native.COUNTERS["float_to_ternary_native"]
+    assert packed_count > 0
+
+    next_token = torch.randint(0, 256, (1, 1))
+    model.forward_infer_step(next_token, states)
+    assert native.COUNTERS["float_to_ternary_native"] == packed_count
+    model._clear_direct_ternary_caches()
+    model.pager.close()
