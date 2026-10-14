@@ -509,7 +509,10 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
             # depth applications already scale these grads through autograd;
             # any manual factor here would double-count them.
             _ver_before = int(getattr(rec, "version", 0))
-            opt.step_expert(rec, compute, 1.0, cfg.expert_lr * lr_scale)
+            opt.step_expert(
+                rec, compute, 1.0, cfg.expert_lr * lr_scale,
+                ternary_direct=cfg.full_ternary_qat,
+            )
             # Applied iff the version bumped: skipped updates (non-finite
             # grads, no grads) bump nothing and must not pose as stepped nor
             # evict good cache entries. Version-delta is unambiguous where
