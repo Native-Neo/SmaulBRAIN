@@ -117,3 +117,37 @@ extern "C" void smaul_ternary_linear_forward(
                             out_features, threads);
     }
 }
+
+
+// Input-gradient kernel for a ternary linear layer. The caller has already
+// multiplied each output-gradient column by its corresponding ternary row scale,
+// so the inner loop consists exclusively of signed additions/subtractions.
+// packed stores the forward weight [out_features, in_features], row-major.
+extern "C" void smaul_ternary_linear_input_grad(
+    const float* grad_scaled, const std::uint8_t* packed, float* grad_input,
+    std::size_t rows, std::size_t in_features, std::size_t out_features,
+    int threads
+) {
+    if (!grad_scaled || !packed || !grad_input || rows == 0 ||
+        in_features == 0 || out_features == 0) {
+        return;
+    }
+    const std::size_t outputs = rows * in_features;
+    parallel_for(outputs, threads, [&](std::size_t begin, std::size_t end) {
+        for (std::size_t cell = begin; cell < end; ++cell) {
+            const std::size_t row = cell / in_features;
+            const std::size_t in = cell % in_features;
+            float sum = 0.0f;
+            for (std::size_t out = 0; out < out_features; ++out) {
+                const std::uint8_t code = code_at(packed, out * in_features + in);
+                const float value = grad_scaled[row * out_features + out];
+                if (code == 1u) {
+                    sum += value;
+                } else if (code == 2u) {
+                    sum -= value;
+                }
+            }
+            grad_input[cell] = sum;
+        }
+    });
+}
