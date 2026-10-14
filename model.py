@@ -29,6 +29,7 @@ from paging import ExpertPager
 from recurrent import CausalByteConv, SharedRecurrentBlock
 from rmsnorm import RMSNorm
 from precision import enable_hybrid_fp8_linears
+from ternary import enable_full_ternary_qat, clear_ternary_qat_caches
 from routing import SparseRouter
 
 
@@ -87,6 +88,11 @@ class SmaulBrainModel(nn.Module):
                 trunk_mods.append(self.byte_conv.conv)
             for mod in trunk_mods:
                 mod.to(torch.bfloat16)
+        # Full ternary QAT is opt-in. It wraps every trainable model layer,
+        # including router/head, embeddings, byte convolution and RMSNorm gains.
+        # ExpertPool uses the existing custom ternary expert path separately.
+        if config.full_ternary_qat:
+            enable_full_ternary_qat(self)
         # One external leaf-weight dictionary per expert per train step.
         # Recurrent depth reuses these leaves, so autograd accumulates all
         # uses into one .grad tensor instead of retaining full weight copies.
@@ -115,7 +121,7 @@ class SmaulBrainModel(nn.Module):
         return leaves
 
     def _eval_provider(self, expert_id: str) -> dict[str, torch.Tensor]:
-        if not self.cfg.ternary_qat:
+        if not (self.cfg.ternary_qat or self.cfg.full_ternary_qat):
             return self.pager.provider(expert_id)
         rec = self.pool.experts.get(expert_id)
         if rec is None:
@@ -149,7 +155,7 @@ class SmaulBrainModel(nn.Module):
             y = self.pool.forward(
                 x, plan.top_ids, plan.top_weights, plan.dropped, prov,
                 step=step,
-                ternary_qat=(train and self.cfg.ternary_qat),
+                ternary_qat=(self.cfg.ternary_qat or self.cfg.full_ternary_qat),
             )
             if prof:
                 self._profile_times["expert_s"] += time.perf_counter() - started
@@ -358,7 +364,7 @@ class SmaulBrainModel(nn.Module):
         # The QAT cache is one same-shaped compute-dtype copy per leaf, reused
         # by every recurrent-depth invocation and checkpoint recomputation.
         ternary_qat_cache_bytes = (
-            expert_leaf_bytes if self.cfg.ternary_qat else 0
+            expert_leaf_bytes if (self.cfg.ternary_qat or self.cfg.full_ternary_qat) else 0
         )
         checkpoint_input_bytes = (
             batch_tokens * self.cfg.top_k * self.cfg.d_model
@@ -376,7 +382,7 @@ class SmaulBrainModel(nn.Module):
         # boolean masks; do not multiply this by depth or expert count.
         qat_projection_temp_bytes = (
             self.cfg.d_model * self.cfg.expert_hidden * 24
-            if self.cfg.ternary_qat else 0
+            if (self.cfg.ternary_qat or self.cfg.full_ternary_qat) else 0
         )
         # D2R warms at most ram_cache dequantized expert tensors; R2VR/D2VR
         # hold compute tensors in the VRAM cache (CPU-backed on CPU-only
@@ -492,6 +498,8 @@ class SmaulBrainModel(nn.Module):
                 "call take_expert_grads() or zero_grad() before running forward again"
             )
         self._last_step = step
+        if self.cfg.full_ternary_qat:
+            clear_ternary_qat_caches(self)
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
         # Scored positions: padding is not data and is excluded from the MoE
@@ -628,6 +636,8 @@ class SmaulBrainModel(nn.Module):
                 "16M-element head budget (logits [B,T,V] transient; chunk T)"
             )
         self._check_activation_budget(ids, training=False)
+        if self.cfg.full_ternary_qat:
+            clear_ternary_qat_caches(self)
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
         emb = self.embed(ids)
@@ -744,6 +754,8 @@ class SmaulBrainModel(nn.Module):
                 "16M-element head budget (chunk T)"
             )
         self._check_activation_budget(ids, training=False)
+        if self.cfg.full_ternary_qat:
+            clear_ternary_qat_caches(self)
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, _T = ids.shape
         # Fresh stream: reset conv carryover BEFORE convolving, so the prompt
