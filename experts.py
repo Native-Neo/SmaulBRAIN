@@ -20,7 +20,8 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from native import (call_ternary_backward_input, call_ternary_linear_forward,\n                     call_ternary_linear_backward_input)
+from native import (call_ternary_backward_input, call_ternary_linear_forward,
+                     call_ternary_linear_backward_input)
 from torch.utils.checkpoint import checkpoint
 
 from precision import FP8BlockTensor, dequantize_fp8_blockwise, quantize_fp8_blockwise
