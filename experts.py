@@ -85,8 +85,8 @@ def ternary_qat_weight(w: torch.Tensor, threshold_ratio: float = 0.7) -> torch.T
     """Per-output-row ternary QAT with a straight-through estimator.
 
     This helper is useful for inference and reference tests. Training uses
-    _TernaryQATLinear so the ternary matrix is temporary and is recomputed
-    during backward instead of being retained once per recurrent depth.
+    _TernaryQATLinear to keep latent weights and activations in its explicit
+    autograd save set; cached quantized values serve its ordinary matmul gradients.
     """
     quantized = _ternary_values(w, threshold_ratio)
     return quantized.detach() + (w - w.detach())
