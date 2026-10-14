@@ -1513,7 +1513,7 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
     # a checkpoint starts a fresh stream and fresh autograd leaf generation.
     if hasattr(model, "_conv_hist"):
         model._conv_hist = None
-    for attr in ("_leaves", "_ternary_eval_cache"):
+    for attr in ("_leaves", "_ternary_eval_cache", "_ternary_expert_grads"):
         cache = getattr(model, attr, None)
         if cache is not None:
             cache.clear()
