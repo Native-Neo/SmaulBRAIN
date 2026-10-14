@@ -180,13 +180,14 @@ The exact formats can change depending on the hardware and the part of the model
 python cli.py --dtype fp32 --ternary-qat train --steps 1 --batch 1
 ```
 
-This opt-in native path skips exact-zero weight entries when computing expert
-linear-layer input gradients. The straight-through estimator still computes
-dense, full-precision weight gradients; the optimizer is unchanged. Native
-dispatch is limited to non-empty, contiguous CPU FP32 matrices. BF16,
-accelerator, non-contiguous, and unsupported inputs use PyTorch's dense
-fallback. The native implementation is covered by a dispatch-and-gradient
-parity test and is built with baseline x86-64 flags.
+This opt-in native path skips contributions from exact-zero ternary weights
+when computing linear-layer input gradients. In expert-only mode this covers
+expert projections; full-model mode also uses it for the trunk, router, and
+output heads. The straight-through estimator still computes dense,
+full-precision weight gradients; the optimizer is unchanged. Native dispatch
+is CPU-only and accepts non-empty, contiguous FP32 scaled gradients and packed
+ternary codes. Unsupported inputs use PyTorch's dense fallback. The kernel is
+built with baseline x86-64 flags.
 
 ### Full-model ternary QAT (experimental)
 
@@ -202,11 +203,12 @@ remain trainable through a straight-through estimator. Activations, gradients,
 loss, recurrent state, and SmaulOpt remain FP32/BF16; this is **not** an
 all-ternary optimizer or a claim that all training arithmetic is addition-only.
 
-On CPU, the custom expert input-gradient kernel can fold row scales into the
-upstream gradient once and use packed `{-1, 0, +1}` signs for additions and
-subtractions. The weight-gradient calculation still uses dense matrix
-multiplication. On accelerators, operations unsupported by the native CPU
-kernel retain the PyTorch dense fallback, so ternary values alone do not
+On CPU, linear layers use packed ternary forward accumulation and a custom
+input-gradient kernel that folds row scales into the upstream gradient once,
+then accumulates with sign-coded additions/subtractions. Weight gradients still
+use dense matrix multiplication; the byte convolution also uses PyTorch's
+convolution kernel over ternary filter values. On accelerators, unsupported
+operations use PyTorch's dense fallback, so ternary values alone do not
 guarantee a faster GPU training run. The feature is opt-in and should be
 validated with the small correctness tests before any full-size benchmark.
 
