@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import time
+import threading
 
 import torch
 import torch.nn as nn
@@ -98,10 +99,33 @@ class SmaulBrainModel(nn.Module):
         # uses into one .grad tensor instead of retaining full weight copies.
         self._leaves: dict[str, dict[str, torch.Tensor]] = {}
         self._ternary_eval_cache: dict[str, tuple[tuple[int, int], dict[str, torch.Tensor]]] = {}
+        # Full-ternary expert gradients are captured directly by packed-weight
+        # autograd kernels; only gradient matrices are dense, never the weights.
+        self._ternary_expert_grads: dict[str, dict[str, torch.Tensor]] = {}
+        self._ternary_grad_lock = threading.Lock()
         self._last_step: int = 0
 
     # -- MoE wiring --
-    def _train_provider(self, expert_id: str) -> dict[str, torch.Tensor]:
+    def _accumulate_ternary_expert_grad(
+        self, expert_id: str, weight_name: str, grad: torch.Tensor
+    ) -> None:
+        """Accumulate STE gradients without retaining/materializing master weights."""
+        with self._ternary_grad_lock:
+            slots = self._ternary_expert_grads.setdefault(expert_id, {})
+            if weight_name in slots:
+                slots[weight_name].add_(grad)
+            else:
+                slots[weight_name] = grad.detach()
+
+    def _train_provider(self, expert_id: str):
+        if self.cfg.full_ternary_qat:
+            rec = self.pool.experts.get(expert_id)
+            if rec is None:
+                raise KeyError(f"expert {expert_id!r} is missing from the live pool")
+            compute_dtype = (torch.bfloat16 if self.cfg.dtype == "bf16"
+                             else torch.float32)
+            sink = self._accumulate_ternary_expert_grad if torch.is_grad_enabled() else None
+            return rec.direct_ternary_weights(compute_dtype, grad_sink=sink)
         base = self.pager.provider(expert_id)
         if not torch.is_grad_enabled():
             # The training dispatch applies QAT inside its custom linear op;
@@ -120,12 +144,14 @@ class SmaulBrainModel(nn.Module):
         # full copy per active expert per recurrent depth.
         return leaves
 
-    def _eval_provider(self, expert_id: str) -> dict[str, torch.Tensor]:
-        # In full-model mode, experts are ternarized by the custom linear
-        # during dispatch. Returning raw pager weights avoids a redundant
-        # whole-expert transformed copy in the eval cache.
+    def _eval_provider(self, expert_id: str):
         if self.cfg.full_ternary_qat:
-            return self.pager.provider(expert_id)
+            rec = self.pool.experts.get(expert_id)
+            if rec is None:
+                raise KeyError(f"expert {expert_id!r} is missing from the live pool")
+            compute_dtype = (torch.bfloat16 if self.cfg.dtype == "bf16"
+                             else torch.float32)
+            return rec.direct_ternary_weights(compute_dtype, grad_sink=None)
         if not self.cfg.ternary_qat:
             return self.pager.provider(expert_id)
         rec = self.pool.experts.get(expert_id)
@@ -188,6 +214,8 @@ class SmaulBrainModel(nn.Module):
                     else:
                         leaf.grad.zero_()
         self._leaves.clear()
+        with self._ternary_grad_lock:
+            self._ternary_expert_grads.clear()
 
     def take_expert_grads(self) -> dict[str, dict[str, torch.Tensor]]:
         """Collect accumulated per-expert leaf grads and clear the buffer.
@@ -208,6 +236,14 @@ class SmaulBrainModel(nn.Module):
                     leaf.grad = None
                 if grads:
                     agg[eid] = grads
+            with self._ternary_grad_lock:
+                for eid, packed_grads in self._ternary_expert_grads.items():
+                    target = agg.setdefault(eid, {})
+                    for name, grad in packed_grads.items():
+                        if name in target:
+                            target[name] = target[name] + grad.detach()
+                        else:
+                            target[name] = grad.detach()
             return agg
         finally:
             self.clear_expert_grads()
