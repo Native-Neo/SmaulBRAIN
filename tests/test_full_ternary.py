@@ -118,16 +118,13 @@ def test_full_ternary_qat_config_roundtrip_and_type_validation():
 def test_full_ternary_expert_forward_backward_never_calls_dense_dequantize(
     monkeypatch, paging_method,
 ):
-    def forbidden_dense(*_args, **_kwargs):
-        raise AssertionError("full_ternary_qat must not materialize dense ternary weight matrices")
-
-    monkeypatch.setattr(experts_module, "_cached_ternary_values", forbidden_dense)
-    monkeypatch.setattr(experts_module, "_cached_packed_ternary_values", forbidden_dense)
-    """No paging mode may route full ternary through dense expert dequantization."""
+    """No pager mode may fall back to dense FP8 decode or dense ternary weights."""
     def forbidden(*_args, **_kwargs):
-        raise AssertionError("full_ternary_qat must not dequantize an expert matrix")
+        raise AssertionError("full_ternary_qat must not materialize dense weight matrices")
 
     monkeypatch.setattr(ExpertRecord, "dequantize", forbidden)
+    monkeypatch.setattr(experts_module, "_cached_ternary_values", forbidden)
+    monkeypatch.setattr(experts_module, "_cached_packed_ternary_values", forbidden)
     monkeypatch.setenv("SMAUL_NATIVE", "1")
     native.reset_counters()
     model = SmaulBrainModel(_tiny_full_ternary_config(paging_method))
@@ -140,7 +137,7 @@ def test_full_ternary_expert_forward_backward_never_calls_dense_dequantize(
     assert grads
     assert native.COUNTERS["fp8_to_ternary_native"] >= 1
     assert native.COUNTERS["ternary_linear_forward_native"] >= 3
-
+    model.pager.close()
 
 def test_full_ternary_expert_optimizer_never_dense_dequantizes(monkeypatch):
     """The expert optimizer updates FP8 codes tile-by-tile with no dense weight decode."""
