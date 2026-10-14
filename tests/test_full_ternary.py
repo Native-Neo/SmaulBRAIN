@@ -13,8 +13,9 @@ from experts import ExpertRecord, make_expert, ternary_qat_weight
 from model import SmaulBrainModel
 import native
 import smaulopt as smaulopt_module
-from smaulopt import SmaulOpt
+from smaulopt import SmaulOpt, SmaulOptHParams
 from types import SimpleNamespace
+from copy import deepcopy
 from precision import HybridFP8Linear
 from rmsnorm import RMSNorm
 from ternary import (
@@ -153,3 +154,46 @@ def test_full_ternary_expert_optimizer_never_dense_dequantizes(monkeypatch):
         assert compute[name].grad is None
         assert torch.isfinite(record.weights_fp8[name].scales).all()
     assert record.version == 1
+
+
+def test_direct_no_dequant_optimizer_matches_fp8_reference_update(monkeypatch):
+    """The scalar updater must preserve SmaulOpt math within FP8 quantization."""
+    monkeypatch.setenv("SMAUL_NATIVE", "1")
+    torch.manual_seed(29)
+    direct_record = make_expert(
+        "expert_00007", d_model=8, expert_hidden=16, fp8_tile=8
+    )
+    reference_record = deepcopy(direct_record)
+    grads = {
+        "w_gate": torch.randn(16, 8).mul_(0.001).contiguous(),
+        "w_up": torch.randn(16, 8).mul_(0.001).contiguous(),
+        "w_down": torch.randn(8, 16).mul_(0.001).contiguous(),
+    }
+    direct_compute = {
+        name: SimpleNamespace(grad=grad.clone()) for name, grad in grads.items()
+    }
+    reference_compute = {
+        name: SimpleNamespace(grad=grad.clone()) for name, grad in grads.items()
+    }
+    hp = SmaulOptHParams(state_dtype="fp32")
+    direct_opt, reference_opt = SmaulOpt(hp), SmaulOpt(deepcopy(hp))
+    direct_opt.step_expert(
+        direct_record, direct_compute, 1.0, 0.02, ternary_direct=True
+    )
+    reference_opt.step_expert(
+        reference_record, reference_compute, 1.0, 0.02
+    )
+
+    from precision import dequantize_fp8_blockwise
+    for name in ("w_gate", "w_up", "w_down"):
+        direct = direct_record.weights_fp8[name]
+        reference = reference_record.weights_fp8[name]
+        direct_values = dequantize_fp8_blockwise(direct, dtype=torch.float32)
+        reference_values = dequantize_fp8_blockwise(reference, dtype=torch.float32)
+        assert torch.allclose(direct_values, reference_values, atol=2e-3, rtol=2e-3), name
+        for moment in ("m", "v_row", "v_col"):
+            assert torch.allclose(
+                direct_record.optim_state[name][moment],
+                reference_record.optim_state[name][moment],
+                atol=2e-6, rtol=2e-4,
+            ), f"{name}.{moment}"
