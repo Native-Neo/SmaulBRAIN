@@ -546,6 +546,20 @@ def test_ternary_input_grad_uses_packed_add_sub(force_native):
     assert native.COUNTERS["ternary_linear_input_grad_native"] == 1
 
 
+def test_float_to_packed_ternary_matches_reference_without_dense_output(force_native):
+    """Packing ordinary FP32/BF16 master weights must match ternary-QAT without dense Q."""
+    torch.manual_seed(101)
+    source = torch.randn(11, 37).contiguous()
+    for weight in (source, source.to(torch.bfloat16)):
+        expected_codes, expected_scales = _cached_packed_ternary_values(weight)
+        actual = native.call_float_to_packed_ternary(weight)
+        assert actual is not None
+        packed, scales = actual
+        assert torch.equal(packed, expected_codes)
+        assert torch.allclose(scales, expected_scales, atol=1e-6, rtol=1e-6)
+    assert native.COUNTERS["float_to_ternary_native"] == 2
+
+
 def test_fp8_to_packed_ternary_matches_reference_without_dense_output(force_native):
     """Direct trit conversion agrees with QAT reference for FP32 and BF16 semantics."""
     torch.manual_seed(2026)
