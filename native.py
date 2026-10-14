@@ -477,12 +477,16 @@ def _self_test() -> None:
         raise RuntimeError(f"low-memory FP8 optimizer self-test failed: status={opt_status}, activity={opt_activity[0]}")
 
     # Float-to-trit conversion consumes the original parameter directly.
-    float_src = torch.tensor([[2.0, -1.0, 0.0, 0.5]], dtype=torch.float32)
-    float_packed, float_scales = call_float_to_packed_ternary(float_src)
-    if float_packed is None or float_scales is None or float_packed.tolist() != [0x09] or abs(float_scales[0].item() - 1.5) > 1e-6:
+    float_src = (ctypes.c_float * 4)(2.0, -1.0, 0.0, 0.5)
+    float_packed = (ctypes.c_ubyte * 1)()
+    float_scales = (ctypes.c_float * 1)()
+    _libs["ternary_linear"].smaul_float_to_packed_ternary(
+        float_src, float_packed, float_scales, 1, 4, 0.7, 0
+    )
+    if float_packed[0] != 0x09 or abs(float_scales[0] - 1.5) > 1e-6:
         raise RuntimeError(
-            f"float-to-ternary self-test failed: codes={None if float_packed is None else float_packed.tolist()}, "
-            f"scales={None if float_scales is None else float_scales.tolist()}"
+            f"float-to-ternary self-test failed: codes={float_packed[0]:#x}, "
+            f"scale={float_scales[0]}"
         )
     # Direct FP8 clone update stays encoded and uses no dense weight buffer.
     clone_src = (ctypes.c_ubyte * 4)(0x38, 0xC0, 0x30, 0xB0)
