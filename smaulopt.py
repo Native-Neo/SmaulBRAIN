@@ -70,6 +70,9 @@ from dataclasses import dataclass
 
 import torch
 
+from native import call_fp8_factored_ternary_update
+import native
+
 from precision import (
     dequantize_fp8_blockwise,
     dequantize_fp8_row_block,
@@ -624,6 +627,77 @@ class SmaulOpt:
     def step_router(self, named_params: list[tuple[str, torch.Tensor]], router_lr: float) -> float:
         return self.step_dense(named_params, router_lr, self.router_state)
 
+    def _step_expert_no_dequant(
+        self, record, compute: dict, names: list[str],
+        scale: float, grad_scale: float, lr: float,
+    ) -> float:
+        """Update FP8 weights in place without ever creating a dense weight tensor."""
+        prepared = []
+        # Preflight every participating matrix/state before the first mutation.
+        # The direct path deliberately refuses a dense fallback if native code
+        # is disabled or a checkpoint has an unsupported full-v state layout.
+        if native.native_mode() == "off":
+            raise RuntimeError(
+                "full_ternary_qat no-dequant optimizer requires native kernels; "
+                "SMAUL_NATIVE=off is incompatible with this mode"
+            )
+        if not native.ensure_native():
+            status = native.status()
+            raise RuntimeError(
+                "full_ternary_qat no-dequant optimizer could not build native kernels: "
+                + str(status.get("build_failed") or "unknown build failure")
+            )
+        for name in names:
+            weight = record.weights_fp8[name]
+            grad = compute[name].grad
+            shape = tuple(weight.shape)
+            if (len(shape) != 2 or tuple(grad.shape) != shape
+                    or grad.device.type != "cpu"):
+                raise ValueError(
+                    f"no-dequant expert update requires a full CPU gradient matching {name} {shape}"
+                )
+            state = record.optim_state.get(name)
+            state, action = ensure_state(state, shape, self.hp)
+            if action == "init" or record.optim_state.get(name) is not state:
+                record.optim_state[name] = state
+            if not all(k in state for k in ("m", "v_row", "v_col")) or "v" in state:
+                raise ValueError(
+                    f"no-dequant expert update requires factored-v state for {name}"
+                )
+            if (tuple(state["m"].shape) != shape
+                    or tuple(state["v_row"].shape) != (shape[0], 1)
+                    or tuple(state["v_col"].shape) != (1, shape[1])):
+                raise ValueError(f"bad factored optimizer-state shape for {name}")
+            prepared.append((name, weight, grad.detach().float().contiguous(), state,
+                             int(state.get("step", 0)) + 1))
+
+        activity = 0.0
+        for name, weight, grad, state, next_step in prepared:
+            value = call_fp8_factored_ternary_update(
+                weight, grad, state, step=next_step,
+                beta_m=self.hp.beta_m, beta_v=self.hp.beta_v,
+                lr=lr * scale, wd=self.hp.wd, eps=self.hp.eps,
+                update_clip=self.hp.update_clip,
+                grad_multiplier=scale * grad_scale,
+            )
+            if value is None:
+                # Inputs were fully preflighted before any update. A kernel
+                # rejection here is an invariant violation, not a reason to
+                # silently fall back to dense dequantization.
+                raise RuntimeError(
+                    f"native no-dequant expert update refused {record.expert_id}.{name}; "
+                    "no dense FP32 fallback is permitted"
+                )
+            state["step"] = next_step
+            activity += value
+            compute[name].grad = None
+
+        record.version = getattr(record, "version", 0) + 1
+        record.grad_activity = (
+            0.9 * record.grad_activity + 0.1 * (activity / max(1, len(names)))
+        )
+        return record.grad_activity
+
     # -- expert-local (state lives on the record; weights written back to FP8) --
     def step_expert(
         self,
@@ -634,6 +708,7 @@ class SmaulOpt:
         row_range: tuple[int, int] | None = None,
         row_start: int | None = None,
         row_end: int | None = None,
+        ternary_direct: bool = False,
     ) -> float:
         """Apply grads to one expert and requantize its FP8 storage in place.
 
@@ -647,6 +722,9 @@ class SmaulOpt:
         optimizer state, bumps no version, touches no FP8 bytes, and
         preserves grads, so a retry with the same grads is bit-equivalent.
         Returns mean |update| as a gradient-activity signal (FP32 math).
+
+        ternary_direct=True switches to an in-place scalar FP8 optimizer
+        kernel: weights are never expanded to a dense FP32/BF16 tensor.
         """
 
         names = [n for n in ("w_gate", "w_up", "w_down") if n in compute and compute[n].grad is not None]
@@ -693,6 +771,12 @@ class SmaulOpt:
             # untouched for retry equivalence (mirrors step_dense).
             return 0.0
         scale = clip_scale(norm, self.hp.clip)
+        if ternary_direct:
+            if row_range is not None or row_start is not None or row_end is not None:
+                raise ValueError("ternary_direct optimizer updates require whole expert matrices")
+            return self._step_expert_no_dequant(
+                record, compute, names, scale, grad_scale, lr
+            )
         activity = 0.0
         tile = record.weights_fp8["w_gate"].tile
         if row_range is not None:
