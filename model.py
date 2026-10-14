@@ -121,7 +121,12 @@ class SmaulBrainModel(nn.Module):
         return leaves
 
     def _eval_provider(self, expert_id: str) -> dict[str, torch.Tensor]:
-        if not (self.cfg.ternary_qat or self.cfg.full_ternary_qat):
+        # In full-model mode, experts are ternarized by the custom linear
+        # during dispatch. Returning raw pager weights avoids a redundant
+        # whole-expert transformed copy in the eval cache.
+        if self.cfg.full_ternary_qat:
+            return self.pager.provider(expert_id)
+        if not self.cfg.ternary_qat:
             return self.pager.provider(expert_id)
         rec = self.pool.experts.get(expert_id)
         if rec is None:
