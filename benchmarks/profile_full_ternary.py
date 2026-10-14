@@ -83,7 +83,7 @@ def main() -> int:
     )
     print(
         "Profile shape: batch=2, context=1024, experts=64, top_k=8, "
-        "hidden=3328, depth=1..3, dtype=bf16, ternary_qat=true, "
+        "hidden=3328, depth=1..3, dtype=bf16, ternary_qat=true",
         flush=True,
     )
 
