@@ -157,6 +157,7 @@ def clear_ternary_qat_caches(module: nn.Module) -> None:
     """
     for parameter in module.parameters():
         for attribute in ("_smaul_ternary_qat_cache",
-                          "_smaul_packed_ternary_qat_cache"):
+                          "_smaul_packed_ternary_qat_cache",
+                          "_smaul_direct_packed_ternary_qat_cache"):
             if hasattr(parameter, attribute):
                 delattr(parameter, attribute)
