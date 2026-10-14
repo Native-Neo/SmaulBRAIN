@@ -45,6 +45,7 @@ import os
 import random
 import shutil
 import tempfile
+import warnings
 
 from checkpoint_paths import _jailed_path
 
@@ -1370,8 +1371,8 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         # Preserve the ternary execution wrapper after restoring its separately
         # serialized router tensors. A plain Linear has the same state-dict
         # keys but would silently bypass packed ternary execution on resume.
-        with __import__("warnings").catch_warnings():
-            __import__("warnings").simplefilter("ignore")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
             raw_proj = nn.Linear(
                 saved_cfg.d_model, len(eids), bias=old_proj.bias is not None
             ).to(device=dev, dtype=dt)
