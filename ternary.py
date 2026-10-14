@@ -88,7 +88,7 @@ class TernaryQATConv1d(nn.Module):
         weight_q = ternary_qat_weight(
             self.weight.reshape(self.out_channels, -1)
         ).reshape_as(self.weight)
-        bias_q = (ternary_qat_weight(self.bias.float().reshape(1, -1)).reshape(-1)
+        bias_q = (ternary_qat_weight(self.bias.float().reshape(1, -1)).reshape(-1).to(x.dtype)
                   if self.bias is not None else None)
         padding = self.padding
         if self.padding_mode != "zeros":
