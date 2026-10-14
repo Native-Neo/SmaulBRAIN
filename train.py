@@ -509,13 +509,21 @@ def train_step(model, opt, cfg, x: torch.Tensor, y: torch.Tensor, step: int,
             # depth applications already scale these grads through autograd;
             # any manual factor here would double-count them.
             _ver_before = int(getattr(rec, "version", 0))
-            opt.step_expert(rec, compute, 1.0, cfg.expert_lr * lr_scale)
+            opt.step_expert(
+                rec, compute, 1.0, cfg.expert_lr * lr_scale,
+                ternary_direct=cfg.full_ternary_qat,
+            )
             # Applied iff the version bumped: skipped updates (non-finite
             # grads, no grads) bump nothing and must not pose as stepped nor
             # evict good cache entries. Version-delta is unambiguous where
             # the EMA activity signal is not (EMA can be exactly 0.0).
             if int(getattr(rec, "version", 0)) != _ver_before:
                 model.pager.invalidate(eid)
+                if cfg.full_ternary_qat:
+                    # The native optimizer already dropped the record's packed
+                    # tensor; clear its LRU slot too so the tracker cannot keep
+                    # a phantom entry that reduces cache capacity after training.
+                    model._evict_direct_ternary_cache(eid)
                 stepped.append(eid)
             # The optimizer has consumed this expert's gradients; release
             # their final references before moving to the next expert.
@@ -704,6 +712,7 @@ def run_training(
             seed=seed + salt, k=count,
             fp8_tile=cfg.fp8_tile, max_experts=cfg.max_experts,
             optim_state=opt.router_state,
+            direct_no_dequant=cfg.full_ternary_qat,
         )
         for eid in new_ids:
             log_fn(f"[grow] step={step} new={eid} pool={len(model.pool)}")

@@ -901,6 +901,34 @@ blockwise E4M3 FP8 storage with per-tile FP32 scales; they use the existing
 expert-local paging and optimizer path. Correctness and training behavior are
 covered by `tests/test_hybrid_fp8.py` and `tests/test_precision.py`.
 
+### Full ternary QAT without dense expert dequantization
+
+Enable the experimental path with `--full-ternary-qat`. The expert runtime
+reads the stored E4M3 codes and FP32 block scales directly and creates 2-bit
+packed trits in a native CPU kernel. The FP8 values are inspected one scalar
+at a time to decide each trit; **no full FP32/BF16 expert weight matrix is
+materialized**. Shared linear layers also pack directly from their original
+master parameters without creating a same-size floating-point ternary matrix.
+Forward and input-gradient projections consume packed trits directly, and
+zero trits contribute nothing.
+
+The expert optimizer likewise updates/requantizes the stored FP8 codes
+in-place one tile at a time; it does not create a dense floating-point copy
+of an expert's weights. The STE weight gradients are still dense FP32 matrices,
+and optimizer momentum remains stored as BF16 by default. The shared trunk's
+master parameters/activations and ordinary loss/normalization arithmetic also
+remain floating point; this is not an integer-only training system.
+
+This direct no-dequant expert path is **CPU-only** and requires the native
+C++ toolchain supported by `native.py`. It intentionally raises an error if
+the packed forward, input-gradient, FP8 conversion, or direct optimizer kernel
+is unavailable rather than silently falling back to dense weight
+dequantization. Do not run it with `SMAUL_NATIVE=off`.
+
+The checkpoint continues storing the latent expert weights as blockwise FP8
+codes plus FP32 scales. Packed ternary matrices are a derived in-memory cache,
+rebuilt after each expert update/version change.
+
 ### What is `retention_harness.py`
 
 Standalone A/B continual-learning gauntlet (not imported by training):

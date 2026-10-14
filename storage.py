@@ -45,6 +45,7 @@ import os
 import random
 import shutil
 import tempfile
+import warnings
 
 from checkpoint_paths import _jailed_path
 
@@ -1357,6 +1358,7 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
 
     import torch.nn as nn
     from precision import HybridFP8Linear
+    from ternary import TernaryQATLinear, enable_full_ternary_qat
     new_experts: dict = {}
     new_order: list[str] = []
     for t, m in parts:
@@ -1365,7 +1367,18 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         new_order.append(rec.expert_id)
     old_proj = model.router.proj
     dev, dt = old_proj.weight.device, old_proj.weight.dtype
-    if isinstance(old_proj, HybridFP8Linear):
+    if saved_cfg.full_ternary_qat:
+        # Preserve the ternary execution wrapper after restoring its separately
+        # serialized router tensors. A plain Linear has the same state-dict
+        # keys but would silently bypass packed ternary execution on resume.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            raw_proj = nn.Linear(
+                saved_cfg.d_model, len(eids), bias=old_proj.bias is not None
+            ).to(device=dev, dtype=dt)
+        new_proj = TernaryQATLinear(raw_proj)
+        new_proj.out_dtype = getattr(old_proj, "out_dtype", dt)
+    elif isinstance(old_proj, HybridFP8Linear):
         # Preserve the execution class, not just the parameter tensors.
         # Replacing this layer with nn.Linear keeps state_dict parity but
         # silently disables the FP8 forward/backward policy after every load.
@@ -1414,6 +1427,11 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
             f"missing={sorted(unexpected_missing)}, "
             f"unexpected={sorted(incompatible.unexpected_keys)}"
         )
+    if saved_cfg.full_ternary_qat:
+        # Commit the architecture transform only after every checkpoint part
+        # has passed validation. A corrupt checkpoint must not leave a wrapper
+        # mutation behind on the caller's live model.
+        enable_full_ternary_qat(model)
     model.pool.experts = new_experts
     model.pool.order = new_order
     model.pool._next_id = int(next_id)
@@ -1488,15 +1506,22 @@ def load_model(ckpt_dir: str, model, opt) -> dict:
         buf = getattr(model.pager, attr, None)
         if buf is not None:
             buf.clear()
-    if model.cfg.paging_method == "R2VR":
+    if model.cfg.paging_method == "R2VR" and not model.cfg.full_ternary_qat:
+        # Packed ternary providers read encoded FP8 records directly. Warming
+        # the ordinary pager here would dequantize every expert on resume.
         model.pager.warm_ram()
     # These are deliberately runtime-only and never checkpointed. Restoring
     # a checkpoint starts a fresh stream and fresh autograd leaf generation.
     if hasattr(model, "_conv_hist"):
         model._conv_hist = None
-    for attr in ("_leaves", "_ternary_eval_cache"):
+    for attr in ("_leaves", "_ternary_eval_cache", "_ternary_expert_grads", "_direct_ternary_cached_ids", "_direct_ternary_cache_order"):
         cache = getattr(model, attr, None)
         if cache is not None:
             cache.clear()
+    if model.cfg.full_ternary_qat:
+        # Loading copies new master parameters into existing objects; packed
+        # trunk caches are derived data and must never survive a checkpoint swap.
+        from ternary import clear_ternary_qat_caches
+        clear_ternary_qat_caches(model)
     model._resume_step = int(step)
     return manifest

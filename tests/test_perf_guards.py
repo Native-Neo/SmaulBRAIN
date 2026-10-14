@@ -16,28 +16,27 @@ import torch
 import pytest
 
 
-def test_j1_cube_guard_counts_both_cubes():
-    """B=2 H=4 Dh=128 must trip (or require chunking) once both cubes count.
+def test_j1_chunk_score_guard_counts_both_score_blocks():
+    """Reject only when the actual quadratic score working set exceeds budget.
 
-    Per-chunk working set is 2*B*H*Tc*Dh^2*4B (updates + prefix_S).
-    B=2,H=4,Dh=128 -> 1MB per Tc; Tc=320 (T=320, chunk 512) is ~320MB and
-    must refuse, while Tc=128 chunks (~128MB) still pass.
+    linear_attn_forward builds two [B,H,Tc,Tc] score-sized blocks, not the
+    old per-token [Tc,Dh,Dh] state cube. With B=2,H=4,Tc=2049 the current
+    guard estimate is just over 256 MiB. Smaller chunks should still run.
     """
     from linear_attention import linear_attn_forward
 
-    B, H, Dh, T = 2, 4, 128, 320
+    B, H, Dh, T = 2, 4, 128, 2049
     torch.manual_seed(0)
     q = torch.randn(B, H, T, Dh)
     k = torch.randn(B, H, T, Dh)
     v = torch.randn(B, H, T, Dh)
-    import pytest
 
-    with pytest.raises(ValueError, match="256MB cube budget"):
-        linear_attn_forward(q, k, v, chunk_size=512)
-    # Chunked path stays under budget and runs.
-    out, _ = linear_attn_forward(q, k, v, chunk_size=128)
-    assert out.shape == (B, T, H, Dh)
+    with pytest.raises(ValueError, match="256MB working-set budget"):
+        linear_attn_forward(q, k, v, chunk_size=4096)
 
+    out, _ = linear_attn_forward(q[:, :, :64], k[:, :, :64], v[:, :, :64],
+                                 chunk_size=128)
+    assert out.shape == (B, 64, H, Dh)
 
 def test_j2_width_aware_qkv_budget():
     """rough_state_bytes(B,T,d,D) refuses wide qkv before the matmul."""

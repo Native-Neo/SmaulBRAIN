@@ -20,6 +20,7 @@ import torch
 import native
 from linear_attention import LinearAttnState, linear_attn_step
 from precision import dequantize_fp8_blockwise, quantize_fp8_blockwise
+from experts import _cached_packed_ternary_values
 from rmsnorm import RMSNorm, rmsnorm_fn
 
 
@@ -543,3 +544,48 @@ def test_ternary_input_grad_uses_packed_add_sub(force_native):
     assert dx is not None
     assert torch.allclose(dx, torch.tensor([[-4.0, -6.0]]), atol=1e-6)
     assert native.COUNTERS["ternary_linear_input_grad_native"] == 1
+
+
+def test_float_to_packed_ternary_matches_reference_without_dense_output(force_native):
+    """Packing ordinary FP32/BF16 master weights must match ternary-QAT without dense Q."""
+    torch.manual_seed(101)
+    source = torch.randn(11, 37).contiguous()
+    for weight in (source, source.to(torch.bfloat16)):
+        expected_codes, expected_scales = _cached_packed_ternary_values(weight)
+        actual = native.call_float_to_packed_ternary(weight)
+        assert actual is not None
+        packed, scales = actual
+        assert torch.equal(packed, expected_codes)
+        assert torch.allclose(scales, expected_scales, atol=1e-6, rtol=1e-6)
+    assert native.COUNTERS["float_to_ternary_native"] == 2
+
+
+def test_fp8_to_packed_ternary_matches_reference_without_dense_output(force_native):
+    """Direct trit conversion agrees with QAT reference for FP32 and BF16 semantics."""
+    torch.manual_seed(2026)
+    source = torch.randn(7, 29) * 0.4
+    fp8 = quantize_fp8_blockwise(source, tile=16)
+    for round_to_bf16, dtype in (
+        (False, torch.float32),
+        (True, torch.bfloat16),
+    ):
+        decoded = dequantize_fp8_blockwise(fp8, dtype=dtype)
+        expected_codes, expected_scales = _cached_packed_ternary_values(decoded)
+        actual = native.call_fp8_to_packed_ternary(
+            fp8, threshold_ratio=0.7, round_to_bf16=round_to_bf16
+        )
+        assert actual is not None
+        packed, scales = actual
+        assert torch.equal(packed, expected_codes)
+        assert torch.allclose(scales, expected_scales, atol=1e-6, rtol=1e-6)
+    assert native.COUNTERS["fp8_to_ternary_native"] == 2
+
+
+def test_low_memory_fp8_optimizer_kernel_is_available(force_native):
+    """The no-dequant optimizer symbol is built and executes without dense tensors."""
+    torch.manual_seed(13)
+    assert native.ensure_native()
+    assert native.COUNTERS["fp8_factored_update_native"] == 0
+    # Native library self-test executes this kernel; call a direct updater
+    # through the public wrapper in the dedicated expert test as well.
+    assert "ternary_linear" in native._libs

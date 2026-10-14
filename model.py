@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import math
 import time
+import threading
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -76,7 +78,9 @@ class SmaulBrainModel(nn.Module):
                                  vram_cache=config.vram_cache,
                                  compute_dtype=(torch.bfloat16 if config.dtype == "bf16"
                                                 else torch.float32))
-        if config.paging_method == "R2VR":
+        if config.paging_method == "R2VR" and not config.full_ternary_qat:
+            # Full ternary reads the stored FP8 code stream directly. Warming
+            # the normal pager would materialize every expert as dense BF16/FP32.
             self.pager.warm_ram()
         # Trunk linears/embeddings run in the compute dtype (precision policy:
         # BF16 activations; RMSNorm weights intentionally stay FP32).
@@ -98,10 +102,85 @@ class SmaulBrainModel(nn.Module):
         # uses into one .grad tensor instead of retaining full weight copies.
         self._leaves: dict[str, dict[str, torch.Tensor]] = {}
         self._ternary_eval_cache: dict[str, tuple[tuple[int, int], dict[str, torch.Tensor]]] = {}
+        # Full-ternary expert gradients are captured directly by packed-weight
+        # autograd kernels; only gradient matrices are dense, never the weights.
+        self._ternary_expert_grads: dict[str, dict[str, torch.Tensor]] = {}
+        self._ternary_grad_lock = threading.Lock()
+        # LRU tracks persistent inference caches. Training clears this cache
+        # per step and raises its limit to the union of possible active experts
+        # so recurrent depth/checkpoint recomputation reuses each packed matrix.
+        self._direct_ternary_cached_ids: set[str] = set()
+        self._direct_ternary_cache_order: OrderedDict[str, None] = OrderedDict()
+        self._direct_ternary_cache_limit = max(1, int(config.ram_cache))
         self._last_step: int = 0
 
+    def _evict_direct_ternary_cache(self, expert_id: str) -> None:
+        self._direct_ternary_cache_order.pop(expert_id, None)
+        self._direct_ternary_cached_ids.discard(expert_id)
+        rec = self.pool.experts.get(expert_id)
+        if rec is not None and hasattr(rec, "_smaul_direct_ternary_cache"):
+            delattr(rec, "_smaul_direct_ternary_cache")
+
+    def _prepare_direct_ternary_cache(self, expert_id: str) -> None:
+        """Make room before conversion, preserving recently-used packed weights."""
+        if expert_id in self._direct_ternary_cache_order:
+            self._direct_ternary_cache_order.move_to_end(expert_id)
+            return
+        while len(self._direct_ternary_cache_order) >= self._direct_ternary_cache_limit:
+            oldest = next(iter(self._direct_ternary_cache_order))
+            self._evict_direct_ternary_cache(oldest)
+
+    def _remember_direct_ternary_cache(self, expert_id: str) -> None:
+        self._direct_ternary_cached_ids.add(expert_id)
+        self._direct_ternary_cache_order[expert_id] = None
+        self._direct_ternary_cache_order.move_to_end(expert_id)
+
+    def _trim_direct_ternary_caches(self) -> None:
+        while len(self._direct_ternary_cache_order) > self._direct_ternary_cache_limit:
+            oldest = next(iter(self._direct_ternary_cache_order))
+            self._evict_direct_ternary_cache(oldest)
+
+    def _clear_direct_ternary_caches(self) -> None:
+        """Release all record-held packed matrices without touching live FP8 weights."""
+        for expert_id in list(self._direct_ternary_cache_order):
+            self._evict_direct_ternary_cache(expert_id)
+        # Defensive cleanup if a caller/test left the tracking structures apart.
+        for expert_id in list(self._direct_ternary_cached_ids):
+            self._evict_direct_ternary_cache(expert_id)
+
+    def _direct_ternary_weights(self, expert_id: str, rec, compute_dtype, grad_sink):
+        self._prepare_direct_ternary_cache(expert_id)
+        try:
+            weights = rec.direct_ternary_weights(compute_dtype, grad_sink=grad_sink)
+        except Exception:
+            if not hasattr(rec, "_smaul_direct_ternary_cache"):
+                self._evict_direct_ternary_cache(expert_id)
+            raise
+        if expert_id not in self._direct_ternary_cache_order:
+            self._remember_direct_ternary_cache(expert_id)
+        return weights
+
     # -- MoE wiring --
-    def _train_provider(self, expert_id: str) -> dict[str, torch.Tensor]:
+    def _accumulate_ternary_expert_grad(
+        self, expert_id: str, weight_name: str, grad: torch.Tensor
+    ) -> None:
+        """Accumulate STE gradients without retaining/materializing master weights."""
+        with self._ternary_grad_lock:
+            slots = self._ternary_expert_grads.setdefault(expert_id, {})
+            if weight_name in slots:
+                slots[weight_name].add_(grad)
+            else:
+                slots[weight_name] = grad.detach()
+
+    def _train_provider(self, expert_id: str):
+        if self.cfg.full_ternary_qat:
+            rec = self.pool.experts.get(expert_id)
+            if rec is None:
+                raise KeyError(f"expert {expert_id!r} is missing from the live pool")
+            compute_dtype = (torch.bfloat16 if self.cfg.dtype == "bf16"
+                             else torch.float32)
+            sink = self._accumulate_ternary_expert_grad if torch.is_grad_enabled() else None
+            return self._direct_ternary_weights(expert_id, rec, compute_dtype, sink)
         base = self.pager.provider(expert_id)
         if not torch.is_grad_enabled():
             # The training dispatch applies QAT inside its custom linear op;
@@ -120,12 +199,16 @@ class SmaulBrainModel(nn.Module):
         # full copy per active expert per recurrent depth.
         return leaves
 
-    def _eval_provider(self, expert_id: str) -> dict[str, torch.Tensor]:
-        # In full-model mode, experts are ternarized by the custom linear
-        # during dispatch. Returning raw pager weights avoids a redundant
-        # whole-expert transformed copy in the eval cache.
+    def _eval_provider(self, expert_id: str):
         if self.cfg.full_ternary_qat:
-            return self.pager.provider(expert_id)
+            rec = self.pool.experts.get(expert_id)
+            if rec is None:
+                raise KeyError(f"expert {expert_id!r} is missing from the live pool")
+            compute_dtype = (torch.bfloat16 if self.cfg.dtype == "bf16"
+                             else torch.float32)
+            return self._direct_ternary_weights(
+                expert_id, rec, compute_dtype, grad_sink=None
+            )
         if not self.cfg.ternary_qat:
             return self.pager.provider(expert_id)
         rec = self.pool.experts.get(expert_id)
@@ -188,6 +271,8 @@ class SmaulBrainModel(nn.Module):
                     else:
                         leaf.grad.zero_()
         self._leaves.clear()
+        with self._ternary_grad_lock:
+            self._ternary_expert_grads.clear()
 
     def take_expert_grads(self) -> dict[str, dict[str, torch.Tensor]]:
         """Collect accumulated per-expert leaf grads and clear the buffer.
@@ -208,6 +293,14 @@ class SmaulBrainModel(nn.Module):
                     leaf.grad = None
                 if grads:
                     agg[eid] = grads
+            with self._ternary_grad_lock:
+                for eid, packed_grads in self._ternary_expert_grads.items():
+                    target = agg.setdefault(eid, {})
+                    for name, grad in packed_grads.items():
+                        if name in target:
+                            target[name] = target[name] + grad.detach()
+                        else:
+                            target[name] = grad.detach()
             return agg
         finally:
             self.clear_expert_grads()
@@ -322,11 +415,11 @@ class SmaulBrainModel(nn.Module):
         """Guard retained activations and available memory before training.
 
         The 256 MiB activation estimate covers retained hidden/logit/CE tensors
-        and FP32 attention states. The separate working-set check budgets leaf
-        weights and gradients for potentially active experts, checkpoint inputs,
-        one expert's SwiGLU/QAT temporary peak, a cold-page dequantization peak,
-        and the pager's maximum compute-weight cache. FP8 storage and optimizer
-        state are already resident when this method runs.
+        and FP32 attention states. The separate working-set check budgets the
+        actual active-expert gradient representation, checkpoint inputs, SwiGLU
+        temporaries, and only the dense leaf/pager/dequant buffers used by the
+        selected execution mode. FP8 storage and optimizer state are already
+        resident when this method runs.
         """
         batch_tokens = ids.shape[0] * ids.shape[1]
         dtype_bytes = 2 if self.cfg.dtype == "bf16" else 4
@@ -355,22 +448,45 @@ class SmaulBrainModel(nn.Module):
         if not training:
             return
 
-        # Expert leaves are materialized once per active expert, not once per
-        # recurrent depth. Bound the worst-case leaf working set and account
-        # for checkpoint inputs (large SwiGLU intermediates are recomputed).
-        # Ternary QAT now caches one quantized compute-dtype matrix per leaf
-        # until backward/step cleanup; budget that additional copy explicitly.
-        # FP8 weights and optimizer state are already resident by this point.
-        active_upper = min(self.cfg.num_experts, batch_tokens * self.cfg.top_k)
-        expert_params = 3 * self.cfg.d_model * self.cfg.expert_hidden
-        expert_leaf_bytes = active_upper * expert_params * dtype_bytes
-        # Autograd retains a same-shaped, same-dtype gradient for each leaf.
-        expert_grad_bytes = expert_leaf_bytes
-        # The QAT cache is one same-shaped compute-dtype copy per leaf, reused
-        # by every recurrent-depth invocation and checkpoint recomputation.
-        ternary_qat_cache_bytes = (
-            expert_leaf_bytes if (self.cfg.ternary_qat or self.cfg.full_ternary_qat) else 0
+        # At most active_upper experts can be addressed by this batch. In
+        # ordinary mode the pager yields dense compute weights and training
+        # makes one dense leaf per active expert; full ternary instead reads
+        # FP8 storage straight into packed trits and creates no dense leaves.
+        # The union is across every recurrent depth: each depth routes the
+        # whole batch again and may touch a different expert set.
+        active_upper = min(
+            self.cfg.num_experts,
+            batch_tokens * self.cfg.top_k * self.cfg.max_depth,
         )
+        expert_params = 3 * self.cfg.d_model * self.cfg.expert_hidden
+        direct_ternary = self.cfg.full_ternary_qat
+        expert_leaf_bytes = (
+            0 if direct_ternary else active_upper * expert_params * dtype_bytes
+        )
+        # Direct ternary STE captures only gradients, still dense FP32. The
+        # ordinary path stores leaf gradients in its compute dtype.
+        expert_grad_bytes = active_upper * expert_params * (
+            4 if direct_ternary else dtype_bytes
+        )
+        if direct_ternary:
+            # Per active expert: four trits per code byte plus one FP32 row
+            # scale per output row. Matrices are packed separately, so round
+            # each matrix's byte count up independently.
+            d, h = self.cfg.d_model, self.cfg.expert_hidden
+            packed_codes = (
+                (h * d + 3) // 4
+                + (h * d + 3) // 4
+                + (d * h + 3) // 4
+            )
+            row_scale_bytes = 4 * (2 * h + d)
+            ternary_qat_cache_bytes = active_upper * (
+                packed_codes + row_scale_bytes
+            )
+        elif self.cfg.ternary_qat:
+            # Expert-only QAT retains one compute-dtype quantized matrix copy.
+            ternary_qat_cache_bytes = expert_leaf_bytes
+        else:
+            ternary_qat_cache_bytes = 0
         checkpoint_input_bytes = (
             batch_tokens * self.cfg.top_k * self.cfg.d_model
             * self.cfg.max_depth * dtype_bytes
@@ -382,12 +498,12 @@ class SmaulBrainModel(nn.Module):
         expert_mlp_temp_bytes = (
             4 * batch_tokens * self.cfg.expert_hidden * dtype_bytes
         )
-        # Ternary QAT materializes one projection at a time and recomputes it
-        # during backward. Budget a conservative peak for its FP32 values and
-        # boolean masks; do not multiply this by depth or expert count.
+        # Expert-only QAT still forms a dense ternary projection temporary.
+        # Full-ternary mode uses packed codes for both expert and shared
+        # linear projections, so do not reserve the former full-matrix buffer.
         qat_projection_temp_bytes = (
             self.cfg.d_model * self.cfg.expert_hidden * 24
-            if (self.cfg.ternary_qat or self.cfg.full_ternary_qat) else 0
+            if self.cfg.ternary_qat and not direct_ternary else 0
         )
         # D2R warms at most ram_cache dequantized expert tensors; R2VR/D2VR
         # hold compute tensors in the VRAM cache (CPU-backed on CPU-only
@@ -402,13 +518,15 @@ class SmaulBrainModel(nn.Module):
             self.cfg.paging_method == "D2R" or not torch.cuda.is_available()
         )
         pager_cache_bytes = (
-            cache_slots * expert_params * dtype_bytes if cache_uses_host_ram else 0
+            cache_slots * expert_params * dtype_bytes
+            if cache_uses_host_ram and not direct_ternary else 0
         )
-        # A cold page briefly holds FP32 dequantized weights and the converted
-        # compute-dtype tensors together. This host-side load peak happens
-        # before that expert's SwiGLU work, so take the maximum rather than
-        # add mutually exclusive loading and projection peaks.
-        expert_dequant_temp_bytes = expert_params * (4 + dtype_bytes)
+        # Normal paging briefly holds FP32-dequantized and compute-dtype
+        # expert weights together. Direct ternary reads encoded FP8 scalars
+        # into a packed trit cache, never a full dense weight temporary.
+        expert_dequant_temp_bytes = (
+            expert_params * (4 + dtype_bytes) if not direct_ternary else 0
+        )
         expert_peak_temp_bytes = max(
             expert_dequant_temp_bytes,
             expert_mlp_temp_bytes + qat_projection_temp_bytes,
@@ -466,6 +584,11 @@ class SmaulBrainModel(nn.Module):
             with torch.inference_mode():
                 return self.forward(ids, targets=None, step=step)
         self._check_ids(ids, "ids")
+        if self.cfg.full_ternary_qat and self._ternary_expert_grads:
+            raise RuntimeError(
+                "unconsumed packed-expert gradients from prior forward; "
+                "call take_expert_grads() or zero_grad() before running forward again"
+            )
         if targets is not None:
             self._check_ids(targets, "targets")
             if targets.ndim != 2:
@@ -496,6 +619,23 @@ class SmaulBrainModel(nn.Module):
                 f"B*T*V={ids.shape[0] * ids.shape[1] * self.cfg.vocab_size} exceeds "
                 "16M-element head budget (logits [B,T,V] transient; chunk T)"
             )
+        if self.cfg.full_ternary_qat:
+            batch_tokens = int(ids.shape[0] * ids.shape[1])
+            active_upper = min(
+                self.cfg.num_experts,
+                batch_tokens * self.cfg.top_k * self.cfg.max_depth,
+            )
+            if targets is not None:
+                # Release prior-step caches before the available-memory guard
+                # and retain this step's complete expert union through backward.
+                self._clear_direct_ternary_caches()
+                self._direct_ternary_cache_limit = max(1, active_upper)
+            else:
+                # Inference is not checkpointed, so evicting a trit matrix and
+                # rebuilding it later is safe. Honor the configured cache cap
+                # even for a large input chunk that can route to every expert.
+                self._direct_ternary_cache_limit = max(1, int(self.cfg.ram_cache))
+                self._trim_direct_ternary_caches()
         self._check_activation_budget(ids, training=targets is not None)
         if self._leaves:
             raise RuntimeError(
@@ -642,7 +782,19 @@ class SmaulBrainModel(nn.Module):
             )
         self._check_activation_budget(ids, training=False)
         if self.cfg.full_ternary_qat:
-            clear_ternary_qat_caches(self)
+            active_upper = min(
+                self.cfg.num_experts,
+                int(ids.shape[0] * ids.shape[1]) * self.cfg.top_k * self.cfg.max_depth,
+            )
+            self._direct_ternary_cache_limit = max(
+                1, int(self.cfg.ram_cache), active_upper
+            )
+            self._trim_direct_ternary_caches()
+            # Inference weights are immutable during a stream. Keep the
+            # shared trunk's packed linear caches across token steps, clearing
+            # them only at the beginning of a fresh stream.
+            if attn_states is None:
+                clear_ternary_qat_caches(self)
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, T = ids.shape
         emb = self.embed(ids)
@@ -758,15 +910,20 @@ class SmaulBrainModel(nn.Module):
                 f"B*T*V={ids.shape[0] * ids.shape[1] * self.cfg.vocab_size} exceeds "
                 "16M-element head budget (chunk T)"
             )
-        self._check_activation_budget(ids, training=False)
         if self.cfg.full_ternary_qat:
-            clear_ternary_qat_caches(self)
+            # Enforce the inference LRU limit before the memory guard, not
+            # after a potentially expensive activation allocation.
+            self._direct_ternary_cache_limit = max(1, int(self.cfg.ram_cache))
+            self._trim_direct_ternary_caches()
+        self._check_activation_budget(ids, training=False)
         compute = torch.bfloat16 if self.cfg.dtype == "bf16" else torch.float32
         B, _T = ids.shape
-        # Fresh stream: reset conv carryover BEFORE convolving, so the prompt
-        # never mixes with a previous stream's tail (and the prompt tail is
-        # retained for subsequent single-step calls instead of being dropped).
+        # Fresh stream: reset derived packed weights and conv carryover. Reusing
+        # supplied attention states means we are continuing the same stream,
+        # so keep packed shared-linear weights cached between tokens.
         if attn_states is None:
+            if self.cfg.full_ternary_qat:
+                clear_ternary_qat_caches(self)
             attn_states = self.new_infer_state(B)
         emb = self.embed(ids)
         if self.byte_conv is not None:
