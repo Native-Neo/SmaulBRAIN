@@ -37,6 +37,10 @@ concurrency:
 
 jobs:
   profile-full-cpu:
+    # This experiment uses the tiny correctness tests; do not start the
+    # full 2x1024-token/64-expert training profile on every code push here.
+    # Keep the full profile enabled for main and other branches.
+    if: github.ref != 'refs/heads/experiment/full-ternary-qat' && github.head_ref != 'experiment/full-ternary-qat'
     name: Full (512-wide, 64 experts) ternary-QAT training profile
     runs-on: ubuntu-latest
     timeout-minutes: 60
