@@ -1,0 +1,61 @@
+name: Fast full-ternary-QAT checks
+
+on:
+  push:
+    branches: ["experiment/full-ternary-qat"]
+    paths:
+      - "ternary.py"
+      - "experts.py"
+      - "model.py"
+      - "native.py"
+      - "config.py"
+      - "cli.py"
+      - "kernels_cpp/**"
+      - "tests/test_native.py"
+      - "tests/test_full_ternary.py"
+      - "tests/test_expert_memory.py"
+      - ".github/workflows/test-full-ternary-fast.yml"
+  pull_request:
+    paths:
+      - "ternary.py"
+      - "experts.py"
+      - "model.py"
+      - "native.py"
+      - "config.py"
+      - "cli.py"
+      - "kernels_cpp/**"
+      - "tests/test_native.py"
+      - "tests/test_full_ternary.py"
+      - "tests/test_expert_memory.py"
+      - ".github/workflows/test-full-ternary-fast.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  fast-ternary-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+      - name: Compile changed Python modules
+        run: python -m py_compile ternary.py experts.py model.py native.py config.py cli.py
+      - name: Run focused native and full-model ternary tests
+        env:
+          PYTHONFAULTHANDLER: "1"
+        run: >-
+          python -m pytest -q
+          tests/test_native.py::test_ternary_input_grad_uses_packed_add_sub
+          tests/test_full_ternary.py
+          tests/test_expert_memory.py::test_ternary_qat_custom_linear_preserves_ste_gradients_without_saving_cache
+          tests/test_expert_memory.py::test_ternary_qat_checkpointed_swiglu_preserves_gradients
