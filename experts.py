@@ -220,8 +220,6 @@ class _TernaryQATLinear(torch.autograd.Function):
                 if grad_input is None:
                     grad_input = grad_out_2d @ quantized
             grad_input = grad_input.reshape_as(x)
-        elif ctx.needs_input_grad[1]:
-            # For STE dW only, the quantized matrix is unnecessary.
         if ctx.needs_input_grad[1]:
             grad_weight = grad_out_2d.transpose(0, 1) @ x_2d
         return grad_input, grad_weight, None
