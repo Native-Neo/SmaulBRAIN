@@ -33,7 +33,7 @@ permissions:
 
 concurrency:
   group: full-ternary-profile-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   profile-full-cpu:
