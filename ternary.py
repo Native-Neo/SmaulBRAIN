@@ -30,7 +30,7 @@ class TernaryQATLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # HybridFP8Linear used FP32 arithmetic around low-precision operands.
         # Match that contract here so weight/activation dtypes always agree.
-        y = _TernaryQATLinear.apply(x.float(), self.weight.float())
+        y = _TernaryQATLinear.apply(x.float(), self.weight.float(), True)
         if self.bias is not None:
             bias_q = ternary_qat_weight(self.bias.float().reshape(1, -1)).reshape(-1)
             y = y + bias_q
