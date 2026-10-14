@@ -26,7 +26,7 @@ from ternary import (
 )
 
 
-def _tiny_full_ternary_config():
+def _tiny_full_ternary_config(paging_method="D2R"):
     return SmaulBrainConfig(
         d_model=16,
         n_heads=4,
@@ -37,6 +37,7 @@ def _tiny_full_ternary_config():
         max_depth=1,
         context_length=4,
         dtype="fp32",
+        paging_method=paging_method,
         use_byte_conv=True,
         full_ternary_qat=True,
     )
@@ -109,15 +110,18 @@ def test_full_ternary_qat_config_roundtrip_and_type_validation():
         SmaulBrainConfig.from_dict({"full_ternary_qat": "yes"})
 
 
-def test_full_ternary_expert_forward_backward_never_calls_dense_dequantize(monkeypatch):
-    """Full ternary must fail the test if the old FP8->dense expert path is reached."""
+@pytest.mark.parametrize("paging_method", ["D2R", "R2VR", "D2VR"])
+def test_full_ternary_expert_forward_backward_never_calls_dense_dequantize(
+    monkeypatch, paging_method,
+):
+    """No paging mode may route full ternary through dense expert dequantization."""
     def forbidden(*_args, **_kwargs):
         raise AssertionError("full_ternary_qat must not dequantize an expert matrix")
 
     monkeypatch.setattr(ExpertRecord, "dequantize", forbidden)
     monkeypatch.setenv("SMAUL_NATIVE", "1")
     native.reset_counters()
-    model = SmaulBrainModel(_tiny_full_ternary_config())
+    model = SmaulBrainModel(_tiny_full_ternary_config(paging_method))
     ids = torch.randint(0, 256, (1, 4))
     targets = torch.randint(0, 256, (1, 4))
     result = model(ids, targets, step=0)
