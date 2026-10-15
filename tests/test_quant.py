@@ -241,3 +241,23 @@ def test_fp8_weight_cache_reuses_and_selectively_invalidates_quantization():
     before = m.fp8.builds
     m.forward(toks)
     assert m.fp8.builds == before + 1
+
+@pytest.mark.parametrize(("tokens", "width"), [(0, 64), (1, 7), (33, 32), (64, 512), (19, 1000)])
+def test_native_recurrent_scan_matches_numpy(tokens, width):
+    if tokens and not Q.prepare_ternary_backend():
+        pytest.skip("native C++ compiler/backend unavailable")
+    rng = np.random.default_rng(809 + tokens + width)
+    kv = rng.standard_normal((tokens, width)).astype(np.float32)
+    alpha = rng.uniform(0.7, 0.999, size=width).astype(np.float32)
+    initial = rng.standard_normal(width).astype(np.float32)
+    state = initial.copy()
+    expected = np.empty_like(kv)
+    for t in range(tokens):
+        state = alpha * state + kv[t]
+        expected[t] = state
+    final_state = initial.copy()
+    actual = np.empty_like(kv)
+    assert Q.recurrent_scan(kv, alpha, final_state, actual)
+    assert np.allclose(actual, expected, rtol=1e-6, atol=1e-6)
+    assert np.allclose(final_state, state, rtol=1e-6, atol=1e-6)
+
