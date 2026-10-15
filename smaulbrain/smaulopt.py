@@ -64,8 +64,8 @@ class SmaulOPT:
                 full += 2 * s["m"].size
         return {"factored_elements": factored, "full_elements": full}
 
-    def step(self, params: dict, grads: dict) -> dict:
-        """In-place update of params; returns per-param update norms."""
+    def step(self, params: dict, grads: dict, collect_norms: bool = True) -> dict:
+        """In-place update; optionally return per-parameter RMS update norms."""
         norms = {}
         beta1 = np.float32(self.beta1)
         beta2 = np.float32(self.beta2)
@@ -95,16 +95,23 @@ class SmaulOPT:
                 st["C"] = C.astype(np.float32, copy=False)
                 mean_r = float(np.mean(R, dtype=np.float64)) if R.size else 0.0
                 denom_r = np.float32(mean_r if mean_r > 1e-30 else 1e-30)
-                Vhat = np.outer(R, C) / denom_r
-                upd = m / (np.sqrt(np.maximum(Vhat, 0.0)) + eps)
+                Vhat = np.outer(R, C)
+                Vhat /= denom_r
+                np.maximum(Vhat, 0.0, out=Vhat)
+                np.sqrt(Vhat, out=Vhat)
+                Vhat += eps
+                upd = m / Vhat
             else:
                 v = st["v"] * beta2 + g2 * one_minus_beta2
                 st["v"] = v.astype(np.float32, copy=False)
-                upd = m / (np.sqrt(np.maximum(v, 0.0)) + eps)
+                denom = np.maximum(v, 0.0)
+                np.sqrt(denom, out=denom)
+                denom += eps
+                upd = m / denom
+            if collect_norms:
+                # Only a scalar reduction uses fp64; never widen the update tensor.
+                norms[name] = float(np.sqrt(np.mean(upd * upd, dtype=np.float64)))
             w -= (np.float32(self.lr) * upd).astype(np.float32, copy=False)
-            # Keep only the scalar accumulation in fp64; do not widen the full
-            # update tensor just to report its RMS magnitude.
-            norms[name] = float(np.sqrt(np.mean(upd * upd, dtype=np.float64)))
         self.n_updates += 1
         return norms
 
