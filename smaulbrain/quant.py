@@ -26,6 +26,8 @@ from pathlib import Path
 import shutil
 import subprocess
 
+from . import cpu as _cpu
+
 FP8_E4M3_MAX = 448.0
 FP8_E4M3_BIAS = 8
 
@@ -101,6 +103,7 @@ def packed_matvec_scalar(x: np.ndarray, packed: np.ndarray, shape, scale: float)
 _NATIVE_LIB = None
 _NATIVE_ATTEMPTED = False
 _NATIVE_ERROR = None
+_NATIVE_VARIANT = "unavailable"
 
 
 def prepare_ternary_backend() -> bool:
@@ -109,7 +112,7 @@ def prepare_ternary_backend() -> bool:
     No -march=native or AVX requirement is used. If a compiler is unavailable,
     operations remain correct through the packed scalar reference path.
     """
-    global _NATIVE_LIB, _NATIVE_ATTEMPTED, _NATIVE_ERROR
+    global _NATIVE_LIB, _NATIVE_ATTEMPTED, _NATIVE_ERROR, _NATIVE_VARIANT
     if _NATIVE_LIB is not None:
         return True
     if _NATIVE_ATTEMPTED:
@@ -129,15 +132,21 @@ def prepare_ternary_backend() -> bool:
 
     try:
         source_bytes = source.read_bytes()
-        digest = hashlib.sha256(source_bytes + compiler.encode("utf-8")).hexdigest()[:20]
+        # Compile an AVX1 variant only if the running OS/CPU advertises AVX.
+        # Ivy Bridge supports AVX but not AVX2. Never use -march=native.
+        has_avx = bool(_cpu.detect().get("has_avx", False))
+        variant_flag = "-mavx" if has_avx else "-msse2"
+        flags = ["-O3", "-std=c++17", "-shared", "-fPIC",
+                 "-fno-fast-math", variant_flag]
+        digest_data = source_bytes + compiler.encode("utf-8") + " ".join(flags).encode("ascii")
+        digest = hashlib.sha256(digest_data).hexdigest()[:20]
         cache_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
         cache_dir = cache_home / "smaulbrain"
         cache_dir.mkdir(parents=True, exist_ok=True)
-        target = cache_dir / f"ternary-{digest}.so"
+        target = cache_dir / f"ternary-{variant_flag[1:]}-{digest}.so"
         if not target.is_file():
-            temporary = cache_dir / f"ternary-{digest}-{os.getpid()}.tmp.so"
-            command = [compiler, "-O3", "-std=c++17", "-shared", "-fPIC",
-                       "-fno-fast-math", str(source), "-o", str(temporary)]
+            temporary = cache_dir / f"ternary-{variant_flag[1:]}-{digest}-{os.getpid()}.tmp.so"
+            command = [compiler, *flags, str(source), "-o", str(temporary)]
             result = subprocess.run(command, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True, timeout=90)
             if result.returncode != 0:
@@ -166,6 +175,7 @@ def prepare_ternary_backend() -> bool:
         lib.smaulbrain_ternary_transpose_matmat.argtypes = argtypes
         lib.smaulbrain_ternary_transpose_matmat.restype = ctypes.c_int
         _NATIVE_LIB = lib
+        _NATIVE_VARIANT = "avx1" if has_avx else "sse2"
         _NATIVE_ERROR = None
         return True
     except Exception as exc:
@@ -174,7 +184,9 @@ def prepare_ternary_backend() -> bool:
 
 
 def ternary_backend_name() -> str:
-    return "native-cpp-packed" if prepare_ternary_backend() else "python-packed-reference"
+    if not prepare_ternary_backend():
+        return "python-packed-reference"
+    return f"native-cpp-packed-{_NATIVE_VARIANT}"
 
 
 def _check_packed_shape(packed: np.ndarray, shape):
