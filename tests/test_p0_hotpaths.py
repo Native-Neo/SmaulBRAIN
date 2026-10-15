@@ -5,6 +5,7 @@ from smaulbrain import inference as _inference
 from smaulbrain import moe as _moe
 from smaulbrain import paging as _paging
 from smaulbrain import quant as _quant
+from smaulbrain import smaulopt as _smaulopt
 
 
 def test_router_top_k_matches_stable_full_sort_including_cutoff_ties():
@@ -190,3 +191,32 @@ def test_paged_expert_writeback_stays_cached_then_flushes_on_eviction(tmp_path):
     with np.load(tmp_path / "expert_0.npz") as saved:
         assert np.array_equal(saved["Win"], updated["Win"])
         assert np.array_equal(saved["Wout"], updated["Wout"])
+
+def test_optimizer_inplace_update_buffers_preserve_norms_and_updates():
+    rng = np.random.default_rng(41)
+    params_a = {
+        "matrix": rng.standard_normal((9, 7)).astype(np.float32),
+        "vector": rng.standard_normal(11).astype(np.float32),
+    }
+    params_b = {k: v.copy() for k, v in params_a.items()}
+    grads = {k: rng.standard_normal(v.shape).astype(np.float32)
+             for k, v in params_a.items()}
+    opt_a = _smaulopt.SmaulOPT(lr=2e-3, beta1=0.9, beta2=0.98,
+                               eps=1e-8, weight_decay=1e-3)
+    opt_b = _smaulopt.SmaulOPT(lr=2e-3, beta1=0.9, beta2=0.98,
+                               eps=1e-8, weight_decay=1e-3)
+    opt_a.register(params_a)
+    opt_b.register(params_b)
+    norms = opt_a.step(params_a, grads, collect_norms=True)
+    no_norms = opt_b.step(params_b, grads, collect_norms=False)
+    assert norms.keys() == params_a.keys()
+    assert no_norms == {}
+    for name in params_a:
+        assert np.allclose(params_a[name], params_b[name], rtol=1e-6, atol=1e-7)
+        for state_key in opt_a.state[name]:
+            if state_key == "factored":
+                assert opt_a.state[name][state_key] == opt_b.state[name][state_key]
+            else:
+                assert np.allclose(opt_a.state[name][state_key],
+                                   opt_b.state[name][state_key], rtol=0, atol=0)
+
