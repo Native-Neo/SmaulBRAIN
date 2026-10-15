@@ -323,7 +323,9 @@ def fp8_e4m3_quantize(W: np.ndarray, scale=None):
     """
     Wf = np.asarray(W, dtype=np.float64)
     if scale is None:
-        mx = float(np.max(np.abs(Wf))) if Wf.size else 0.0
+        # NaN/Inf must not poison the scale chosen for finite values.
+        finite_abs = np.abs(Wf[np.isfinite(Wf)])
+        mx = float(np.max(finite_abs)) if finite_abs.size else 0.0
         scale = np.float32(mx / FP8_E4M3_MAX) if mx > 0 else np.float32(1.0)
     if scale == 0:
         scale = np.float32(1.0)
