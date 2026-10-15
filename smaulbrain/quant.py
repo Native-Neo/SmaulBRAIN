@@ -197,6 +197,10 @@ def prepare_ternary_backend() -> bool:
             ptr_f32, ptr_u8, ctypes.c_size_t,
             ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float)]
         lib.smaulbrain_pack_ternary.restype = ctypes.c_int
+        lib.smaulbrain_recurrent_scan.argtypes = [
+            ptr_f32, ptr_f32, ptr_f32, ptr_f32,
+            ctypes.c_size_t, ctypes.c_size_t]
+        lib.smaulbrain_recurrent_scan.restype = ctypes.c_int
         _NATIVE_LIB = lib
         _NATIVE_VARIANT = "avx1" if has_avx else "sse2"
         _NATIVE_ERROR = None
@@ -204,6 +208,36 @@ def prepare_ternary_backend() -> bool:
     except Exception as exc:
         _NATIVE_ERROR = f"{type(exc).__name__}: {exc}"
         return False
+
+
+def recurrent_scan(kv: np.ndarray, alpha: np.ndarray, state: np.ndarray,
+                   states: np.ndarray) -> bool:
+    """Run the native time scan when the packed C++ backend is already loaded.
+
+    Returns False without changing the buffers if no native backend is available
+    or inputs need conversion. The caller can then use its portable reference loop.
+    """
+    if _NATIVE_LIB is None:
+        return False
+    arrays = (kv, alpha, state, states)
+    if any(not isinstance(a, np.ndarray) or a.dtype != np.float32
+           or not a.flags.c_contiguous for a in arrays):
+        return False
+    if kv.ndim != 2 or states.shape != kv.shape:
+        raise ValueError("recurrent scan expects KV/states with matching (T, d) shapes")
+    if alpha.shape != (kv.shape[1],) or state.shape != alpha.shape:
+        raise ValueError("recurrent scan alpha/state widths must match KV")
+    if not state.flags.writeable or not states.flags.writeable:
+        return False
+    status = _NATIVE_LIB.smaulbrain_recurrent_scan(
+        kv.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        alpha.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        state.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        states.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        kv.shape[0], kv.shape[1])
+    if status != 0:
+        raise RuntimeError(f"native recurrent scan failed with status {status}")
+    return True
 
 
 def ternary_backend_name() -> str:
