@@ -223,14 +223,17 @@ class Model:
         G = _ops.sigmoid(R)
         Y = G * (S + u * KV)
         O, hO = self._lin_fwd(Y, p[px + "attn.Wo"], px + "attn.Wo")
-        cache = (X, R, K, V, KV, S, G, alpha, hR, hK, hV, hO, px)
+        # Keep the projection input Y, but reconstruct KV during backward.
+        # This drops one full [T,d] activation from every layer's train cache.
+        cache = (X, R, K, V, S, Y, alpha, hR, hK, hV, hO, px)
         return O, (s.copy(), cache)
 
     def _attn_bwd(self, dO, cache):
-        X, R, K, V, KV, S, G, alpha, hR, hK, hV, hO, px = cache
+        X, R, K, V, S, Y, alpha, hR, hK, hV, hO, px = cache
         T, d = X.shape
         p = self.p
-        dY_full, dWo = self._lin_bwd(dO, G * (S + p[px + "attn.u"] * KV), hO)
+        KV = K * V
+        dY_full, dWo = self._lin_bwd(dO, Y, hO)
         dY = dY_full
         sig = _ops.sigmoid(R)
         dS_total = dY * sig
