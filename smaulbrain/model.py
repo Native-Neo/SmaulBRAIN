@@ -391,7 +391,7 @@ class Model:
         grads: dict = {}
         dH = dlogits @ self.p["embed"]
         grads["embed"] = dlogits.T @ H
-        dX, dgfinal = _rms_bwd_with_cache(dH, Xlast, self.p["final_norm"], H)
+        dX, dgfinal = _ops.rmsnorm_bwd(dH, cf)
         grads["final_norm"] = dgfinal
         spec = self.spec
         for i in range(spec.n_layers - 1, -1, -1):
@@ -443,16 +443,3 @@ class Model:
 
 def dHo_res(a, b):
     return (a + b).astype(np.float32)
-
-
-def _stack_rms_cache(cfwd, g):
-    # cfwd from rmsnorm_fwd is (x, g, xn, ms); rebuild expected tuple
-    return cfwd
-
-
-def _rms_bwd_with_cache(dH, Xlast, g, H):
-    ms = np.mean(Xlast.astype(np.float64) ** 2, axis=-1, keepdims=True)
-    inv = 1.0 / np.sqrt(ms + 1e-6)
-    xn = (Xlast.astype(np.float64) * inv).astype(np.float32)
-    cache = (Xlast.astype(np.float32), g.astype(np.float32), xn, None)
-    return _ops.rmsnorm_bwd(dH, cache)
