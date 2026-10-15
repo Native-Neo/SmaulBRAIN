@@ -69,8 +69,10 @@ def test_native_kernels_optional_but_defined():
                 "smaulbrain_ternary_transpose_matmat"):
         assert sym in src
 
-    # SSE2 is baseline on x86-64; AVX2/AVX-512 are never required.
-    assert "immintrin" not in src.lower()
-    assert "avxintrin" not in src.lower()
-    assert "__m256" not in src and "__m512" not in src
+    # The optional fast path is AVX1 only. AVX2/AVX-512 and -march=native
+    # are forbidden; dispatch selects the AVX1 build only when the OS/CPU
+    # advertises AVX, otherwise the SSE2/scalar build remains usable.
+    assert "__AVX2__" not in src
+    assert "__m256i" not in src and "__m512" not in src
+    assert "_mm256_i32gather" not in src
     assert "-march=native" not in src
