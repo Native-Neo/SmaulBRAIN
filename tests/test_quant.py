@@ -61,9 +61,11 @@ def test_unsupported_combo_rejected():
 
 def test_packed_matmat_and_transpose_match_dense_reference():
     rng = np.random.default_rng(91)
-    W = rng.standard_normal((12, 20)).astype(np.float32)
+    # Output width 32 exercises the AVX1/SSE2 packed kernel; batch 5
+    # also exercises the odd final token in the two-row prefill tile.
+    W = rng.standard_normal((12, 32)).astype(np.float32)
     X = rng.standard_normal((5, 12)).astype(np.float32)
-    dY = rng.standard_normal((5, 20)).astype(np.float32)
+    dY = rng.standard_normal((5, 32)).astype(np.float32)
     packed, scale, shape, _ = Q.pack_ternary(W)
     dense_q = Q.unpack_ternary(packed, shape, scale)
     expected_y = X @ dense_q
