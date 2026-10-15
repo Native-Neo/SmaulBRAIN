@@ -256,15 +256,19 @@ class Model:
         # float64 row conversions. FP32-only/compiler-free runs keep the
         # straightforward reference implementation.
         if not _quant.recurrent_backward_scan(dS_total, S, alpha, dKV_state, dalpha):
+            # Amortize dtype conversion instead of allocating a fresh float64
+            # row on every step of both recurrent backward loops.
+            dS64 = dS_total.astype(np.float64)
+            S64 = S.astype(np.float64)
             ds = np.zeros(d, dtype=np.float64)
             for t in range(T - 1, -1, -1):
-                ds = ds * Aw + dS_total[t].astype(np.float64)
+                ds = ds * Aw + dS64[t]
                 dKV_state[t] = ds.astype(np.float32)
             dsdalpha = np.zeros(d, dtype=np.float64)
             for t in range(T):
-                s_prev = S[t - 1].astype(np.float64) if t > 0 else np.zeros(d)
+                s_prev = S64[t - 1] if t > 0 else np.zeros(d)
                 dsdalpha = s_prev + Aw * dsdalpha
-                dalpha += dS_total[t].astype(np.float64) * dsdalpha
+                dalpha += dS64[t] * dsdalpha
         dKV = dKV_state + dY * sig * p[px + "attn.u"]
         dK = dKV * V
         dV = dKV * K
