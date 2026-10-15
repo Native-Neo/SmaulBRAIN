@@ -79,6 +79,9 @@ extern "C" int smaulbrain_ternary_matmat(
             for (std::size_t i = 0; i < din; ++i) {
                 const __m256 xv = _mm256_set1_ps(x[i]);
                 const std::size_t base = (i * dout + j0) >> 2;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC unroll 8
+#endif
                 for (std::size_t v = 0; v < nvec; ++v) {
                     const __m256 wv = trit_vector8(packed[base + v * 2],
                                                    packed[base + v * 2 + 1]);
@@ -117,6 +120,9 @@ extern "C" int smaulbrain_ternary_matmat(
                     const __m256 x0 = _mm256_set1_ps(in0[i]);
                     const __m256 x1 = has_second ? _mm256_set1_ps(in1[i]) : _mm256_setzero_ps();
                     const std::size_t base = (i * dout + j0) >> 2;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC unroll 4
+#endif
                     for (std::size_t v = 0; v < nvec; ++v) {
                         const __m256 wv = trit_vector8(packed[base + v * 2],
                                                        packed[base + v * 2 + 1]);
