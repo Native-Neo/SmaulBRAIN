@@ -57,15 +57,20 @@ def test_native_kernels_optional_but_defined():
     caps = CPU.detect()
     assert caps["portable_scalar"] is True
     assert "dispatch" in info
-    import os
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    cpp = os.path.join(root, "v2", "kernels", "cpu_kernels.cpp")
-    assert os.path.exists(cpp)
-    with open(cpp) as f:
-        src = f.read()
-    for sym in ("rmsnorm_fwd", "ternary_pack", "packed_matvec", "recurrent_step",
-                "factored_update", "clone_perturb"):
+
+    # V2 owns a focused packed-ternary kernel. V1's broad kernels.cpp path is
+    # intentionally not required by this independent implementation.
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    cpp = root / "smaulbrain" / "_ternary_kernels.cpp"
+    assert cpp.is_file()
+    src = cpp.read_text()
+    for sym in ("smaulbrain_ternary_matmat",
+                "smaulbrain_ternary_transpose_matmat"):
         assert sym in src
-    # mandatory path never requires AVX2/512 intrinsics
+
+    # SSE2 is baseline on x86-64; AVX2/AVX-512 are never required.
     assert "immintrin" not in src.lower()
-    assert "avxintrin" not in src.lower() and "__m256" not in src and "__m512" not in src
+    assert "avxintrin" not in src.lower()
+    assert "__m256" not in src and "__m512" not in src
+    assert "-march=native" not in src
