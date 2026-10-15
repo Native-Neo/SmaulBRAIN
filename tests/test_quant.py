@@ -59,6 +59,82 @@ def test_unsupported_combo_rejected():
         C.validate_quant_combo("fp32", "ternary")
 
 
+def test_packed_matmat_and_transpose_match_dense_reference():
+    rng = np.random.default_rng(91)
+    W = rng.standard_normal((12, 20)).astype(np.float32)
+    X = rng.standard_normal((5, 12)).astype(np.float32)
+    dY = rng.standard_normal((5, 20)).astype(np.float32)
+    packed, scale, shape, _ = Q.pack_ternary(W)
+    dense_q = Q.unpack_ternary(packed, shape, scale)
+    expected_y = X @ dense_q
+    expected_dx = dY @ dense_q.T
+    actual_y = Q.packed_matmat(X, packed, shape, scale)
+    actual_dx = Q.packed_matmat_transpose(dY, packed, shape, scale)
+    assert np.allclose(actual_y, expected_y, atol=2e-5, rtol=2e-5)
+    assert np.allclose(actual_dx, expected_dx, atol=2e-5, rtol=2e-5)
+
+
+def test_model_ternary_path_never_unpacks_dense_weights(monkeypatch):
+    m = _tiny_moe("ternary", "ternary")
+    toks = [10, 20, 30, 40, 50]
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("model path attempted to unpack a packed ternary matrix")
+
+    monkeypatch.setattr(Q, "unpack_codes", forbidden)
+    logits, _ = m.forward(toks, train=False)
+    assert np.all(np.isfinite(logits))
+    loss, grads, _ = m.loss_and_backward(toks)
+    assert np.isfinite(loss)
+    assert all(np.all(np.isfinite(g)) for g in grads.values())
+
+
+def _legacy_fp8_scalar_reference(W, scale=None):
+    Wf = W.astype(np.float64)
+    if scale is None:
+        mx = float(np.max(np.abs(Wf))) if Wf.size else 0.0
+        scale = np.float32(mx / Q.FP8_E4M3_MAX) if mx > 0 else np.float32(1.0)
+    if scale == 0:
+        scale = np.float32(1.0)
+    norm = Wf / float(scale)
+    out = np.empty_like(norm)
+    values = []
+    for e in range(-8, 9):
+        base = 2.0 ** e
+        for m in range(8):
+            cand = base * (1 + m / 8.0) if e > -8 else base * (m / 8.0)
+            values.append(cand)
+    for idx, v in np.ndenumerate(norm):
+        if not np.isfinite(v):
+            out[idx] = v
+            continue
+        sign = -1.0 if v < 0 else 1.0
+        a = abs(v)
+        if a > Q.FP8_E4M3_MAX:
+            out[idx] = sign * Q.FP8_E4M3_MAX
+            continue
+        best = 0.0
+        for cand in values:
+            if abs(cand - a) < abs(best - a):
+                best = cand
+        out[idx] = sign * best
+    return (out * float(scale)).astype(np.float32), np.float32(scale)
+
+
+def test_fp8_vectorized_conversion_matches_scalar_reference():
+    rng = np.random.default_rng(42)
+    W = np.concatenate([
+        rng.standard_normal(257).astype(np.float32) * 12,
+        np.array([0.0, -0.0, 1e-30, -1e-30, 1.0, -1.0,
+                  448.0, -448.0, 500.0, -500.0, np.nan, np.inf, -np.inf],
+                 dtype=np.float32),
+    ])
+    got, got_scale = Q.fp8_e4m3_quantize(W)
+    expected, expected_scale = _legacy_fp8_scalar_reference(W)
+    assert got_scale == expected_scale
+    assert np.allclose(got, expected, rtol=0.0, atol=0.0, equal_nan=True)
+
+
 def test_fp8_format_properties():
     W = np.array([0.0, 1.0, -1.0, 1000.0, -1000.0, np.nan], dtype=np.float32)
     Wq, scale = Q.fp8_e4m3_quantize(W)
