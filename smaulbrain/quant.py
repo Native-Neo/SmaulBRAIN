@@ -264,7 +264,13 @@ def packed_matmat(X: np.ndarray, packed: np.ndarray, shape, scale: float,
         if status != 0:
             raise RuntimeError(f"native packed ternary matmat failed with status {status}")
     else:
-        out = packed_matmat_scalar(x, p, (d_in, d_out), scale)
+        # Compiler-free fallback: decode to a temporary dense matrix and let
+        # NumPy/BLAS do the multiply. Never cache this expansion. The scalar
+        # reference remains available for tests but is not viable at model size.
+        Wq = unpack_codes(p, (d_in, d_out)).astype(np.float32)
+        Wq *= np.float32(scale)
+        out = x @ Wq
+        out = np.asarray(out, dtype=np.float32)
     return out[0] if one_row else out
 
 
@@ -320,7 +326,12 @@ def packed_matmat_transpose(dY: np.ndarray, packed: np.ndarray, shape,
         if status != 0:
             raise RuntimeError(f"native packed ternary transpose matmat failed with status {status}")
     else:
-        dx = packed_matmat_transpose_scalar(dy, p, (d_in, d_out), scale)
+        # As above, prefer a one-call BLAS multiply over Python's triple loop
+        # if the C++ compiler is missing. The decoded matrix is call-local.
+        Wq = unpack_codes(p, (d_in, d_out)).astype(np.float32)
+        Wq *= np.float32(scale)
+        dx = dy @ Wq.T
+        dx = np.asarray(dx, dtype=np.float32)
     return dx[0] if one_row else dx
 
 
