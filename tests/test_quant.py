@@ -80,7 +80,10 @@ def test_native_ternary_packer_matches_numpy_reference():
     assert np.isclose(actual[3], expected[3], equal_nan=True)
 
 
-@pytest.mark.parametrize(("din", "dout"), [(17, 64), (33, 72), (37, 136)])
+@pytest.mark.parametrize(
+    ("din", "dout"),
+    [(17, 64), (33, 72), (37, 136), (512, 5000), (5000, 512)],
+)
 def test_batch_one_packed_matmat_fast_path_matches_dense(din, dout):
     rng = np.random.default_rng(701 + din + dout)
     W = rng.standard_normal((din, dout)).astype(np.float32)
@@ -90,7 +93,9 @@ def test_batch_one_packed_matmat_fast_path_matches_dense(din, dout):
     actual = Q.packed_matmat(x, packed, shape, scale)
     expected = x @ dense_q
     assert actual.shape == (dout,)
-    assert np.allclose(actual, expected, atol=2e-5, rtol=2e-5)
+    # Long reductions accumulate in a different order from NumPy/BLAS.
+    tol = 3e-4 if din >= 512 else 2e-5
+    assert np.allclose(actual, expected, atol=tol, rtol=2e-5)
 
 
 def test_moe_forward_skips_unused_diagnostic_reductions(monkeypatch):
