@@ -151,18 +151,27 @@ def eval_loss_on_tokens(model, tokens) -> float:
     return float(nll.mean())
 
 
-def rank_experts(model, eval_batches, min_samples: int):
-    """Returns (scores dict, total_samples) or (None, total_samples) if insufficient."""
+def rank_experts(model, eval_batches, min_samples: int, max_batches=None):
+    """Return expert ablation deltas and evidence count.
+
+    max_batches limits the batches used to score ablations. The full supplied
+    sample count still gates whether a ranking event has enough evidence, but
+    limiting score batches is approximate: expert ordering may differ from a
+    multi-batch estimate. None retains the exact all-batches reference behavior.
+    """
     total = sum(max(len(b) - 1, 0) for b in eval_batches)
     if total < min_samples:
         return None, total
-    base_losses = [eval_loss_on_tokens(model, b) for b in eval_batches]
+    score_batches = list(eval_batches if max_batches is None else eval_batches[:max_batches])
+    if not score_batches:
+        return None, total
+    base_losses = [eval_loss_on_tokens(model, b) for b in score_batches]
     from . import model as _m
     eids = _m.expert_ids(model.p)
     scores = {}
     for eid in eids:
         masked = []
-        for b in eval_batches:
+        for b in score_batches:
             logits, _ = model.forward(b, train=False, disabled=(eid,))
             tgt = np.asarray(b[1:])
             lg = logits[:-1]
