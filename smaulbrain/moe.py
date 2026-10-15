@@ -40,20 +40,24 @@ class Router:
         if top_k > enabled_count:
             raise ValueError(f"top_k={top_k} exceeds enabled experts={enabled_count}")
 
-        # Partition finds the top-k score threshold in linear time. Sort only
-        # the k selected candidates. Repair ties at the threshold using the
-        # smallest expert IDs so behavior is identical to stable argsort on
-        # (-score, expert_id), even when argpartition's boundary tie is arbitrary.
+        # Partition finds the top-k threshold in linear time. Resolve boundary
+        # ties over the full row with cumulative masks, then sort only the k
+        # selected candidates. np.nonzero returns expert IDs in ascending order,
+        # so a stable score sort preserves the expert-ID tie break without any
+        # per-token Python loop.
         part = np.argpartition(-scores, kth=top_k - 1, axis=1)[:, :top_k]
         part_scores = np.take_along_axis(scores, part, axis=1)
-        cutoff = part_scores.min(axis=1)
-        top_idx = np.empty((T, top_k), dtype=np.int64)
-        for t in range(T):
-            above = np.flatnonzero(scores[t] > cutoff[t])
-            equal = np.flatnonzero(scores[t] == cutoff[t])
-            chosen = np.concatenate((above, equal[:top_k - above.size]))
-            order = np.argsort(-scores[t, chosen], kind="stable")
-            top_idx[t] = chosen[order]
+        cutoff = part_scores.min(axis=1, keepdims=True)
+        above = scores > cutoff
+        equal = scores == cutoff
+        need_equal = top_k - above.sum(axis=1)
+        equal_rank = np.cumsum(equal, axis=1)
+        selected = above | (equal & (equal_rank <= need_equal[:, None]))
+        rows, cols = np.nonzero(selected)
+        selected_idx = cols.reshape(T, top_k)
+        selected_scores = scores[rows, cols].reshape(T, top_k)
+        local_order = np.argsort(-selected_scores, axis=1, kind="stable")
+        top_idx = np.take_along_axis(selected_idx, local_order, axis=1)
         top_scores = np.take_along_axis(scores, top_idx, axis=1)
         # softmax over selected
         m = top_scores.max(axis=1, keepdims=True)
@@ -61,15 +65,22 @@ class Router:
         weights = ex / ex.sum(axis=1, keepdims=True)
         cap = int(np.ceil(capacity_factor * T * top_k / E))
         cap = max(cap, 1)
-        # Capacity keeps the first 'cap' occurrences of each expert in
-        # flattened token/rank order, exactly matching the old nested loop.
+        # Keep the first 'cap' assignments per expert in flattened
+        # token/rank order. A single stable grouping sort yields each route's
+        # within-expert rank without a Python loop over tokens or experts.
         flat_idx = top_idx.reshape(-1)
-        assigned = np.bincount(flat_idx, minlength=E).astype(np.int64, copy=False)
-        load = np.minimum(assigned, cap)
-        keep_flat = np.ones(flat_idx.size, dtype=bool)
-        for eid in np.flatnonzero(assigned > cap):
-            positions = np.flatnonzero(flat_idx == eid)
-            keep_flat[positions[cap:]] = False
+        assigned = np.bincount(flat_idx, minlength=E)
+        load = np.minimum(assigned, cap).astype(np.int64, copy=False)
+        grouped_positions = np.argsort(flat_idx, kind="stable")
+        grouped_eids = flat_idx[grouped_positions]
+        group_starts = np.empty(grouped_eids.size, dtype=bool)
+        group_starts[0] = True
+        group_starts[1:] = grouped_eids[1:] != grouped_eids[:-1]
+        group_base = np.maximum.accumulate(
+            np.where(group_starts, np.arange(grouped_eids.size), 0))
+        rank = np.arange(grouped_eids.size) - group_base
+        keep_flat = np.empty(flat_idx.size, dtype=bool)
+        keep_flat[grouped_positions] = rank < cap
         keep = keep_flat.reshape(top_idx.shape)
         overflow = int(flat_idx.size - int(load.sum()))
         # renormalize kept weights
