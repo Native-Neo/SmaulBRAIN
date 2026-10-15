@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #if defined(__AVX__)
 #include <immintrin.h>
 #elif defined(__SSE2__)
@@ -197,5 +198,52 @@ extern "C" int smaulbrain_ternary_transpose_matmat(
             grad_in[i] = acc * scale;
         }
     }
+    return 0;
+}
+
+
+extern "C" int smaulbrain_pack_ternary(
+    const float* weights, std::uint8_t* packed, std::size_t n,
+    float* scale_out, float* threshold_out) noexcept {
+    if (!weights || !packed || !scale_out || !threshold_out || n == 0) return 1;
+
+    double sum_abs = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        sum_abs += std::fabs(static_cast<double>(weights[i]));
+    }
+    const double mean_abs = sum_abs / static_cast<double>(n);
+    const double threshold = 0.7 * mean_abs;
+
+    double selected_abs_sum = 0.0;
+    std::size_t selected_count = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double v = static_cast<double>(weights[i]);
+        if (v > threshold || v < -threshold) {
+            selected_abs_sum += std::fabs(v);
+            ++selected_count;
+        }
+    }
+    double scale = selected_count
+        ? selected_abs_sum / static_cast<double>(selected_count)
+        : mean_abs;
+    if (!(scale > 0.0)) scale = 1.0;
+
+    const std::size_t nbytes = (n + 3u) / 4u;
+    for (std::size_t b = 0; b < nbytes; ++b) {
+        unsigned byte = 0u;
+        for (unsigned lane = 0; lane < 4; ++lane) {
+            const std::size_t idx = b * 4u + lane;
+            unsigned code = 1u;
+            if (idx < n) {
+                const double v = static_cast<double>(weights[idx]);
+                if (v > threshold) code = 2u;
+                else if (v < -threshold) code = 0u;
+            }
+            byte |= code << (lane * 2u);
+        }
+        packed[b] = static_cast<std::uint8_t>(byte);
+    }
+    *scale_out = static_cast<float>(scale);
+    *threshold_out = static_cast<float>(threshold);
     return 0;
 }
