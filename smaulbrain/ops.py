@@ -38,8 +38,15 @@ def rmsnorm_bwd(dy: np.ndarray, cache, eps: float = EPS):
 
 
 def sigmoid(x):
-    return np.where(x >= 0, 1 / (1 + np.exp(-np.clip(x, -60, 60))),
-                   np.exp(np.clip(x, -60, 60)) / (1 + np.exp(np.clip(x, -60, 60))))
+    # Evaluate only the numerically stable branch for each element; np.where
+    # evaluates both expressions and used to compute several full-array exp's.
+    xc = np.clip(x, -60, 60)
+    out = np.empty_like(xc, dtype=np.result_type(xc.dtype, np.float32))
+    positive = xc >= 0
+    out[positive] = 1.0 / (1.0 + np.exp(-xc[positive]))
+    e = np.exp(xc[~positive])
+    out[~positive] = e / (1.0 + e)
+    return out
 
 
 def silu(x):
