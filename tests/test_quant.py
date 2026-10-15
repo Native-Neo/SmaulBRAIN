@@ -261,3 +261,32 @@ def test_native_recurrent_scan_matches_numpy(tokens, width):
     assert np.allclose(actual, expected, rtol=1e-6, atol=1e-6)
     assert np.allclose(final_state, state, rtol=1e-6, atol=1e-6)
 
+@pytest.mark.parametrize(("tokens", "width"), [(0, 64), (1, 7), (19, 32), (64, 512), (33, 1000)])
+def test_native_recurrent_backward_scan_matches_numpy(tokens, width):
+    if not Q.prepare_ternary_backend():
+        pytest.skip("native C++ compiler/backend unavailable")
+    rng = np.random.default_rng(1409 + tokens + width)
+    ds = rng.standard_normal((tokens, width)).astype(np.float32)
+    states = rng.standard_normal((tokens, width)).astype(np.float32)
+    alpha = rng.uniform(0.7, 0.999, size=width).astype(np.float32)
+
+    expected_dkv = np.empty_like(ds)
+    carry = np.zeros(width, dtype=np.float64)
+    for t in range(tokens - 1, -1, -1):
+        carry = carry * alpha.astype(np.float64) + ds[t].astype(np.float64)
+        expected_dkv[t] = carry.astype(np.float32)
+    expected_dalpha = np.zeros(width, dtype=np.float64)
+    carry_alpha = np.zeros(width, dtype=np.float64)
+    alpha64 = alpha.astype(np.float64)
+    for t in range(tokens):
+        previous = states[t - 1].astype(np.float64) if t > 0 else np.zeros(width)
+        carry_alpha = previous + alpha64 * carry_alpha
+        expected_dalpha += ds[t].astype(np.float64) * carry_alpha
+
+    actual_dkv = np.empty_like(ds)
+    actual_dalpha = np.zeros(width, dtype=np.float64)
+    assert Q.recurrent_backward_scan(
+        ds, states, alpha, actual_dkv, actual_dalpha)
+    assert np.allclose(actual_dkv, expected_dkv, rtol=0, atol=0)
+    assert np.allclose(actual_dalpha, expected_dalpha, rtol=0, atol=0)
+
