@@ -223,9 +223,13 @@ class Model:
         s = np.zeros(d, dtype=np.float32) if s0 is None else s0.astype(np.float32).copy()
         KV = K * V
         S = np.empty((T, d), dtype=np.float32)
-        for t in range(T):
-            s = alpha * s + KV[t]
-            S[t] = s
+        # Ternary mode already loaded the native C++ backend. Use its SIMD scan
+        # to remove the per-token Python loop during prefill/training; keep the
+        # numerically matching NumPy loop as the portable/non-native fallback.
+        if not _quant.recurrent_scan(KV, alpha, s, S):
+            for t in range(T):
+                s = alpha * s + KV[t]
+                S[t] = s
         G = _ops.sigmoid(R)
         Y = G * (S + u * KV)
         O, hO = self._lin_fwd(Y, p[px + "attn.Wo"], px + "attn.Wo")
