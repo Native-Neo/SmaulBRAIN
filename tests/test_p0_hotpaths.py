@@ -1,6 +1,7 @@
 import numpy as np
 
 from smaulbrain import data as _data
+from smaulbrain import growth as _growth
 from smaulbrain import inference as _inference
 from smaulbrain import moe as _moe
 from smaulbrain import paging as _paging
@@ -219,4 +220,29 @@ def test_optimizer_inplace_update_buffers_preserve_norms_and_updates():
             else:
                 assert np.allclose(opt_a.state[name][state_key],
                                    opt_b.state[name][state_key], rtol=0, atol=0)
+
+def test_growth_ranking_can_use_one_batch_without_changing_evidence_count():
+    class FakeRankModel:
+        def __init__(self):
+            self.p = {
+                "expert.0.Win": np.zeros((1, 1), dtype=np.float32),
+                "expert.1.Win": np.zeros((1, 1), dtype=np.float32),
+            }
+            self.calls = 0
+
+        def forward(self, tokens, train=False, disabled=()):
+            self.calls += 1
+            logits = np.zeros((len(tokens), 16), dtype=np.float32)
+            # Make each ablation measurable while keeping all logits finite.
+            if disabled:
+                logits[:, int(disabled[0])] = 1.0
+            return logits, None
+
+    batches = [list(range(5)), list(range(5, 10))]
+    model = FakeRankModel()
+    scores, total_samples = _growth.rank_experts(
+        model, batches, min_samples=8, max_batches=1)
+    assert total_samples == 8
+    assert set(scores) == {0, 1}
+    assert model.calls == 3  # one baseline and one ablation per expert
 
