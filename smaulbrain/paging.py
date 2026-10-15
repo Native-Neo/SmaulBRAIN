@@ -62,6 +62,7 @@ class ExpertStore:
         self.peak_cached = 0
         self.peak_staging_bytes = 0
         self._pinned = set()
+        self._dirty = set()  # modified D2R/D2V entries awaiting disk write-back
         if mode in ("V", "D2V", "R2V"):
             ok, reason = accelerator_available()
             if not ok:
@@ -116,9 +117,11 @@ class ExpertStore:
                         break
                 if victim2 is None:
                     raise PagingError("cache full of pinned experts; cannot evict")
+                self._flush_dirty(victim2)
                 del self.cache[victim2]
                 self.evictions += 1
             else:
+                self._flush_dirty(victim)
                 del self.cache[victim]
                 self.evictions += 1
         return w
@@ -127,28 +130,51 @@ class ExpertStore:
         path = os.path.join(self.disk_dir, f"expert_{eid}.npz")
         if not os.path.exists(path):
             raise KeyError(f"expert {eid} backing file missing: {path}")
-        z = np.load(path)
-        return {"Win": z["Win"], "Wout": z["Wout"]}
+        with np.load(path) as z:
+            return {"Win": z["Win"].copy(), "Wout": z["Wout"].copy()}
+
+    def _write_expert_file(self, eid: int, weights) -> None:
+        path = os.path.join(self.disk_dir, f"expert_{eid}.npz")
+        tmp = path + ".tmp"
+        # NOTE: pass an open handle: np.savez appends '.npz' to string paths
+        # that lack the extension, which would break the atomic replace.
+        with open(tmp, "wb") as f:
+            np.savez(f, **{k: v for k, v in weights.items()})
+        os.replace(tmp, path)
+
+    def _flush_dirty(self, eid: int) -> None:
+        if eid in self._dirty and eid in self.cache:
+            self._write_expert_file(eid, self.cache[eid])
+            self._dirty.discard(eid)
 
     def write_back(self, eid: int, weights) -> None:
-        """Persist updated expert weights (optimizer updates) and invalidate cache."""
+        """Synchronize an optimizer-updated expert without flushing the whole cache."""
         eid = int(eid)
         if self.mode in ("R", "R2V", "V"):
-            self.ram_weights[eid] = {k: v.copy() for k, v in weights.items()}
+            # Model parameters are updated in place; keep direct references so
+            # the paging layer doesn't make another full copy of each expert.
+            self.ram_weights[eid] = weights
+            return
+
+        if eid in self.cache:
+            entry = self.cache[eid]
+            for key, value in weights.items():
+                if key in entry and entry[key].shape == value.shape:
+                    np.copyto(entry[key], value)
+                else:
+                    entry[key] = value.copy()
+            self._dirty.add(eid)
         else:
-            path = os.path.join(self.disk_dir, f"expert_{eid}.npz")
-            tmp = path + ".tmp"
-            # NOTE: pass an open handle: np.savez appends '.npz' to str paths
-            # that lack the extension, which would break the atomic replace.
-            with open(tmp, "wb") as f:
-                np.savez(f, **{k: v for k, v in weights.items()})
-            os.replace(tmp, path)
-            if eid in self.cache:
-                del self.cache[eid]  # invalidate stale cache entry
+            # It may have been evicted earlier in the same forward pass. Write
+            # its authoritative optimizer-updated weights directly to backing.
+            self._write_expert_file(eid, weights)
 
     def invalidate_all(self) -> None:
         if self.mode in ("D2R", "D2V"):
+            for eid in list(self._dirty):
+                self._flush_dirty(eid)
             self.cache.clear()
+            self._dirty.clear()
 
     def register_expert(self, eid: int, weights) -> None:
         eid = int(eid)
@@ -163,6 +189,7 @@ class ExpertStore:
         eid = int(eid)
         self.ram_weights.pop(eid, None)
         self.cache.pop(eid, None)
+        self._dirty.discard(eid)
         if self.disk_dir:
             try:
                 os.remove(os.path.join(self.disk_dir, f"expert_{eid}.npz"))

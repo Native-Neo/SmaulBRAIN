@@ -64,9 +64,14 @@ class SmaulOPT:
                 full += 2 * s["m"].size
         return {"factored_elements": factored, "full_elements": full}
 
-    def step(self, params: dict, grads: dict) -> dict:
-        """In-place update of params; returns per-param update norms."""
+    def step(self, params: dict, grads: dict, collect_norms: bool = True) -> dict:
+        """In-place update; optionally return per-parameter RMS update norms."""
         norms = {}
+        beta1 = np.float32(self.beta1)
+        beta2 = np.float32(self.beta2)
+        one_minus_beta1 = np.float32(1.0 - self.beta1)
+        one_minus_beta2 = np.float32(1.0 - self.beta2)
+        eps = np.float32(self.eps)
         for name, w in params.items():
             g = grads.get(name)
             if g is None:
@@ -74,28 +79,44 @@ class SmaulOPT:
             if name not in self.state:
                 self._init_state(name, w)
             st = self.state[name]
-            gf = g.astype(np.float64)
+            gf = np.asarray(g, dtype=np.float32)
             if self.weight_decay:
                 w -= np.float32(self.lr * self.weight_decay) * w
-            m = st["m"].astype(np.float64) * self.beta1 + gf * (1 - self.beta1)
-            st["m"] = m.astype(np.float32)
+
+            m = st["m"] * beta1 + gf * one_minus_beta1
+            st["m"] = m.astype(np.float32, copy=False)
+            g2 = gf * gf
             if st["factored"]:
-                row = np.mean(gf ** 2, axis=1)
-                col = np.mean(gf ** 2, axis=0)
-                R = st["R"].astype(np.float64) * self.beta2 + row * (1 - self.beta2)
-                C = st["C"].astype(np.float64) * self.beta2 + col * (1 - self.beta2)
-                st["R"] = R.astype(np.float32)
-                st["C"] = C.astype(np.float32)
-                mean_r = float(R.mean()) if R.size else 0.0
-                denom_r = mean_r if mean_r > 1e-30 else 1e-30
-                Vhat = np.outer(R, C) / denom_r
-                upd = m / (np.sqrt(np.maximum(Vhat, 0.0)) + self.eps)
+                row = np.mean(g2, axis=1, dtype=np.float32)
+                col = np.mean(g2, axis=0, dtype=np.float32)
+                del g2  # release the full matrix-square temporary before updates
+                R = st["R"] * beta2 + row * one_minus_beta2
+                C = st["C"] * beta2 + col * one_minus_beta2
+                st["R"] = R.astype(np.float32, copy=False)
+                st["C"] = C.astype(np.float32, copy=False)
+                mean_r = float(np.mean(R, dtype=np.float64)) if R.size else 0.0
+                denom_r = np.float32(mean_r if mean_r > 1e-30 else 1e-30)
+                # Reuse the outer-product buffer as sqrt(vhat), then as the
+                # update itself; avoid an extra full-matrix m / denom allocation.
+                upd = np.outer(R, C)
+                upd /= denom_r
+                np.maximum(upd, 0.0, out=upd)
+                np.sqrt(upd, out=upd)
+                upd += eps
+                np.divide(m, upd, out=upd)
             else:
-                v = st["v"].astype(np.float64) * self.beta2 + (gf ** 2) * (1 - self.beta2)
-                st["v"] = v.astype(np.float32)
-                upd = m / (np.sqrt(np.maximum(v, 0.0)) + self.eps)
-            w -= (self.lr * upd).astype(np.float32)
-            norms[name] = float(np.sqrt(np.mean(upd ** 2)))
+                v = st["v"] * beta2 + g2 * one_minus_beta2
+                del g2
+                st["v"] = v.astype(np.float32, copy=False)
+                upd = np.maximum(v, 0.0)
+                np.sqrt(upd, out=upd)
+                upd += eps
+                np.divide(m, upd, out=upd)
+            if collect_norms:
+                # Only a scalar reduction uses fp64; never widen the update tensor.
+                norms[name] = float(np.sqrt(np.mean(upd * upd, dtype=np.float64)))
+            np.multiply(upd, np.float32(self.lr), out=upd)
+            np.subtract(w, upd, out=w)
         self.n_updates += 1
         return norms
 

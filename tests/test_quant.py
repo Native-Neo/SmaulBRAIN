@@ -80,16 +80,22 @@ def test_native_ternary_packer_matches_numpy_reference():
     assert np.isclose(actual[3], expected[3], equal_nan=True)
 
 
-def test_batch_one_packed_matmat_fast_path_matches_dense():
-    rng = np.random.default_rng(701)
-    W = rng.standard_normal((17, 64)).astype(np.float32)
-    x = rng.standard_normal(17).astype(np.float32)
+@pytest.mark.parametrize(
+    ("din", "dout"),
+    [(17, 64), (33, 72), (37, 136), (512, 5000), (5000, 512)],
+)
+def test_batch_one_packed_matmat_fast_path_matches_dense(din, dout):
+    rng = np.random.default_rng(701 + din + dout)
+    W = rng.standard_normal((din, dout)).astype(np.float32)
+    x = rng.standard_normal(din).astype(np.float32)
     packed, scale, shape, _ = Q.pack_ternary(W)
     dense_q = Q.unpack_ternary(packed, shape, scale)
     actual = Q.packed_matmat(x, packed, shape, scale)
     expected = x @ dense_q
-    assert actual.shape == (64,)
-    assert np.allclose(actual, expected, atol=2e-5, rtol=2e-5)
+    assert actual.shape == (dout,)
+    # Long reductions accumulate in a different order from NumPy/BLAS.
+    tol = 3e-4 if din >= 512 else 2e-5
+    assert np.allclose(actual, expected, atol=tol, rtol=2e-5)
 
 
 def test_moe_forward_skips_unused_diagnostic_reductions(monkeypatch):
@@ -208,9 +214,79 @@ def test_cache_reuse_and_invalidation():
     toks = [1, 2, 3, 4]
     m.forward(toks)
     builds = m.packed.builds
+    cache_keys = set(m.packed.d)
     m.forward(toks)  # same objects -> reuse, no rebuilds
     assert m.packed.builds == builds
     assert m.packed.reuse_hits > 0
+    # Selective invalidation keeps packed projections whose params did not change.
+    m.packed.invalidate(["L0.attn.Wr"])
+    assert "L0.attn.Wr" not in m.packed.d
+    assert cache_keys - {"L0.attn.Wr"} <= set(m.packed.d)
     m.packed.invalidate()
     m.forward(toks)
     assert m.packed.builds > builds
+
+
+def test_fp8_weight_cache_reuses_and_selectively_invalidates_quantization():
+    m = _tiny_moe("fp8", "fp8")
+    toks = [1, 2, 3, 4]
+    m.forward(toks)
+    builds = m.fp8.builds
+    assert builds > 0
+    m.forward(toks)
+    assert m.fp8.builds == builds
+    assert m.fp8.reuse_hits > 0
+    key = "L0.attn.Wr"
+    m.fp8.invalidate([key])
+    before = m.fp8.builds
+    m.forward(toks)
+    assert m.fp8.builds == before + 1
+
+@pytest.mark.parametrize(("tokens", "width"), [(0, 64), (1, 7), (33, 32), (64, 512), (19, 1000)])
+def test_native_recurrent_scan_matches_numpy(tokens, width):
+    if not Q.prepare_ternary_backend():
+        pytest.skip("native C++ compiler/backend unavailable")
+    rng = np.random.default_rng(809 + tokens + width)
+    kv = rng.standard_normal((tokens, width)).astype(np.float32)
+    alpha = rng.uniform(0.7, 0.999, size=width).astype(np.float32)
+    initial = rng.standard_normal(width).astype(np.float32)
+    state = initial.copy()
+    expected = np.empty_like(kv)
+    for t in range(tokens):
+        state = alpha * state + kv[t]
+        expected[t] = state
+    final_state = initial.copy()
+    actual = np.empty_like(kv)
+    assert Q.recurrent_scan(kv, alpha, final_state, actual)
+    assert np.allclose(actual, expected, rtol=1e-6, atol=1e-6)
+    assert np.allclose(final_state, state, rtol=1e-6, atol=1e-6)
+
+@pytest.mark.parametrize(("tokens", "width"), [(0, 64), (1, 7), (19, 32), (64, 512), (33, 1000)])
+def test_native_recurrent_backward_scan_matches_numpy(tokens, width):
+    if not Q.prepare_ternary_backend():
+        pytest.skip("native C++ compiler/backend unavailable")
+    rng = np.random.default_rng(1409 + tokens + width)
+    ds = rng.standard_normal((tokens, width)).astype(np.float32)
+    states = rng.standard_normal((tokens, width)).astype(np.float32)
+    alpha = rng.uniform(0.7, 0.999, size=width).astype(np.float32)
+
+    expected_dkv = np.empty_like(ds)
+    carry = np.zeros(width, dtype=np.float64)
+    for t in range(tokens - 1, -1, -1):
+        carry = carry * alpha.astype(np.float64) + ds[t].astype(np.float64)
+        expected_dkv[t] = carry.astype(np.float32)
+    expected_dalpha = np.zeros(width, dtype=np.float64)
+    carry_alpha = np.zeros(width, dtype=np.float64)
+    alpha64 = alpha.astype(np.float64)
+    for t in range(tokens):
+        previous = states[t - 1].astype(np.float64) if t > 0 else np.zeros(width)
+        carry_alpha = previous + alpha64 * carry_alpha
+        expected_dalpha += ds[t].astype(np.float64) * carry_alpha
+
+    actual_dkv = np.empty_like(ds)
+    actual_dalpha = np.zeros(width, dtype=np.float64)
+    assert Q.recurrent_backward_scan(
+        ds, states, alpha, actual_dkv, actual_dalpha)
+    assert np.allclose(actual_dkv, expected_dkv, rtol=0, atol=0)
+    assert np.allclose(actual_dalpha, expected_dalpha, rtol=0, atol=0)
+

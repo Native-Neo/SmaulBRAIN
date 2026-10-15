@@ -197,6 +197,15 @@ def prepare_ternary_backend() -> bool:
             ptr_f32, ptr_u8, ctypes.c_size_t,
             ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float)]
         lib.smaulbrain_pack_ternary.restype = ctypes.c_int
+        lib.smaulbrain_recurrent_scan.argtypes = [
+            ptr_f32, ptr_f32, ptr_f32, ptr_f32,
+            ctypes.c_size_t, ctypes.c_size_t]
+        lib.smaulbrain_recurrent_scan.restype = ctypes.c_int
+        ptr_f64 = ctypes.POINTER(ctypes.c_double)
+        lib.smaulbrain_recurrent_backward_scan.argtypes = [
+            ptr_f32, ptr_f32, ptr_f32, ptr_f32, ptr_f64,
+            ctypes.c_size_t, ctypes.c_size_t]
+        lib.smaulbrain_recurrent_backward_scan.restype = ctypes.c_int
         _NATIVE_LIB = lib
         _NATIVE_VARIANT = "avx1" if has_avx else "sse2"
         _NATIVE_ERROR = None
@@ -204,6 +213,77 @@ def prepare_ternary_backend() -> bool:
     except Exception as exc:
         _NATIVE_ERROR = f"{type(exc).__name__}: {exc}"
         return False
+
+
+def recurrent_scan(kv: np.ndarray, alpha: np.ndarray, state: np.ndarray,
+                   states: np.ndarray) -> bool:
+    """Run the native time scan when the packed C++ backend is already loaded.
+
+    Returns False without changing the buffers if no native backend is available
+    or inputs need conversion. The caller can then use its portable reference loop.
+    """
+    if _NATIVE_LIB is None:
+        return False
+    arrays = (kv, alpha, state, states)
+    if any(not isinstance(a, np.ndarray) or a.dtype != np.float32
+           or not a.flags.c_contiguous for a in arrays):
+        return False
+    if kv.ndim != 2 or states.shape != kv.shape:
+        raise ValueError("recurrent scan expects KV/states with matching (T, d) shapes")
+    if alpha.shape != (kv.shape[1],) or state.shape != alpha.shape:
+        raise ValueError("recurrent scan alpha/state widths must match KV")
+    if kv.shape[0] == 0:
+        return True
+    if not state.flags.writeable or not states.flags.writeable:
+        return False
+    status = _NATIVE_LIB.smaulbrain_recurrent_scan(
+        kv.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        alpha.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        state.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        states.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        kv.shape[0], kv.shape[1])
+    if status != 0:
+        raise RuntimeError(f"native recurrent scan failed with status {status}")
+    return True
+
+
+def recurrent_backward_scan(dS: np.ndarray, states: np.ndarray,
+                            alpha: np.ndarray, dKV: np.ndarray,
+                            dalpha: np.ndarray) -> bool:
+    """Run native recurrent BPTT scans when the C++ backend is already loaded.
+
+    Buffers must be preallocated contiguous arrays with float32 activations and
+    a float64 dalpha accumulator. Returns False without modifying them if no
+    native backend is loaded or conversion would be required.
+    """
+    if _NATIVE_LIB is None:
+        return False
+    arrays = (dS, states, alpha, dKV)
+    if any(not isinstance(a, np.ndarray) or a.dtype != np.float32
+           or not a.flags.c_contiguous for a in arrays):
+        return False
+    if not isinstance(dalpha, np.ndarray) or dalpha.dtype != np.float64 or not dalpha.flags.c_contiguous:
+        return False
+    if dS.ndim != 2 or states.shape != dS.shape or dKV.shape != dS.shape:
+        raise ValueError("recurrent backward expects matching (T, d) arrays")
+    T, d = dS.shape
+    if alpha.shape != (d,) or dalpha.shape != (d,):
+        raise ValueError("recurrent backward alpha/dalpha widths must match activations")
+    if T == 0:
+        dalpha.fill(0.0)
+        return True
+    if not dKV.flags.writeable or not dalpha.flags.writeable:
+        return False
+    status = _NATIVE_LIB.smaulbrain_recurrent_backward_scan(
+        dS.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        states.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        alpha.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        dKV.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        dalpha.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        T, d)
+    if status != 0:
+        raise RuntimeError(f"native recurrent backward scan failed with status {status}")
+    return True
 
 
 def ternary_backend_name() -> str:
@@ -264,7 +344,13 @@ def packed_matmat(X: np.ndarray, packed: np.ndarray, shape, scale: float,
         if status != 0:
             raise RuntimeError(f"native packed ternary matmat failed with status {status}")
     else:
-        out = packed_matmat_scalar(x, p, (d_in, d_out), scale)
+        # Compiler-free fallback: decode to a temporary dense matrix and let
+        # NumPy/BLAS do the multiply. Never cache this expansion. The scalar
+        # reference remains available for tests but is not viable at model size.
+        Wq = unpack_codes(p, (d_in, d_out)).astype(np.float32)
+        Wq *= np.float32(scale)
+        out = x @ Wq
+        out = np.asarray(out, dtype=np.float32)
     return out[0] if one_row else out
 
 
@@ -320,7 +406,12 @@ def packed_matmat_transpose(dY: np.ndarray, packed: np.ndarray, shape,
         if status != 0:
             raise RuntimeError(f"native packed ternary transpose matmat failed with status {status}")
     else:
-        dx = packed_matmat_transpose_scalar(dy, p, (d_in, d_out), scale)
+        # As above, prefer a one-call BLAS multiply over Python's triple loop
+        # if the C++ compiler is missing. The decoded matrix is call-local.
+        Wq = unpack_codes(p, (d_in, d_out)).astype(np.float32)
+        Wq *= np.float32(scale)
+        dx = dy @ Wq.T
+        dx = np.asarray(dx, dtype=np.float32)
     return dx[0] if one_row else dx
 
 

@@ -79,9 +79,17 @@ class Trainer:
             {"class": "SmaulOPT", "lr": self.opt.lr, "beta1": self.opt.beta1,
              "beta2": self.opt.beta2, "eps": self.opt.eps,
              "weight_decay": self.opt.weight_decay})
-        opt_state = self.opt.state_dict()
-        opt_state["_factored_flags"] = {k: np.asarray([s["factored"]]) for k, s in self.opt.state.items()}
-        return man, dict(self.model.p), opt_state
+        # Checkpoint writing is synchronous, so the serializer can read live
+        # arrays directly. Avoid duplicating the entire parameter dict and the
+        # optimizer's potentially multi-gigabyte moment tensors before writing.
+        opt_state = {
+            k: {sk: sv for sk, sv in state.items() if not isinstance(sv, bool)}
+            for k, state in self.opt.state.items()
+        }
+        opt_state["_factored_flags"] = {
+            k: np.asarray([state["factored"]]) for k, state in self.opt.state.items()
+        }
+        return man, self.model.p, opt_state
 
     def save(self, pending_phase=False):
         man, params, opt_state = self._payload()
@@ -97,6 +105,7 @@ class Trainer:
             raise ValueError(f"checkpoint preset {man['preset']} != {self.spec.name}")
         self.model.p = {k: v for k, v in blob["params"].items()}
         self.model.packed.invalidate()
+        self.model.fp8.invalidate()
         flags = man.get("optimizer", {}).get("factored", {})
         self.opt.load_state_dict(blob["opt_state"], flags)
         self.opt.register(self.model.p)
@@ -142,7 +151,13 @@ class Trainer:
         # ranking
         if pend.get("sources") is None:
             batches = self._eval_batches()
-            scores, nsamp = _growth.rank_experts(self.model, batches, sched.min_eval_samples)
+            # Growth ranking is a rare but expensive operation: score every
+            # expert on one representative batch instead of forwarding all
+            # experts over every evidence batch. The full sample count still
+            # gates eligibility; the source ordering is explicitly approximate.
+            score_samples = max(len(batches[0]) - 1, 0) if batches else 0
+            scores, nsamp = _growth.rank_experts(
+                self.model, batches, sched.min_eval_samples, max_batches=1)
             if scores is None:
                 pend["status"] = "WAITING_FOR_RANKING"
                 pend["ranking"] = {"samples": nsamp, "insufficient": True}
@@ -156,7 +171,9 @@ class Trainer:
                 self.save()
                 raise _NeedEvidence("no reliably ranked source experts; trigger retained")
             pend["ranking"] = {"scores": {str(k): v for k, v in scores.items()},
-                               "samples": nsamp}
+                               "samples": nsamp,
+                               "score_samples": score_samples,
+                               "approximate": True}
             pend["sources"] = sources
             pend["status"] = "PREPARED"
             pend["mutation"] = {"scale": self.args.growth_noise_scale,
@@ -226,9 +243,11 @@ class Trainer:
              "eps": opt.eps, "weight_decay": opt.weight_decay,
              "factored": {k: bool(s["factored"]) for k, s in opt.state.items()}})
         # optimizer state carried by name; router state carried per-column below
-        opt_state = {k: {sk: sv.copy() for sk, sv in s.items() if not isinstance(sv, bool)}
+        # _write_tree consumes array references synchronously; avoid a second
+        # copy of every optimizer tensor at the growth commit checkpoint.
+        opt_state = {k: {sk: sv for sk, sv in s.items() if not isinstance(sv, bool)}
                      for k, s in opt.state.items()}
-        _ckpt.save_checkpoint(self.args.checkpoint, man, dict(cand), opt_state)
+        _ckpt.save_checkpoint(self.args.checkpoint, man, cand, opt_state)
 
     def _resize_router_opt_state(self, cand):
         import numpy as _np
@@ -255,6 +274,7 @@ class Trainer:
             model.store.n_experts = len(_model.expert_ids(cand))
             model.store.invalidate_all()
         model.packed.invalidate()
+        model.fp8.invalidate()
         model._assert_counts()
 
     def train(self, max_steps=None, log_every=10, eval_every=0, ckpt_every=0,
@@ -272,15 +292,27 @@ class Trainer:
             if not np.isfinite(loss):
                 raise RuntimeError(f"non-finite loss at step {self.sched.global_step}")
             # gradient clipping (global norm)
-            total = float(np.sqrt(sum(float(np.sum(g.astype(np.float64) ** 2))
-                                        for g in grads.values())))
+            total_sq = sum(float(np.sum(g * g, dtype=np.float64))
+                           for g in grads.values())
+            total = float(np.sqrt(total_sq))
             if total > grad_clip and total > 0:
                 scale = grad_clip / total
                 grads = {k: (g * scale).astype(np.float32) for k, g in grads.items()}
-            self.opt.step(self.model.p, grads)
-            self.model.packed.invalidate()  # caches invalid after parameter updates
-            if self.model.store is not None:
-                self.model.store.invalidate_all()
+            # Training never consumes per-parameter update norms; skip their
+            # extra full-array reductions unless an explicit caller requests them.
+            self.opt.step(self.model.p, grads, collect_norms=False)
+            # Only parameters with gradients were updated in-place. Invalidate
+            # their quantized representations, not every projection in the model.
+            self.model.packed.invalidate(grads.keys())
+            self.model.fp8.invalidate(grads.keys())
+            if self.model.store is not None and self.spec.kind == "moe":
+                changed_experts = set()
+                for name in grads:
+                    parts = name.split(".")
+                    if len(parts) == 3 and parts[0] == "expert" and parts[2] in ("Win", "Wout"):
+                        changed_experts.add(int(parts[1]))
+                for eid in changed_experts:
+                    self.model.store.write_back(eid, _expert_dict(self.model.p, eid))
             # 1-4: step counter, smoothing, triggers, single pending creation
             reason = self.sched.note_optimizer_step(loss)
             if reason is not None and self.sched.pending is None:

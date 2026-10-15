@@ -9,6 +9,7 @@ blocks (documented choice: global expert registry; keeps per-expert counts
 exact and memory bounded by one pool).
 """
 import numpy as np
+import weakref
 
 from . import config as _cfg
 from . import moe as _moe
@@ -71,19 +72,56 @@ class PackedCache:
 
     def get(self, key, W: np.ndarray):
         e = self.d.get(key)
-        if e is not None and e["id"] == id(W) and e["nbytes"] == W.nbytes:
+        if (e is not None and e["ref"]() is W and e["id"] == id(W)
+                and e["nbytes"] == W.nbytes):
             self.reuse_hits += 1
             return e["packed"], e["scale"], e["shape"]
         packed, scale, shape, _th = _quant.pack_ternary(W)
         if len(self.d) >= self.max_entries:
             self.d.pop(next(iter(self.d)))
         self.d[key] = {"packed": packed, "scale": scale, "shape": shape,
-                       "id": id(W), "nbytes": W.nbytes}
+                       "id": id(W), "ref": weakref.ref(W), "nbytes": W.nbytes}
         self.builds += 1
         return packed, scale, shape
 
-    def invalidate(self):
-        self.d.clear()
+    def invalidate(self, keys=None):
+        """Invalidate all cached weights, or only the named changed parameters."""
+        if keys is None:
+            self.d.clear()
+            return
+        for key in keys:
+            self.d.pop(key, None)
+
+
+class FP8Cache:
+    """Bounded-by-model FP8 weight cache; entries are invalidated by parameter name."""
+
+    def __init__(self, max_entries: int = 256):
+        self.max_entries = max_entries
+        self.d = {}
+        self.builds = 0
+        self.reuse_hits = 0
+
+    def get(self, key, W: np.ndarray):
+        entry = self.d.get(key)
+        if (entry is not None and entry["ref"]() is W and entry["id"] == id(W)
+                and entry["nbytes"] == W.nbytes):
+            self.reuse_hits += 1
+            return entry["weight"], entry["scale"]
+        Wq, scale = _quant.fp8_e4m3_quantize(W)
+        if key not in self.d and len(self.d) >= self.max_entries:
+            self.d.pop(next(iter(self.d)))
+        self.d[key] = {"weight": Wq, "scale": scale,
+                       "id": id(W), "ref": weakref.ref(W), "nbytes": W.nbytes}
+        self.builds += 1
+        return Wq, scale
+
+    def invalidate(self, keys=None):
+        if keys is None:
+            self.d.clear()
+            return
+        for key in keys:
+            self.d.pop(key, None)
 
 
 class Model:
@@ -102,6 +140,7 @@ class Model:
         self.paging_mode = paging_mode
         self.store = paging_store
         self.packed = PackedCache()
+        self.fp8 = FP8Cache()
         self.loss_smooth_beta = float(loss_smooth_beta)
         self.capacity_factor = float(capacity_factor)
         self._assert_counts()
@@ -134,7 +173,7 @@ class Model:
         if self.forward_quant == "fp32":
             return W, ("fp32", W)
         if self.forward_quant == "fp8":
-            Wq, scale = _quant.fp8_e4m3_quantize(W)
+            Wq, scale = self.fp8.get(key, W)
             return Wq, ("fp8", W, Wq, scale)
         packed, scale, shape = self.packed.get(key, W)
         return (packed, scale, shape), ("ternary", W, packed, scale, shape)
@@ -184,30 +223,52 @@ class Model:
         s = np.zeros(d, dtype=np.float32) if s0 is None else s0.astype(np.float32).copy()
         KV = K * V
         S = np.empty((T, d), dtype=np.float32)
-        for t in range(T):
-            s = alpha * s + KV[t]
-            S[t] = s
+        # Ternary mode already loaded the native C++ backend. Use its SIMD scan
+        # to remove the per-token Python loop during prefill/training; keep the
+        # numerically matching NumPy loop as the portable/non-native fallback.
+        if not _quant.recurrent_scan(KV, alpha, s, S):
+            for t in range(T):
+                s = alpha * s + KV[t]
+                S[t] = s
         G = _ops.sigmoid(R)
         Y = G * (S + u * KV)
         O, hO = self._lin_fwd(Y, p[px + "attn.Wo"], px + "attn.Wo")
-        cache = (X, R, K, V, KV, S, G, alpha, hR, hK, hV, hO, px)
+        # Keep the projection input Y, but reconstruct KV during backward.
+        # This drops one full [T,d] activation from every layer's train cache.
+        cache = (X, R, K, V, S, Y, alpha, hR, hK, hV, hO, px)
         return O, (s.copy(), cache)
 
     def _attn_bwd(self, dO, cache):
-        X, R, K, V, KV, S, G, alpha, hR, hK, hV, hO, px = cache
+        X, R, K, V, S, Y, alpha, hR, hK, hV, hO, px = cache
         T, d = X.shape
         p = self.p
-        dY_full, dWo = self._lin_bwd(dO, G * (S + p[px + "attn.u"] * KV), hO)
+        KV = K * V
+        dY_full, dWo = self._lin_bwd(dO, Y, hO)
         dY = dY_full
         sig = _ops.sigmoid(R)
         dS_total = dY * sig
         dG = dY * (S + p[px + "attn.u"] * KV) * sig * (1 - sig)
         dKV_state = np.empty_like(KV)
-        ds = np.zeros(d, dtype=np.float64)
         Aw = alpha.astype(np.float64)
-        for t in range(T - 1, -1, -1):
-            ds = ds * Aw + dS_total[t].astype(np.float64)
-            dKV_state[t] = ds.astype(np.float32)
+        dalpha = np.zeros(d, dtype=np.float64)
+        # The packed backend includes native time scans for both BPTT
+        # recurrences. This removes two Python loops and repeated per-token
+        # float64 row conversions. FP32-only/compiler-free runs keep the
+        # straightforward reference implementation.
+        if not _quant.recurrent_backward_scan(dS_total, S, alpha, dKV_state, dalpha):
+            # Amortize dtype conversion instead of allocating a fresh float64
+            # row on every step of both recurrent backward loops.
+            dS64 = dS_total.astype(np.float64)
+            S64 = S.astype(np.float64)
+            ds = np.zeros(d, dtype=np.float64)
+            for t in range(T - 1, -1, -1):
+                ds = ds * Aw + dS64[t]
+                dKV_state[t] = ds.astype(np.float32)
+            dsdalpha = np.zeros(d, dtype=np.float64)
+            for t in range(T):
+                s_prev = S64[t - 1] if t > 0 else np.zeros(d)
+                dsdalpha = s_prev + Aw * dsdalpha
+                dalpha += dS64[t] * dsdalpha
         dKV = dKV_state + dY * sig * p[px + "attn.u"]
         dK = dKV * V
         dV = dKV * K
@@ -216,13 +277,6 @@ class Model:
         dXk, dWk = self._lin_bwd(dK, X, hK)
         dXv, dWv = self._lin_bwd(dV, X, hV)
         dX = (dXr + dXk + dXv).astype(np.float32)
-        # dw
-        dsdalpha = np.zeros(d, dtype=np.float64)
-        dalpha = np.zeros(d, dtype=np.float64)
-        for t in range(T):
-            s_prev = S[t - 1].astype(np.float64) if t > 0 else np.zeros(d)
-            dsdalpha = s_prev + Aw * dsdalpha
-            dalpha += dS_total[t].astype(np.float64) * dsdalpha
         sigw = 1.0 / (1.0 + np.exp(-np.clip(p[px + "attn.w"].astype(np.float64), -60, 60)))
         dw = (dalpha * (-Aw * sigw)).astype(np.float32)
         du = np.sum(dY * sig * KV, axis=0).astype(np.float32)
@@ -281,10 +335,20 @@ class Model:
         T, d = X.shape
         Y = np.zeros_like(X)
         expert_caches = {}
-        Xc, scores, _ti, _w, _keep = rcache
-        for eid in np.unique(top_idx):
+        # Group token/rank assignments once rather than scanning top_idx with
+        # np.where for every active expert. Stable sorting preserves the
+        # original row-major order within each expert group.
+        flat_eids = top_idx.reshape(-1)
+        route_rows = np.repeat(np.arange(T, dtype=np.int64), top_idx.shape[1])
+        route_cols = np.tile(np.arange(top_idx.shape[1], dtype=np.int64), T)
+        grouped_order = np.argsort(flat_eids, kind="stable")
+        grouped_eids, group_counts = np.unique(flat_eids, return_counts=True)
+        group_starts = np.cumsum(group_counts, dtype=np.int64) - group_counts
+        for eid, start, count in zip(grouped_eids, group_starts, group_counts):
             eid = int(eid)
-            rows, cols = np.where(top_idx == eid)
+            pos = grouped_order[int(start):int(start + count)]
+            rows = route_rows[pos]
+            cols = route_cols[pos]
             if self.store is not None:
                 self.store.pin(eid)
             try:
@@ -292,7 +356,10 @@ class Model:
                 Yb, ec = self._expert_fwd(Xb, eid)
                 w = weights[rows, cols][:, None]
                 Y[rows] += w * Yb
-                expert_caches[eid] = (rows, cols, ec)
+                # Cache the output used by router-gradient computation;
+                # recomputing an expert forward in backward doubles its large
+                # input/output projections.
+                expert_caches[eid] = (rows, cols, ec, Yb)
             finally:
                 if self.store is not None:
                     self.store.unpin(eid)
@@ -311,18 +378,17 @@ class Model:
         dX = np.zeros_like(X)
         dWsum = np.zeros_like(weights)
         grads = {}
-        for eid, (rows, cols, ec) in expert_caches.items():
+        for eid, (rows, cols, ec, Yb) in expert_caches.items():
             w = weights[rows, cols][:, None]
-            Yb_cache = ec
             dYb = dY[rows] * w
-            dXb, g = self._expert_bwd(dYb, Yb_cache)
-            # need Yb for router grad: recompute cheaply
-            Xb = X[rows]
-            Yb, _ = self._expert_fwd(Xb, eid)
+            dXb, g = self._expert_bwd(dYb, ec)
             dWsum[rows, cols] = np.sum(dY[rows] * Yb, axis=1)
             for kk, vv in g.items():
                 grads[kk] = grads.get(kk, 0) + vv if isinstance(grads.get(kk), np.ndarray) else vv
-            np.add.at(dX, rows, dXb)
+            # Each token can select an expert at most once, so rows is
+            # unique within one expert group; indexed addition is safe and
+            # avoids np.add.at's general duplicate-index machinery.
+            dX[rows] += dXb
         # router backward
         dXr, dRouter = router.backward(dWsum, rcache)
         dX = dX + dXr
@@ -387,7 +453,7 @@ class Model:
         grads: dict = {}
         dH = dlogits @ self.p["embed"]
         grads["embed"] = dlogits.T @ H
-        dX, dgfinal = _rms_bwd_with_cache(dH, Xlast, self.p["final_norm"], H)
+        dX, dgfinal = _ops.rmsnorm_bwd(dH, cf)
         grads["final_norm"] = dgfinal
         spec = self.spec
         for i in range(spec.n_layers - 1, -1, -1):
@@ -439,16 +505,3 @@ class Model:
 
 def dHo_res(a, b):
     return (a + b).astype(np.float32)
-
-
-def _stack_rms_cache(cfwd, g):
-    # cfwd from rmsnorm_fwd is (x, g, xn, ms); rebuild expected tuple
-    return cfwd
-
-
-def _rms_bwd_with_cache(dH, Xlast, g, H):
-    ms = np.mean(Xlast.astype(np.float64) ** 2, axis=-1, keepdims=True)
-    inv = 1.0 / np.sqrt(ms + 1e-6)
-    xn = (Xlast.astype(np.float64) * inv).astype(np.float32)
-    cache = (Xlast.astype(np.float32), g.astype(np.float32), xn, None)
-    return _ops.rmsnorm_bwd(dH, cache)

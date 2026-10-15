@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
+#include <vector>
 #if defined(__AVX__)
 #include <immintrin.h>
 #elif defined(__SSE2__)
@@ -67,32 +68,47 @@ extern "C" int smaulbrain_ternary_matmat(
 
 #if defined(__AVX__)
     if (batch == 1 && (dout & 7u) == 0u) {
-        // Autoregressive decoding always has batch=1. Do not reserve registers
-        // and branch for a nonexistent second row. A 64-column tile halves
-        // tile-loop overhead versus the paired-prefill kernel.
-        constexpr std::size_t kTile = 64;
-        for (std::size_t j0 = 0; j0 < dout; j0 += kTile) {
-            const std::size_t width = std::min(kTile, dout - j0);
-            const std::size_t nvec = width / 8;
-            __m256 acc[8];
-            for (std::size_t v = 0; v < nvec; ++v) acc[v] = _mm256_setzero_ps();
-            for (std::size_t i = 0; i < din; ++i) {
-                const __m256 xv = _mm256_set1_ps(x[i]);
-                const std::size_t base = (i * dout + j0) >> 2;
+        // Block input rows outside output tiles so the current row group stays
+        // cache-hot while scanning adjacent output columns. The output-tile
+        // outer loop revisited widely spaced row cache lines for each tile.
+        constexpr std::size_t kInputTile = 16;
+        constexpr std::size_t kOutputTile = 64;
+        std::fill(y, y + dout, 0.0f);
+        for (std::size_t i0 = 0; i0 < din; i0 += kInputTile) {
+            const std::size_t iend = std::min(i0 + kInputTile, din);
+            for (std::size_t j0 = 0; j0 < dout; j0 += kOutputTile) {
+                const std::size_t width = std::min(kOutputTile, dout - j0);
+                const std::size_t nvec = width / 8;
+                __m256 acc[8];
                 for (std::size_t v = 0; v < nvec; ++v) {
-                    const __m256 wv = trit_vector8(packed[base + v * 2],
-                                                   packed[base + v * 2 + 1]);
-                    acc[v] = _mm256_add_ps(acc[v], _mm256_mul_ps(xv, wv));
+                    acc[v] = _mm256_setzero_ps();
+                }
+                for (std::size_t i = i0; i < iend; ++i) {
+                    const __m256 xv = _mm256_set1_ps(x[i]);
+                    const std::size_t base = (i * dout + j0) >> 2;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC unroll 8
+#endif
+                    for (std::size_t v = 0; v < nvec; ++v) {
+                        const __m256 wv = trit_vector8(packed[base + v * 2],
+                                                       packed[base + v * 2 + 1]);
+                        acc[v] = _mm256_add_ps(acc[v], _mm256_mul_ps(xv, wv));
+                    }
+                }
+                for (std::size_t v = 0; v < nvec; ++v) {
+                    const std::size_t out_idx = j0 + v * 8;
+                    const __m256 prior = _mm256_loadu_ps(y + out_idx);
+                    _mm256_storeu_ps(y + out_idx, _mm256_add_ps(prior, acc[v]));
                 }
             }
-            const __m256 scalev = _mm256_set1_ps(scale);
-            for (std::size_t v = 0; v < nvec; ++v) {
-                _mm256_storeu_ps(y + j0 + v * 8, _mm256_mul_ps(acc[v], scalev));
-            }
+        }
+        const __m256 scalev = _mm256_set1_ps(scale);
+        for (std::size_t j = 0; j < dout; j += 8) {
+            const __m256 sum = _mm256_loadu_ps(y + j);
+            _mm256_storeu_ps(y + j, _mm256_mul_ps(sum, scalev));
         }
         return 0;
     }
-
     if ((dout & 7u) == 0u) {
         // Process two tokens at once so packed bytes and decoded trit vectors
         // are reused for both rows. This is especially useful for prompt
@@ -274,5 +290,73 @@ extern "C" int smaulbrain_pack_ternary(
     if (!(scale > 0.0)) scale = 1.0;
     *scale_out = static_cast<float>(scale);
     *threshold_out = static_cast<float>(threshold);
+    return 0;
+}
+
+extern "C" int smaulbrain_recurrent_scan(
+    const float* kv, const float* alpha, float* state, float* states,
+    std::size_t T, std::size_t d) {
+    if (!kv || !alpha || !state || !states || d == 0) return 1;
+    // Time remains sequential, but each feature recurrence is independent.
+    // Process one timestep at a time and vectorize across the feature axis.
+    for (std::size_t t = 0; t < T; ++t) {
+        const float* kvt = kv + t * d;
+        float* st = states + t * d;
+        std::size_t j = 0;
+#if defined(__AVX__)
+        for (; j + 8 <= d; j += 8) {
+            const __m256 a = _mm256_loadu_ps(alpha + j);
+            const __m256 s = _mm256_loadu_ps(state + j);
+            const __m256 x = _mm256_loadu_ps(kvt + j);
+            const __m256 next = _mm256_add_ps(_mm256_mul_ps(a, s), x);
+            _mm256_storeu_ps(state + j, next);
+            _mm256_storeu_ps(st + j, next);
+        }
+#elif defined(__SSE2__)
+        for (; j + 4 <= d; j += 4) {
+            const __m128 a = _mm_loadu_ps(alpha + j);
+            const __m128 s = _mm_loadu_ps(state + j);
+            const __m128 x = _mm_loadu_ps(kvt + j);
+            const __m128 next = _mm_add_ps(_mm_mul_ps(a, s), x);
+            _mm_storeu_ps(state + j, next);
+            _mm_storeu_ps(st + j, next);
+        }
+#endif
+        for (; j < d; ++j) {
+            const float next = alpha[j] * state[j] + kvt[j];
+            state[j] = next;
+            st[j] = next;
+        }
+    }
+    return 0;
+}
+
+extern "C" int smaulbrain_recurrent_backward_scan(
+    const float* dS, const float* S, const float* alpha, float* dKV,
+    double* dalpha, std::size_t T, std::size_t d) {
+    if (!dS || !S || !alpha || !dKV || !dalpha || d == 0) return 1;
+    // Use double recurrent accumulators to match the stable Python reference,
+    // but keep all per-timestep loops inside native code instead of Python.
+    std::vector<double> ds(d, 0.0);
+    std::vector<double> dsdalpha(d, 0.0);
+    std::vector<double> da(d, 0.0);
+    for (std::size_t t = T; t-- > 0;) {
+        const std::size_t base = t * d;
+        for (std::size_t j = 0; j < d; ++j) {
+            ds[j] = ds[j] * static_cast<double>(alpha[j]) +
+                    static_cast<double>(dS[base + j]);
+            dKV[base + j] = static_cast<float>(ds[j]);
+        }
+    }
+    for (std::size_t t = 0; t < T; ++t) {
+        const std::size_t base = t * d;
+        const std::size_t prev = t > 0 ? (t - 1) * d : 0;
+        for (std::size_t j = 0; j < d; ++j) {
+            const double s_prev = t > 0 ? static_cast<double>(S[prev + j]) : 0.0;
+            dsdalpha[j] = s_prev + static_cast<double>(alpha[j]) * dsdalpha[j];
+            da[j] += static_cast<double>(dS[base + j]) * dsdalpha[j];
+        }
+    }
+    for (std::size_t j = 0; j < d; ++j) dalpha[j] = da[j];
     return 0;
 }

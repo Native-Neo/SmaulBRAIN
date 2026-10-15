@@ -38,10 +38,14 @@ def main(argv=None):
     ap.add_argument("--steps", type=int, default=5)
     ap.add_argument("--repeat", type=int, default=5,
                     help="number of warm-forward and decode repetitions (default: 5)")
+    ap.add_argument("--max-new-tokens", type=int, default=None,
+                    help="tokens to generate per decode repetition (default: preset-specific smoke count)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args(argv)
     if args.repeat < 1:
         ap.error("--repeat must be at least 1")
+    if args.max_new_tokens is not None and args.max_new_tokens < 1:
+        ap.error("--max-new-tokens must be at least 1")
     try:
         preset = _cli.validate_args(args)
     except ValueError as e:
@@ -83,7 +87,9 @@ def main(argv=None):
     # Measure inference before the optimizer mutates parameters, so the
     # quantized cache always matches the weights being benchmarked.
     prefill_times, decode_rates = [], []
-    n = 16 if spec.name.endswith("tiny") else 2
+    n = args.max_new_tokens if args.max_new_tokens is not None else (
+        16 if spec.name.endswith("tiny") else 2)
+    res["max_new_tokens"] = n
     for _ in range(args.repeat):
         eng = _inf.InferenceEngine(m, seed=0, temperature=0.0)
         t0 = time.perf_counter()

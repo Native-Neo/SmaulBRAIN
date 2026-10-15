@@ -13,33 +13,47 @@ def _check_tmp(n: int, what: str) -> None:
 
 
 def rmsnorm_fwd(x: np.ndarray, g: np.ndarray, eps: float = EPS):
-    ms = np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True)
-    inv = 1.0 / np.sqrt(ms + eps)
-    xn = x.astype(np.float64) * inv
-    y = (xn * g.astype(np.float64)).astype(np.float32)
-    cache = (x.astype(np.float32), g.astype(np.float32), xn.astype(np.float32),
-             np.float32(ms.mean()) if ms.size == 1 else ms.astype(np.float32))
-    return y, cache
+    # Activations and scale parameters are already fp32. Keep the large
+    # elementwise temporaries in fp32; reductions can choose their accumulator
+    # dtype without first widening the whole tensor.
+    x32 = np.asarray(x, dtype=np.float32)
+    g32 = np.asarray(g, dtype=np.float32)
+    ms = np.mean(x32 * x32, axis=-1, keepdims=True, dtype=np.float32)
+    inv = 1.0 / np.sqrt(ms + np.float32(eps))
+    xn = x32 * inv
+    y = xn * g32
+    cached_ms = np.float32(ms.reshape(-1)[0]) if ms.size == 1 else ms
+    cache = (x32, g32, xn, cached_ms)
+    return y.astype(np.float32, copy=False), cache
 
 
 def rmsnorm_bwd(dy: np.ndarray, cache, eps: float = EPS):
-    x, g, xn, _ = cache
-    xf = x.astype(np.float64)
-    df = dy.astype(np.float64)
-    gf = g.astype(np.float64)
+    x, g, xn, cached_ms = cache
+    dy32 = np.asarray(dy, dtype=np.float32)
     n = x.shape[-1]
-    ms = np.mean(xf ** 2, axis=-1, keepdims=True)
-    inv = 1.0 / np.sqrt(ms + eps)
-    d_xn = df * gf
-    dot = np.sum(d_xn * xf, axis=-1, keepdims=True)
-    dx = ((d_xn - xf * dot / (n * (ms + eps))) * inv).astype(np.float32)
-    dg = np.sum(df * xn.astype(np.float64), axis=tuple(range(dy.ndim - 1))).astype(np.float32)
-    return dx, dg
+    # Reuse the forward statistics instead of recomputing RMS from a widened
+    # copy of x. Only row reductions use fp64 accumulation for stability.
+    ms = np.asarray(cached_ms, dtype=np.float32)
+    denom = ms + np.float32(eps)
+    inv = 1.0 / np.sqrt(denom)
+    d_xn = dy32 * g
+    dot = np.sum(d_xn * x, axis=-1, keepdims=True, dtype=np.float64).astype(np.float32)
+    dx = (d_xn - x * (dot / (n * denom))) * inv
+    axes = tuple(range(dy32.ndim - 1))
+    dg = np.sum(dy32 * xn, axis=axes, dtype=np.float64).astype(np.float32)
+    return dx.astype(np.float32, copy=False), dg
 
 
 def sigmoid(x):
-    return np.where(x >= 0, 1 / (1 + np.exp(-np.clip(x, -60, 60))),
-                   np.exp(np.clip(x, -60, 60)) / (1 + np.exp(np.clip(x, -60, 60))))
+    # Evaluate only the numerically stable branch for each element; np.where
+    # evaluates both expressions and used to compute several full-array exp's.
+    xc = np.clip(x, -60, 60)
+    out = np.empty_like(xc, dtype=np.result_type(xc.dtype, np.float32))
+    positive = xc >= 0
+    out[positive] = 1.0 / (1.0 + np.exp(-xc[positive]))
+    e = np.exp(xc[~positive])
+    out[~positive] = e / (1.0 + e)
+    return out
 
 
 def silu(x):
