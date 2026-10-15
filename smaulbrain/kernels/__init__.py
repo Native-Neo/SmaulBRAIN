@@ -6,6 +6,7 @@ reference path always remains available.
 """
 import os
 import sys
+from functools import lru_cache
 
 from .. import cpu as _cpu
 
@@ -36,6 +37,7 @@ def build_here(build_dir="", verbose: bool = True) -> str:
                        "to produce the module; Python reference kernels are used otherwise.")
 
 
+@lru_cache(maxsize=1)
 def try_load():
     """(module, info). Never raises for missing builds; reports reason."""
     caps = _cpu.detect()
