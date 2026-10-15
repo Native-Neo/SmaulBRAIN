@@ -297,9 +297,11 @@ class Model:
                 if self.store is not None:
                     self.store.unpin(eid)
         cache = (X, top_idx, weights, rcache, expert_caches, router)
+        # Only overflow is consumed by the public model path. Balance-loss and
+        # per-expert reporting helpers are diagnostics, not part of the forward
+        # result or loss, so do not run their Python loops on every decode token.
         aux = {"overflow_dropped": info["overflow_dropped"],
-               "balance_aux": _moe.balance_aux_loss(weights, top_idx, router.n_experts),
-               "expert_stats": _moe.expert_output_stats(top_idx, weights, router.n_experts)}
+               "balance_aux": 0.0}
         return Y, (cache, aux)
 
     def _moe_bwd(self, dY, moe_cache):
