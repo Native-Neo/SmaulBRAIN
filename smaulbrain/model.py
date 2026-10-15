@@ -9,6 +9,7 @@ blocks (documented choice: global expert registry; keeps per-expert counts
 exact and memory bounded by one pool).
 """
 import numpy as np
+import weakref
 
 from . import config as _cfg
 from . import moe as _moe
@@ -71,14 +72,14 @@ class PackedCache:
 
     def get(self, key, W: np.ndarray):
         e = self.d.get(key)
-        if e is not None and e["id"] == id(W) and e["nbytes"] == W.nbytes:
+        if (e is not None and e["ref"]() is W and e["id"] == id(W)\n                and e["nbytes"] == W.nbytes):
             self.reuse_hits += 1
             return e["packed"], e["scale"], e["shape"]
         packed, scale, shape, _th = _quant.pack_ternary(W)
         if len(self.d) >= self.max_entries:
             self.d.pop(next(iter(self.d)))
         self.d[key] = {"packed": packed, "scale": scale, "shape": shape,
-                       "id": id(W), "nbytes": W.nbytes}
+                       "id": id(W), "ref": weakref.ref(W), "nbytes": W.nbytes}
         self.builds += 1
         return packed, scale, shape
 
@@ -101,12 +102,12 @@ class FP8Cache:
 
     def get(self, key, W: np.ndarray):
         entry = self.d.get(key)
-        if entry is not None and entry["id"] == id(W) and entry["nbytes"] == W.nbytes:
+        if (entry is not None and entry["ref"]() is W and entry["id"] == id(W)\n                and entry["nbytes"] == W.nbytes):
             self.reuse_hits += 1
             return entry["weight"], entry["scale"]
         Wq, scale = _quant.fp8_e4m3_quantize(W)
         self.d[key] = {"weight": Wq, "scale": scale,
-                       "id": id(W), "nbytes": W.nbytes}
+                       "id": id(W), "ref": weakref.ref(W), "nbytes": W.nbytes}
         self.builds += 1
         return Wq, scale
 
