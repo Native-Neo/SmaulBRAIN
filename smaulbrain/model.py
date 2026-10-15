@@ -249,11 +249,22 @@ class Model:
         dS_total = dY * sig
         dG = dY * (S + p[px + "attn.u"] * KV) * sig * (1 - sig)
         dKV_state = np.empty_like(KV)
-        ds = np.zeros(d, dtype=np.float64)
         Aw = alpha.astype(np.float64)
-        for t in range(T - 1, -1, -1):
-            ds = ds * Aw + dS_total[t].astype(np.float64)
-            dKV_state[t] = ds.astype(np.float32)
+        dalpha = np.zeros(d, dtype=np.float64)
+        # The packed backend includes native time scans for both BPTT
+        # recurrences. This removes two Python loops and repeated per-token
+        # float64 row conversions. FP32-only/compiler-free runs keep the
+        # straightforward reference implementation.
+        if not _quant.recurrent_backward_scan(dS_total, S, alpha, dKV_state, dalpha):
+            ds = np.zeros(d, dtype=np.float64)
+            for t in range(T - 1, -1, -1):
+                ds = ds * Aw + dS_total[t].astype(np.float64)
+                dKV_state[t] = ds.astype(np.float32)
+            dsdalpha = np.zeros(d, dtype=np.float64)
+            for t in range(T):
+                s_prev = S[t - 1].astype(np.float64) if t > 0 else np.zeros(d)
+                dsdalpha = s_prev + Aw * dsdalpha
+                dalpha += dS_total[t].astype(np.float64) * dsdalpha
         dKV = dKV_state + dY * sig * p[px + "attn.u"]
         dK = dKV * V
         dV = dKV * K
@@ -262,13 +273,6 @@ class Model:
         dXk, dWk = self._lin_bwd(dK, X, hK)
         dXv, dWv = self._lin_bwd(dV, X, hV)
         dX = (dXr + dXk + dXv).astype(np.float32)
-        # dw
-        dsdalpha = np.zeros(d, dtype=np.float64)
-        dalpha = np.zeros(d, dtype=np.float64)
-        for t in range(T):
-            s_prev = S[t - 1].astype(np.float64) if t > 0 else np.zeros(d)
-            dsdalpha = s_prev + Aw * dsdalpha
-            dalpha += dS_total[t].astype(np.float64) * dsdalpha
         sigw = 1.0 / (1.0 + np.exp(-np.clip(p[px + "attn.w"].astype(np.float64), -60, 60)))
         dw = (dalpha * (-Aw * sigw)).astype(np.float32)
         du = np.sum(dY * sig * KV, axis=0).astype(np.float32)
