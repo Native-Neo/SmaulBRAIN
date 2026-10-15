@@ -67,32 +67,48 @@ extern "C" int smaulbrain_ternary_matmat(
 
 #if defined(__AVX__)
     if (batch == 1 && (dout & 7u) == 0u) {
-        // Autoregressive decoding always has batch=1. Do not reserve registers
-        // and branch for a nonexistent second row. A 64-column tile halves
-        // tile-loop overhead versus the paired-prefill kernel.
-        constexpr std::size_t kTile = 64;
-        for (std::size_t j0 = 0; j0 < dout; j0 += kTile) {
-            const std::size_t width = std::min(kTile, dout - j0);
-            const std::size_t nvec = width / 8;
-            __m256 acc[8];
-            for (std::size_t v = 0; v < nvec; ++v) acc[v] = _mm256_setzero_ps();
-            for (std::size_t i = 0; i < din; ++i) {
-                const __m256 xv = _mm256_set1_ps(x[i]);
-                const std::size_t base = (i * dout + j0) >> 2;
+        // Decode is batch-one and weight-read heavy. Block input rows outside
+        // output tiles so packed slices for a small group of rows remain in
+        // L1 while we sweep contiguous output columns. The output-tile outer
+        // loop revisited hundreds/thousands of row cache lines per tile.
+        constexpr std::size_t kInputTile = 16;
+        constexpr std::size_t kOutputTile = 64;
+        std::fill(y, y + dout, 0.0f);
+        for (std::size_t i0 = 0; i0 < din; i0 += kInputTile) {
+            const std::size_t iend = std::min(i0 + kInputTile, din);
+            for (std::size_t j0 = 0; j0 < dout; j0 += kOutputTile) {
+                const std::size_t width = std::min(kOutputTile, dout - j0);
+                const std::size_t nvec = width / 8;
+                __m256 acc[8];
                 for (std::size_t v = 0; v < nvec; ++v) {
-                    const __m256 wv = trit_vector8(packed[base + v * 2],
-                                                   packed[base + v * 2 + 1]);
-                    acc[v] = _mm256_add_ps(acc[v], _mm256_mul_ps(xv, wv));
+                    acc[v] = _mm256_setzero_ps();
+                }
+                for (std::size_t i = i0; i < iend; ++i) {
+                    const __m256 xv = _mm256_set1_ps(x[i]);
+                    const std::size_t base = (i * dout + j0) >> 2;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC unroll 8
+#endif
+                    for (std::size_t v = 0; v < nvec; ++v) {
+                        const __m256 wv = trit_vector8(packed[base + v * 2],
+                                                       packed[base + v * 2 + 1]);
+                        acc[v] = _mm256_add_ps(acc[v], _mm256_mul_ps(xv, wv));
+                    }
+                }
+                for (std::size_t v = 0; v < nvec; ++v) {
+                    const std::size_t out_idx = j0 + v * 8;
+                    const __m256 prior = _mm256_loadu_ps(y + out_idx);
+                    _mm256_storeu_ps(y + out_idx, _mm256_add_ps(prior, acc[v]));
                 }
             }
-            const __m256 scalev = _mm256_set1_ps(scale);
-            for (std::size_t v = 0; v < nvec; ++v) {
-                _mm256_storeu_ps(y + j0 + v * 8, _mm256_mul_ps(acc[v], scalev));
-            }
+        }
+        const __m256 scalev = _mm256_set1_ps(scale);
+        for (std::size_t j = 0; j < dout; j += 8) {
+            const __m256 sum = _mm256_loadu_ps(y + j);
+            _mm256_storeu_ps(y + j, _mm256_mul_ps(sum, scalev));
         }
         return 0;
     }
-
     if ((dout & 7u) == 0u) {
         // Process two tokens at once so packed bytes and decoded trit vectors
         // are reused for both rows. This is especially useful for prompt
