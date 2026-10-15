@@ -32,10 +32,11 @@ jobs:
           python -m pip install -r requirements.txt
       - name: Compile Python sources
         run: python -m compileall -q .
-      - name: V2 FP32 baseline and packed-ternary benchmark smoke tests
+      - name: V2 FP32 baseline, packed-ternary, and router benchmark smoke tests
         run: |
           python bench.py --preset dense-tiny --seq-len 8 --forward-quant fp32 --backward-mode fp32
           python bench.py --preset dense-tiny --seq-len 8 --forward-quant ternary --backward-mode ternary
+          python bench_router.py --tokens 64 --experts 64 --d-model 512 --top-k 8 --repeat 2
       - name: Run full regression suite
         env:
           PYTHONFAULTHANDLER: "1"
