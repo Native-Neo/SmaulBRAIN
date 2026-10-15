@@ -67,6 +67,11 @@ class SmaulOPT:
     def step(self, params: dict, grads: dict) -> dict:
         """In-place update of params; returns per-param update norms."""
         norms = {}
+        beta1 = np.float32(self.beta1)
+        beta2 = np.float32(self.beta2)
+        one_minus_beta1 = np.float32(1.0 - self.beta1)
+        one_minus_beta2 = np.float32(1.0 - self.beta2)
+        eps = np.float32(self.eps)
         for name, w in params.items():
             g = grads.get(name)
             if g is None:
@@ -74,28 +79,32 @@ class SmaulOPT:
             if name not in self.state:
                 self._init_state(name, w)
             st = self.state[name]
-            gf = g.astype(np.float64)
+            gf = np.asarray(g, dtype=np.float32)
             if self.weight_decay:
                 w -= np.float32(self.lr * self.weight_decay) * w
-            m = st["m"].astype(np.float64) * self.beta1 + gf * (1 - self.beta1)
-            st["m"] = m.astype(np.float32)
+
+            m = st["m"] * beta1 + gf * one_minus_beta1
+            st["m"] = m.astype(np.float32, copy=False)
+            g2 = gf * gf
             if st["factored"]:
-                row = np.mean(gf ** 2, axis=1)
-                col = np.mean(gf ** 2, axis=0)
-                R = st["R"].astype(np.float64) * self.beta2 + row * (1 - self.beta2)
-                C = st["C"].astype(np.float64) * self.beta2 + col * (1 - self.beta2)
-                st["R"] = R.astype(np.float32)
-                st["C"] = C.astype(np.float32)
-                mean_r = float(R.mean()) if R.size else 0.0
-                denom_r = mean_r if mean_r > 1e-30 else 1e-30
+                row = np.mean(g2, axis=1, dtype=np.float32)
+                col = np.mean(g2, axis=0, dtype=np.float32)
+                R = st["R"] * beta2 + row * one_minus_beta2
+                C = st["C"] * beta2 + col * one_minus_beta2
+                st["R"] = R.astype(np.float32, copy=False)
+                st["C"] = C.astype(np.float32, copy=False)
+                mean_r = float(np.mean(R, dtype=np.float64)) if R.size else 0.0
+                denom_r = np.float32(mean_r if mean_r > 1e-30 else 1e-30)
                 Vhat = np.outer(R, C) / denom_r
-                upd = m / (np.sqrt(np.maximum(Vhat, 0.0)) + self.eps)
+                upd = m / (np.sqrt(np.maximum(Vhat, 0.0)) + eps)
             else:
-                v = st["v"].astype(np.float64) * self.beta2 + (gf ** 2) * (1 - self.beta2)
-                st["v"] = v.astype(np.float32)
-                upd = m / (np.sqrt(np.maximum(v, 0.0)) + self.eps)
-            w -= (self.lr * upd).astype(np.float32)
-            norms[name] = float(np.sqrt(np.mean(upd ** 2)))
+                v = st["v"] * beta2 + g2 * one_minus_beta2
+                st["v"] = v.astype(np.float32, copy=False)
+                upd = m / (np.sqrt(np.maximum(v, 0.0)) + eps)
+            w -= (np.float32(self.lr) * upd).astype(np.float32, copy=False)
+            # Keep only the scalar accumulation in fp64; do not widen the full
+            # update tensor just to report its RMS magnitude.
+            norms[name] = float(np.sqrt(np.mean(upd * upd, dtype=np.float64)))
         self.n_updates += 1
         return norms
 
