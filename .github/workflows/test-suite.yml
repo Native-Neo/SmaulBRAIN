@@ -32,10 +32,10 @@ jobs:
           python -m pip install -r requirements.txt
       - name: Compile Python sources
         run: python -m compileall -q .
-      - name: V2 benchmark CLI smoke test
-        run: >-
-          python bench.py --preset dense-tiny --seq-len 8
-          --forward-quant ternary --backward-mode ternary
+      - name: V2 FP32 baseline and packed-ternary benchmark smoke tests
+        run: |
+          python bench.py --preset dense-tiny --seq-len 8 --forward-quant fp32 --backward-mode fp32
+          python bench.py --preset dense-tiny --seq-len 8 --forward-quant ternary --backward-mode ternary
       - name: Run full regression suite
         env:
           PYTHONFAULTHANDLER: "1"
