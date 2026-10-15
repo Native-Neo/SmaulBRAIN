@@ -66,6 +66,33 @@ extern "C" int smaulbrain_ternary_matmat(
     if (!x || !packed || !y || din == 0 || dout == 0) return 1;
 
 #if defined(__AVX__)
+    if (batch == 1 && (dout & 7u) == 0u) {
+        // Autoregressive decoding always has batch=1. Do not reserve registers
+        // and branch for a nonexistent second row. A 64-column tile halves
+        // tile-loop overhead versus the paired-prefill kernel.
+        constexpr std::size_t kTile = 64;
+        for (std::size_t j0 = 0; j0 < dout; j0 += kTile) {
+            const std::size_t width = std::min(kTile, dout - j0);
+            const std::size_t nvec = width / 8;
+            __m256 acc[8];
+            for (std::size_t v = 0; v < nvec; ++v) acc[v] = _mm256_setzero_ps();
+            for (std::size_t i = 0; i < din; ++i) {
+                const __m256 xv = _mm256_set1_ps(x[i]);
+                const std::size_t base = (i * dout + j0) >> 2;
+                for (std::size_t v = 0; v < nvec; ++v) {
+                    const __m256 wv = trit_vector8(packed[base + v * 2],
+                                                   packed[base + v * 2 + 1]);
+                    acc[v] = _mm256_add_ps(acc[v], _mm256_mul_ps(xv, wv));
+                }
+            }
+            const __m256 scalev = _mm256_set1_ps(scale);
+            for (std::size_t v = 0; v < nvec; ++v) {
+                _mm256_storeu_ps(y + j0 + v * 8, _mm256_mul_ps(acc[v], scalev));
+            }
+        }
+        return 0;
+    }
+
     if ((dout & 7u) == 0u) {
         // Process two tokens at once so packed bytes and decoded trit vectors
         // are reused for both rows. This is especially useful for prompt
@@ -214,20 +241,11 @@ extern "C" int smaulbrain_pack_ternary(
     const double mean_abs = sum_abs / static_cast<double>(n);
     const double threshold = 0.7 * mean_abs;
 
+    // Combine scale accumulation and code emission into one pass. The threshold
+    // is already known, so we can classify each weight, accumulate the nonzero
+    // absolute values, and write its packed trit without a third matrix scan.
     double selected_abs_sum = 0.0;
     std::size_t selected_count = 0;
-    for (std::size_t i = 0; i < n; ++i) {
-        const double v = static_cast<double>(weights[i]);
-        if (v > threshold || v < -threshold) {
-            selected_abs_sum += std::fabs(v);
-            ++selected_count;
-        }
-    }
-    double scale = selected_count
-        ? selected_abs_sum / static_cast<double>(selected_count)
-        : mean_abs;
-    if (!(scale > 0.0)) scale = 1.0;
-
     const std::size_t nbytes = (n + 3u) / 4u;
     for (std::size_t b = 0; b < nbytes; ++b) {
         unsigned byte = 0u;
@@ -236,13 +254,24 @@ extern "C" int smaulbrain_pack_ternary(
             unsigned code = 1u;
             if (idx < n) {
                 const double v = static_cast<double>(weights[idx]);
-                if (v > threshold) code = 2u;
-                else if (v < -threshold) code = 0u;
+                if (v > threshold) {
+                    code = 2u;
+                    selected_abs_sum += v;
+                    ++selected_count;
+                } else if (v < -threshold) {
+                    code = 0u;
+                    selected_abs_sum -= v;
+                    ++selected_count;
+                }
             }
             byte |= code << (lane * 2u);
         }
         packed[b] = static_cast<std::uint8_t>(byte);
     }
+    double scale = selected_count
+        ? selected_abs_sum / static_cast<double>(selected_count)
+        : mean_abs;
+    if (!(scale > 0.0)) scale = 1.0;
     *scale_out = static_cast<float>(scale);
     *threshold_out = static_cast<float>(threshold);
     return 0;
