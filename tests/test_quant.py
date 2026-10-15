@@ -244,7 +244,7 @@ def test_fp8_weight_cache_reuses_and_selectively_invalidates_quantization():
 
 @pytest.mark.parametrize(("tokens", "width"), [(0, 64), (1, 7), (33, 32), (64, 512), (19, 1000)])
 def test_native_recurrent_scan_matches_numpy(tokens, width):
-    if tokens and not Q.prepare_ternary_backend():
+    if not Q.prepare_ternary_backend():
         pytest.skip("native C++ compiler/backend unavailable")
     rng = np.random.default_rng(809 + tokens + width)
     kv = rng.standard_normal((tokens, width)).astype(np.float32)
