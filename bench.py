@@ -36,8 +36,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     _cli.add_common_args(ap)
     ap.add_argument("--steps", type=int, default=5)
+    ap.add_argument("--repeat", type=int, default=5,
+                    help="number of warm-forward and decode repetitions (default: 5)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args(argv)
+    if args.repeat < 1:
+        ap.error("--repeat must be at least 1")
     try:
         preset = _cli.validate_args(args)
     except ValueError as e:
@@ -65,12 +69,36 @@ def main(argv=None):
     logits, _ = m.forward(toks)
     res["forward_s"] = time.perf_counter() - t0
     res["rss_after_fwd_mb"] = rss_mb()
-    t0 = time.perf_counter()
-    m.forward(toks)
-    res["warm_forward_s"] = time.perf_counter() - t0
+    warm_times = []
+    for _ in range(args.repeat):
+        t0 = time.perf_counter()
+        m.forward(toks)
+        warm_times.append(time.perf_counter() - t0)
+    res["warm_forward_s"] = float(_np.median(warm_times))
+    res["warm_forward_samples_s"] = warm_times
     res["packed_cache_builds"] = m.packed.builds
     res["packed_cache_hits"] = m.packed.reuse_hits
     res["packed_cache_bytes"] = int(sum(v["packed"].nbytes for v in m.packed.d.values()))
+
+    # Measure inference before the optimizer mutates parameters, so the
+    # quantized cache always matches the weights being benchmarked.
+    prefill_times, decode_rates = [], []
+    n = 16 if spec.name.endswith("tiny") else 2
+    for _ in range(args.repeat):
+        eng = _inf.InferenceEngine(m, seed=0, temperature=0.0)
+        t0 = time.perf_counter()
+        eng.prefill(toks)
+        t1 = time.perf_counter()
+        eng.generate([], max_new_tokens=n)
+        t2 = time.perf_counter()
+        prefill_times.append(t1 - t0)
+        decode_rates.append(n / max(t2 - t1, 1e-9))
+    res["prefill_s"] = float(_np.median(prefill_times))
+    res["prefill_samples_s"] = prefill_times
+    res["decode_tokens_per_s"] = float(_np.median(decode_rates))
+    res["decode_tokens_per_s_samples"] = decode_rates
+    res["recurrent_state_bytes"] = spec.n_layers * spec.d_model * 4
+
     if spec.name.endswith("tiny"):
         t0 = time.perf_counter()
         loss, grads, _ = m.loss_and_backward(toks)
@@ -83,16 +111,6 @@ def main(argv=None):
         t0 = time.perf_counter()
         opt.step(params, grads)
         res["opt_step_s"] = time.perf_counter() - t0
-    eng = _inf.InferenceEngine(m, seed=0, temperature=0.0)
-    t0 = time.perf_counter()
-    eng.prefill(toks)
-    t1 = time.perf_counter()
-    n = 16 if spec.name.endswith("tiny") else 2
-    eng.generate([], max_new_tokens=n)
-    t2 = time.perf_counter()
-    res["prefill_s"] = t1 - t0
-    res["decode_tokens_per_s"] = n / max(t2 - t1, 1e-9)
-    res["recurrent_state_bytes"] = spec.n_layers * spec.d_model * 4
     print(json.dumps(res, indent=2))
     if args.out:
         with open(args.out, "w") as f:
