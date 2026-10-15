@@ -10,6 +10,7 @@ def detect() -> dict:
     info = {
         "machine": platform.machine(),
         "processor": platform.processor(),
+        "has_avx": False,
         "has_avx2": False,
         "has_avx512": False,
         "has_sse2": False,
@@ -22,6 +23,7 @@ def detect() -> dict:
         for line in text.splitlines():
             if line.startswith("flags"):
                 flags.update(line.split(":")[1].split())
+        info["has_avx"] = "avx" in flags
         info["has_avx2"] = "avx2" in flags
         info["has_avx512"] = any(x in flags for x in ("avx512f", "avx512bw", "avx512vl"))
         info["has_sse2"] = "sse2" in flags
