@@ -272,8 +272,9 @@ class Trainer:
             if not np.isfinite(loss):
                 raise RuntimeError(f"non-finite loss at step {self.sched.global_step}")
             # gradient clipping (global norm)
-            total = float(np.sqrt(sum(float(np.sum(g.astype(np.float64) ** 2))
-                                        for g in grads.values())))
+            total_sq = sum(float(np.sum(g * g, dtype=np.float64))
+                           for g in grads.values())
+            total = float(np.sqrt(total_sq))
             if total > grad_clip and total > 0:
                 scale = grad_clip / total
                 grads = {k: (g * scale).astype(np.float32) for k, g in grads.items()}
