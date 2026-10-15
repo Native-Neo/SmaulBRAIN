@@ -89,29 +89,34 @@ class SmaulOPT:
             if st["factored"]:
                 row = np.mean(g2, axis=1, dtype=np.float32)
                 col = np.mean(g2, axis=0, dtype=np.float32)
+                del g2  # release the full matrix-square temporary before updates
                 R = st["R"] * beta2 + row * one_minus_beta2
                 C = st["C"] * beta2 + col * one_minus_beta2
                 st["R"] = R.astype(np.float32, copy=False)
                 st["C"] = C.astype(np.float32, copy=False)
                 mean_r = float(np.mean(R, dtype=np.float64)) if R.size else 0.0
                 denom_r = np.float32(mean_r if mean_r > 1e-30 else 1e-30)
-                Vhat = np.outer(R, C)
-                Vhat /= denom_r
-                np.maximum(Vhat, 0.0, out=Vhat)
-                np.sqrt(Vhat, out=Vhat)
-                Vhat += eps
-                upd = m / Vhat
+                # Reuse the outer-product buffer as sqrt(vhat), then as the
+                # update itself; avoid an extra full-matrix m / denom allocation.
+                upd = np.outer(R, C)
+                upd /= denom_r
+                np.maximum(upd, 0.0, out=upd)
+                np.sqrt(upd, out=upd)
+                upd += eps
+                np.divide(m, upd, out=upd)
             else:
                 v = st["v"] * beta2 + g2 * one_minus_beta2
+                del g2
                 st["v"] = v.astype(np.float32, copy=False)
-                denom = np.maximum(v, 0.0)
-                np.sqrt(denom, out=denom)
-                denom += eps
-                upd = m / denom
+                upd = np.maximum(v, 0.0)
+                np.sqrt(upd, out=upd)
+                upd += eps
+                np.divide(m, upd, out=upd)
             if collect_norms:
                 # Only a scalar reduction uses fp64; never widen the update tensor.
                 norms[name] = float(np.sqrt(np.mean(upd * upd, dtype=np.float64)))
-            w -= (np.float32(self.lr) * upd).astype(np.float32, copy=False)
+            np.multiply(upd, np.float32(self.lr), out=upd)
+            np.subtract(w, upd, out=w)
         self.n_updates += 1
         return norms
 
