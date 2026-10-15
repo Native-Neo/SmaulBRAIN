@@ -71,16 +71,17 @@ class Router:
         flat_idx = top_idx.reshape(-1)
         assigned = np.bincount(flat_idx, minlength=E)
         load = np.minimum(assigned, cap).astype(np.int64, copy=False)
-        grouped_positions = np.argsort(flat_idx, kind="stable")
-        grouped_eids = flat_idx[grouped_positions]
-        group_starts = np.empty(grouped_eids.size, dtype=bool)
-        group_starts[0] = True
-        group_starts[1:] = grouped_eids[1:] != grouped_eids[:-1]
-        group_base = np.maximum.accumulate(
-            np.where(group_starts, np.arange(grouped_eids.size), 0))
-        rank = np.arange(grouped_eids.size) - group_base
         keep_flat = np.empty(flat_idx.size, dtype=bool)
-        keep_flat[grouped_positions] = rank < cap
+        if flat_idx.size:
+            grouped_positions = np.argsort(flat_idx, kind="stable")
+            grouped_eids = flat_idx[grouped_positions]
+            group_starts = np.empty(grouped_eids.size, dtype=bool)
+            group_starts[0] = True
+            group_starts[1:] = grouped_eids[1:] != grouped_eids[:-1]
+            group_base = np.maximum.accumulate(
+                np.where(group_starts, np.arange(grouped_eids.size), 0))
+            rank = np.arange(grouped_eids.size) - group_base
+            keep_flat[grouped_positions] = rank < cap
         keep = keep_flat.reshape(top_idx.shape)
         overflow = int(flat_idx.size - int(load.sum()))
         # renormalize kept weights
