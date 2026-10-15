@@ -59,6 +59,26 @@ def test_unsupported_combo_rejected():
         C.validate_quant_combo("fp32", "ternary")
 
 
+def test_native_ternary_packer_matches_numpy_reference():
+    rng = np.random.default_rng(237)
+    for shape in ((12, 32), (3, 5), (17,), (4, 4)):
+        W = rng.standard_normal(shape).astype(np.float32)
+        expected = Q._pack_ternary_numpy(W)
+        actual = Q.pack_ternary(W)
+        assert np.array_equal(actual[0], expected[0])
+        assert actual[2] == expected[2]
+        assert np.isclose(actual[1], expected[1], rtol=2e-6, atol=1e-7)
+        assert np.isclose(actual[3], expected[3], rtol=2e-6, atol=1e-7)
+
+    # Non-finite inputs must not break the kernel or generate invalid codes.
+    W = np.array([1.0, -3.0, np.nan, np.inf, -np.inf], dtype=np.float32)
+    expected = Q._pack_ternary_numpy(W)
+    actual = Q.pack_ternary(W)
+    assert np.array_equal(actual[0], expected[0])
+    assert np.isclose(actual[1], expected[1], equal_nan=True)
+    assert np.isclose(actual[3], expected[3], equal_nan=True)
+
+
 def test_packed_matmat_and_transpose_match_dense_reference():
     rng = np.random.default_rng(91)
     # Output width 32 exercises the AVX1/SSE2 packed kernel; batch 5
