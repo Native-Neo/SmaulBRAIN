@@ -91,6 +91,10 @@ class Model:
                  paging_mode="R", paging_store=None, loss_smooth_beta=0.99,
                  capacity_factor: float = 1.25):
         _cfg.validate_quant_combo(forward_quant, backward_mode)
+        if forward_quant == "ternary":
+            # Prepare the packed native backend before timing/runtime forward calls.
+            # A packed scalar reference remains available when no compiler exists.
+            _quant.prepare_ternary_backend()
         self.spec = spec
         self.p = params
         self.forward_quant = forward_quant
@@ -139,9 +143,8 @@ class Model:
         eff, handle = self._qw(W, key)
         if self.forward_quant == "ternary":
             packed, scale, shape = eff
-            codes = _quant.unpack_codes(packed, shape).astype(np.float32)
-            Y = (X @ codes * scale).astype(np.float32)
-            return Y, handle + (codes,)
+            Y = _quant.packed_matmat(X, packed, shape, float(scale))
+            return Y.astype(np.float32, copy=False), handle
         return (X @ eff).astype(np.float32), handle
 
     def _lin_bwd(self, dY: np.ndarray, X: np.ndarray, handle, codes=None):
@@ -156,25 +159,18 @@ class Model:
                 Xq, _ = _quant.fp8_e4m3_quantize(X)
                 return (dYq @ Wq.T).astype(np.float32), (Xq.T @ dYq).astype(np.float32)
             return (dY @ Wq.T).astype(np.float32), (X.T @ dY).astype(np.float32)
-        # ternary
-        _, W, _packed, scale, _shape = handle[:5]
-        if len(handle) <= 5 or handle[5] is None:
-            raise RuntimeError("ternary backward requires packed forward codes; "
-                               "selected packed/native path is required and unavailable")
-        codes = handle[5]
-        Wq = (codes * float(scale)).astype(np.float32)
-        if self.backward_mode in ("ternary", "fp8"):
-            dX = (dY @ Wq.T).astype(np.float32)
-        else:
-            dX = (dY @ Wq.T).astype(np.float32)
+
+        # Use the packed ternary matrix directly for the input gradient. No
+        # dense FP32 reconstruction is created or retained in the backward cache.
+        _, W, packed, scale, shape = handle
+        dX = _quant.packed_matmat_transpose(dY, packed, shape, float(scale))
         if self.backward_mode == "fp8":
             dYq, _ = _quant.fp8_e4m3_quantize(dY)
             Xq, _ = _quant.fp8_e4m3_quantize(X)
-            dW = (Xq.T @ dYq).astype(np.float32)  # STE into master
+            dW = (Xq.T @ dYq).astype(np.float32)  # STE into latent master
         else:
             dW = (X.T @ dY).astype(np.float32)  # straight-through estimator
-        return dX, dW
-
+        return dX.astype(np.float32, copy=False), dW
     # -- recurrence (quant-aware projections) --
     def _attn_fwd(self, X, px, s0):
         p = self.p
