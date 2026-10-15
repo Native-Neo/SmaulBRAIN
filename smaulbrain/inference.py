@@ -68,27 +68,36 @@ class InferenceEngine:
 
     def generate(self, prompt_tokens, max_new_tokens=64, stop_ids=(),
                  stream: bool = False):
-        self.prefill(prompt_tokens)
+        # Keep the final input token in a scalar. Rebuilding prompt_tokens + out
+        # on every step made decoding allocate and copy O(prompt + generated)^2
+        # elements over a long generation.
+        prompt = list(prompt_tokens)
+        self.prefill(prompt)
         out = []
+        last = prompt[-1] if prompt else 0
+        stop_set = set(stop_ids)
         for _ in range(max_new_tokens):
-            logits = self.model.step_token(
-                (prompt_tokens + out)[-1] if (prompt_tokens or out) else 0, self.states)
+            logits = self.model.step_token(last, self.states)
             nxt = self._sample(logits)
             out.append(nxt)
-            if nxt in tuple(stop_ids):
+            last = nxt
+            if nxt in stop_set:
                 break
             if stream:
                 pass  # caller consumes incrementally via iterator below
         return out
 
     def generate_stream(self, prompt_tokens, max_new_tokens=64, stop_ids=()):
-        self.prefill(prompt_tokens)
+        prompt = list(prompt_tokens)
+        self.prefill(prompt)
         out = []
+        last = prompt[-1] if prompt else 0
+        stop_set = set(stop_ids)
         for _ in range(max_new_tokens):
-            last = (prompt_tokens + out)[-1] if (prompt_tokens or out) else 0
             logits = self.model.step_token(last, self.states)
             nxt = self._sample(logits)
             out.append(nxt)
+            last = nxt
             yield nxt
-            if nxt in tuple(stop_ids):
+            if nxt in stop_set:
                 break
