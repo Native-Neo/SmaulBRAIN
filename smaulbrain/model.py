@@ -96,7 +96,8 @@ class PackedCache:
 class FP8Cache:
     """Bounded-by-model FP8 weight cache; entries are invalidated by parameter name."""
 
-    def __init__(self):
+    def __init__(self, max_entries: int = 256):
+        self.max_entries = max_entries
         self.d = {}
         self.builds = 0
         self.reuse_hits = 0
@@ -108,6 +109,8 @@ class FP8Cache:
             self.reuse_hits += 1
             return entry["weight"], entry["scale"]
         Wq, scale = _quant.fp8_e4m3_quantize(W)
+        if key not in self.d and len(self.d) >= self.max_entries:
+            self.d.pop(next(iter(self.d)))
         self.d[key] = {"weight": Wq, "scale": scale,
                        "id": id(W), "ref": weakref.ref(W), "nbytes": W.nbytes}
         self.builds += 1
