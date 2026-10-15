@@ -97,6 +97,7 @@ class Trainer:
             raise ValueError(f"checkpoint preset {man['preset']} != {self.spec.name}")
         self.model.p = {k: v for k, v in blob["params"].items()}
         self.model.packed.invalidate()
+        self.model.fp8.invalidate()
         flags = man.get("optimizer", {}).get("factored", {})
         self.opt.load_state_dict(blob["opt_state"], flags)
         self.opt.register(self.model.p)
@@ -255,6 +256,7 @@ class Trainer:
             model.store.n_experts = len(_model.expert_ids(cand))
             model.store.invalidate_all()
         model.packed.invalidate()
+        model.fp8.invalidate()
         model._assert_counts()
 
     def train(self, max_steps=None, log_every=10, eval_every=0, ckpt_every=0,
@@ -282,6 +284,7 @@ class Trainer:
             # Only parameters with gradients were updated in-place. Invalidate
             # their quantized representations, not every projection in the model.
             self.model.packed.invalidate(grads.keys())
+            self.model.fp8.invalidate(grads.keys())
             if self.model.store is not None and self.spec.kind == "moe":
                 changed_experts = set()
                 for name in grads:
