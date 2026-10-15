@@ -91,6 +91,33 @@ class PackedCache:
             self.d.pop(key, None)
 
 
+class FP8Cache:
+    """Bounded-by-model FP8 weight cache; entries are invalidated by parameter name."""
+
+    def __init__(self):
+        self.d = {}
+        self.builds = 0
+        self.reuse_hits = 0
+
+    def get(self, key, W: np.ndarray):
+        entry = self.d.get(key)
+        if entry is not None and entry["id"] == id(W) and entry["nbytes"] == W.nbytes:
+            self.reuse_hits += 1
+            return entry["weight"], entry["scale"]
+        Wq, scale = _quant.fp8_e4m3_quantize(W)
+        self.d[key] = {"weight": Wq, "scale": scale,
+                       "id": id(W), "nbytes": W.nbytes}
+        self.builds += 1
+        return Wq, scale
+
+    def invalidate(self, keys=None):
+        if keys is None:
+            self.d.clear()
+            return
+        for key in keys:
+            self.d.pop(key, None)
+
+
 class Model:
     def __init__(self, spec, params: dict, forward_quant="fp32", backward_mode="fp32",
                  paging_mode="R", paging_store=None, loss_smooth_beta=0.99,
@@ -107,6 +134,7 @@ class Model:
         self.paging_mode = paging_mode
         self.store = paging_store
         self.packed = PackedCache()
+        self.fp8 = FP8Cache()
         self.loss_smooth_beta = float(loss_smooth_beta)
         self.capacity_factor = float(capacity_factor)
         self._assert_counts()
@@ -139,7 +167,7 @@ class Model:
         if self.forward_quant == "fp32":
             return W, ("fp32", W)
         if self.forward_quant == "fp8":
-            Wq, scale = _quant.fp8_e4m3_quantize(W)
+            Wq, scale = self.fp8.get(key, W)
             return Wq, ("fp8", W, Wq, scale)
         packed, scale, shape = self.packed.get(key, W)
         return (packed, scale, shape), ("ternary", W, packed, scale, shape)
