@@ -9,6 +9,7 @@ class ByteStream:
         if path is None and not data:
             raise ValueError("ByteStream needs path or data")
         self.path = path
+        self._fh = None
         if data:
             self._data = bytes(data)
             self.size = len(self._data)
@@ -18,16 +19,29 @@ class ByteStream:
             self.size = os.path.getsize(path)
             if self.size == 0:
                 raise ValueError(f"empty corpus: {path}")
+            # Reuse one buffered file handle instead of open/seek/read/close
+            # on every training step.
+            self._fh = open(path, "rb")
         self.cursor = 0
         self.rng = __import__("numpy").random.default_rng(seed)
 
     def _read_at(self, off: int, n: int) -> bytes:
         if self._data is not None:
             return self._data[off:off + n]
-        assert self.path is not None
-        with open(self.path, "rb") as f:
-            f.seek(off)
-            return f.read(n)
+        assert self.path is not None and self._fh is not None
+        self._fh.seek(off)
+        return self._fh.read(n)
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
 
     def next_tokens(self, seq_len: int) -> list:
         n = seq_len + 1  # +1 so loss has a target for every input position
