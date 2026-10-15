@@ -3,6 +3,7 @@ import pytest
 
 from smaulbrain import config as C
 from smaulbrain import model as M
+from smaulbrain import moe as _moe
 from smaulbrain import quant as Q
 
 
@@ -77,6 +78,30 @@ def test_native_ternary_packer_matches_numpy_reference():
     assert np.array_equal(actual[0], expected[0])
     assert np.isclose(actual[1], expected[1], equal_nan=True)
     assert np.isclose(actual[3], expected[3], equal_nan=True)
+
+
+def test_batch_one_packed_matmat_fast_path_matches_dense():
+    rng = np.random.default_rng(701)
+    W = rng.standard_normal((17, 64)).astype(np.float32)
+    x = rng.standard_normal(17).astype(np.float32)
+    packed, scale, shape, _ = Q.pack_ternary(W)
+    dense_q = Q.unpack_ternary(packed, shape, scale)
+    actual = Q.packed_matmat(x, packed, shape, scale)
+    expected = x @ dense_q
+    assert actual.shape == (64,)
+    assert np.allclose(actual, expected, atol=2e-5, rtol=2e-5)
+
+
+def test_moe_forward_skips_unused_diagnostic_reductions(monkeypatch):
+    m = _tiny_moe("ternary", "ternary")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unused MoE diagnostics ran in the forward hot path")
+
+    monkeypatch.setattr(_moe, "balance_aux_loss", forbidden)
+    monkeypatch.setattr(_moe, "expert_output_stats", forbidden)
+    logits, _ = m.forward([10, 20, 30], train=False)
+    assert np.all(np.isfinite(logits))
 
 
 def test_packed_matmat_and_transpose_match_dense_reference():
