@@ -327,10 +327,20 @@ class Model:
         T, d = X.shape
         Y = np.zeros_like(X)
         expert_caches = {}
-        Xc, scores, _ti, _w, _keep = rcache
-        for eid in np.unique(top_idx):
+        # Group token/rank assignments once rather than scanning top_idx with
+        # np.where for every active expert. Stable sorting preserves the
+        # original row-major order within each expert group.
+        flat_eids = top_idx.reshape(-1)
+        route_rows = np.repeat(np.arange(T, dtype=np.int64), top_idx.shape[1])
+        route_cols = np.tile(np.arange(top_idx.shape[1], dtype=np.int64), T)
+        grouped_order = np.argsort(flat_eids, kind="stable")
+        grouped_eids, group_counts = np.unique(flat_eids, return_counts=True)
+        group_starts = np.cumsum(group_counts, dtype=np.int64) - group_counts
+        for eid, start, count in zip(grouped_eids, group_starts, group_counts):
             eid = int(eid)
-            rows, cols = np.where(top_idx == eid)
+            pos = grouped_order[int(start):int(start + count)]
+            rows = route_rows[pos]
+            cols = route_cols[pos]
             if self.store is not None:
                 self.store.pin(eid)
             try:
@@ -367,7 +377,10 @@ class Model:
             dWsum[rows, cols] = np.sum(dY[rows] * Yb, axis=1)
             for kk, vv in g.items():
                 grads[kk] = grads.get(kk, 0) + vv if isinstance(grads.get(kk), np.ndarray) else vv
-            np.add.at(dX, rows, dXb)
+            # Each token can select an expert at most once, so rows is
+            # unique within one expert group; indexed addition is safe and
+            # avoids np.add.at's general duplicate-index machinery.
+            dX[rows] += dXb
         # router backward
         dXr, dRouter = router.backward(dWsum, rcache)
         dX = dX + dXr
