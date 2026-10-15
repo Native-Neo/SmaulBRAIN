@@ -208,9 +208,30 @@ def test_cache_reuse_and_invalidation():
     toks = [1, 2, 3, 4]
     m.forward(toks)
     builds = m.packed.builds
+    cache_keys = set(m.packed.d)
     m.forward(toks)  # same objects -> reuse, no rebuilds
     assert m.packed.builds == builds
     assert m.packed.reuse_hits > 0
+    # Selective invalidation keeps packed projections whose params did not change.
+    m.packed.invalidate(["L0.attn.Wr"])
+    assert "L0.attn.Wr" not in m.packed.d
+    assert cache_keys - {"L0.attn.Wr"} <= set(m.packed.d)
     m.packed.invalidate()
     m.forward(toks)
     assert m.packed.builds > builds
+
+
+def test_fp8_weight_cache_reuses_and_selectively_invalidates_quantization():
+    m = _tiny_moe("fp8", "fp8")
+    toks = [1, 2, 3, 4]
+    m.forward(toks)
+    builds = m.fp8.builds
+    assert builds > 0
+    m.forward(toks)
+    assert m.fp8.builds == builds
+    assert m.fp8.reuse_hits > 0
+    key = "L0.attn.Wr"
+    m.fp8.invalidate([key])
+    before = m.fp8.builds
+    m.forward(toks)
+    assert m.fp8.builds == before + 1
