@@ -291,3 +291,41 @@ extern "C" int smaulbrain_pack_ternary(
     *threshold_out = static_cast<float>(threshold);
     return 0;
 }
+
+extern "C" int smaulbrain_recurrent_scan(
+    const float* kv, const float* alpha, float* state, float* states,
+    std::size_t T, std::size_t d) {
+    if (!kv || !alpha || !state || !states || d == 0) return 1;
+    // Time remains sequential, but each feature recurrence is independent.
+    // Process one timestep at a time and vectorize across the feature axis.
+    for (std::size_t t = 0; t < T; ++t) {
+        const float* kvt = kv + t * d;
+        float* st = states + t * d;
+        std::size_t j = 0;
+#if defined(__AVX__)
+        for (; j + 8 <= d; j += 8) {
+            const __m256 a = _mm256_loadu_ps(alpha + j);
+            const __m256 s = _mm256_loadu_ps(state + j);
+            const __m256 x = _mm256_loadu_ps(kvt + j);
+            const __m256 next = _mm256_add_ps(_mm256_mul_ps(a, s), x);
+            _mm256_storeu_ps(state + j, next);
+            _mm256_storeu_ps(st + j, next);
+        }
+#elif defined(__SSE2__)
+        for (; j + 4 <= d; j += 4) {
+            const __m128 a = _mm_loadu_ps(alpha + j);
+            const __m128 s = _mm_loadu_ps(state + j);
+            const __m128 x = _mm_loadu_ps(kvt + j);
+            const __m128 next = _mm_add_ps(_mm_mul_ps(a, s), x);
+            _mm_storeu_ps(state + j, next);
+            _mm_storeu_ps(st + j, next);
+        }
+#endif
+        for (; j < d; ++j) {
+            const float next = alpha[j] * state[j] + kvt[j];
+            state[j] = next;
+            st[j] = next;
+        }
+    }
+    return 0;
+}
