@@ -63,7 +63,7 @@ def expert_ids(p: dict) -> list:
 class PackedCache:
     """Bounded cache of packed ternary weights. Key -> (packed, scale, shape)."""
 
-    def __init__(self, max_entries: int = 64):
+    def __init__(self, max_entries: int = 256):
         self.max_entries = max_entries
         self.d = {}
         self.reuse_hits = 0
