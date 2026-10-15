@@ -297,7 +297,10 @@ class Model:
                 Yb, ec = self._expert_fwd(Xb, eid)
                 w = weights[rows, cols][:, None]
                 Y[rows] += w * Yb
-                expert_caches[eid] = (rows, cols, ec)
+                # Cache the output used by router-gradient computation;
+                # recomputing an expert forward in backward doubles its large
+                # input/output projections.
+                expert_caches[eid] = (rows, cols, ec, Yb)
             finally:
                 if self.store is not None:
                     self.store.unpin(eid)
@@ -316,14 +319,10 @@ class Model:
         dX = np.zeros_like(X)
         dWsum = np.zeros_like(weights)
         grads = {}
-        for eid, (rows, cols, ec) in expert_caches.items():
+        for eid, (rows, cols, ec, Yb) in expert_caches.items():
             w = weights[rows, cols][:, None]
-            Yb_cache = ec
             dYb = dY[rows] * w
-            dXb, g = self._expert_bwd(dYb, Yb_cache)
-            # need Yb for router grad: recompute cheaply
-            Xb = X[rows]
-            Yb, _ = self._expert_fwd(Xb, eid)
+            dXb, g = self._expert_bwd(dYb, ec)
             dWsum[rows, cols] = np.sum(dY[rows] * Yb, axis=1)
             for kk, vv in g.items():
                 grads[kk] = grads.get(kk, 0) + vv if isinstance(grads.get(kk), np.ndarray) else vv
