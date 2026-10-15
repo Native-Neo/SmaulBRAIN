@@ -64,39 +64,57 @@ extern "C" int smaulbrain_ternary_matmat(
     std::size_t batch, std::size_t din, std::size_t dout) noexcept {
     if (!x || !packed || !y || din == 0 || dout == 0) return 1;
 
-    for (std::size_t b = 0; b < batch; ++b) {
-        const float* in = x + b * din;
-        float* out = y + b * dout;
-
 #if defined(__AVX__)
-        if ((dout & 7u) == 0u) {
-            // Four 256-bit accumulators hold a 32-column tile in registers.
-            // Each packed byte pair yields eight ternary weights; the output
-            // tile is written once, not reloaded/stored for every input row.
-            constexpr std::size_t kTile = 32;
-            for (std::size_t j0 = 0; j0 < dout; j0 += kTile) {
-                const std::size_t width = std::min(kTile, dout - j0);
-                const std::size_t nvec = width / 8;
-                __m256 acc[4];
-                for (std::size_t v = 0; v < nvec; ++v) acc[v] = _mm256_setzero_ps();
+    if ((dout & 7u) == 0u) {
+        // Process two tokens at once so packed bytes and decoded trit vectors
+        // are reused for both rows. This is especially useful for prompt
+        // prefill, where the same weights multiply multiple input positions.
+        constexpr std::size_t kTile = 32;
+        constexpr std::size_t kBatchTile = 2;
+        for (std::size_t j0 = 0; j0 < dout; j0 += kTile) {
+            const std::size_t width = std::min(kTile, dout - j0);
+            const std::size_t nvec = width / 8;
+            for (std::size_t b0 = 0; b0 < batch; b0 += kBatchTile) {
+                const bool has_second = b0 + 1 < batch;
+                const float* in0 = x + b0 * din;
+                const float* in1 = has_second ? x + (b0 + 1) * din : nullptr;
+                float* out0 = y + b0 * dout;
+                float* out1 = has_second ? y + (b0 + 1) * dout : nullptr;
+                __m256 acc0[4], acc1[4];
+                for (std::size_t v = 0; v < nvec; ++v) {
+                    acc0[v] = _mm256_setzero_ps();
+                    if (has_second) acc1[v] = _mm256_setzero_ps();
+                }
                 for (std::size_t i = 0; i < din; ++i) {
-                    const __m256 xv = _mm256_set1_ps(in[i]);
+                    const __m256 x0 = _mm256_set1_ps(in0[i]);
+                    const __m256 x1 = has_second ? _mm256_set1_ps(in1[i]) : _mm256_setzero_ps();
                     const std::size_t base = (i * dout + j0) >> 2;
                     for (std::size_t v = 0; v < nvec; ++v) {
                         const __m256 wv = trit_vector8(packed[base + v * 2],
                                                        packed[base + v * 2 + 1]);
-                        acc[v] = _mm256_add_ps(acc[v], _mm256_mul_ps(xv, wv));
+                        acc0[v] = _mm256_add_ps(acc0[v], _mm256_mul_ps(x0, wv));
+                        if (has_second) {
+                            acc1[v] = _mm256_add_ps(acc1[v], _mm256_mul_ps(x1, wv));
+                        }
                     }
                 }
                 const __m256 scalev = _mm256_set1_ps(scale);
                 for (std::size_t v = 0; v < nvec; ++v) {
-                    _mm256_storeu_ps(out + j0 + v * 8, _mm256_mul_ps(acc[v], scalev));
+                    _mm256_storeu_ps(out0 + j0 + v * 8, _mm256_mul_ps(acc0[v], scalev));
+                    if (has_second) {
+                        _mm256_storeu_ps(out1 + j0 + v * 8,
+                                         _mm256_mul_ps(acc1[v], scalev));
+                    }
                 }
             }
-            continue;
         }
+        return 0;
+    }
 #endif
 
+    for (std::size_t b = 0; b < batch; ++b) {
+        const float* in = x + b * din;
+        float* out = y + b * dout;
 #if defined(__SSE2__)
         if ((dout & 3u) == 0u) {
             constexpr std::size_t kTile = 32;
@@ -121,7 +139,6 @@ extern "C" int smaulbrain_ternary_matmat(
             continue;
         }
 #endif
-
         for (std::size_t j = 0; j < dout; ++j) {
             float acc = 0.0f;
             for (std::size_t i = 0; i < din; ++i) {
