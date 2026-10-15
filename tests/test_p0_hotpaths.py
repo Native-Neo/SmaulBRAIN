@@ -23,6 +23,17 @@ def test_router_top_k_matches_stable_full_sort_including_cutoff_ties():
         assert info["overflow_dropped"] == 0
 
 
+def test_router_empty_token_batch_is_well_formed():
+    router = _moe.Router(5, 7, np.random.default_rng(12))
+    X = np.empty((0, 5), dtype=np.float32)
+    top_idx, weights, info, cache = router.route(X, top_k=3)
+    assert top_idx.shape == (0, 3)
+    assert weights.shape == (0, 3)
+    assert info["overflow_dropped"] == 0
+    assert np.array_equal(info["load"], np.zeros(7, dtype=np.int64))
+    assert cache[4].shape == (0, 3)
+
+
 def test_router_vectorized_capacity_preserves_flat_token_order():
     router = _moe.Router(2, 4, np.random.default_rng(2))
     router.W[:] = np.array([[4, 3, 2, 1], [4, 3, 2, 1]], dtype=np.float32)
