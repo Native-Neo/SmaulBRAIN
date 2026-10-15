@@ -19,18 +19,26 @@ CPU FP8 is software-emulated (no native FP8 on Ivy Bridge).
 """
 import numpy as np
 
+import ctypes
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import subprocess
+
 FP8_E4M3_MAX = 448.0
 FP8_E4M3_BIAS = 8
 
 
 def ternary_threshold(W: np.ndarray) -> float:
-    return float(0.7 * np.mean(np.abs(W.astype(np.float64))))
+    # Accumulate in float64 without materializing a second float64 copy of W.
+    return float(0.7 * np.mean(np.abs(W), dtype=np.float64))
 
 
 def ternary_scale(W: np.ndarray, q: np.ndarray) -> float:
     flat = W.reshape(-1)
     nz = np.abs(flat[q.reshape(-1) != 0]) if np.any(q != 0) else np.abs(flat)
-    m = float(np.mean(np.abs(nz.astype(np.float64)))) if nz.size else 1.0
+    m = float(np.mean(nz, dtype=np.float64)) if nz.size else 1.0
     return m if m > 0 else 1.0
 
 
@@ -69,68 +77,272 @@ def unpack_ternary(packed: np.ndarray, shape, scale: float):
 
 
 def packed_matvec_scalar(x: np.ndarray, packed: np.ndarray, shape, scale: float) -> np.ndarray:
-    """Scalar reference: y = x @ W_q * scale directly from packed bytes."""
+    """Scalar reference: y = x @ W_q * scale, decoding each trit in place."""
     d_in, d_out = shape
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+    if x.size != d_in:
+        raise ValueError(f"input width {x.size} does not match packed matrix width {d_in}")
+    packed = np.asarray(packed, dtype=np.uint8).reshape(-1)
+    if packed.size < (d_in * d_out + 3) // 4:
+        raise ValueError("packed ternary buffer is shorter than the declared shape")
     y = np.zeros(d_out, dtype=np.float64)
     for j in range(d_out):
         acc = 0.0
         for i in range(d_in):
-            pos = i * d_out + j  # row-major W[i, j]
-            byte = int(packed[pos // 4])
-            q = ((byte >> (2 * (pos % 4))) & 0x3) - 1
-            if q > 1:
-                q = 1
+            pos = i * d_out + j
+            code = (int(packed[pos >> 2]) >> (2 * (pos & 3))) & 3
+            q = -1 if code == 0 else (1 if code >= 2 else 0)
             if q:
                 acc += float(x[i]) * q
         y[j] = acc
     return (y * float(scale)).astype(np.float32)
 
 
-def packed_matvec(x: np.ndarray, packed: np.ndarray, shape, scale: float,
+_NATIVE_LIB = None
+_NATIVE_ATTEMPTED = False
+_NATIVE_ERROR = None
+
+
+def prepare_ternary_backend() -> bool:
+    """Build/load a baseline-CPU C++ packed-trit kernel, cached between runs.
+
+    No -march=native or AVX requirement is used. If a compiler is unavailable,
+    operations remain correct through the packed scalar reference path.
+    """
+    global _NATIVE_LIB, _NATIVE_ATTEMPTED, _NATIVE_ERROR
+    if _NATIVE_LIB is not None:
+        return True
+    if _NATIVE_ATTEMPTED:
+        return False
+    _NATIVE_ATTEMPTED = True
+    source = Path(__file__).with_name("_ternary_kernels.cpp")
+    if not source.is_file():
+        _NATIVE_ERROR = f"native kernel source missing: {source}"
+        return False
+    compiler_name = os.environ.get("CXX", "g++")
+    compiler = shutil.which(compiler_name)
+    if compiler is None:
+        compiler = shutil.which("c++")
+    if compiler is None:
+        _NATIVE_ERROR = "no C++ compiler found (tried CXX and c++)"
+        return False
+
+    try:
+        source_bytes = source.read_bytes()
+        digest = hashlib.sha256(source_bytes + compiler.encode("utf-8")).hexdigest()[:20]
+        cache_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        cache_dir = cache_home / "smaulbrain"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        target = cache_dir / f"ternary-{digest}.so"
+        if not target.is_file():
+            temporary = cache_dir / f"ternary-{digest}-{os.getpid()}.tmp.so"
+            command = [compiler, "-O3", "-std=c++17", "-shared", "-fPIC",
+                       "-fno-fast-math", str(source), "-o", str(temporary)]
+            result = subprocess.run(command, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, timeout=90)
+            if result.returncode != 0:
+                _NATIVE_ERROR = result.stderr.strip() or "C++ ternary kernel compilation failed"
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+                return False
+            try:
+                os.replace(temporary, target)
+            except OSError:
+                if not target.is_file():
+                    raise
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+        lib = ctypes.CDLL(str(target))
+        ptr_f32 = ctypes.POINTER(ctypes.c_float)
+        ptr_u8 = ctypes.POINTER(ctypes.c_uint8)
+        argtypes = [ptr_f32, ptr_u8, ctypes.c_float, ptr_f32,
+                    ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t]
+        lib.smaulbrain_ternary_matmat.argtypes = argtypes
+        lib.smaulbrain_ternary_matmat.restype = ctypes.c_int
+        lib.smaulbrain_ternary_transpose_matmat.argtypes = argtypes
+        lib.smaulbrain_ternary_transpose_matmat.restype = ctypes.c_int
+        _NATIVE_LIB = lib
+        _NATIVE_ERROR = None
+        return True
+    except Exception as exc:
+        _NATIVE_ERROR = f"{type(exc).__name__}: {exc}"
+        return False
+
+
+def ternary_backend_name() -> str:
+    return "native-cpp-packed" if prepare_ternary_backend() else "python-packed-reference"
+
+
+def _check_packed_shape(packed: np.ndarray, shape):
+    d_in, d_out = (int(shape[0]), int(shape[1]))
+    if d_in < 1 or d_out < 1:
+        raise ValueError(f"invalid packed matrix shape {shape}")
+    packed = np.ascontiguousarray(packed, dtype=np.uint8).reshape(-1)
+    need = (d_in * d_out + 3) // 4
+    if packed.size < need:
+        raise ValueError(f"packed buffer has {packed.size} bytes, needs at least {need}")
+    return packed, d_in, d_out
+
+
+def packed_matmat_scalar(X: np.ndarray, packed: np.ndarray, shape,
+                         scale: float) -> np.ndarray:
+    """Portable reference for X @ packed_ternary(W) without dense W creation."""
+    x = np.asarray(X, dtype=np.float32)
+    if x.ndim == 1:
+        return packed_matvec_scalar(x, packed, shape, scale)
+    if x.ndim != 2:
+        raise ValueError("packed ternary matmat expects a 1-D or 2-D input")
+    d_in, _ = shape
+    if x.shape[1] != d_in:
+        raise ValueError(f"input width {x.shape[1]} does not match packed matrix width {d_in}")
+    return np.stack([packed_matvec_scalar(row, packed, shape, scale) for row in x], axis=0)
+
+
+def packed_matmat(X: np.ndarray, packed: np.ndarray, shape, scale: float,
                   allow_dense_reconstruction: bool = False) -> np.ndarray:
-    """Packed-kernel matvec. Operates on int8 codes + scale; never builds a
-    dense FP32/BF16 weight matrix (passing allow_dense_reconstruction=True
-    raises: the forbidden path)."""
+    """Multiply by a packed ternary matrix directly; never materialize dense W."""
     if allow_dense_reconstruction:
         raise RuntimeError("forbidden path: full dense expert-weight reconstruction "
                            "is not allowed on direct-packed execution")
-    codes = unpack_codes(packed, shape).astype(np.float32)
-    return ((x.astype(np.float32) @ codes) * np.float32(scale)).astype(np.float32)
+    x = np.asarray(X, dtype=np.float32)
+    one_row = x.ndim == 1
+    if one_row:
+        x = x.reshape(1, -1)
+    if x.ndim != 2:
+        raise ValueError("packed ternary matmat expects a 1-D or 2-D input")
+    p, d_in, d_out = _check_packed_shape(packed, shape)
+    if x.shape[1] != d_in:
+        raise ValueError(f"input width {x.shape[1]} does not match packed matrix width {d_in}")
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    out = np.empty((x.shape[0], d_out), dtype=np.float32)
+    if prepare_ternary_backend():
+        status = _NATIVE_LIB.smaulbrain_ternary_matmat(
+            x.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            p.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            ctypes.c_float(float(scale)),
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            x.shape[0], d_in, d_out)
+        if status != 0:
+            raise RuntimeError(f"native packed ternary matmat failed with status {status}")
+    else:
+        out = packed_matmat_scalar(x, p, (d_in, d_out), scale)
+    return out[0] if one_row else out
 
 
-def packed_matmat(X: np.ndarray, packed: np.ndarray, shape, scale: float) -> np.ndarray:
-    return np.stack([packed_matvec(row, packed, shape, scale) for row in X])
+def packed_matmat_transpose_scalar(dY: np.ndarray, packed: np.ndarray, shape,
+                                   scale: float) -> np.ndarray:
+    """Portable reference for dY @ (scale * ternary(W)).T, without dense W."""
+    dy = np.asarray(dY, dtype=np.float32)
+    one_row = dy.ndim == 1
+    if one_row:
+        dy = dy.reshape(1, -1)
+    if dy.ndim != 2:
+        raise ValueError("packed ternary transpose matmat expects 1-D or 2-D input")
+    p, d_in, d_out = _check_packed_shape(packed, shape)
+    if dy.shape[1] != d_out:
+        raise ValueError(f"gradient width {dy.shape[1]} does not match packed output width {d_out}")
+    dx = np.zeros((dy.shape[0], d_in), dtype=np.float32)
+    for b in range(dy.shape[0]):
+        for i in range(d_in):
+            acc = 0.0
+            row = i * d_out
+            for j in range(d_out):
+                pos = row + j
+                code = (int(p[pos >> 2]) >> (2 * (pos & 3))) & 3
+                if code == 0:
+                    acc -= float(dy[b, j])
+                elif code >= 2:
+                    acc += float(dy[b, j])
+            dx[b, i] = np.float32(acc * float(scale))
+    return dx[0] if one_row else dx
+
+
+def packed_matmat_transpose(dY: np.ndarray, packed: np.ndarray, shape,
+                            scale: float) -> np.ndarray:
+    """Compute the input gradient from packed ternary weights directly."""
+    dy = np.asarray(dY, dtype=np.float32)
+    one_row = dy.ndim == 1
+    if one_row:
+        dy = dy.reshape(1, -1)
+    if dy.ndim != 2:
+        raise ValueError("packed ternary transpose matmat expects 1-D or 2-D input")
+    p, d_in, d_out = _check_packed_shape(packed, shape)
+    if dy.shape[1] != d_out:
+        raise ValueError(f"gradient width {dy.shape[1]} does not match packed output width {d_out}")
+    dy = np.ascontiguousarray(dy, dtype=np.float32)
+    dx = np.empty((dy.shape[0], d_in), dtype=np.float32)
+    if prepare_ternary_backend():
+        status = _NATIVE_LIB.smaulbrain_ternary_transpose_matmat(
+            dy.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            p.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            ctypes.c_float(float(scale)),
+            dx.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            dy.shape[0], d_in, d_out)
+        if status != 0:
+            raise RuntimeError(f"native packed ternary transpose matmat failed with status {status}")
+    else:
+        dx = packed_matmat_transpose_scalar(dy, p, (d_in, d_out), scale)
+    return dx[0] if one_row else dx
+
+
+def packed_matvec(x: np.ndarray, packed: np.ndarray, shape, scale: float,
+                  allow_dense_reconstruction: bool = False) -> np.ndarray:
+    """Packed-kernel matvec. No full FP32/BF16 weight matrix is reconstructed."""
+    return packed_matmat(x, packed, shape, scale,
+                         allow_dense_reconstruction=allow_dense_reconstruction)
 
 
 # ---------------- FP8 E4M3 software emulation ----------------
 
+def _make_fp8_positive_values() -> np.ndarray:
+    # Preserve the representable set used by the original scalar implementation,
+    # excluding values above its documented finite saturation point (448).
+    values = {0.0}
+    for e in range(-8, 9):
+        base = 2.0 ** e
+        for m in range(8):
+            value = base * (m / 8.0) if e == -8 else base * (1.0 + m / 8.0)
+            if 0.0 <= value <= FP8_E4M3_MAX:
+                values.add(value)
+    return np.asarray(sorted(values), dtype=np.float64)
+
+
+_FP8_POSITIVE_VALUES = _make_fp8_positive_values()
+
+
 def fp8_e4m3_quantize(W: np.ndarray, scale=None):
-    Wf = W.astype(np.float64)
+    """Vectorized E4M3 software quantization with the legacy rounding rule.
+
+    The positive representable values are sorted once, then nearest neighbors
+    are selected with NumPy searchsorted. This avoids Python loops over every
+    weight/activation/gradient element.
+    """
+    Wf = np.asarray(W, dtype=np.float64)
     if scale is None:
         mx = float(np.max(np.abs(Wf))) if Wf.size else 0.0
         scale = np.float32(mx / FP8_E4M3_MAX) if mx > 0 else np.float32(1.0)
     if scale == 0:
         scale = np.float32(1.0)
     norm = Wf / float(scale)
-    out = np.empty_like(norm)
-    for idx, v in np.ndenumerate(norm):
-        if not np.isfinite(v):
-            out[idx] = v
-            continue
-        s = -1.0 if v < 0 else 1.0
-        a = abs(v)
-        if a > FP8_E4M3_MAX:
-            out[idx] = s * FP8_E4M3_MAX
-            continue
-        # find exponent
-        best = 0.0
-        for e in range(-8, 9):  # biased range incl. subnormals approx
-            base = (2.0 ** e)
-            for m in range(8):
-                cand = base * (1 + m / 8.0) if e > -8 else base * (m / 8.0)
-                if abs(cand - a) < abs(best - a):
-                    best = cand
-        out[idx] = s * best
+    finite = np.isfinite(norm)
+    magnitude = np.abs(norm)
+    magnitude = np.where(finite, np.minimum(magnitude, FP8_E4M3_MAX), 0.0)
+
+    hi_idx = np.searchsorted(_FP8_POSITIVE_VALUES, magnitude, side="left")
+    hi_idx = np.minimum(hi_idx, _FP8_POSITIVE_VALUES.size - 1)
+    lo_idx = np.maximum(hi_idx - 1, 0)
+    lower = _FP8_POSITIVE_VALUES[lo_idx]
+    upper = _FP8_POSITIVE_VALUES[hi_idx]
+    # Scalar code only replaces best on a strict improvement, so exact ties
+    # choose the lower (earlier) representable value.
+    choose_upper = (upper - magnitude) < (magnitude - lower)
+    quantized = np.where(choose_upper, upper, lower)
+    sign = np.where(norm < 0.0, -1.0, 1.0)  # legacy behavior maps -0 to +0
+    out = np.where(finite, sign * quantized, norm)
     return (out * float(scale)).astype(np.float32), np.float32(scale)
 
 
