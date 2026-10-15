@@ -130,8 +130,8 @@ class ExpertStore:
         path = os.path.join(self.disk_dir, f"expert_{eid}.npz")
         if not os.path.exists(path):
             raise KeyError(f"expert {eid} backing file missing: {path}")
-        z = np.load(path)
-        return {"Win": z["Win"], "Wout": z["Wout"]}
+        with np.load(path) as z:
+            return {"Win": z["Win"].copy(), "Wout": z["Wout"].copy()}
 
     def _write_expert_file(self, eid: int, weights) -> None:
         path = os.path.join(self.disk_dir, f"expert_{eid}.npz")
@@ -189,6 +189,7 @@ class ExpertStore:
         eid = int(eid)
         self.ram_weights.pop(eid, None)
         self.cache.pop(eid, None)
+        self._dirty.discard(eid)
         if self.disk_dir:
             try:
                 os.remove(os.path.join(self.disk_dir, f"expert_{eid}.npz"))
