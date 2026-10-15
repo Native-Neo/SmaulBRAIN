@@ -280,7 +280,9 @@ class Trainer:
             if total > grad_clip and total > 0:
                 scale = grad_clip / total
                 grads = {k: (g * scale).astype(np.float32) for k, g in grads.items()}
-            self.opt.step(self.model.p, grads)
+            # Training never consumes per-parameter update norms; skip their
+            # extra full-array reductions unless an explicit caller requests them.
+            self.opt.step(self.model.p, grads, collect_norms=False)
             # Only parameters with gradients were updated in-place. Invalidate
             # their quantized representations, not every projection in the model.
             self.model.packed.invalidate(grads.keys())
