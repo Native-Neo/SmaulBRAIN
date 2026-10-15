@@ -44,8 +44,8 @@ def ternary_scale(W: np.ndarray, q: np.ndarray) -> float:
     return m if m > 0 else 1.0
 
 
-def pack_ternary(W: np.ndarray):
-    """Returns (packed uint8 array, scale, shape, threshold)."""
+def _pack_ternary_numpy(W: np.ndarray):
+    """Portable NumPy reference/fallback for pack_ternary()."""
     flat = W.reshape(-1)
     th = ternary_threshold(W)
     q = np.zeros(flat.shape, dtype=np.int8)
@@ -60,6 +60,25 @@ def pack_ternary(W: np.ndarray):
     q4 = codes.reshape(-1, 4).astype(np.uint8)
     packed = (q4[:, 0] | (q4[:, 1] << 2) | (q4[:, 2] << 4) | (q4[:, 3] << 6))
     return packed, np.float32(s), W.shape, np.float32(th)
+
+
+def pack_ternary(W: np.ndarray):
+    """Pack weights using native code when possible, with a NumPy reference."""
+    arr = np.asarray(W)
+    if (arr.dtype == np.float32 and arr.flags.c_contiguous and arr.size > 0
+            and prepare_ternary_backend()):
+        n = int(arr.size)
+        packed = np.empty((n + 3) // 4, dtype=np.uint8)
+        scale_out = ctypes.c_float(1.0)
+        threshold_out = ctypes.c_float(0.0)
+        status = _NATIVE_LIB.smaulbrain_pack_ternary(
+            arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            packed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            n, ctypes.byref(scale_out), ctypes.byref(threshold_out))
+        if status != 0:
+            raise RuntimeError(f"native ternary packing failed with status {status}")
+        return packed, np.float32(scale_out.value), arr.shape, np.float32(threshold_out.value)
+    return _pack_ternary_numpy(arr)
 
 
 def unpack_codes(packed: np.ndarray, shape) -> np.ndarray:
@@ -174,6 +193,10 @@ def prepare_ternary_backend() -> bool:
         lib.smaulbrain_ternary_matmat.restype = ctypes.c_int
         lib.smaulbrain_ternary_transpose_matmat.argtypes = argtypes
         lib.smaulbrain_ternary_transpose_matmat.restype = ctypes.c_int
+        lib.smaulbrain_pack_ternary.argtypes = [
+            ptr_f32, ptr_u8, ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float)]
+        lib.smaulbrain_pack_ternary.restype = ctypes.c_int
         _NATIVE_LIB = lib
         _NATIVE_VARIANT = "avx1" if has_avx else "sse2"
         _NATIVE_ERROR = None
