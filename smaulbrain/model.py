@@ -82,8 +82,13 @@ class PackedCache:
         self.builds += 1
         return packed, scale, shape
 
-    def invalidate(self):
-        self.d.clear()
+    def invalidate(self, keys=None):
+        """Invalidate all cached weights, or only the named changed parameters."""
+        if keys is None:
+            self.d.clear()
+            return
+        for key in keys:
+            self.d.pop(key, None)
 
 
 class Model:
