@@ -18,6 +18,7 @@ from smaulbrain import cpu as _cpu
 from smaulbrain import data as _data
 from smaulbrain import inference as _inf
 from smaulbrain import model as _model
+from smaulbrain import quant as _quant
 
 
 def rss_mb():
@@ -45,21 +46,31 @@ def main(argv=None):
     if spec.name in ("dense-full", "moe-full"):
         print("note: full presets are memory-heavy; running forward-only micro-bench",
               file=sys.stderr)
-    rng = __import__("numpy").random.default_rng(args.seed)
     import numpy as _np
+    init_t0 = time.perf_counter()
+    rng = _np.random.default_rng(args.seed)
     params = _model.build_params(spec, rng)
     m = _model.Model(spec, params, forward_quant=args.forward_quant,
                      backward_mode=args.backward_mode)
+    model_init_s = time.perf_counter() - init_t0
     toks = list(_np.random.default_rng(1).integers(0, 256, size=args.seq_len))
     res = {"hw": {"cpu": _cpu.detect(), "dispatch": _cpu.dispatch_name()},
            "preset": preset, "params": m.report()["total_params"],
            "seq_len": args.seq_len, "forward_quant": args.forward_quant,
            "backward_mode": args.backward_mode, "paging": args.paging,
+           "model_init_s": model_init_s,
+           "ternary_backend": _quant.ternary_backend_name() if args.forward_quant == "ternary" else None,
            "rss_before_mb": rss_mb()}
     t0 = time.perf_counter()
     logits, _ = m.forward(toks)
     res["forward_s"] = time.perf_counter() - t0
     res["rss_after_fwd_mb"] = rss_mb()
+    t0 = time.perf_counter()
+    m.forward(toks)
+    res["warm_forward_s"] = time.perf_counter() - t0
+    res["packed_cache_builds"] = m.packed.builds
+    res["packed_cache_hits"] = m.packed.reuse_hits
+    res["packed_cache_bytes"] = int(sum(v["packed"].nbytes for v in m.packed.d.values()))
     if spec.name.endswith("tiny"):
         t0 = time.perf_counter()
         loss, grads, _ = m.loss_and_backward(toks)
