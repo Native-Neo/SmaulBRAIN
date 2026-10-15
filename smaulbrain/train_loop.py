@@ -278,9 +278,17 @@ class Trainer:
                 scale = grad_clip / total
                 grads = {k: (g * scale).astype(np.float32) for k, g in grads.items()}
             self.opt.step(self.model.p, grads)
-            self.model.packed.invalidate()  # caches invalid after parameter updates
-            if self.model.store is not None:
-                self.model.store.invalidate_all()
+            # Only parameters with gradients were updated in-place. Invalidate
+            # their quantized representations, not every projection in the model.
+            self.model.packed.invalidate(grads.keys())
+            if self.model.store is not None and self.spec.kind == "moe":
+                changed_experts = set()
+                for name in grads:
+                    parts = name.split(".")
+                    if len(parts) == 3 and parts[0] == "expert" and parts[2] in ("Win", "Wout"):
+                        changed_experts.add(int(parts[1]))
+                for eid in changed_experts:
+                    self.model.store.write_back(eid, _expert_dict(self.model.p, eid))
             # 1-4: step counter, smoothing, triggers, single pending creation
             reason = self.sched.note_optimizer_step(loss)
             if reason is not None and self.sched.pending is None:
