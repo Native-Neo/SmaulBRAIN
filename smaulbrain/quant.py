@@ -227,6 +227,8 @@ def recurrent_scan(kv: np.ndarray, alpha: np.ndarray, state: np.ndarray,
         raise ValueError("recurrent scan expects KV/states with matching (T, d) shapes")
     if alpha.shape != (kv.shape[1],) or state.shape != alpha.shape:
         raise ValueError("recurrent scan alpha/state widths must match KV")
+    if kv.shape[0] == 0:
+        return True
     if not state.flags.writeable or not states.flags.writeable:
         return False
     status = _NATIVE_LIB.smaulbrain_recurrent_scan(
