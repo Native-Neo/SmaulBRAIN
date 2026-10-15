@@ -151,7 +151,13 @@ class Trainer:
         # ranking
         if pend.get("sources") is None:
             batches = self._eval_batches()
-            scores, nsamp = _growth.rank_experts(self.model, batches, sched.min_eval_samples)
+            # Growth ranking is a rare but expensive operation: score every
+            # expert on one representative batch instead of forwarding all
+            # experts over every evidence batch. The full sample count still
+            # gates eligibility; the source ordering is explicitly approximate.
+            score_samples = max(len(batches[0]) - 1, 0) if batches else 0
+            scores, nsamp = _growth.rank_experts(
+                self.model, batches, sched.min_eval_samples, max_batches=1)
             if scores is None:
                 pend["status"] = "WAITING_FOR_RANKING"
                 pend["ranking"] = {"samples": nsamp, "insufficient": True}
@@ -165,7 +171,9 @@ class Trainer:
                 self.save()
                 raise _NeedEvidence("no reliably ranked source experts; trigger retained")
             pend["ranking"] = {"scores": {str(k): v for k, v in scores.items()},
-                               "samples": nsamp}
+                               "samples": nsamp,
+                               "score_samples": score_samples,
+                               "approximate": True}
             pend["sources"] = sources
             pend["status"] = "PREPARED"
             pend["mutation"] = {"scale": self.args.growth_noise_scale,
