@@ -79,9 +79,17 @@ class Trainer:
             {"class": "SmaulOPT", "lr": self.opt.lr, "beta1": self.opt.beta1,
              "beta2": self.opt.beta2, "eps": self.opt.eps,
              "weight_decay": self.opt.weight_decay})
-        opt_state = self.opt.state_dict()
-        opt_state["_factored_flags"] = {k: np.asarray([s["factored"]]) for k, s in self.opt.state.items()}
-        return man, dict(self.model.p), opt_state
+        # Checkpoint writing is synchronous, so the serializer can read live
+        # arrays directly. Avoid duplicating the entire parameter dict and the
+        # optimizer's potentially multi-gigabyte moment tensors before writing.
+        opt_state = {
+            k: {sk: sv for sk, sv in state.items() if not isinstance(sv, bool)}
+            for k, state in self.opt.state.items()
+        }
+        opt_state["_factored_flags"] = {
+            k: np.asarray([state["factored"]]) for k, state in self.opt.state.items()
+        }
+        return man, self.model.p, opt_state
 
     def save(self, pending_phase=False):
         man, params, opt_state = self._payload()
@@ -227,9 +235,11 @@ class Trainer:
              "eps": opt.eps, "weight_decay": opt.weight_decay,
              "factored": {k: bool(s["factored"]) for k, s in opt.state.items()}})
         # optimizer state carried by name; router state carried per-column below
-        opt_state = {k: {sk: sv.copy() for sk, sv in s.items() if not isinstance(sv, bool)}
+        # _write_tree consumes array references synchronously; avoid a second
+        # copy of every optimizer tensor at the growth commit checkpoint.
+        opt_state = {k: {sk: sv for sk, sv in s.items() if not isinstance(sv, bool)}
                      for k, s in opt.state.items()}
-        _ckpt.save_checkpoint(self.args.checkpoint, man, dict(cand), opt_state)
+        _ckpt.save_checkpoint(self.args.checkpoint, man, cand, opt_state)
 
     def _resize_router_opt_state(self, cand):
         import numpy as _np
