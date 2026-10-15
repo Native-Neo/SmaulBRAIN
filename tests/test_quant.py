@@ -92,7 +92,8 @@ def test_model_ternary_path_never_unpacks_dense_weights(monkeypatch):
 def _legacy_fp8_scalar_reference(W, scale=None):
     Wf = W.astype(np.float64)
     if scale is None:
-        mx = float(np.max(np.abs(Wf))) if Wf.size else 0.0
+        finite_abs = np.abs(Wf[np.isfinite(Wf)])
+        mx = float(np.max(finite_abs)) if finite_abs.size else 0.0
         scale = np.float32(mx / Q.FP8_E4M3_MAX) if mx > 0 else np.float32(1.0)
     if scale == 0:
         scale = np.float32(1.0)
@@ -133,6 +134,16 @@ def test_fp8_vectorized_conversion_matches_scalar_reference():
     expected, expected_scale = _legacy_fp8_scalar_reference(W)
     assert got_scale == expected_scale
     assert np.allclose(got, expected, rtol=0.0, atol=0.0, equal_nan=True)
+
+
+def test_fp8_auto_scale_ignores_nonfinite_values():
+    W = np.array([1.0, -3.0, np.nan, np.inf, -np.inf], dtype=np.float32)
+    Wq, scale = Q.fp8_e4m3_quantize(W)
+    assert np.isfinite(scale) and scale > 0
+    assert np.isfinite(Wq[0]) and np.isfinite(Wq[1])
+    assert np.isnan(Wq[2])
+    assert np.isposinf(Wq[3])
+    assert np.isneginf(Wq[4])
 
 
 def test_fp8_format_properties():
