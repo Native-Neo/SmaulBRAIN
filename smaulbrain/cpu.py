@@ -4,8 +4,10 @@ No mandatory operation may require AVX2 or AVX-512. Native kernels must
 dispatch only to instruction sets reported here.
 """
 import platform
+from functools import lru_cache
 
 
+@lru_cache(maxsize=1)
 def detect() -> dict:
     info = {
         "machine": platform.machine(),
