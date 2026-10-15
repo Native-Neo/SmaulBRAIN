@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
+#include <vector>
 #if defined(__AVX__)
 #include <immintrin.h>
 #elif defined(__SSE2__)
