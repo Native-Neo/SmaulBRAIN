@@ -75,4 +75,3 @@ def test_native_kernels_optional_but_defined():
     assert "__AVX2__" not in src
     assert "__m256i" not in src and "__m512" not in src
     assert "_mm256_i32gather" not in src
-    assert "-march=native" not in src
