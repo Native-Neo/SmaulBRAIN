@@ -101,7 +101,8 @@ class Router:
         row_dot = np.sum(weights * dWeights, axis=1, keepdims=True)
         dTop = np.where(keep, weights * (dWeights - row_dot), 0.0)
         dScores = np.zeros_like(scores)
-        np.add.at(dScores, (np.repeat(np.arange(T), k), top_idx.ravel()), dTop.ravel())
+        # top-k experts are distinct within a row, so plain assignment is exact.
+        dScores[np.arange(T)[:, None], top_idx] = dTop
         dW = X.T @ dScores
         dX = dScores @ self.W.T
         return dX.astype(np.float32), dW.astype(np.float32)
