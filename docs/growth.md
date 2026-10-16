@@ -1,7 +1,8 @@
 # Growth scheduler
 
-Automatic growth lives in the training loop (`v2/train_loop.py`), driven by
-`v2/growth.py`. No manual command is needed; ordinary MoE training grows.
+Automatic growth lives in the training loop (`smaulbrain/train_loop.py`),
+driven by `smaulbrain/growth.py`. No manual command is needed; ordinary MoE
+training grows.
 
 ## Triggers (logical OR)
 
