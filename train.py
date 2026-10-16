@@ -26,9 +26,9 @@ def main(argv=None):
     if preset.startswith("dense") and (args.growth_every_steps or args.growth_loss_nats is not None):
         print("note: MoE growth is disabled for dense models; growth triggers ignored")
     if args.corpus:
-        stream = _data.ByteStream(path=args.corpus, seed=args.seed)
+        stream = _data.ByteStream(path=args.corpus)
     else:
-        stream = _data.ByteStream(data=_data.synth_bytes(args.synth_bytes, args.seed), seed=args.seed)
+        stream = _data.ByteStream(data=_data.synth_bytes(args.synth_bytes, args.seed))
     tr = _tl.Trainer(spec, args, stream)
     if args.resume:
         if not os.path.exists(os.path.join(args.checkpoint, "manifest.json")):
