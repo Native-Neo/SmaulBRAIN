@@ -30,9 +30,8 @@ def main(argv=None):
     spec = _cfg.PRESETS[preset]
     m = _model.Model(spec, dict(blob["params"]), forward_quant=args.forward_quant,
                      backward_mode=args.backward_mode)
-    stream = (_data.ByteStream(path=args.corpus, seed=args.seed) if args.corpus
-              else _data.ByteStream(data=_data.synth_bytes(args.synth_bytes, args.seed + 1),
-                                    seed=args.seed + 1))
+    stream = (_data.ByteStream(path=args.corpus) if args.corpus
+              else _data.ByteStream(data=_data.synth_bytes(args.synth_bytes, args.seed + 1)))
     batches = [stream.next_tokens(args.seq_len) for _ in range(args.eval_batches)]
     losses = [_growth.eval_loss_on_tokens(m, b) for b in batches]
     import numpy as _np
