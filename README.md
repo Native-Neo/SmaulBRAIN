@@ -25,8 +25,8 @@ Preset flags: `--moe/--dense` are mutually exclusive; `--preset` accepts
 ## Layout
 
 - `train.py / infer.py / prune.py / evaluate.py / bench.py` — entry points
-- `v2/` — framework: `vocab, config, cli, cpu, math_ref, ops, model, moe,
-  paging, quant, kernels/, smaulopt, growth, checkpoint, train_loop,
+- `smaulbrain/` — framework: `vocab, config, cli, cpu, math_ref, ops, model,
+  moe, paging, quant, kernels/, smaulopt, growth, checkpoint, train_loop,
   inference, data, prune_cmd`
 - `tests/` — mathematical, preset, paging, quant, optimizer, growth,
   crash-recovery, and end-to-end tests
