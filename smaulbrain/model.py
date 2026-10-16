@@ -76,7 +76,7 @@ class PackedCache:
                 and e["nbytes"] == W.nbytes):
             self.reuse_hits += 1
             return e["packed"], e["scale"], e["shape"]
-        packed, scale, shape, _th = _quant.pack_ternary(W)
+        packed, scale, shape, _th = _quant.pack_ternary_tiled(W)
         if len(self.d) >= self.max_entries:
             self.d.pop(next(iter(self.d)))
         self.d[key] = {"packed": packed, "scale": scale, "shape": shape,
@@ -321,10 +321,7 @@ class Model:
     def _expert_bwd(self, dYb, cache):
         Xb, Hpre, H, h1, h2, eid = cache
         dH, dWout = self._lin_bwd(dYb, H, h2)
-        Z = Hpre
-        t = np.tanh(np.sqrt(2 / np.pi) * (Z + 0.044715 * Z ** 3))
-        dg = 0.5 * (1 + t) + 0.5 * Z * (1 - t ** 2) * np.sqrt(2 / np.pi) * (1 + 3 * 0.044715 * Z ** 2)
-        dZ = dH * dg
+        dZ = dH * _ops.gelu_tanh_grad(Hpre)
         dXb, dWin = self._lin_bwd(dZ, Xb, h1)
         return dXb, {f"expert.{eid}.Win": dWin, f"expert.{eid}.Wout": dWout}
 
@@ -434,14 +431,14 @@ class Model:
         H, cf = _ops.rmsnorm_fwd(X, self.p["final_norm"])
         logits = (H @ self.p["embed"].T).astype(np.float32)
         if train:
-            return logits, (layer_caches, H, cf, X, np.asarray(tokens))
+            return logits, (layer_caches, H, cf, aux_all)
         return logits, (states if states is not None else new_states)
 
     def loss_and_backward(self, tokens):
         tokens = np.asarray(tokens, dtype=np.int64)
         inp, tgt = tokens[:-1], tokens[1:]
         logits, cache = self.forward(inp, train=True)
-        layer_caches, H, cf, Xlast, _inp = cache
+        layer_caches, H, cf, aux = cache
         # softmax CE (nats per predicted byte)
         m = logits.max(axis=1, keepdims=True)
         logsum = m + np.log(np.exp(logits - m).sum(axis=1, keepdims=True))
@@ -483,8 +480,8 @@ class Model:
             grads[px + "n1"] = dgn1
             dX = (dX_mid + dX_in_norm).astype(np.float32)
         # gradient wrt input embeddings accumulates into the tied embed matrix
-        np.add.at(grads["embed"], inp, dX)
-        return loss, grads, {"overflow_dropped": 0}
+        _ops.scatter_add_rows(grads["embed"], inp, dX)
+        return loss, grads, aux
 
     # -- incremental inference --
     def init_states(self):
@@ -501,7 +498,3 @@ class Model:
     def step_token(self, tok: int, states):
         logits, _ = self.forward([tok], states=states, train=False)
         return logits[0]
-
-
-def dHo_res(a, b):
-    return (a + b).astype(np.float32)
