@@ -29,7 +29,6 @@ def detect() -> dict:
         info["has_avx2"] = "avx2" in flags
         info["has_avx512"] = any(x in flags for x in ("avx512f", "avx512bw", "avx512vl"))
         info["has_sse2"] = "sse2" in flags
-        info["flags_sample"] = sorted(flags)[:0]  # do not bloat logs
     except OSError:
         pass
     return info
@@ -42,8 +41,3 @@ def dispatch_name() -> str:
     if caps["has_avx2"]:
         return "portable-scalar(avx2-present-but-optional)"
     return "portable-scalar"
-
-
-def require_no_mandatory_simd() -> None:
-    # Assertion helper: portable path must always exist.
-    assert True
