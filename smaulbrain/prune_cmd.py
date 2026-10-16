@@ -30,8 +30,6 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
     params = blob["params"]
     eids = _model.expert_ids(params)
     # quality evidence from current model
-    import types
-    probe_args = types.SimpleNamespace()
     m = _model.Model(spec, params, forward_quant=man["config"].get("forward_quant", "fp32"),
                      backward_mode=man["config"].get("backward_mode", "fp32"))
     scores, nsamp = _growth.rank_experts(m, eval_batches, min_samples)
@@ -73,6 +71,7 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
     man2 = dict(man)
     man2["n_experts_current"] = len(keep)
     man2["expert_registry"] = list(range(len(keep)))
+    man2["arch"] = _cfg.arch_report(spec, len(keep))
     man2.setdefault("prune_history", []).append(
         {"removed": victims, "scores": {str(v): scores[v] for v in victims},
          "prev_count": len(eids), "new_count": len(keep)})
