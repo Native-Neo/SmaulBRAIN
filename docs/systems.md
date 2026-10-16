@@ -17,7 +17,7 @@ and tested with fault injection.
 
 # Paging
 
-`--paging R|V|D2R|D2V|R2V` (`v2/paging.py`). R/D2R work on CPU-only hosts; V,
+`--paging R|V|D2R|D2V|R2V` (`smaulbrain/paging.py`). R/D2R work on CPU-only hosts; V,
 D2V, R2V require a compatible accelerator and raise actionable errors
 otherwise (system RAM / iGPU / shared memory is never claimed as VRAM).
 D2R/D2V use bounded LRU caches (`--paging-cache-experts`,
@@ -38,7 +38,7 @@ parameter change.
 
 # SmaulOPT
 
-`v2/smaulopt.py`: `m <- b1*m + (1-b1)*g`; 2-D params use factored row/col
+`smaulbrain/smaulopt.py`: `m <- b1*m + (1-b1)*g`; 2-D params use factored row/col
 statistics `R (m), C (n)`, `V_hat = outer(R,C)/mean(R)`; vectors/scalars use a
 full `v` (documented non-factored). No bias correction; `denom = sqrt(V)+eps`;
 decoupled weight decay; fp32 state. Missing grads skipped; new experts
@@ -47,18 +47,24 @@ zero-initialized; pruned experts dropped; state checkpointed and resumed.
 # Hardware, install, limitations
 
 Target: i3-3220 (no AVX2/AVX-512), 8GB RAM, CPU-only. `pip install numpy
-pytest`; no CUDA/Triton needed. Native C++ (`v2/kernels/cpu_kernels.cpp`) is
-portable scalar only and optional: `c++ -O2 -std=c++11 -fPIC -shared
-v2/kernels/cpu_kernels.cpp -o smaul_kernels.so`. `v2/cpu.py` detects features;
-no mandatory path needs AVX2/512 (asserted in tests).
+pytest`; no CUDA/Triton needed. The optional native paths are C++17, built on
+demand into `~/.cache/smaulbrain/` with
+`-O3 -std=c++17 -fPIC -shared -fno-fast-math -ffp-contract=off [-pthread]
+-mavx|-msse2`: `smaulbrain/_ternary_kernels.cpp` (packed ternary matmul +
+persistent thread pool) and `smaulbrain/_optimizer_kernels.cpp` (fused factored
+SmaulOPT); both fall back to the NumPy path when no compiler is available.
+`smaulbrain/kernels/cpu_kernels.cpp` is a legacy portable-scalar reference
+built by `smaulbrain/kernels/__init__.py`. `smaulbrain/cpu.py` detects
+features; no mandatory path needs AVX2/512 (source-level guard tests live in
+`tests/test_inference_native.py`).
 
 Measured on the target machine (i3-3220, numpy 2.4.6, seq 64):
 
 | workload | forward | backward | opt step | decode tok/s | peak RSS |
 |---|---|---|---|---|---|
-| dense-tiny fp32 | 0.016s | 0.051s | 0.021s | ~211 | ~61MB |
-| moe-tiny fp32 | 0.030s | 0.071s | 0.018s | ~402 | ~69MB |
-| moe-tiny ternary-fwd/fp32-bwd | — | 0.17s | — | ~160 | ~74MB |
+| dense-tiny fp32 | 0.018s | 0.051s | 0.013s | ~237 | ~63MB |
+| moe-tiny fp32 | 0.021s | 0.052s | 0.008s | ~317 | ~69MB |
+| moe-tiny ternary-fwd/fp32-bwd | 0.031s | 0.060s | 0.007s | ~217 | ~70MB |
 
 Weight footprints: dense-full 977MB, moe-full 1275MB (fp32). Full-preset
 *training* (weights + grads + optimizer ≈ 3–4GB plus activations) is not
