@@ -60,8 +60,59 @@ def silu(x):
     return x * sigmoid(x)
 
 
+_GELU_C = 0.7978845608028654  # sqrt(2/pi)
+
+
 def gelu_tanh(x):
-    return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x ** 3)))
+    x = np.asarray(x)
+    if x.dtype != np.float32:
+        return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x ** 3)))
+    # float32, two buffers, in-place: avoids ~8 float64 temporaries.
+    t = np.multiply(x, x)
+    t *= np.float32(0.044715 * _GELU_C)
+    t += np.float32(_GELU_C)
+    t *= x
+    np.tanh(t, out=t)
+    t += np.float32(1.0)
+    t *= x
+    t *= np.float32(0.5)
+    return t
+
+
+def gelu_tanh_grad(z):
+    """d/dz gelu_tanh(z). float32 in-place fast path; float64 reference otherwise."""
+    z = np.asarray(z)
+    if z.dtype != np.float32:
+        t = np.tanh(np.sqrt(2 / np.pi) * (z + 0.044715 * z ** 3))
+        return 0.5 * (1 + t) + 0.5 * z * (1 - t ** 2) * np.sqrt(2 / np.pi) * (1 + 3 * 0.044715 * z ** 2)
+    z2 = np.multiply(z, z)
+    t = np.multiply(z2, np.float32(0.044715 * _GELU_C))
+    t += np.float32(_GELU_C)
+    t *= z
+    np.tanh(t, out=t)                       # t = tanh(u)
+    z2 *= np.float32(3 * 0.044715 * _GELU_C)
+    z2 += np.float32(_GELU_C)               # c * (1 + 3*0.044715 z^2)
+    z2 *= z
+    u = np.multiply(t, t)
+    np.subtract(np.float32(1.0), u, out=u)  # 1 - t^2
+    u *= z2
+    u *= np.float32(0.5)
+    t += np.float32(1.0)
+    t *= np.float32(0.5)
+    t += u
+    return t
+
+
+def scatter_add_rows(dst, idx, src):
+    """dst[idx[k]] += src[k] with duplicate indices (faster than np.add.at)."""
+    idx = np.asarray(idx)
+    if idx.size == 0:
+        return dst
+    order = np.argsort(idx, kind="stable")
+    si = idx[order]
+    starts = np.flatnonzero(np.concatenate(([True], si[1:] != si[:-1])))
+    dst[si[starts]] += np.add.reduceat(np.asarray(src)[order], starts, axis=0)
+    return dst
 
 
 def softplus(x):
