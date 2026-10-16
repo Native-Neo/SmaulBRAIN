@@ -5,7 +5,7 @@ import os
 class ByteStream:
     """Reproducible cursor over raw bytes (file or in-memory buffer)."""
 
-    def __init__(self, path=None, data: bytes = b"", seed: int = 0):
+    def __init__(self, path=None, data: bytes = b""):
         if path is None and not data:
             raise ValueError("ByteStream needs path or data")
         self.path = path
@@ -23,7 +23,6 @@ class ByteStream:
             # on every training step.
             self._fh = open(path, "rb")
         self.cursor = 0
-        self.rng = __import__("numpy").random.default_rng(seed)
 
     def _read_at(self, off: int, n: int) -> bytes:
         if self._data is not None:
