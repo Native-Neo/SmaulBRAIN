@@ -164,7 +164,7 @@ def test_compiler_free_packed_matmul_fallback_uses_blas_not_scalar_loops(monkeyp
 def test_dataset_stream_reuses_persistent_file_handle(tmp_path):
     path = tmp_path / "bytes.bin"
     path.write_bytes(bytes(range(32)))
-    with _data.ByteStream(str(path), seed=0) as stream:
+    with _data.ByteStream(str(path)) as stream:
         fh = stream._fh
         assert fh is not None and not fh.closed
         assert stream.next_tokens(4) == [0, 1, 2, 3, 4]
