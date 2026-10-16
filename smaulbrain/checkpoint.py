@@ -4,10 +4,11 @@ Directory layout:
   manifest.json   all metadata + scheduler state + pending/committed growth records
   params.npz      master parameters (incl. all experts)
   optim.npz       SmaulOPT state arrays
-  experts/        per-expert .npz mirrors for disk-backed paging (D2R/D2V)
 
-Atomic publish: build in <dir>.tmp.<pid> then os.replace(). Readers only ever
-observe a complete version. manifest records sha256 of the npz payloads.
+Publish: build in a temp dir next to the target, then swap it in. Replacing an
+existing checkpoint moves the old tree to <dir>.bak for the swap; if the process
+dies in between, the previous checkpoint is still loadable from <dir>.bak and
+load_checkpoint() falls back to it. manifest records sha256 of the payloads.
 """
 import hashlib
 import json
@@ -67,8 +68,7 @@ def build_manifest(preset_name: str, arch: dict, extra: dict, sched: dict,
     }
 
 
-def _write_tree(target_dir: str, manifest: dict, params: dict, opt_state: dict,
-                disk_experts=None) -> str:
+def _write_tree(target_dir: str, manifest: dict, params: dict, opt_state: dict) -> str:
     parent = os.path.dirname(os.path.abspath(target_dir))
     os.makedirs(parent, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix=".ckpt.", dir=parent)
@@ -81,12 +81,6 @@ def _write_tree(target_dir: str, manifest: dict, params: dict, opt_state: dict,
                 opt_flat[f"{k}::{sk}"] = np.asarray(sv)
         opt_path = os.path.join(tmp, "optim.npz")
         np.savez(opt_path, **opt_flat)
-        if disk_experts:
-            ed = os.path.join(tmp, "experts")
-            os.makedirs(ed, exist_ok=True)
-            for eid, w in disk_experts.items():
-                np.savez(os.path.join(ed, f"expert_{eid}.npz"),
-                         **{k: np.asarray(v) for k, v in w.items()})
         manifest = dict(manifest)
         manifest["files"] = {
             "params.npz": _sha256(params_path),
@@ -103,12 +97,19 @@ def _write_tree(target_dir: str, manifest: dict, params: dict, opt_state: dict,
 
 
 def _publish_dir(tmp: str, target_dir: str) -> None:
-    """Atomically publish tmp as target_dir, preserving the original on failure."""
+    """Publish tmp as target_dir, keeping the previous version recoverable.
+
+    A fresh target is published with a single atomic os.replace(). Replacing an
+    existing tree needs two renames, so a crash in between leaves the previous
+    checkpoint at <target_dir>.bak (load_checkpoint falls back to it); the
+    reverse rename restores the target on a failed second step.
+    """
     import shutil
+    target_dir = os.path.normpath(target_dir)
     if not os.path.exists(target_dir):
         os.replace(tmp, target_dir)
         return
-    bak = target_dir.rstrip("/") + ".bak"
+    bak = target_dir + ".bak"
     if os.path.exists(bak):
         shutil.rmtree(bak)
     os.rename(target_dir, bak)
@@ -118,6 +119,16 @@ def _publish_dir(tmp: str, target_dir: str) -> None:
         os.rename(bak, target_dir)
         raise
     shutil.rmtree(bak, ignore_errors=True)
+
+
+def _resolve_checkpoint_dir(ckpt_dir: str) -> str:
+    """Recover the previous checkpoint when a publish was interrupted mid-swap."""
+    if os.path.exists(os.path.join(ckpt_dir, "manifest.json")):
+        return ckpt_dir
+    bak = os.path.normpath(ckpt_dir) + ".bak"
+    if os.path.exists(os.path.join(bak, "manifest.json")):
+        return bak
+    return ckpt_dir
 
 
 def _json_default(o):
@@ -133,7 +144,7 @@ def _json_default(o):
 
 
 def save_checkpoint(target_dir: str, manifest: dict, params: dict,
-                    opt_state: dict, disk_experts=None) -> str:
+                    opt_state: dict) -> str:
     for c in manifest.get("scheduler", {}).get("history", []):
         if not isinstance(c.get("id"), int):
             raise ValueError("committed history entries require integer ids")
@@ -144,7 +155,7 @@ def save_checkpoint(target_dir: str, manifest: dict, params: dict,
     if pend is not None and pend.get("id") in ids:
         raise ValueError("pending event id already committed")
     _check_consistency(manifest, params)
-    return _write_tree(target_dir, manifest, params, opt_state, disk_experts)
+    return _write_tree(target_dir, manifest, params, opt_state)
 
 
 def _check_consistency(manifest: dict, params: dict) -> None:
@@ -161,6 +172,7 @@ def _check_consistency(manifest: dict, params: dict) -> None:
 
 
 def load_checkpoint(ckpt_dir: str) -> dict:
+    ckpt_dir = _resolve_checkpoint_dir(ckpt_dir)
     man_path = os.path.join(ckpt_dir, "manifest.json")
     if not os.path.exists(man_path):
         raise FileNotFoundError(f"no manifest at {man_path}")
