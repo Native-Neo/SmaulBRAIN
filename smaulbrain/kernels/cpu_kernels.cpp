@@ -1,6 +1,6 @@
 // SmaulBRAIN V2 portable native kernels (scalar C++; no AVX2/AVX-512 required).
 // Build: python -m v2.kernels.build   (explicit, actionable errors on failure)
-// All ops have Python scalar references in v2/math_ref.py; parity tested.
+// All ops have Python scalar references in smaulbrain/math_ref.py; parity tested.
 #include <cmath>
 #include <cstdint>
 
@@ -68,23 +68,6 @@ void recurrent_step(const float* s_prev, const float* k, const float* v, const f
         double g = 1.0 / (1.0 + std::exp(-(double)r[i]));
         y[i] = (float)(g * (s + (double)u[i] * kv));
     }
-}
-
-// factored SmaulOPT update for one matrix row/col slice (see v2/smaulopt.py)
-void factored_update(float* W, float* M, const float* G, const float* R, const float* C,
-                     float meanR, int m, int n, float lr, float b1, float b2, float eps) {
-    (void)b2;
-    for (int i = 0; i < m; ++i)
-        for (int j = 0; j < n; ++j) {
-            int k = i * n + j;
-            double g = G[k];
-            double mm = b1 * M[k] + (1 - b1) * g;
-            M[k] = (float)mm;
-            double denom = meanR > 1e-30 ? meanR : 1e-30;
-            double vhat = ((double)R[i] * C[j]) / denom;
-            double upd = mm / (std::sqrt(vhat > 0 ? vhat : 0) + eps);
-            W[k] = (float)((double)W[k] - lr * upd);
-        }
 }
 
 // expert clone with additive Gaussian noise (Box-Muller, seeded LCG)
