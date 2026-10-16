@@ -61,7 +61,7 @@ def test_training_changes_params_and_routed_experts_update(tmp_path):
         growth_every_steps=0, growth_loss_nats=None, growth_loss_beta=0.98,
         growth_min_eval_samples=64, growth_noise_scale=0.01, growth_seed=1,
         expert_capacity_factor=99.0)
-    stream = D.ByteStream(data=D.synth_bytes(2048, 0), seed=0)
+    stream = D.ByteStream(data=D.synth_bytes(2048, 0))
     tr = T.Trainer(spec, args, stream)
     before = {k: v.copy() for k, v in tr.model.p.items()}
     tr.train(max_steps=3, log_every=1)
