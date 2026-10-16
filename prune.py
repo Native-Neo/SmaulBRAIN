@@ -28,10 +28,9 @@ def main(argv=None):
     except ValueError as e:
         ap.error(str(e))
     if args.corpus:
-        stream = _data.ByteStream(path=args.corpus, seed=args.seed)
+        stream = _data.ByteStream(path=args.corpus)
     else:
-        stream = _data.ByteStream(data=_data.synth_bytes(args.synth_bytes, args.seed),
-                                  seed=args.seed)
+        stream = _data.ByteStream(data=_data.synth_bytes(args.synth_bytes, args.seed))
     batches = [stream.next_tokens(args.seq_len) for _ in range(args.eval_batches)]
     try:
         report = _pc.prune_checkpoint(
