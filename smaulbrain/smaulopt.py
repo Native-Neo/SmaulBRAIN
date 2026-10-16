@@ -20,6 +20,8 @@ Missing gradients (None) and unused experts are skipped safely.
 """
 import numpy as np
 
+from . import _native_opt
+
 
 class SmaulOPT:
     def __init__(self, lr=1e-3, beta1=0.9, beta2=0.98, eps=1e-8, weight_decay=0.0):
@@ -79,12 +81,23 @@ class SmaulOPT:
             if name not in self.state:
                 self._init_state(name, w)
             st = self.state[name]
+            if st["factored"]:
+                native = _native_opt.factored_step(self, w, g, st, collect_norms)
+                if native is not None:  # fused native update (see _optimizer_kernels.cpp)
+                    if collect_norms:
+                        norms[name] = native
+                    continue
             gf = np.asarray(g, dtype=np.float32)
             if self.weight_decay:
                 w -= np.float32(self.lr * self.weight_decay) * w
 
-            m = st["m"] * beta1 + gf * one_minus_beta1
-            st["m"] = m.astype(np.float32, copy=False)
+            m = st["m"]
+            if m.dtype == np.float32 and m.flags.writeable:
+                m *= beta1                      # in place: same values, no new matrix
+                m += gf * one_minus_beta1
+            else:
+                m = (m * beta1 + gf * one_minus_beta1).astype(np.float32, copy=False)
+                st["m"] = m
             g2 = gf * gf
             if st["factored"]:
                 row = np.mean(g2, axis=1, dtype=np.float32)
