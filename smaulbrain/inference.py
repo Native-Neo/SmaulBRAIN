@@ -47,7 +47,8 @@ class InferenceEngine:
             return int(np.argmax(logits))
         l = logits.astype(np.float64) / self.temperature
         if self.top_k > 0:
-            idx = np.argpartition(l, -self.top_k)[-self.top_k:]
+            k = min(self.top_k, l.size)  # argpartition rejects k > vocab
+            idx = np.argpartition(l, -k)[-k:]
             mask = np.full_like(l, -np.inf)
             mask[idx] = l[idx]
             l = mask
@@ -66,8 +67,7 @@ class InferenceEngine:
         probs = e / e.sum()
         return int(self.rng.choice(len(probs), p=probs))
 
-    def generate(self, prompt_tokens, max_new_tokens=64, stop_ids=(),
-                 stream: bool = False):
+    def generate(self, prompt_tokens, max_new_tokens=64, stop_ids=()):
         # Keep the final input token in a scalar. Rebuilding prompt_tokens + out
         # on every step made decoding allocate and copy O(prompt + generated)^2
         # elements over a long generation.
@@ -83,8 +83,6 @@ class InferenceEngine:
             last = nxt
             if nxt in stop_set:
                 break
-            if stream:
-                pass  # caller consumes incrementally via iterator below
         return out
 
     def generate_stream(self, prompt_tokens, max_new_tokens=64, stop_ids=()):
