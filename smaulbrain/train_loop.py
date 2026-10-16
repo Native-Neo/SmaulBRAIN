@@ -5,8 +5,9 @@ After each successful optimizer update, in order:
  4. create one pending event on fire (dedup 'both'); 5. resolve ranking
     (NO optimizer update while an event is pending); 6. prepare; 7. build
     candidate in isolation; 8. validate; 9. publish committed checkpoint;
- 10. adopt candidate; 11. next update.
+  10. adopt candidate; 11. next update.
 """
+import os
 import time
 
 import numpy as np
@@ -48,12 +49,16 @@ class Trainer:
             loss_beta=args.growth_loss_beta, min_eval_samples=args.growth_min_eval_samples)
         self.log = []
 
+    def _live_experts_dir(self) -> str:
+        # Live per-expert disk mirrors are transient and must not live inside
+        # the published checkpoint tree, which _publish_dir replaces wholesale.
+        return os.path.normpath(self.args.checkpoint) + ".experts_live"
+
     def _make_store(self, mode, n_exp, params, disk_dir):
         if mode in ("R", "V", "R2V"):
             ram = {e: _expert_dict(params, e) for e in range(n_exp)}
             return _paging.ExpertStore(mode, n_exp, ram_weights=ram)
-        import os
-        dd = disk_dir or os.path.join(self.args.checkpoint, "experts_live")
+        dd = disk_dir or self._live_experts_dir()
         os.makedirs(dd, exist_ok=True)
         for e in range(n_exp):
             w = _expert_dict(params, e)
@@ -116,12 +121,11 @@ class Trainer:
         # rebuild paging store
         if self.spec.kind == "moe":
             n_exp = man["n_experts_current"]
-            import os
             if self.args.paging in ("R", "V", "R2V"):
                 ram = {e: _expert_dict(self.model.p, e) for e in range(n_exp)}
                 self.model.store = _paging.ExpertStore(self.args.paging, n_exp, ram_weights=ram)
             else:
-                dd = os.path.join(self.args.checkpoint, "experts_live")
+                dd = self._live_experts_dir()
                 os.makedirs(dd, exist_ok=True)
                 for e in range(n_exp):
                     np.savez(os.path.join(dd, f"expert_{e}.npz"), **_expert_dict(self.model.p, e))
@@ -133,8 +137,17 @@ class Trainer:
 
     # -- growth resolution (no optimizer step may intervene) --
     def _eval_batches(self, n_batches=4):
-        src = self.eval_stream or self.stream
-        return [src.next_tokens(self.args.seq_len) for _ in range(n_batches)]
+        src = self.eval_stream
+        if src is not None:
+            return [src.next_tokens(self.args.seq_len) for _ in range(n_batches)]
+        # No dedicated eval stream: replay from the training cursor so evidence
+        # collection does not silently skip training tokens.
+        src = self.stream
+        cursor = src.cursor
+        try:
+            return [src.next_tokens(self.args.seq_len) for _ in range(n_batches)]
+        finally:
+            src.cursor = cursor
 
     def _resolve_pending(self, fail_at=None):
         """Complete self.sched.pending through commit. Returns history entry."""
@@ -288,13 +301,15 @@ class Trainer:
                 self._resolve_pending(fail_at=growth_fail_at)
                 continue
             toks = self.stream.next_tokens(self.args.seq_len)
-            loss, grads, _info = self.model.loss_and_backward(toks)
+            loss, grads, info = self.model.loss_and_backward(toks)
             if not np.isfinite(loss):
                 raise RuntimeError(f"non-finite loss at step {self.sched.global_step}")
             # gradient clipping (global norm)
             total_sq = sum(float(np.sum(g * g, dtype=np.float64))
                            for g in grads.values())
             total = float(np.sqrt(total_sq))
+            if not np.isfinite(total):
+                raise RuntimeError(f"non-finite gradient norm at step {self.sched.global_step}")
             if total > grad_clip and total > 0:
                 scale = grad_clip / total
                 grads = {k: (g * scale).astype(np.float32) for k, g in grads.items()}
@@ -331,7 +346,8 @@ class Trainer:
             steps += 1
             if log_every and steps % log_every == 0:
                 self.log.append({"step": self.sched.global_step, "loss": loss,
-                                 "smooth": self.sched.smooth_loss})
+                                 "smooth": self.sched.smooth_loss,
+                                 "overflow_dropped": int(info.get("overflow_dropped", 0))})
             if ckpt_every and self.sched.global_step % ckpt_every == 0:
                 self.save()
             if fail_at == "after_step":
