@@ -134,10 +134,6 @@ def resolve_preset(cli_preset: str, moe: bool, dense: bool) -> str:
                      f"full|tiny (with --moe/--dense) or {', '.join(VALID_PRESETS)}")
 
 
-class ValueJingError(Exception):
-    pass
-
-
 def parse_growth_every_steps(raw) -> int:
     try:
         v = int(raw)
