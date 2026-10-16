@@ -29,7 +29,7 @@ def _args(ckpt, **kw):
 def _trainer(preset, ckpt, **kw):
     spec = C.PRESETS[preset]
     args = _args(ckpt, **kw)
-    stream = D.ByteStream(data=D.synth_bytes(4096, 0), seed=0)
+    stream = D.ByteStream(data=D.synth_bytes(4096, 0))
     return T.Trainer(spec, args, stream)
 
 
@@ -159,14 +159,15 @@ def test_prune_lifecycle_and_regrow(tmp_path):
                   growth_min_eval_samples=16)
     tr.train(max_steps=1)
     assert _expert_count(tr) == 34
-    stream = D.ByteStream(data=D.synth_bytes(4096, 9), seed=9)
+    stream = D.ByteStream(data=D.synth_bytes(4096, 9))
     batches = [stream.next_tokens(16) for _ in range(4)]
     rep = PR.prune_checkpoint(ckpt, 2, batches, min_samples=16,
                               dry_run=False, assume_yes=True)
     assert rep["new_count"] == 32
     tr2 = _trainer("moe-tiny", ckpt)
-    tr2.load(ckpt)
+    man = tr2.load(ckpt)
     assert _expert_count(tr2) == 32
+    assert man["arch"]["experts_current"] == 32
     logits, _ = tr2.model.forward([65, 66, 67, 68], train=False)
     assert np.all(np.isfinite(logits))
 
