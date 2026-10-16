@@ -81,6 +81,50 @@ def pack_ternary(W: np.ndarray):
     return _pack_ternary_numpy(arr)
 
 
+class TiledPacked:
+    """Native tile-contiguous ternary layout (see _ternary_kernels.cpp).
+
+    Only produced/consumed by the native backend; the canonical row-major
+    2-bit format from pack_ternary() stays the portable/reference format.
+    """
+    __slots__ = ("buf",)
+
+    def __init__(self, buf: np.ndarray):
+        self.buf = buf
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.buf.nbytes)
+
+
+def pack_ternary_tiled(W: np.ndarray):
+    """pack_ternary() then retile for the fast native kernels when available."""
+    arr = np.asarray(W)
+    if (arr.dtype == np.float32 and arr.ndim == 2 and arr.flags.c_contiguous
+            and arr.size > 0 and prepare_ternary_backend()):
+        d_in, d_out = int(arr.shape[0]), int(arr.shape[1])
+        buf = np.empty(((d_out + 15) // 16) * d_in * 4, dtype=np.uint8)
+        scale_out = ctypes.c_float(1.0)
+        threshold_out = ctypes.c_float(0.0)
+        if _NATIVE_LIB.smaulbrain_pack_ternary_tiled(
+                arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                d_in, d_out, ctypes.byref(scale_out), ctypes.byref(threshold_out)) == 0:
+            return (TiledPacked(buf), np.float32(scale_out.value), arr.shape,
+                    np.float32(threshold_out.value))
+    packed, scale, shape, th = pack_ternary(W)
+    if len(shape) == 2 and prepare_ternary_backend():
+        d_in, d_out = int(shape[0]), int(shape[1])
+        packed = np.ascontiguousarray(packed, dtype=np.uint8)
+        buf = np.empty(((d_out + 15) // 16) * d_in * 4, dtype=np.uint8)
+        if _NATIVE_LIB.smaulbrain_retile_ternary(
+                packed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                d_in, d_out) == 0:
+            return TiledPacked(buf), scale, shape, th
+    return packed, scale, shape, th
+
+
 def unpack_codes(packed: np.ndarray, shape) -> np.ndarray:
     """Unpack to int8 codes {-1,0,+1} (NOT a dense fp32 reconstruction)."""
     n = int(np.prod(shape))
@@ -156,7 +200,7 @@ def prepare_ternary_backend() -> bool:
         has_avx = bool(_cpu.detect().get("has_avx", False))
         variant_flag = "-mavx" if has_avx else "-msse2"
         flags = ["-O3", "-std=c++17", "-shared", "-fPIC",
-                 "-fno-fast-math", variant_flag]
+                 "-fno-fast-math", "-ffp-contract=off", "-pthread", variant_flag]
         digest_data = source_bytes + compiler.encode("utf-8") + " ".join(flags).encode("ascii")
         digest = hashlib.sha256(digest_data).hexdigest()[:20]
         cache_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
@@ -193,6 +237,17 @@ def prepare_ternary_backend() -> bool:
         lib.smaulbrain_ternary_matmat.restype = ctypes.c_int
         lib.smaulbrain_ternary_transpose_matmat.argtypes = argtypes
         lib.smaulbrain_ternary_transpose_matmat.restype = ctypes.c_int
+        lib.smaulbrain_tiled_matmat.argtypes = argtypes
+        lib.smaulbrain_tiled_matmat.restype = ctypes.c_int
+        lib.smaulbrain_tiled_transpose_matmat.argtypes = argtypes
+        lib.smaulbrain_tiled_transpose_matmat.restype = ctypes.c_int
+        lib.smaulbrain_retile_ternary.argtypes = [
+            ptr_u8, ptr_u8, ctypes.c_size_t, ctypes.c_size_t]
+        lib.smaulbrain_retile_ternary.restype = ctypes.c_int
+        lib.smaulbrain_pack_ternary_tiled.argtypes = [
+            ptr_f32, ptr_u8, ctypes.c_size_t, ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float)]
+        lib.smaulbrain_pack_ternary_tiled.restype = ctypes.c_int
         lib.smaulbrain_pack_ternary.argtypes = [
             ptr_f32, ptr_u8, ctypes.c_size_t,
             ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float)]
@@ -329,6 +384,20 @@ def packed_matmat(X: np.ndarray, packed: np.ndarray, shape, scale: float,
         x = x.reshape(1, -1)
     if x.ndim != 2:
         raise ValueError("packed ternary matmat expects a 1-D or 2-D input")
+    if isinstance(packed, TiledPacked):
+        d_in, d_out = int(shape[0]), int(shape[1])
+        if x.shape[1] != d_in:
+            raise ValueError(f"input width {x.shape[1]} does not match packed matrix width {d_in}")
+        x = np.ascontiguousarray(x, dtype=np.float32)
+        out = np.empty((x.shape[0], d_out), dtype=np.float32)
+        if _NATIVE_LIB.smaulbrain_tiled_matmat(
+                x.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                packed.buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                ctypes.c_float(float(scale)),
+                out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                x.shape[0], d_in, d_out) != 0:
+            raise RuntimeError("native tiled ternary matmat failed")
+        return out[0] if one_row else out
     p, d_in, d_out = _check_packed_shape(packed, shape)
     if x.shape[1] != d_in:
         raise ValueError(f"input width {x.shape[1]} does not match packed matrix width {d_in}")
@@ -391,6 +460,20 @@ def packed_matmat_transpose(dY: np.ndarray, packed: np.ndarray, shape,
         dy = dy.reshape(1, -1)
     if dy.ndim != 2:
         raise ValueError("packed ternary transpose matmat expects 1-D or 2-D input")
+    if isinstance(packed, TiledPacked):
+        d_in, d_out = int(shape[0]), int(shape[1])
+        if dy.shape[1] != d_out:
+            raise ValueError(f"gradient width {dy.shape[1]} does not match packed output width {d_out}")
+        dy = np.ascontiguousarray(dy, dtype=np.float32)
+        dx = np.empty((dy.shape[0], d_in), dtype=np.float32)
+        if _NATIVE_LIB.smaulbrain_tiled_transpose_matmat(
+                dy.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                packed.buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                ctypes.c_float(float(scale)),
+                dx.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                dy.shape[0], d_in, d_out) != 0:
+            raise RuntimeError("native tiled ternary transpose matmat failed")
+        return dx[0] if one_row else dx
     p, d_in, d_out = _check_packed_shape(packed, shape)
     if dy.shape[1] != d_out:
         raise ValueError(f"gradient width {dy.shape[1]} does not match packed output width {d_out}")
@@ -475,5 +558,10 @@ def fp8_e4m3_quantize(W: np.ndarray, scale=None):
 
 
 def fp8_error_bound(scale: float) -> float:
-    # half-ulp bound at scale: ulp <= 2^-3 * 2^e <= 2^-3*448*scale/448... simplify
-    return float(scale) * 0.0625
+    """Worst-case absolute error of fp8_e4m3_quantize for inputs |v| <= 448*scale.
+
+    Auto-scaling puts the largest magnitude at FP8_E4M3_MAX, where the legacy
+    E4M3 mantissa (3 bits) has a grid step of 2^-3 * 448 * scale = 56 * scale;
+    round-to-nearest halves that, giving 28 * scale.
+    """
+    return abs(float(scale)) * (FP8_E4M3_MAX / 16.0)
