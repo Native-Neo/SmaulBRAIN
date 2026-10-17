@@ -65,8 +65,11 @@ class InferenceEngine:
         l = logits.float() / self.temperature
         if self.top_k > 0:
             k = min(self.top_k, l.numel())
-            threshold = torch.topk(l, k).values[-1]
-            l = l.masked_fill(l < threshold, -torch.inf)
+            # Mask by rank, not by cutoff value: cutoff-based filtering
+            # retains every tied logit and can silently exceed top_k.
+            order = torch.argsort(l, descending=True, stable=True)
+            l = l.clone()
+            l[order[k:]] = -torch.inf
         if self.top_p < 1:
             sorted_l, idx = torch.sort(l, descending=True)
             probs = torch.softmax(sorted_l, dim=0)
