@@ -70,14 +70,17 @@ def unpack_codes(packed, shape):
         if din < 1 or dout < 1 or buf.size != expected:
             raise ValueError("invalid tiled packed buffer for declared shape")
         import numpy as np
+        buf = np.asarray(buf, dtype=np.uint8).reshape(-1)
         out = np.empty((din, dout), dtype=np.int8)
+        columns = np.arange(dout, dtype=np.int64)
+        tile = columns // 16
+        local = columns % 16
+        byte_index = tile * din * 4 + local // 4
+        shift = 2 * (local % 4)
         for i in range(din):
-            for j in range(dout):
-                tile = j // 16
-                local = j % 16
-                byte = int(buf[tile * din * 4 + i * 4 + local // 4])
-                code = (byte >> (2 * (local % 4))) & 3
-                out[i, j] = -1 if code == 0 else (1 if code >= 2 else 0)
+            packed_bytes = buf[byte_index + i * 4]
+            codes = (packed_bytes >> shift) & 3
+            out[i] = np.where(codes == 0, -1, np.where(codes >= 2, 1, 0))
         return torch.from_numpy(out)
     p = packed
     if isinstance(p, torch.Tensor): p = _np(p, torch.uint8)
