@@ -146,3 +146,34 @@ def test_checkpoint_rejects_optimizer_moment_shape_mismatch(tmp_path):
     )
     with pytest.raises(ValueError, match="optimizer m shape for embed"):
         CK.save_checkpoint(str(tmp_path / "bad-optimizer"), manifest, params, bad_state)
+
+
+def test_checkpoint_rejects_architecture_expert_count_disagreement(tmp_path):
+    spec = C.PRESETS["moe-tiny"]
+    params = M.build_params(spec, torch.Generator().manual_seed(6))
+    arch = C.arch_report(spec, spec.n_experts_init)
+    arch["experts_current"] = spec.n_experts_init - 1
+    manifest = CK.build_manifest(
+        spec.name, arch, {}, CK.blank_scheduler_state(), 0, {},
+        spec.n_experts_init, list(range(spec.n_experts_init)), {},
+    )
+    with pytest.raises(ValueError, match="experts_current disagrees"):
+        CK.save_checkpoint(str(tmp_path / "arch-count"), manifest, params, {})
+
+
+def test_checkpoint_rejects_mismatched_factored_optimizer_flag(tmp_path):
+    spec = C.PRESETS["dense-tiny"]
+    params = M.build_params(spec, torch.Generator().manual_seed(7))
+    opt_state = {
+        "embed": {
+            "m": torch.zeros_like(params["embed"]),
+            "R": torch.zeros(spec.vocab_size),
+            "C": torch.zeros(spec.d_model),
+        }
+    }
+    manifest = CK.build_manifest(
+        spec.name, C.arch_report(spec), {}, CK.blank_scheduler_state(), 0, {},
+        0, [], {"class": "SmaulOPT", "factored": {"embed": False}},
+    )
+    with pytest.raises(ValueError, match="factored flag for embed disagrees"):
+        CK.save_checkpoint(str(tmp_path / "bad-factored-flag"), manifest, params, opt_state)
