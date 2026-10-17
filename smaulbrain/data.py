@@ -83,11 +83,15 @@ class ByteStream:
         }
 
     def load_state_dict(self, sd: dict) -> None:
-        if sd.get("size") != self.size or sd.get("path") != self.path:
-            raise ValueError("dataset mismatch on resume")
         saved_identity = sd.get("identity")
-        if saved_identity is not None and saved_identity != self.identity:
-            raise ValueError("dataset contents or file metadata changed since checkpoint")
+        if saved_identity is not None:
+            # Identity uses real paths for files and a content hash for in-memory
+            # corpora, so equivalent relative/absolute path spellings can resume.
+            if saved_identity != self.identity:
+                raise ValueError("dataset contents or file metadata changed since checkpoint")
+        elif sd.get("size") != self.size or sd.get("path") != self.path:
+            # Compatibility with checkpoints written before data identity existed.
+            raise ValueError("dataset mismatch on resume")
         try:
             cursor = int(sd["cursor"])
         except (KeyError, TypeError, ValueError) as exc:
