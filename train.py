@@ -80,10 +80,13 @@ def main(argv=None):
                        ckpt_every=args.ckpt_every, grad_clip=args.grad_clip)
     finally:
         signal.signal(signal.SIGINT, previous_sigint)
-    # With periodic checkpointing enabled, Trainer.train() writes the final
-    # state (unless the final step already had a periodic save). When periodic
-    # saves are disabled, the CLI still writes one checkpoint on normal exit.
-    if not tr.stop_requested and not args.ckpt_every:
+    # Close the narrow SIGINT race where the signal lands after train()
+    # returns but before the handler is restored. Save only if the current
+    # global step is not already represented on disk.
+    if tr.stop_requested:
+        if tr.last_checkpoint_step != tr.sched.global_step:
+            tr.save()
+    elif not args.ckpt_every:
         tr.save()
     from smaulbrain import model as _model
     n_exp = len(_model.expert_ids(tr.model.p)) if preset.startswith("moe") else 0
