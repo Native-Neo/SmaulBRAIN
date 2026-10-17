@@ -26,6 +26,16 @@ def main(argv=None):
     args = ap.parse_args(raw_argv)
     if args.eval_batches < 1:
         ap.error("--eval-batches must be >= 1")
+    checkpoint_present = (
+        os.path.exists(os.path.join(args.checkpoint, "manifest.json"))
+        or os.path.exists(os.path.join(os.path.normpath(args.checkpoint) + ".bak", "manifest.json"))
+    )
+    # Fail on malformed evidence before checkpoint I/O when we know the
+    # requested sequence length cannot be used. If a checkpoint exists and
+    # --seq-len was omitted, defer until after restoring its saved default.
+    if (not args.corpus and args.synth_bytes < args.seq_len + 1
+            and (not checkpoint_present or _was_provided(raw_argv, "--seq-len"))):
+        ap.error("--synth-bytes must be at least --seq-len + 1 when --corpus is not set")
 
     from smaulbrain import checkpoint as _ckpt
     try:
