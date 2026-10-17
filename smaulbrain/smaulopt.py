@@ -1,12 +1,29 @@
 """PyTorch implementation of SmaulOPT's factored second-moment optimizer."""
+import math
+
 import torch
 from . import _native_opt
 
 
 class SmaulOPT:
     def __init__(self, lr=1e-3, beta1=0.9, beta2=0.98, eps=1e-8, weight_decay=0.0):
-        self.lr=float(lr); self.beta1=float(beta1); self.beta2=float(beta2); self.eps=float(eps)
-        self.weight_decay=float(weight_decay); self.state={}; self.n_updates=0
+        self.lr=float(lr)
+        self.beta1=float(beta1)
+        self.beta2=float(beta2)
+        self.eps=float(eps)
+        self.weight_decay=float(weight_decay)
+        if not math.isfinite(self.lr) or self.lr <= 0:
+            raise ValueError("lr must be finite and > 0")
+        if not math.isfinite(self.beta1) or not 0 <= self.beta1 < 1:
+            raise ValueError("beta1 must be finite and in [0, 1)")
+        if not math.isfinite(self.beta2) or not 0 <= self.beta2 < 1:
+            raise ValueError("beta2 must be finite and in [0, 1)")
+        if not math.isfinite(self.eps) or self.eps <= 0:
+            raise ValueError("eps must be finite and > 0")
+        if not math.isfinite(self.weight_decay) or self.weight_decay < 0:
+            raise ValueError("weight_decay must be finite and >= 0")
+        self.state={}
+        self.n_updates=0
 
     def _init_state(self,name,w):
         if w.ndim==2:
