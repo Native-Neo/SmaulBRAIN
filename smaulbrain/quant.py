@@ -4,6 +4,8 @@ All trainable weights and activations remain torch.Tensor objects. The native
 backend uses a narrow CPU buffer bridge for packed ternary matrix operations;
 it never stores a dense dequantized weight matrix.
 """
+import math
+
 import torch
 from . import _quant_native as _native
 
@@ -154,7 +156,16 @@ def fp8_e4m3_quantize(W, scale=None):
         finite = wf[torch.isfinite(wf)].abs()
         mx = float(finite.max().item()) if finite.numel() else 0.0
         scale = mx / FP8_E4M3_MAX if mx > 0 else 1.0
-    scale = float(torch.tensor(float(scale), dtype=torch.float32).item()) or 1.0
+    requested_scale = float(scale)
+    if not math.isfinite(requested_scale) or requested_scale < 0:
+        raise ValueError("FP8 quantization scale must be finite and >= 0")
+    scale = float(torch.tensor(requested_scale, dtype=torch.float32).item())
+    if not math.isfinite(scale):
+        raise ValueError("FP8 quantization scale is outside the float32 range")
+    if scale == 0:
+        # Preserve the documented legacy behavior for scale=0 and for a
+        # positive value too small to survive float32 conversion.
+        scale = 1.0
     norm = wf / scale
     finite = torch.isfinite(norm)
     mag = torch.where(finite, norm.abs().clamp(max=FP8_E4M3_MAX), torch.zeros_like(norm))
