@@ -89,8 +89,21 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
          "prev_count": len(eids), "new_count": len(keep)})
     # router optimizer state is shape-bound: drop it so it re-initializes
     renamed.pop("router", None)
+    # Validate the candidate before touching the on-disk checkpoint. Saving
+    # first and smoke-testing afterward can destroy the last usable checkpoint
+    # if a shape/configuration problem makes inference fail.
+    candidate_model = _model.Model(
+        spec,
+        new_params,
+        forward_quant=forward_quant,
+        backward_mode=backward_mode,
+        capacity_factor=capacity_factor,
+    )
+    logits, _ = candidate_model.forward([65, 66, 67, 68], train=False)
+    if not torch.isfinite(logits).all().item():
+        raise RuntimeError("pruned candidate failed validation")
     _ckpt.save_checkpoint(ckpt_dir, man2, new_params, renamed)
-    # validate: reload + inference smoke
+    # Reload the published generation and confirm serialized state is usable.
     blob2 = _ckpt.load_checkpoint(ckpt_dir)
     m2 = _model.Model(
         spec,
@@ -101,5 +114,5 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
     )
     logits, _ = m2.forward([65, 66, 67, 68], train=False)
     if not torch.isfinite(logits).all().item():
-        raise RuntimeError("pruned model failed validation")
+        raise RuntimeError("published pruned checkpoint failed validation")
     return report
