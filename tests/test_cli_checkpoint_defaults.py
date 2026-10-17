@@ -15,7 +15,7 @@ def _checkpoint(path):
     config = {
         "forward_quant": "ternary",
         "backward_mode": "ternary",
-        "paging": "R",
+        "paging": "V",
         "seed": 17,
         "seq_len": 12,
         "capacity_factor": 7.5,
@@ -59,6 +59,8 @@ def test_inference_defaults_to_checkpoint_quantization_and_capacity(tmp_path, ca
     assert observed["forward_quant"] == "ternary"
     assert observed["backward_mode"] == "ternary"
     assert observed["capacity_factor"] == 7.5
+    assert observed["paging_mode"] == "R"
+    assert observed["paging_mode"] == "R"
 
 
 def test_evaluation_defaults_to_checkpoint_quantization_and_capacity(tmp_path, capsys, monkeypatch):
