@@ -28,15 +28,46 @@ class InferenceEngine:
         self._pending_token = None
 
     def export_states(self):
-        return self.model.serialize_states(self.states)
+        """Export recurrent state plus enough sampler state for exact continuation."""
+        blob = dict(self.model.serialize_states(self.states))
+        blob["__inference__"] = {
+            "pending_token": self._pending_token,
+            "next_logits": (
+                self._next_logits.detach().cpu().tolist()
+                if isinstance(self._next_logits, torch.Tensor) else None
+            ),
+            "generator_state": self.generator.get_state().cpu().tolist(),
+        }
+        return blob
 
     def import_states(self, blob):
+        if not isinstance(blob, dict):
+            raise ValueError("inference state must be a mapping")
+        state_keys = sorted(
+            (key for key in blob if isinstance(key, str) and key.isdigit()),
+            key=int,
+        )
+        if not state_keys or state_keys != [str(i) for i in range(len(state_keys))]:
+            raise ValueError("inference state must contain contiguous numeric layer keys")
+        device = getattr(self.model, "device", "cpu")
         self.states = [
-            torch.as_tensor(blob[str(i)], dtype=torch.float32, device=self.model.device)
-            for i in range(len(blob))
+            torch.as_tensor(blob[str(i)], dtype=torch.float32, device=device)
+            for i in range(len(state_keys))
         ]
-        self._next_logits = None
-        self._pending_token = None
+        # Bare numeric-key dictionaries from older versions remain importable.
+        metadata = blob.get("__inference__", {})
+        if not isinstance(metadata, dict):
+            raise ValueError("invalid inference metadata")
+        next_logits = metadata.get("next_logits")
+        self._next_logits = (
+            torch.as_tensor(next_logits, dtype=torch.float32, device=device)
+            if next_logits is not None else None
+        )
+        pending = metadata.get("pending_token")
+        self._pending_token = None if pending is None else int(pending)
+        rng_state = metadata.get("generator_state")
+        if rng_state is not None:
+            self.generator.set_state(torch.as_tensor(rng_state, dtype=torch.uint8, device="cpu"))
 
     def prefill(self, tokens, chunk=0):
         """Consume context once and retain logits predicting its next token."""
