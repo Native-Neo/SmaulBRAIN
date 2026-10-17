@@ -62,9 +62,9 @@ def pack_ternary_tiled(W):
 
 def unpack_codes(packed, shape):
     if isinstance(packed, TiledPacked):
-        # Tiled layout is [column tile][input row][four packed bytes], with
-        # four 2-bit codes per byte. Decode to row-major signed trits only for
-        # callers explicitly asking to unpack the codes.
+        # Native tiled layout is [column tile][input row][4 bitplane bytes]:
+        # pos-low8, neg-low8, pos-high8, neg-high8. Each bit is one column.
+        # Decode to row-major signed trits only for explicit unpack requests.
         din, dout = (int(shape[0]), int(shape[1]))
         tiles = (dout + 15) // 16
         buf = packed.buf
@@ -77,12 +77,14 @@ def unpack_codes(packed, shape):
         columns = np.arange(dout, dtype=np.int64)
         tile = columns // 16
         local = columns % 16
-        byte_index = tile * din * 4 + local // 4
-        shift = 2 * (local % 4)
+        block = (local // 8) * 2
+        bit = local % 8
+        row_offsets = tile * din * 4 + block
         for i in range(din):
-            packed_bytes = buf[byte_index + i * 4]
-            codes = (packed_bytes >> shift) & 3
-            out[i] = np.where(codes == 0, -1, np.where(codes >= 2, 1, 0))
+            base = row_offsets + i * 4
+            positive = (buf[base] >> bit) & 1
+            negative = (buf[base + 1] >> bit) & 1
+            out[i] = np.where(positive != 0, 1, np.where(negative != 0, -1, 0))
         return torch.from_numpy(out)
     p = packed
     if isinstance(p, torch.Tensor): p = _np(p, torch.uint8)
