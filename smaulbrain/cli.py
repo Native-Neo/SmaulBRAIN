@@ -38,7 +38,8 @@ def add_common_args(ap: argparse.ArgumentParser, need_train: bool = False):
         ap.add_argument("--synth-bytes", type=int, default=1 << 16)
         ap.add_argument("--grad-clip", type=float, default=1.0)
         ap.add_argument("--log-every", type=int, default=10)
-        ap.add_argument("--ckpt-every", type=int, default=0)
+        ap.add_argument("--ckpt-every", type=int, default=100,
+                            help="save a recovery checkpoint every N optimizer updates (0 disables periodic saves)")
 
 
 def validate_args(args) -> str:
