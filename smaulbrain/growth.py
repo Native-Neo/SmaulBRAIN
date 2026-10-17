@@ -150,9 +150,13 @@ class GrowthScheduler:
 # ---------------- quality ranking ----------------
 
 def eval_loss_on_tokens(model, tokens) -> float:
-    logits, _ = model.forward(tokens, train=False)
+    if len(tokens) < 2:
+        raise ValueError("evaluation sequence needs at least two tokens")
+    # The last byte is a target, not an input. Forwarding it would consume an
+    # extra expert-capacity slot even though its corresponding logit is unused.
+    logits, _ = model.forward(tokens[:-1], train=False)
     tgt = torch.as_tensor(tokens[1:], dtype=torch.long, device=logits.device)
-    return float(torch.nn.functional.cross_entropy(logits[:-1], tgt).item())
+    return float(torch.nn.functional.cross_entropy(logits, tgt).item())
 
 
 def rank_experts(model, eval_batches, min_samples: int, max_batches=None):
@@ -177,9 +181,11 @@ def rank_experts(model, eval_batches, min_samples: int, max_batches=None):
 
 
 def eval_loss_on_tokens_disabled(model, tokens, disabled):
-    logits, _ = model.forward(tokens, train=False, disabled=(disabled,))
+    if len(tokens) < 2:
+        raise ValueError("evaluation sequence needs at least two tokens")
+    logits, _ = model.forward(tokens[:-1], train=False, disabled=(disabled,))
     tgt = torch.as_tensor(tokens[1:], dtype=torch.long, device=logits.device)
-    return float(torch.nn.functional.cross_entropy(logits[:-1], tgt).item())
+    return float(torch.nn.functional.cross_entropy(logits, tgt).item())
 
 
 def prepare_sources(scores: dict, n_needed: int):
