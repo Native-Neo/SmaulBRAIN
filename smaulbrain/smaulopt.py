@@ -79,9 +79,18 @@ class SmaulOPT:
     def state_dict(self):
         return {k:{sk:(sv.clone() if isinstance(sv,torch.Tensor) else sv) for sk,sv in s.items() if sk!="factored"} for k,s in self.state.items()}
 
-    def load_state_dict(self,sd,factored_flags=None):
-        self.state={}
-        for k,s in sd.items():
-            entry={sk:(torch.as_tensor(sv).clone() if not isinstance(sv,torch.Tensor) else sv.clone()) for sk,sv in s.items()}
-            entry["factored"]=bool(factored_flags.get(k,"R" in entry) if factored_flags else "R" in entry)
-            self.state[k]=entry
+    def load_state_dict(self, sd, factored_flags=None, copy=True):
+        """Load optimizer moments; copy=False transfers checkpoint tensor ownership."""
+        self.state = {}
+        for name, saved in sd.items():
+            entry = {}
+            for slot, value in saved.items():
+                if isinstance(value, torch.Tensor):
+                    entry[slot] = value.clone() if copy else value
+                else:
+                    tensor = torch.as_tensor(value)
+                    entry[slot] = tensor.clone() if copy else tensor
+            entry["factored"] = bool(
+                factored_flags.get(name, "R" in entry) if factored_flags else "R" in entry
+            )
+            self.state[name] = entry
