@@ -54,3 +54,22 @@ def test_training_changes_params_and_routed_experts_update(tmp_path):
     changed = [k for k, v in tr.model.p.items() if not torch.equal(v, before[k])]
     assert len(changed) > 10
     assert any(k.startswith("expert.") for k in changed)
+
+
+import pytest
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"lr": 0}, "lr must be finite and > 0"),
+        ({"lr": float("nan")}, "lr must be finite and > 0"),
+        ({"beta1": 1.0}, "beta1 must be finite and in"),
+        ({"beta2": float("inf")}, "beta2 must be finite and in"),
+        ({"eps": 0}, "eps must be finite and > 0"),
+        ({"weight_decay": -1}, "weight_decay must be finite and >= 0"),
+    ],
+)
+def test_optimizer_rejects_invalid_hyperparameters(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        O.SmaulOPT(**kwargs)
