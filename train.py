@@ -35,7 +35,10 @@ def main(argv=None):
     else:
         stream = _data.ByteStream(data=_data.synth_bytes(args.synth_bytes, args.seed))
     tr = _tl.Trainer(spec, args, stream)
-    checkpoint_exists = os.path.exists(os.path.join(args.checkpoint, "manifest.json"))
+    checkpoint_exists = (
+        os.path.exists(os.path.join(args.checkpoint, "manifest.json"))
+        or os.path.exists(os.path.join(os.path.normpath(args.checkpoint) + ".bak", "manifest.json"))
+    )
     if args.resume and not checkpoint_exists:
         print(f"error: nothing to resume at {args.checkpoint}", file=sys.stderr)
         return 2
@@ -77,7 +80,10 @@ def main(argv=None):
                        ckpt_every=args.ckpt_every, grad_clip=args.grad_clip)
     finally:
         signal.signal(signal.SIGINT, previous_sigint)
-    tr.save()
+    # Trainer.train() saves as part of graceful-stop handling. Avoid rewriting
+    # large checkpoints a second time after Ctrl+C.
+    if not tr.stop_requested:
+        tr.save()
     from smaulbrain import model as _model
     n_exp = len(_model.expert_ids(tr.model.p)) if preset.startswith("moe") else 0
     metrics = tr.last_metrics or {}
