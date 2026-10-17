@@ -77,3 +77,14 @@ def test_inference_rejects_nonfinite_temperature():
 
     with pytest.raises(ValueError, match="temperature"):
         InferenceEngine(_CountingModel(), temperature=float("nan"))
+
+
+def test_prefill_rejects_invalid_chunk_without_advancing_state():
+    import pytest
+
+    model = _CountingModel()
+    engine = InferenceEngine(model, temperature=0.0)
+    with pytest.raises(ValueError, match="chunk"):
+        engine.prefill([40, 41], chunk=-1)
+    assert model.step_inputs == []
+    assert engine.states == [0]
