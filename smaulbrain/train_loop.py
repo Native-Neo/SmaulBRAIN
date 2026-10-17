@@ -144,7 +144,7 @@ class Trainer:
         self.model.packed.invalidate()
         self.model.fp8.invalidate()
         flags = man.get("optimizer", {}).get("factored", {})
-        self.opt.load_state_dict(blob["opt_state"], flags)
+        self.opt.load_state_dict(blob["opt_state"], flags, copy=False)
         for state in self.opt.state.values():
             for key, value in list(state.items()):
                 if isinstance(value, torch.Tensor):
