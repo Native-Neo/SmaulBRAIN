@@ -190,3 +190,18 @@ def test_full_lifecycle_dense_and_moe(tmp_path):
         # deterministic repeat
         eng2 = INF.InferenceEngine(tr2.model, seed=1, temperature=0.0)
         assert eng2.generate([72, 101, 108, 108, 111], max_new_tokens=8) == out
+
+
+def test_graceful_stop_finishes_update_and_saves(tmp_path):
+    ckpt = str(tmp_path / "graceful-stop")
+    tr = _trainer("moe-tiny", ckpt)
+    tr.request_stop()
+    tr.train(max_steps=3)
+    assert tr.sched.global_step == 1
+    saved = CK.load_checkpoint(ckpt)
+    assert saved["manifest"]["scheduler"]["global_step"] == 1
+    # A fresh trainer can resume the saved state and continue normally.
+    tr2 = _trainer("moe-tiny", ckpt)
+    tr2.load(ckpt)
+    tr2.train(max_steps=2)
+    assert tr2.sched.global_step == 2
