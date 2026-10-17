@@ -1,5 +1,5 @@
 """Bounded expert storage for resident RAM, disk-to-RAM, and CUDA modes."""
-import collections, os, time
+import collections, os, tempfile, time
 import torch
 
 class PagingError(RuntimeError): pass
@@ -11,9 +11,15 @@ def accelerator_available():
 
 
 class ExpertStore:
-    def __init__(self,mode,n_experts,ram_weights=None,disk_dir=None,ram_cache_max_experts=8,staging_max_bytes=1<<24):
+    def __init__(self,mode,n_experts,ram_weights=None,disk_dir=None,ram_cache_max_experts=8,staging_max_bytes=1<<26):
         if mode not in ("R","V","D2R","D2V","R2V"):raise ValueError(f"unknown paging mode {mode!r}")
-        self.mode=mode;self.n_experts=n_experts;self.ram_weights=ram_weights or {};self.disk_dir=disk_dir
+        if isinstance(n_experts, bool) or int(n_experts) < 1:
+            raise ValueError("n_experts must be an integer >= 1")
+        if isinstance(ram_cache_max_experts, bool) or int(ram_cache_max_experts) < 1:
+            raise ValueError("ram_cache_max_experts must be an integer >= 1")
+        if isinstance(staging_max_bytes, bool) or int(staging_max_bytes) < 1:
+            raise ValueError("staging_max_bytes must be an integer >= 1")
+        self.mode=mode;self.n_experts=int(n_experts);self.ram_weights=ram_weights if ram_weights is not None else {};self.disk_dir=disk_dir
         self.ram_cache_max_experts=int(ram_cache_max_experts);self.staging_max_bytes=int(staging_max_bytes)
         self.cache=collections.OrderedDict();self.hits=self.misses=self.evictions=self.bytes_transferred=0
         self.load_time_s=0.0;self.peak_cached=self.peak_staging_bytes=0;self._pinned=set();self._dirty=set()
@@ -41,7 +47,11 @@ class ExpertStore:
             victim=next(iter(self.cache))
             if victim in self._pinned:
                 self.cache.move_to_end(victim);victim=next((k for k in self.cache if k not in self._pinned),None)
-                if victim is None:raise PagingError("cache full of pinned experts; cannot evict")
+                if victim is None:
+                    # The incoming item was just read and is not dirty. Drop
+                    # it before raising so an error cannot violate the RAM cap.
+                    self.cache.pop(eid,None)
+                    raise PagingError("cache full of pinned experts; cannot evict")
             self._flush_dirty(victim);del self.cache[victim];self.evictions+=1
         return w
 
@@ -56,8 +66,19 @@ class ExpertStore:
         raise KeyError(f"expert {eid} backing file missing: {path}")
 
     def _write_expert_file(self,eid,weights):
-        os.makedirs(self.disk_dir,exist_ok=True);path=self._path(eid);tmp=path+f".{os.getpid()}.tmp"
-        torch.save({k:v.detach().cpu().contiguous() for k,v in weights.items()},tmp);os.replace(tmp,path)
+        os.makedirs(self.disk_dir,exist_ok=True)
+        path=self._path(eid)
+        fd,tmp=tempfile.mkstemp(prefix=f".expert_{eid}.",suffix=".tmp",dir=self.disk_dir)
+        os.close(fd)
+        try:
+            torch.save({k:v.detach().cpu().contiguous() for k,v in weights.items()},tmp)
+            os.replace(tmp,path)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except FileNotFoundError:
+                pass
+            raise
 
     def _flush_dirty(self,eid):
         if eid in self._dirty and eid in self.cache:self._write_expert_file(eid,self.cache[eid]);self._dirty.discard(eid)
@@ -86,10 +107,17 @@ class ExpertStore:
         self.n_experts=max(self.n_experts,eid+1)
 
     def remove_expert(self,eid):
-        eid=int(eid);self.ram_weights.pop(eid,None);self.cache.pop(eid,None);self._dirty.discard(eid)
-        for path in (self._path(eid),os.path.join(self.disk_dir or "",f"expert_{eid}.npz")):
-            try:os.remove(path)
-            except OSError:pass
+        eid=int(eid)
+        self.ram_weights.pop(eid,None)
+        self.cache.pop(eid,None)
+        self._dirty.discard(eid)
+        self._pinned.discard(eid)
+        if self.disk_dir is not None:
+            for path in (self._path(eid), os.path.join(self.disk_dir, f"expert_{eid}.npz")):
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
 
     def stats(self):
         total=self.hits+self.misses

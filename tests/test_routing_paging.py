@@ -97,3 +97,56 @@ def test_paging_v_modes_error_without_backend():
     for mode in ("V", "D2V", "R2V"):
         with pytest.raises(P.PagingError):
             P.ExpertStore(mode, 1, ram_weights={0: {}}, disk_dir="/tmp")
+
+
+@pytest.mark.parametrize("capacity", [0, -1, float("nan"), float("inf"), float("-inf")])
+def test_router_rejects_invalid_capacity_factor(capacity):
+    r = _router()
+    with pytest.raises(ValueError, match="capacity_factor"):
+        r.route(np.zeros((2, 8), dtype=np.float32), top_k=2,
+                capacity_factor=capacity)
+
+
+def test_router_rejects_wrong_input_rank_or_width():
+    r = _router()
+    with pytest.raises(ValueError, match="shape"):
+        r.route(np.zeros(8, dtype=np.float32), top_k=2)
+    with pytest.raises(ValueError, match="shape"):
+        r.route(np.zeros((2, 7), dtype=np.float32), top_k=2)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"n_experts": 0}, "n_experts"),
+        ({"ram_cache_max_experts": 0}, "ram_cache_max_experts"),
+        ({"staging_max_bytes": 0}, "staging_max_bytes"),
+    ],
+)
+def test_paging_rejects_invalid_resource_limits(kwargs, message, tmp_path):
+    settings = {
+        "mode": "D2R",
+        "n_experts": 1,
+        "disk_dir": str(tmp_path),
+    }
+    settings.update(kwargs)
+    with pytest.raises(ValueError, match=message):
+        P.ExpertStore(**settings)
+
+
+def test_paging_pinned_cache_failure_preserves_configured_bound(tmp_path):
+    for eid in range(2):
+        torch.save(
+            {"Win": torch.ones((2, 2)), "Wout": torch.ones((2, 2))},
+            tmp_path / f"expert_{eid}.pt",
+        )
+    store = P.ExpertStore("D2R", 2, disk_dir=str(tmp_path),
+                          ram_cache_max_experts=1)
+    store.pin(0)
+    store.pin(1)
+    store.get(0)
+    with pytest.raises(P.PagingError, match="pinned"):
+        store.get(1)
+    assert len(store.cache) == 1
+    assert 0 in store.cache
+    assert 1 not in store.cache

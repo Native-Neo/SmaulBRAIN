@@ -47,6 +47,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.repeat < 1:
         ap.error("--repeat must be at least 1")
+    if args.steps < 1:
+        ap.error("--steps must be at least 1")
     if args.max_new_tokens is not None and args.max_new_tokens < 1:
         ap.error("--max-new-tokens must be at least 1")
     try:
@@ -63,7 +65,12 @@ def main(argv=None):
     m = _model.Model(spec, params, forward_quant=args.forward_quant,
                      backward_mode=args.backward_mode, device=args.device)
     model_init_s = time.perf_counter() - init_t0
-    toks = torch.randint(0, 256, (args.seq_len,), generator=torch.Generator(device="cpu").manual_seed(1)).tolist()
+    toks = torch.randint(0, 256, (args.seq_len,),
+                         generator=torch.Generator(device="cpu").manual_seed(1)).tolist()
+    train_toks = torch.randint(
+        0, 256, (args.seq_len + 1,),
+        generator=torch.Generator(device="cpu").manual_seed(2),
+    ).tolist()
     res = {"hw": {"cpu": _cpu.detect(), "dispatch": _cpu.dispatch_name()},
            "preset": preset, "params": m.report()["total_params"],
            "seq_len": args.seq_len, "forward_quant": args.forward_quant,
@@ -108,17 +115,33 @@ def main(argv=None):
     res["recurrent_state_bytes"] = spec.n_layers * spec.d_model * 4
 
     if spec.name.endswith("tiny"):
-        t0 = time.perf_counter()
-        loss, grads, _ = m.loss_and_backward(toks)
-        res["backward_s"] = time.perf_counter() - t0
-        res["loss"] = loss
-        res["rss_after_bwd_mb"] = rss_mb()
         from smaulbrain import smaulopt as _opt
         opt = _opt.SmaulOPT()
         opt.register(m.p)
-        t0 = time.perf_counter()
-        opt.step(m.p, grads)
-        res["opt_step_s"] = time.perf_counter() - t0
+        backward_times, optimizer_times, losses = [], [], []
+        for _ in range(args.steps):
+            t0 = time.perf_counter()
+            loss, grads, _ = m.loss_and_backward(train_toks)
+            backward_times.append(time.perf_counter() - t0)
+            losses.append(float(loss))
+            res["rss_after_bwd_mb"] = rss_mb()
+
+            t0 = time.perf_counter()
+            opt.step(m.p, grads)
+            optimizer_times.append(time.perf_counter() - t0)
+            # Explicit invalidation makes this benchmark representative of
+            # real training even if a future optimizer backend changes its
+            # in-place version-counter behavior.
+            m.packed.invalidate(grads.keys())
+            m.fp8.invalidate(grads.keys())
+        res["training_steps"] = args.steps
+        res["loss"] = losses[-1]
+        res["backward_s"] = float(statistics.median(backward_times))
+        res["backward_s_samples"] = backward_times
+        res["opt_step_s"] = float(statistics.median(optimizer_times))
+        res["opt_step_s_samples"] = optimizer_times
+        res["training_step_s_total"] = float(sum(backward_times) + sum(optimizer_times))
+        res["training_step_s_per_step"] = res["training_step_s_total"] / args.steps
     print(json.dumps(res, indent=2))
     if args.out:
         with open(args.out, "w") as f:

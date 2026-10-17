@@ -190,10 +190,13 @@ class Model(nn.Module):
 
     def _moe(self,X,disabled=()):
         p=self.p; router=_moe.Router.__new__(_moe.Router); router.W=p["router"]
-        idx,weights,info,_=router.route(X,self.spec.top_k,self.capacity_factor,disabled)
+        idx,weights,info,cache=router.route(X,self.spec.top_k,self.capacity_factor,disabled)
         Y=X.new_zeros(X.shape)
-        for eid in torch.unique(idx,sorted=True).tolist():
-            flatpos=torch.nonzero(idx.reshape(-1)==eid,as_tuple=False).flatten()
+        flat_idx=idx.reshape(-1)
+        kept=cache[-1].reshape(-1)
+        for eid in torch.unique(flat_idx[kept],sorted=True).tolist():
+            # Do not run experts for assignments already rejected by capacity.
+            flatpos=torch.nonzero((flat_idx==eid)&kept,as_tuple=False).flatten()
             rows=torch.div(flatpos,self.spec.top_k,rounding_mode="floor"); cols=flatpos%self.spec.top_k
             if self.store is not None:self.store.pin(eid)
             try:
@@ -240,9 +243,10 @@ class Model(nn.Module):
         for (eid,suffix),leaf in self._paged_leaves.items():
             target=p[f"expert.{eid}.{suffix}"]
             if leaf.grad is not None:
-                if target.grad is None: target.grad=leaf.grad.detach().clone()
+                if target.grad is None: target.grad=leaf.grad.detach()
                 else: target.grad.add_(leaf.grad.detach())
-        grads={k:v.grad.detach().clone() for k,v in p.items() if v.grad is not None}
+        # Keep the gradient storage itself alive through the returned dict; zero_grad(set_to_none=True) below only detaches it from parameters, so cloning every full-size gradient is unnecessary.
+        grads={k:v.grad.detach() for k,v in p.items() if v.grad is not None}
         out=float(loss.detach().item()); aux=dict(self._last_aux); self.zero_grad(set_to_none=True)
         return out,grads,aux
 

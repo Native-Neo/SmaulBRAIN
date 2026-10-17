@@ -18,8 +18,15 @@ class Router:
 
     def route(self, X, top_k: int, capacity_factor: float = 1.25, disabled=()):
         X = torch.as_tensor(X, dtype=torch.float32, device=self.W.device)
+        if X.ndim != 2 or X.shape[1] != self.W.shape[0]:
+            raise ValueError(
+                f"router inputs must have shape (tokens, {self.W.shape[0]}), got {tuple(X.shape)}"
+            )
         if not torch.isfinite(X).all(): raise ValueError("non-finite router inputs")
-        if top_k < 1: raise ValueError(f"top_k must be >= 1, got {top_k}")
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+            raise ValueError(f"top_k must be an integer >= 1, got {top_k!r}")
+        if not math.isfinite(float(capacity_factor)) or float(capacity_factor) <= 0:
+            raise ValueError("capacity_factor must be finite and > 0")
         disabled = sorted(set(int(i) for i in disabled))
         enabled = self.n_experts - len(disabled)
         if top_k > enabled: raise ValueError(f"top_k={top_k} exceeds enabled experts={enabled}")
@@ -34,10 +41,17 @@ class Router:
         T = X.shape[0]; cap = max(1, math.ceil(capacity_factor * T * top_k / self.n_experts))
         keep = torch.ones_like(idx, dtype=torch.bool)
         flat = idx.reshape(-1)
+        flat_keep = keep.reshape(-1)
+        flat_scores = top_scores.reshape(-1)
         for eid in torch.unique(flat, sorted=True).tolist():
             positions = torch.nonzero(flat == eid, as_tuple=False).flatten()
             if positions.numel() > cap:
-                keep.view(-1)[positions[cap:]] = False
+                # Capacity is a competition among token-expert assignments:
+                # keep the strongest router scores, not whichever tokens
+                # happen to occur earliest in the sequence.
+                assignment_scores = flat_scores[positions]
+                order = torch.argsort(assignment_scores, descending=True, stable=True)
+                flat_keep[positions[order[cap:]]] = False
         kept = raw_weights * keep.to(raw_weights.dtype)
         denom = kept.sum(dim=1, keepdim=True)
         weights = torch.where(denom > 0, kept / denom.clamp_min(1e-12), torch.zeros_like(kept))

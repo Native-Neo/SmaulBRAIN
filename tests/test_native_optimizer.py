@@ -30,3 +30,17 @@ def test_native_factored_step_matches_torch(monkeypatch, wd):
             if key in ref_s[name]:
                 assert torch.allclose(ref_s[name][key], nat_s[name][key], rtol=2e-4, atol=4e-8)
         assert ref_n[name] == pytest.approx(nat_n[name], rel=1e-4)
+
+
+def test_native_factored_optimizer_declines_unsupported_weight_dtype():
+    from smaulbrain import _native_opt
+
+    opt = smaulopt.SmaulOPT()
+    w = torch.zeros((32, 32), dtype=torch.bfloat16)
+    st = {
+        "m": torch.zeros_like(w),
+        "R": torch.zeros(w.shape[0]),
+        "C": torch.zeros(w.shape[1]),
+    }
+    g = torch.zeros(w.shape, dtype=torch.float32)
+    assert _native_opt.factored_step(opt, w, g, st, collect_norms=False) is None

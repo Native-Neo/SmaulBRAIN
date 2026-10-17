@@ -25,28 +25,55 @@ def _expert_dict(params: dict, eid: int) -> dict:
 
 
 class Trainer:
-    def __init__(self, spec, args, stream, eval_stream=None):
+    def __init__(self, spec, args, stream, eval_stream=None, checkpoint_blob=None):
         self.spec = spec
         self.args = args
         self.stream = stream
         self.eval_stream = eval_stream
         self.rng = torch.Generator(device="cpu").manual_seed(int(args.seed))
-        n_exp = spec.n_experts_init if spec.kind == "moe" else 0
-        params = _model.build_params(spec, self.rng, n_exp, device=getattr(args, "device", "cpu"))
-        self.model = _model.Model(spec, params, forward_quant=args.forward_quant,
-                                  backward_mode=args.backward_mode, paging_mode=args.paging,
-                                  paging_store=None, capacity_factor=args.expert_capacity_factor,
-                                  device=getattr(args, "device", "cpu"))
-        if spec.kind == "moe":
+        if checkpoint_blob is not None:
+            if checkpoint_blob["manifest"].get("preset") != spec.name:
+                raise ValueError(
+                    f"checkpoint preset {checkpoint_blob['manifest'].get('preset')} != {spec.name}"
+                )
+            params = checkpoint_blob["params"]
+            n_exp = len(_model.expert_ids(params)) if spec.kind == "moe" else 0
+        else:
+            n_exp = spec.n_experts_init if spec.kind == "moe" else 0
+            params = _model.build_params(
+                spec, self.rng, n_exp, device=getattr(args, "device", "cpu")
+            )
+        self.model = _model.Model(
+            spec, params,
+            forward_quant=args.forward_quant,
+            backward_mode=args.backward_mode,
+            paging_mode=args.paging,
+            paging_store=None,
+            capacity_factor=args.expert_capacity_factor,
+            device=getattr(args, "device", "cpu"),
+        )
+        if spec.kind == "moe" and checkpoint_blob is None:
             self.model.store = self._make_store(args.paging, n_exp, self.model.p, None)
-        self.opt = _opt.SmaulOPT(lr=args.lr, beta1=args.beta1, beta2=args.beta2,
-                                 eps=args.eps, weight_decay=args.weight_decay)
-        self.opt.register(self.model.p)
+        self.opt = _opt.SmaulOPT(
+            lr=args.lr, beta1=args.beta1, beta2=args.beta2,
+            eps=args.eps, weight_decay=args.weight_decay,
+        )
+        # Optimizer moments are initialized lazily on the first gradient. Avoid
+        # allocating a second model-sized state set just to replace it on resume.
         self.sched = _growth.GrowthScheduler(
-            every_steps=args.growth_every_steps, loss_nats=args.growth_loss_nats,
+            every_steps=args.growth_every_steps if spec.kind == "moe" else 0,
+            loss_nats=args.growth_loss_nats if spec.kind == "moe" else None,
             loss_beta=args.growth_loss_beta, min_eval_samples=args.growth_min_eval_samples)
         self.log = []
         self.last_metrics = None
+        self.stop_requested = False
+        self.last_checkpoint_step = None
+        if checkpoint_blob is not None:
+            self.load_blob(checkpoint_blob, params_already_loaded=True)
+
+    def request_stop(self):
+        """Request a graceful stop after the current optimizer update."""
+        self.stop_requested = True
 
     def _live_experts_dir(self) -> str:
         # Live per-expert disk mirrors are transient and must not live inside
@@ -75,7 +102,11 @@ class Trainer:
                  "backward_mode": self.model.backward_mode,
                  "paging": self.args.paging, "seed": self.args.seed,
                  "lr": self.args.lr, "seq_len": self.args.seq_len,
-                 "capacity_factor": self.model.capacity_factor}
+                 "capacity_factor": self.model.capacity_factor,
+                 "synth_bytes": getattr(self.args, "synth_bytes", None),
+                 "growth_noise_scale": self.args.growth_noise_scale,
+                 "growth_seed": self.args.growth_seed,
+                 "grad_clip": getattr(self.args, "grad_clip", None)}
         man = _ckpt.build_manifest(
             spec.name, arch, extra, self.sched.to_record(),
             self.stream.cursor, {"torch_state": self.rng.get_state().tolist()},
@@ -83,6 +114,7 @@ class Trainer:
             {"class": "SmaulOPT", "lr": self.opt.lr, "beta1": self.opt.beta1,
              "beta2": self.opt.beta2, "eps": self.opt.eps,
              "weight_decay": self.opt.weight_decay})
+        man["data_stream"] = dict(self.stream.identity)
         # Checkpoint writing is synchronous, so the serializer can read live
         # arrays directly. Avoid duplicating the entire parameter dict and the
         # optimizer's potentially multi-gigabyte moment tensors before writing.
@@ -94,46 +126,70 @@ class Trainer:
     def save(self, pending_phase=False):
         man, params, opt_state = self._payload()
         _ckpt.save_checkpoint(self.args.checkpoint, man, params, opt_state)
+        self.last_checkpoint_step = int(man["scheduler"]["global_step"])
         return man
 
     def load(self, ckpt_dir):
         blob = _ckpt.load_checkpoint(ckpt_dir)
+        return self.load_blob(blob, params_already_loaded=False)
+
+    def load_blob(self, blob, params_already_loaded=False):
+        """Restore all trainer state from an already validated checkpoint blob."""
         man = blob["manifest"]
+        self.last_checkpoint_step = int(man.get("scheduler", {}).get("global_step", 0))
         if man["preset"] != self.spec.name:
             raise ValueError(f"checkpoint preset {man['preset']} != {self.spec.name}")
-        self.model.p = {k: v for k, v in blob["params"].items()}
+        if not params_already_loaded:
+            self.model.p = {k: v for k, v in blob["params"].items()}
         self.model.packed.invalidate()
         self.model.fp8.invalidate()
         flags = man.get("optimizer", {}).get("factored", {})
-        self.opt.load_state_dict(blob["opt_state"], flags)
+        self.opt.load_state_dict(blob["opt_state"], flags, copy=False)
         for state in self.opt.state.values():
-            for key,value in list(state.items()):
-                if isinstance(value, torch.Tensor): state[key] = value.to(self.model.device)
-        self.opt.register(self.model.p)
+            for key, value in list(state.items()):
+                if isinstance(value, torch.Tensor):
+                    state[key] = value.to(self.model.device)
+        # Missing moment state is initialized lazily by SmaulOPT on the first
+        # gradient for a parameter. Do not allocate buffers for unused experts.
         self.sched = _growth.GrowthScheduler.from_record(man["scheduler"])
+        if self.spec.kind == "dense":
+            if self.sched.pending is not None:
+                raise ValueError("dense checkpoint cannot contain a pending MoE growth event")
+            self.sched.every_steps = 0
+            self.sched.next_periodic_step = None
+            self.sched.loss_threshold = None
         rng_state = man.get("rng_state", {})
         if "torch_state" in rng_state:
             self.rng.set_state(torch.tensor(rng_state["torch_state"], dtype=torch.uint8))
         # Legacy NumPy RNG state is intentionally not replayed; resumed model and optimizer
         # tensors are exact, while newly introduced random experts use their recorded seed.
-        self.stream.load_state_dict({"cursor": man["data_cursor"], "path": self.stream.path,
-                                     "size": self.stream.size})
-        # rebuild paging store
+        self.stream.load_state_dict({
+            "cursor": man["data_cursor"],
+            "path": self.stream.path,
+            "size": self.stream.size,
+            "identity": man.get("data_stream"),
+        })
+        # Rebuild paging store from the canonical checkpoint tensors.
         if self.spec.kind == "moe":
             n_exp = man["n_experts_current"]
             if self.args.paging in ("R", "V", "R2V"):
                 ram = {e: _expert_dict(self.model.p, e) for e in range(n_exp)}
-                self.model.store = _paging.ExpertStore(self.args.paging, n_exp, ram_weights=ram)
+                self.model.store = _paging.ExpertStore(
+                    self.args.paging, n_exp, ram_weights=ram
+                )
             else:
                 dd = self._live_experts_dir()
                 os.makedirs(dd, exist_ok=True)
                 for e in range(n_exp):
-                    torch.save({k:v.detach().cpu() for k,v in _expert_dict(self.model.p, e).items()},
-                               os.path.join(dd, f"expert_{e}.pt"))
+                    torch.save({
+                        k: v.detach().cpu()
+                        for k, v in _expert_dict(self.model.p, e).items()
+                    }, os.path.join(dd, f"expert_{e}.pt"))
                 self.model.store = _paging.ExpertStore(
                     self.args.paging, n_exp, disk_dir=dd,
                     ram_cache_max_experts=self.args.paging_cache_experts,
-                    staging_max_bytes=self.args.paging_staging_bytes)
+                    staging_max_bytes=self.args.paging_staging_bytes,
+                )
         return man
 
     # -- growth resolution (no optimizer step may intervene) --
@@ -228,11 +284,25 @@ class Trainer:
                  "scores": pend["ranking"]["scores"],
                  "mutation": dict(pend["mutation"], n_exact_unperturbed=n_exact),
                  "detail": detail, "status": "committed"}
+        # Prepare the in-memory scheduler/router transition, but roll it back
+        # if the atomic Phase-B checkpoint cannot be published. The on-disk
+        # Phase-A checkpoint must remain resumable and the same Trainer instance
+        # must not be left with grown optimizer state and the old model.
+        scheduler_before_commit = sched.to_record()
+        router_state_before_commit = opt.state.get("router")
         sched.commit_event(entry)
         if fail_at == "during_commit":
             raise _Injected(fail_at)
-        self._resize_router_opt_state(cand)  # part of the committed transition
-        self._save_committed(cand, entry, new_ids)  # Phase B publish
+        self._resize_router_opt_state(cand)
+        try:
+            self._save_committed(cand, entry, new_ids)  # Phase B publish
+        except BaseException:
+            self.sched = _growth.GrowthScheduler.from_record(scheduler_before_commit)
+            if router_state_before_commit is None:
+                self.opt.state.pop("router", None)
+            else:
+                self.opt.state["router"] = router_state_before_commit
+            raise
         entry["duration_s"] = time.perf_counter() - t0
         if fail_at == "after_commit":
             raise _Injected(fail_at)
@@ -249,13 +319,18 @@ class Trainer:
         arch = _cfg.arch_report(self.spec, n_exp)
         extra = {"forward_quant": model.forward_quant, "backward_mode": model.backward_mode,
                  "paging": self.args.paging, "seed": self.args.seed, "lr": self.args.lr,
-                 "seq_len": self.args.seq_len, "capacity_factor": model.capacity_factor}
+                 "seq_len": self.args.seq_len, "capacity_factor": model.capacity_factor,
+                 "synth_bytes": getattr(self.args, "synth_bytes", None),
+                 "growth_noise_scale": self.args.growth_noise_scale,
+                 "growth_seed": self.args.growth_seed,
+                 "grad_clip": getattr(self.args, "grad_clip", None)}
         man = _ckpt.build_manifest(
             self.spec.name, arch, extra, sched.to_record(), self.stream.cursor,
             {"torch_state": self.rng.get_state().tolist()}, n_exp, list(range(n_exp)),
             {"class": "SmaulOPT", "lr": opt.lr, "beta1": opt.beta1, "beta2": opt.beta2,
              "eps": opt.eps, "weight_decay": opt.weight_decay,
              "factored": {k: bool(s["factored"]) for k, s in opt.state.items()}})
+        man["data_stream"] = dict(self.stream.identity)
         # optimizer state carried by name; router state carried per-column below
         # _write_tree consumes array references synchronously; avoid a second
         # copy of every optimizer tensor at the growth commit checkpoint.
@@ -279,10 +354,20 @@ class Trainer:
     def _adopt_candidate(self, cand, new_ids):
         model, opt = self.model, self.opt
         model.p = cand
-        opt.register(cand)  # zero-init state for the new experts
+        # New expert moments are allocated by the optimizer only when that
+        # expert first receives a gradient; registering the entire pool here
+        # would eagerly allocate buffers for every unused expert.
         if model.store is not None:
-            for nid in new_ids:
-                model.store.register_expert(nid, _expert_dict(cand, nid))
+            if model.store.mode in ("R", "V", "R2V"):
+                # ParameterList replacement creates new Parameter objects.
+                # Rebind all RAM-resident experts, not only newly grown IDs.
+                for eid in _model.expert_ids(cand):
+                    model.store.register_expert(eid, _expert_dict(cand, eid))
+            else:
+                # Existing disk mirrors were kept in sync by write_back after
+                # each optimizer step; only new expert backing files are needed.
+                for nid in new_ids:
+                    model.store.register_expert(nid, _expert_dict(cand, nid))
             model.store.n_experts = len(_model.expert_ids(cand))
             model.store.invalidate_all()
         model.packed.invalidate()
@@ -292,25 +377,42 @@ class Trainer:
     def train(self, max_steps=None, log_every=10, eval_every=0, ckpt_every=0,
               grad_clip=1.0, fail_at=None, growth_fail_at=None):
         steps = 0
+        last_saved_step = None
         while True:
-            if max_steps is not None and self.sched.global_step >= max_steps:
+            # A SIGINT between iterations should not make us start another
+            # optimizer update. For a stop requested before the first call to
+            # train(), allow one update to finish, matching request_stop's API.
+            if self.stop_requested and steps > 0:
+                # The final-save block below writes any pending transaction
+                # once, without duplicating a potentially large checkpoint.
                 break
-            # A pending event must be resolved BEFORE any further optimizer update.
+            # Recovery transitions are not optimizer updates. Resolve a saved
+            # pending growth event even when the requested global-step target
+            # has already been reached; otherwise it can remain stuck forever
+            # on repeated runs with the same --max-steps value.
             if self.sched.pending is not None:
                 self._resolve_pending(fail_at=growth_fail_at)
                 continue
+            if max_steps is not None and self.sched.global_step >= max_steps:
+                break
             toks = self.stream.next_tokens(self.args.seq_len)
             loss, grads, info = self.model.loss_and_backward(toks)
             if not math.isfinite(loss):
                 raise RuntimeError(f"non-finite loss at step {self.sched.global_step}")
             # gradient clipping (global norm)
-            total_sq = sum(float(g.detach().double().square().sum().item()) for g in grads.values())
-            total = math.sqrt(total_sq)
+            # Reduce each tensor to a scalar instead of materializing a full
+            # float64 copy of every gradient (catastrophic for dense-full).
+            total = 0.0
+            for grad in grads.values():
+                total = math.hypot(total, float(torch.linalg.vector_norm(grad).item()))
             if not math.isfinite(total):
                 raise RuntimeError(f"non-finite gradient norm at step {self.sched.global_step}")
             if total > grad_clip and total > 0:
                 scale = grad_clip / total
-                grads = {k: g * scale for k, g in grads.items()}
+                # Gradients are detached tensors owned by this step, so in-place
+                # clipping avoids allocating another model-sized gradient set.
+                for grad in grads.values():
+                    grad.mul_(scale)
             # Training never consumes per-parameter update norms; skip their
             # extra full-array reductions unless an explicit caller requests them.
             self.opt.step(self.model.p, grads, collect_norms=False)
@@ -351,9 +453,21 @@ class Trainer:
                                  "overflow_dropped": int(info.get("overflow_dropped", 0))})
             if ckpt_every and self.sched.global_step % ckpt_every == 0:
                 self.save()
+                last_saved_step = self.sched.global_step
+            if self.stop_requested:
+                # A SIGINT handler only sets this flag. Finish the optimizer
+                # update and any growth transaction before publishing state.
+                if last_saved_step != self.sched.global_step:
+                    self.save()
+                    last_saved_step = self.sched.global_step
+                break
             if fail_at == "after_step":
                 raise _Injected(fail_at)
-        if ckpt_every:
+        if (last_saved_step != self.sched.global_step
+                and (ckpt_every or self.stop_requested)):
+            # Save a non-periodic final step and ensure a stop request that
+            # arrives at the loop boundary still leaves a recoverable state.
+            # A zero-step run with periodic saves enabled also gets a checkpoint.
             self.save()
         return self.log
 

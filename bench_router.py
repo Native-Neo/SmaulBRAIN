@@ -6,17 +6,29 @@ from smaulbrain.moe import Router
 
 def stable_reference(router,X,top_k,capacity_factor=1.25,disabled=()):
     scores=X@router.W
-    if disabled:scores=scores.clone();scores[:,list(disabled)]=-torch.inf
-    T,E=scores.shape;idx=torch.argsort(scores,dim=1,descending=True,stable=True)[:,:top_k]
-    values=scores.gather(1,idx);weights=torch.softmax(values,dim=1)
-    cap=max(int((capacity_factor*T*top_k/E)+0.999999),1);load=torch.zeros(E,dtype=torch.long,device=X.device)
+    if disabled:
+        disabled=list(sorted(set(int(i) for i in disabled)))
+        if any(i<0 or i>=scores.shape[1] for i in disabled):
+            raise ValueError("disabled expert index out of range")
+        scores=scores.clone()
+        scores[:,disabled]=-torch.inf
+    T,E=scores.shape
+    idx=torch.argsort(scores,dim=1,descending=True,stable=True)[:,:top_k]
+    values=scores.gather(1,idx)
+    raw_weights=torch.softmax(values,dim=1)
+    cap=max(int((capacity_factor*T*top_k/E)+0.999999),1)
     keep=torch.ones_like(idx,dtype=torch.bool)
-    for t in range(T):
-        for j in range(top_k):
-            e=int(idx[t,j]);
-            if load[e]>=cap:keep[t,j]=False
-            else:load[e]+=1
-    weights=weights*keep;weights=weights/weights.sum(1,keepdim=True).clamp_min(1e-12)
+    flat_idx=idx.reshape(-1)
+    flat_values=values.reshape(-1)
+    flat_keep=keep.reshape(-1)
+    for eid in torch.unique(flat_idx,sorted=True).tolist():
+        positions=torch.nonzero(flat_idx==eid,as_tuple=False).flatten()
+        if positions.numel()>cap:
+            order=torch.argsort(flat_values[positions],descending=True,stable=True)
+            flat_keep[positions[order[cap:]]]=False
+    weights=raw_weights*keep
+    weights=weights/weights.sum(1,keepdim=True).clamp_min(1e-12)
+    load=torch.bincount(flat_idx[flat_keep],minlength=E)
     return idx,weights,load,keep
 
 

@@ -1,54 +1,37 @@
-name: Profile full ternary-QAT CPU training
+name: CPU ternary-QAT full-preset smoke profile
 
 on:
   workflow_dispatch:
   pull_request:
     paths:
-      - "benchmarks/profile_full_ternary.py"
+      - "bench.py"
+      - "smaulbrain/**"
+      - "tests/test_quant.py"
       - ".github/workflows/profile-full-ternary.yml"
-      - "experts.py"
-      - "model.py"
-      - "train.py"
-      - "smaulopt.py"
-      - "native.py"
-      - "config.py"
-      - "kernels_cpp/**"
-      - "tests/test_expert_memory.py"
   push:
-    branches: ["**"]
+    branches: ["main"]
     paths:
-      - "benchmarks/profile_full_ternary.py"
+      - "bench.py"
+      - "smaulbrain/**"
+      - "tests/test_quant.py"
       - ".github/workflows/profile-full-ternary.yml"
-      - "experts.py"
-      - "model.py"
-      - "train.py"
-      - "smaulopt.py"
-      - "native.py"
-      - "config.py"
-      - "kernels_cpp/**"
-      - "tests/test_expert_memory.py"
 
 permissions:
   contents: read
 
 concurrency:
-  group: full-ternary-profile-${{ github.workflow }}-${{ github.ref }}
+  group: ternary-profile-${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
   profile-full-cpu:
-    # This experiment uses the tiny correctness tests; do not start the
-    # full 2x1024-token/64-expert training profile on every code push here.
-    # Keep the full profile enabled for main and other branches.
-    if: github.ref != 'refs/heads/experiment/full-ternary-qat' && github.head_ref != 'experiment/full-ternary-qat' && github.ref != 'refs/heads/experiment/full-ternary-no-dequant' && github.head_ref != 'experiment/full-ternary-no-dequant'
-    name: Full (512-wide, 64 experts) ternary-QAT training profile
+    name: Full preset ternary forward/decode profile
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       OMP_NUM_THREADS: "2"
       MKL_NUM_THREADS: "2"
       OPENBLAS_NUM_THREADS: "2"
-      SMAUL_PROFILE_THREADS: "2"
       PYTHONFAULTHANDLER: "1"
     steps:
       - name: Check out repository
@@ -62,13 +45,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-      - name: Profile one full-size training step
-        run: python -u benchmarks/profile_full_ternary.py
+      - name: Compile the current PyTorch package
+        run: python -m compileall -q smaulbrain train.py infer.py evaluate.py prune.py bench.py
+      - name: Profile full-preset ternary forward and decode
+        run: >-
+          python -u bench.py --preset moe-full --seq-len 128
+          --forward-quant ternary --backward-mode ternary
+          --repeat 1 --max-new-tokens 1 --out ternary-profile-report.json
       - name: Upload operator and memory report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: full-ternary-cpu-profile
+          name: ternary-full-preset-profile
           path: ternary-profile-report.json
           if-no-files-found: warn
           retention-days: 14

@@ -4,6 +4,8 @@ All trainable weights and activations remain torch.Tensor objects. The native
 backend uses a narrow CPU buffer bridge for packed ternary matrix operations;
 it never stores a dense dequantized weight matrix.
 """
+import math
+
 import torch
 from . import _quant_native as _native
 
@@ -59,7 +61,29 @@ def pack_ternary_tiled(W):
 
 
 def unpack_codes(packed, shape):
-    p = packed.buf if isinstance(packed, TiledPacked) else packed
+    if isinstance(packed, TiledPacked):
+        # The current native build uses SB_PLANES=0: each [tile][row] block
+        # contains four bytes, each holding four 2-bit codes for 16 columns.
+        # (A bitplane build would need a different format tag.)
+        din, dout = (int(shape[0]), int(shape[1]))
+        tiles = (dout + 15) // 16
+        buf = packed.buf
+        expected = tiles * din * 4
+        if din < 1 or dout < 1 or buf.size != expected:
+            raise ValueError("invalid tiled packed buffer for declared shape")
+        import numpy as np
+        buf = np.asarray(buf, dtype=np.uint8).reshape(-1)
+        out = np.empty((din, dout), dtype=np.int8)
+        columns = np.arange(dout, dtype=np.int64)
+        tile = columns // 16
+        local = columns % 16
+        byte_index = tile * din * 4 + local // 4
+        shift = 2 * (local % 4)
+        for i in range(din):
+            codes = (buf[byte_index + i * 4] >> shift) & 3
+            out[i] = np.where(codes == 0, -1, np.where(codes >= 2, 1, 0))
+        return torch.from_numpy(out)
+    p = packed
     if isinstance(p, torch.Tensor): p = _np(p, torch.uint8)
     return torch.from_numpy(_native.unpack_codes(p, shape).copy())
 
@@ -73,44 +97,50 @@ def packed_matvec_scalar(x, packed, shape, scale):
 
 
 def packed_matmat_scalar(X, packed, shape, scale):
-    p = packed.buf if isinstance(packed, TiledPacked) else packed
-    if isinstance(p, torch.Tensor): p = _np(p, torch.uint8)
     x = _tensor(X).detach().cpu().contiguous().numpy()
-    return torch.from_numpy(_native.packed_matmat_scalar(x, p, shape, scale).copy()).to(_tensor(X).device)
+    if isinstance(packed, TiledPacked):
+        # The scalar reference only accepts row-major packed bytes. Preserve
+        # correctness for tiled inputs by using the native tiled kernel.
+        result = _native.packed_matmat(x, packed, shape, scale, False)
+    else:
+        p = _np(packed, torch.uint8) if isinstance(packed, torch.Tensor) else packed
+        result = _native.packed_matmat_scalar(x, p, shape, scale)
+    return torch.from_numpy(result.copy()).to(_tensor(X).device)
 
 
 def packed_matmat(X, packed, shape, scale, allow_dense_reconstruction=False):
     if allow_dense_reconstruction:
         raise RuntimeError("forbidden path: dense ternary reconstruction is not allowed")
     x = _tensor(X)
-    p = packed.buf if isinstance(packed, TiledPacked) else packed
-    if isinstance(p, torch.Tensor): p = _np(p, torch.uint8)
-    if x.device.type == "cpu":
-        y = _native.packed_matmat(_np(x), p, shape, scale, False)
-        return torch.from_numpy(y.copy()).to(dtype=x.dtype)
-    # Accelerator fallback: decode only to signed ternary codes for the matmul;
-    # no latent FP32/FP8 master weight is reconstructed or cached.
-    codes = unpack_codes(p, shape).to(device=x.device, dtype=torch.int8)
-    return (x @ codes.to(x.dtype)) * float(scale)
+    # Preserve TiledPacked as a tagged object: removing the tag makes aligned
+    # tiled buffers indistinguishable from row-major packed buffers and yields
+    # incorrect outputs. Until a CUDA packed kernel exists, accelerator inputs
+    # use the direct packed CPU kernel and transfer only activations/results;
+    # they never expand the full weight matrix to FP32.
+    packed_arg = packed
+    if not isinstance(packed, TiledPacked) and isinstance(packed, torch.Tensor):
+        packed_arg = _np(packed, torch.uint8)
+    y = _native.packed_matmat(_np(x), packed_arg, shape, scale, False)
+    return torch.from_numpy(y.copy()).to(device=x.device, dtype=x.dtype)
 
 
 def packed_matmat_transpose_scalar(dY, packed, shape, scale):
-    p = packed.buf if isinstance(packed, TiledPacked) else packed
-    if isinstance(p, torch.Tensor): p = _np(p, torch.uint8)
     dy = _np(_tensor(dY))
-    out = _native.packed_matmat_transpose_scalar(dy, p, shape, scale)
+    if isinstance(packed, TiledPacked):
+        out = _native.packed_matmat_transpose(dy, packed, shape, scale)
+    else:
+        p = _np(packed, torch.uint8) if isinstance(packed, torch.Tensor) else packed
+        out = _native.packed_matmat_transpose_scalar(dy, p, shape, scale)
     return torch.from_numpy(out.copy()).to(_tensor(dY).device)
 
 
 def packed_matmat_transpose(dY, packed, shape, scale):
     dy = _tensor(dY)
-    p = packed.buf if isinstance(packed, TiledPacked) else packed
-    if isinstance(p, torch.Tensor): p = _np(p, torch.uint8)
-    if dy.device.type == "cpu":
-        out = _native.packed_matmat_transpose(_np(dy), p, shape, scale)
-        return torch.from_numpy(out.copy()).to(dtype=dy.dtype)
-    codes = unpack_codes(p, shape).to(device=dy.device, dtype=torch.int8)
-    return (dy @ codes.to(dy.dtype).T) * float(scale)
+    packed_arg = packed
+    if not isinstance(packed, TiledPacked) and isinstance(packed, torch.Tensor):
+        packed_arg = _np(packed, torch.uint8)
+    out = _native.packed_matmat_transpose(_np(dy), packed_arg, shape, scale)
+    return torch.from_numpy(out.copy()).to(device=dy.device, dtype=dy.dtype)
 
 
 def packed_matvec(x, packed, shape, scale, allow_dense_reconstruction=False):
@@ -125,7 +155,16 @@ def fp8_e4m3_quantize(W, scale=None):
         finite = wf[torch.isfinite(wf)].abs()
         mx = float(finite.max().item()) if finite.numel() else 0.0
         scale = mx / FP8_E4M3_MAX if mx > 0 else 1.0
-    scale = float(torch.tensor(float(scale), dtype=torch.float32).item()) or 1.0
+    requested_scale = float(scale)
+    if not math.isfinite(requested_scale) or requested_scale < 0:
+        raise ValueError("FP8 quantization scale must be finite and >= 0")
+    scale = float(torch.tensor(requested_scale, dtype=torch.float32).item())
+    if not math.isfinite(scale):
+        raise ValueError("FP8 quantization scale is outside the float32 range")
+    if scale == 0:
+        # Preserve the documented legacy behavior for scale=0 and for a
+        # positive value too small to survive float32 conversion.
+        scale = 1.0
     norm = wf / scale
     finite = torch.isfinite(norm)
     mag = torch.where(finite, norm.abs().clamp(max=FP8_E4M3_MAX), torch.zeros_like(norm))

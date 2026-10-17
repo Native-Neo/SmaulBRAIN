@@ -1,5 +1,5 @@
 """Atomic, checksummed PyTorch checkpoints with fallback recovery."""
-import hashlib, json, os, shutil, tempfile
+import hashlib, json, os, shutil, tempfile, uuid
 import torch
 from . import vocab as _vocab
 from smaulbrain import CHECKPOINT_VERSION
@@ -50,12 +50,31 @@ def _write_tree(target_dir,manifest,params,opt_state):
 
 def _publish_dir(tmp,target_dir):
     target_dir=os.path.normpath(target_dir)
-    if not os.path.exists(target_dir):os.replace(tmp,target_dir); return
+    if not os.path.exists(target_dir):
+        os.replace(tmp,target_dir)
+        return
     bak=target_dir+".bak"
-    if os.path.exists(bak):shutil.rmtree(bak)
-    os.rename(target_dir,bak)
-    try:os.rename(tmp,target_dir)
-    except BaseException:os.rename(bak,target_dir); raise
+    old_dir=None
+    if not os.path.exists(bak):
+        # First replacement: retain the current generation as the recovery
+        # directory until the new generation has been published.
+        os.replace(target_dir,bak)
+    else:
+        # A backup already exists and may be the only valid generation.
+        # Never delete it before the new checkpoint is safely in place.
+        old_dir=target_dir+".old."+uuid.uuid4().hex
+        os.replace(target_dir,old_dir)
+    try:
+        os.replace(tmp,target_dir)
+    except BaseException:
+        if old_dir is not None:
+            if not os.path.exists(target_dir):
+                os.replace(old_dir,target_dir)
+        elif os.path.exists(bak) and not os.path.exists(target_dir):
+            os.replace(bak,target_dir)
+        raise
+    if old_dir is not None:
+        shutil.rmtree(old_dir,ignore_errors=True)
     shutil.rmtree(bak,ignore_errors=True)
 
 
@@ -80,20 +99,163 @@ def save_checkpoint(target_dir,manifest,params,opt_state):
     pending=manifest.get("scheduler",{}).get("pending")
     if pending is not None and pending.get("id") in ids:raise ValueError("pending event id already committed")
     _check_consistency(manifest,params)
+    _check_optimizer_state(params,opt_state,manifest.get("optimizer", {}).get("factored"))
     return _write_tree(target_dir,manifest,params,opt_state)
 
 
 def _check_consistency(manifest,params):
-    n=manifest.get("n_experts_current"); reg=manifest.get("expert_registry",[])
-    if n is not None and reg and len(reg)!=n:raise ValueError("expert registry length disagrees with n_experts_current")
-    if n is not None and manifest.get("preset","").startswith("moe"):
-        eids=sorted({int(k.split(".")[1]) for k in params if k.startswith("expert.") and k.endswith(".Win")})
-        if eids!=list(range(len(eids))):raise ValueError("expert params are not a dense 0..E-1 registry")
-        if len(eids)!=n:raise ValueError("param expert count disagrees with manifest")
+    from . import config as _cfg
+
+    preset = manifest.get("preset", "")
+    if preset not in _cfg.PRESETS:
+        raise ValueError(f"unknown checkpoint preset {preset!r}")
+    spec = _cfg.PRESETS[preset]
+    n = manifest.get("n_experts_current")
+    if spec.kind == "moe":
+        if n is None:
+            n = spec.n_experts_init
+        if isinstance(n, bool) or not isinstance(n, int) or n < spec.top_k:
+            raise ValueError("invalid n_experts_current for MoE preset")
+        expected_eids = list(range(n))
+        registry = manifest.get("expert_registry", [])
+        if registry and registry != expected_eids:
+            raise ValueError("expert registry disagrees with dense expert indices")
+        arch = manifest.get("arch", {})
+        if arch.get("d_model", spec.d_model) != spec.d_model:
+            raise ValueError("manifest d_model disagrees with selected preset")
+        if arch.get("n_layers", spec.n_layers) != spec.n_layers:
+            raise ValueError("manifest n_layers disagrees with selected preset")
+        if arch.get("expert_hidden", spec.expert_hidden) != spec.expert_hidden:
+            raise ValueError("manifest expert_hidden disagrees with selected preset")
+    else:
+        if n not in (None, 0):
+            raise ValueError("dense checkpoint cannot contain MoE experts")
+        n = 0
+        arch = manifest.get("arch", {})
+        if arch.get("d_model", spec.d_model) != spec.d_model:
+            raise ValueError("manifest d_model disagrees with selected preset")
+        if arch.get("n_layers", spec.n_layers) != spec.n_layers:
+            raise ValueError("manifest n_layers disagrees with selected preset")
+
+    expected = {
+        "embed": (spec.vocab_size, spec.d_model),
+        "final_norm": (spec.d_model,),
+    }
+    for layer in range(spec.n_layers):
+        prefix = f"L{layer}."
+        for name in ("Wr", "Wk", "Wv", "Wo"):
+            expected[prefix + "attn." + name] = (spec.d_model, spec.d_model)
+        for name in ("w", "u"):
+            expected[prefix + "attn." + name] = (spec.d_model,)
+        expected[prefix + "n1"] = (spec.d_model,)
+        expected[prefix + "n2"] = (spec.d_model,)
+        if spec.kind == "dense":
+            expected[prefix + "ffn.Wa"] = (spec.d_model, spec.ffn_hidden)
+            expected[prefix + "ffn.Wb"] = (spec.d_model, spec.ffn_hidden)
+            expected[prefix + "ffn.Wc"] = (spec.ffn_hidden, spec.d_model)
+    if spec.kind == "moe":
+        expected["router"] = (spec.d_model, n)
+        for eid in range(n):
+            expected[f"expert.{eid}.Win"] = (spec.d_model, spec.expert_hidden)
+            expected[f"expert.{eid}.Wout"] = (spec.expert_hidden, spec.d_model)
+
+    actual_keys = set(params)
+    expected_keys = set(expected)
+    missing = sorted(expected_keys - actual_keys)
+    extra = sorted(actual_keys - expected_keys)
+    if missing or extra:
+        raise ValueError(
+            f"checkpoint parameter registry mismatch: missing={missing[:5]}, extra={extra[:5]}"
+        )
+    for key, shape in expected.items():
+        value = params[key]
+        if not isinstance(value, torch.Tensor):
+            raise ValueError(f"checkpoint parameter {key} is not a tensor")
+        if tuple(value.shape) != shape:
+            raise ValueError(
+                f"checkpoint parameter {key} has shape {tuple(value.shape)}, expected {shape}"
+            )
+        if not value.is_floating_point():
+            raise ValueError(f"checkpoint parameter {key} must use a floating-point dtype")
+        if not value.is_contiguous():
+            raise ValueError(f"checkpoint parameter {key} must be contiguous")
+        # Bound the temporary finite-check mask; never create a model-sized
+        # boolean tensor or a flattening copy while validating a low-RAM model.
+        flat = value.detach().view(-1)
+        for offset in range(0, flat.numel(), 1 << 20):
+            if not torch.isfinite(flat[offset:offset + (1 << 20)]).all().item():
+                raise ValueError(f"checkpoint parameter {key} contains non-finite values")
+    vocab = manifest.get("vocab", {})
+    if vocab and vocab.get("vocab_size", spec.vocab_size) != spec.vocab_size:
+        raise ValueError("checkpoint vocabulary size disagrees with selected preset")
+    arch = manifest.get("arch", {})
+    if arch.get("vocab_size", spec.vocab_size) != spec.vocab_size:
+        raise ValueError("manifest vocab_size disagrees with selected preset")
+    expected_report = _cfg.arch_report(spec, n if spec.kind == "moe" else None)
+    for key in ("experts_current", "router_params", "shared_params", "per_expert_params",
+                "total_params", "recurrent_state_total", "recurrent_state_bytes_fp32"):
+        if key in arch and arch[key] != expected_report.get(key):
+            raise ValueError(f"manifest {key} disagrees with parameter registry")
 
 
-def load_checkpoint(ckpt_dir):
-    ckpt_dir=_resolve_checkpoint_dir(ckpt_dir); mp=os.path.join(ckpt_dir,"manifest.json")
+def _check_optimizer_state(params, opt_state, factored_flags=None):
+    """Reject optimizer buffers that cannot safely update the loaded tensors."""
+    if not isinstance(opt_state, dict):
+        raise ValueError("optimizer state must be a mapping")
+    if factored_flags is not None and not isinstance(factored_flags, dict):
+        raise ValueError("optimizer factored flags must be a mapping")
+    if factored_flags and not set(factored_flags).issubset(opt_state):
+        extra = sorted(set(factored_flags) - set(opt_state))
+        raise ValueError(f"optimizer factored flags reference missing states: {extra[:5]}")
+    for name, state in opt_state.items():
+        if name not in params:
+            raise ValueError(f"optimizer state references missing parameter {name!r}")
+        if not isinstance(state, dict):
+            raise ValueError(f"optimizer state for {name} must be a mapping")
+        shape = tuple(params[name].shape)
+        if not isinstance(state.get("m"), torch.Tensor) or tuple(state["m"].shape) != shape:
+            value = state.get("m")
+            got = tuple(value.shape) if isinstance(value, torch.Tensor) else type(value).__name__
+            raise ValueError(f"optimizer m shape for {name} is {got}, expected {shape}")
+        for slot in ("v",):
+            value = state.get(slot)
+            if value is not None:
+                if not isinstance(value, torch.Tensor) or tuple(value.shape) != shape:
+                    got = tuple(value.shape) if isinstance(value, torch.Tensor) else type(value).__name__
+                    raise ValueError(
+                        f"optimizer {slot} shape for {name} is {got}, expected {shape}"
+                    )
+        has_r, has_c = "R" in state, "C" in state
+        if has_r != has_c:
+            raise ValueError(f"optimizer factored state for {name} must contain both R and C")
+        factored = has_r and has_c
+        if factored and "v" in state:
+            raise ValueError(f"optimizer state for {name} cannot contain both factored and full moments")
+        if not factored and "v" not in state:
+            raise ValueError(f"optimizer state for {name} is missing full moment v")
+        if factored:
+            if len(shape) != 2:
+                raise ValueError(f"factored optimizer state attached to non-matrix parameter {name}")
+            for slot, expected in (("R", (shape[0],)), ("C", (shape[1],))):
+                value = state.get(slot)
+                if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected:
+                    got = tuple(value.shape) if isinstance(value, torch.Tensor) else type(value).__name__
+                    raise ValueError(
+                        f"optimizer {slot} shape for {name} is {got}, expected {expected}"
+                    )
+        if factored_flags is not None and name in factored_flags:
+            flag = factored_flags[name]
+            if not isinstance(flag, bool):
+                raise ValueError(f"optimizer factored flag for {name} must be boolean")
+            if flag != factored:
+                raise ValueError(
+                    f"optimizer factored flag for {name} disagrees with saved state"
+                )
+
+
+
+def _load_checkpoint_dir(ckpt_dir):
+    mp=os.path.join(ckpt_dir,"manifest.json")
     if not os.path.exists(mp):raise FileNotFoundError(f"no manifest at {mp}")
     with open(mp) as f:man=json.load(f)
     version=man.get("version")
@@ -103,7 +265,8 @@ def load_checkpoint(ckpt_dir):
         for name in names:
             path=os.path.join(ckpt_dir,name)
             if not os.path.exists(path):raise FileNotFoundError(f"checkpoint missing {name} (incomplete write?)")
-            if man.get("files",{}).get(name) not in (None,_sha256(path)):raise ValueError(f"integrity mismatch for {name}")
+            expected_hash=man.get("files",{}).get(name)
+            if not isinstance(expected_hash,str) or expected_hash!=_sha256(path):raise ValueError(f"missing or invalid integrity hash for {name}")
         params=torch.load(os.path.join(ckpt_dir,"params.pt"),map_location="cpu",weights_only=True)
         opt_state=torch.load(os.path.join(ckpt_dir,"optim.pt"),map_location="cpu",weights_only=True)
     else:
@@ -119,4 +282,29 @@ def load_checkpoint(ckpt_dir):
         for k,v in flat.items():name,_,sub=k.partition("::");opt_state.setdefault(name,{})[sub]=v
     params={k:(v if isinstance(v,torch.Tensor) else torch.as_tensor(v)) for k,v in params.items()}
     _check_consistency(man,params)
+    _check_optimizer_state(params,opt_state,man.get("optimizer", {}).get("factored"))
     return {"manifest":man,"params":params,"opt_state":opt_state,"dir":ckpt_dir}
+
+
+
+def load_checkpoint(ckpt_dir):
+    """Load the primary checkpoint, falling back to a valid backup on corruption."""
+    primary=os.path.normpath(ckpt_dir)
+    backup=primary+".bak"
+    candidates=[]
+    for candidate in (primary,backup):
+        if os.path.isfile(os.path.join(candidate,"manifest.json")):
+            candidates.append(candidate)
+    if not candidates:
+        raise FileNotFoundError(
+            f"no checkpoint manifest at {os.path.join(primary, 'manifest.json')} "
+            f"or {os.path.join(backup, 'manifest.json')}"
+        )
+    failures=[]
+    for candidate in candidates:
+        try:
+            return _load_checkpoint_dir(candidate)
+        except Exception as exc:
+            failures.append((candidate,exc))
+    details="; ".join(f"{path}: {error}" for path,error in failures)
+    raise RuntimeError(f"no valid checkpoint found (primary/backup recovery failed): {details}") from failures[-1][1]

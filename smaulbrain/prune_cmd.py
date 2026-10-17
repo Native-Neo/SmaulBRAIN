@@ -1,4 +1,6 @@
 """Evidence-based expert pruning with atomic checkpoint replacement."""
+import math
+
 import torch
 
 from . import checkpoint as _ckpt
@@ -15,7 +17,12 @@ def rank_for_prune(params: dict, scores: dict, n_remove: int, top_k: int, n_expe
     if n_experts - n_remove < top_k:
         raise ValueError(f"removal would leave {n_experts - n_remove} experts, "
                          f"violating top_k={top_k}")
-    order = sorted(scores.items(), key=lambda kv: (kv[1], kv[0]))
+    expected = set(range(n_experts))
+    if set(scores) != expected:
+        raise ValueError("expert quality scores must cover the complete dense registry")
+    if any(not math.isfinite(float(score)) for score in scores.values()):
+        raise ValueError("expert quality scores must all be finite")
+    order = sorted(scores.items(), key=lambda kv: (float(kv[1]), kv[0]))
     return [eid for eid, _ in order[:n_remove]]
 
 
@@ -30,8 +37,17 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
     params = blob["params"]
     eids = _model.expert_ids(params)
     # quality evidence from current model
-    m = _model.Model(spec, params, forward_quant=man["config"].get("forward_quant", "fp32"),
-                     backward_mode=man["config"].get("backward_mode", "fp32"))
+    config = man.get("config", {})
+    forward_quant = config.get("forward_quant", "fp32")
+    backward_mode = config.get("backward_mode", "fp32")
+    capacity_factor = float(config.get("capacity_factor", 1.25))
+    m = _model.Model(
+        spec,
+        params,
+        forward_quant=forward_quant,
+        backward_mode=backward_mode,
+        capacity_factor=capacity_factor,
+    )
     scores, nsamp = _growth.rank_experts(m, eval_batches, min_samples)
     if scores is None:
         raise RuntimeError(f"insufficient quality evidence ({nsamp} < {min_samples}); "
@@ -40,6 +56,9 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
     report = {"candidates": victims,
               "scores": {str(v): scores[v] for v in victims},
               "samples": nsamp,
+              "capacity_factor": capacity_factor,
+              "forward_quant": forward_quant,
+              "backward_mode": backward_mode,
               "prev_count": len(eids), "new_count": len(eids) - len(victims)}
     if dry_run:
         return report
@@ -77,11 +96,36 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
          "prev_count": len(eids), "new_count": len(keep)})
     # router optimizer state is shape-bound: drop it so it re-initializes
     renamed.pop("router", None)
+    # Factored-state flags are keyed by parameter name and must follow the
+    # compacted expert registry. The router state is intentionally reset.
+    man2.setdefault("optimizer", {})["factored"] = {
+        name: bool("R" in state and "C" in state)
+        for name, state in renamed.items()
+    }
+    # Validate the candidate before touching the on-disk checkpoint. Saving
+    # first and smoke-testing afterward can destroy the last usable checkpoint
+    # if a shape/configuration problem makes inference fail.
+    candidate_model = _model.Model(
+        spec,
+        new_params,
+        forward_quant=forward_quant,
+        backward_mode=backward_mode,
+        capacity_factor=capacity_factor,
+    )
+    logits, _ = candidate_model.forward([65, 66, 67, 68], train=False)
+    if not torch.isfinite(logits).all().item():
+        raise RuntimeError("pruned candidate failed validation")
     _ckpt.save_checkpoint(ckpt_dir, man2, new_params, renamed)
-    # validate: reload + inference smoke
+    # Reload the published generation and confirm serialized state is usable.
     blob2 = _ckpt.load_checkpoint(ckpt_dir)
-    m2 = _model.Model(spec, blob2["params"])
+    m2 = _model.Model(
+        spec,
+        blob2["params"],
+        forward_quant=forward_quant,
+        backward_mode=backward_mode,
+        capacity_factor=capacity_factor,
+    )
     logits, _ = m2.forward([65, 66, 67, 68], train=False)
     if not torch.isfinite(logits).all().item():
-        raise RuntimeError("pruned model failed validation")
+        raise RuntimeError("published pruned checkpoint failed validation")
     return report

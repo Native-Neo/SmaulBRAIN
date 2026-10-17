@@ -67,6 +67,11 @@ def test_full_growth_counts_and_mutation_shape():
     tr = _trainer("moe-tiny", ckpt, growth_every_steps=1,
                   growth_min_eval_samples=16)
     tr.train(max_steps=1)
+    # Candidate adoption replaces Parameter objects; the resident RAM store
+    # must point at the new objects for every expert, not just new IDs.
+    for eid in M.expert_ids(tr.model.p):
+        assert tr.model.store.ram_weights[eid]["Win"] is tr.model.p[f"expert.{eid}.Win"]
+        assert tr.model.store.ram_weights[eid]["Wout"] is tr.model.p[f"expert.{eid}.Wout"]
     e = tr.sched.history[0]
     assert e["prev_count"] == 32 and e["new_count"] == 34
     detail = e["detail"]
@@ -190,3 +195,81 @@ def test_full_lifecycle_dense_and_moe(tmp_path):
         # deterministic repeat
         eng2 = INF.InferenceEngine(tr2.model, seed=1, temperature=0.0)
         assert eng2.generate([72, 101, 108, 108, 111], max_new_tokens=8) == out
+
+
+def test_graceful_stop_finishes_update_and_saves(tmp_path):
+    ckpt = str(tmp_path / "graceful-stop")
+    tr = _trainer("moe-tiny", ckpt)
+    tr.request_stop()
+    tr.train(max_steps=3)
+    assert tr.sched.global_step == 1
+    saved = CK.load_checkpoint(ckpt)
+    assert saved["manifest"]["scheduler"]["global_step"] == 1
+    # A fresh trainer can resume the saved state and continue normally.
+    tr2 = _trainer("moe-tiny", ckpt)
+    tr2.load(ckpt)
+    tr2.train(max_steps=2)
+    assert tr2.sched.global_step == 2
+
+
+def test_stop_request_at_loop_boundary_still_saves_without_periodic_saves(tmp_path):
+    ckpt = str(tmp_path / "stop-at-boundary")
+    tr = _trainer("moe-tiny", ckpt)
+    tr.request_stop()
+
+    tr.train(max_steps=0, ckpt_every=0)
+
+    saved = CK.load_checkpoint(ckpt)
+    assert saved["manifest"]["scheduler"]["global_step"] == 0
+
+
+def test_pending_growth_resolves_when_max_steps_is_already_reached(tmp_path):
+    ckpt = str(tmp_path / "pending-at-target")
+    tr = _trainer("moe-tiny", ckpt, growth_min_eval_samples=16)
+    tr.train(max_steps=1)
+    tr.sched.create_pending("step")
+    tr.save()
+
+    resumed = _trainer("moe-tiny", ckpt, growth_min_eval_samples=16)
+    resumed.load(ckpt)
+    resumed.train(max_steps=1)
+
+    assert resumed.sched.global_step == 1
+    assert resumed.sched.pending is None
+    assert _expert_count(resumed) == 34
+    saved = CK.load_checkpoint(ckpt)
+    assert saved["manifest"]["scheduler"]["pending"] is None
+    assert saved["manifest"]["scheduler"]["global_step"] == 1
+
+
+def test_phase_b_publish_failure_rolls_back_live_growth_state_and_can_retry(tmp_path):
+    ckpt = str(tmp_path / "phase-b-publish-failure")
+    tr = _trainer("moe-tiny", ckpt, growth_every_steps=1,
+                  growth_min_eval_samples=16)
+    publish = tr._save_committed
+
+    def fail_publish(*args, **kwargs):
+        raise OSError("injected disk-full during Phase-B publish")
+
+    tr._save_committed = fail_publish
+    with pytest.raises(OSError, match="disk-full"):
+        tr.train(max_steps=1)
+
+    assert tr.sched.global_step == 1
+    assert tr.sched.pending is not None
+    assert tr.sched.history == []
+    assert _expert_count(tr) == 32
+    assert tr.opt.state["router"]["m"].shape == tr.model.p["router"].shape
+    persisted = CK.load_checkpoint(ckpt)
+    assert persisted["manifest"]["n_experts_current"] == 32
+    assert persisted["manifest"]["scheduler"]["pending"] is not None
+
+    tr._save_committed = publish
+    tr.train(max_steps=1)
+
+    assert tr.sched.pending is None
+    assert [event["id"] for event in tr.sched.history] == [1]
+    assert _expert_count(tr) == 34
+    persisted = CK.load_checkpoint(ckpt)
+    assert persisted["manifest"]["n_experts_current"] == 34
+    assert persisted["manifest"]["scheduler"]["pending"] is None

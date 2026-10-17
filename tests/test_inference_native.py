@@ -75,3 +75,31 @@ def test_native_kernels_optional_but_defined():
     assert "__AVX2__" not in src
     assert "__m256i" not in src and "__m512" not in src
     assert "_mm256_i32gather" not in src
+
+
+def test_export_import_preserves_pending_token_and_next_logits():
+    e1 = _eng(temperature=0.0)
+    prompt = [65, 66, 67]
+    e1.prefill(prompt)
+    assert e1.generate([], max_new_tokens=3)
+    saved = e1.export_states()
+
+    e2 = _eng(temperature=0.0)
+    e2.import_states(saved)
+
+    assert e1.generate([], max_new_tokens=5) == e2.generate([], max_new_tokens=5)
+
+
+def test_export_import_preserves_sampling_rng_for_continuation():
+    kwargs = dict(temperature=1.0, top_k=5, top_p=0.9)
+    e1 = _eng(seed=5, **kwargs)
+    e1.prefill([65, 66, 67])
+    e1.generate([], max_new_tokens=4)
+    saved = e1.export_states()
+
+    # State transfer covers recurrent/sampler state, not model weights; use
+    # the same deterministic initialization for both engines.
+    e2 = _eng(seed=5, **kwargs)
+    e2.import_states(saved)
+
+    assert e1.generate([], max_new_tokens=8) == e2.generate([], max_new_tokens=8)

@@ -58,6 +58,7 @@ class GrowthScheduler:
             "next_periodic_step": self.next_periodic_step,
             "loss_threshold": self.loss_threshold,
             "loss_beta": self.loss_beta,
+            "min_eval_samples": self.min_eval_samples,
             "smooth_loss": self.smooth_loss,
             "loss_armed": self.loss_armed,
             "event_count": self.event_count,
@@ -70,7 +71,8 @@ class GrowthScheduler:
     def from_record(cls, rec: dict):
         s = cls(every_steps=rec.get("growth_every_steps", 10000),
                 loss_nats=rec.get("loss_threshold", 0.5),
-                loss_beta=rec.get("loss_beta", 0.98))
+                loss_beta=rec.get("loss_beta", 0.98),
+                min_eval_samples=rec.get("min_eval_samples", 256))
         s.global_step = int(rec.get("global_step", 0))
         s.smooth_loss = rec.get("smooth_loss")
         s.loss_armed = bool(rec.get("loss_armed", True))
@@ -148,16 +150,27 @@ class GrowthScheduler:
 # ---------------- quality ranking ----------------
 
 def eval_loss_on_tokens(model, tokens) -> float:
-    logits, _ = model.forward(tokens, train=False)
+    if len(tokens) < 2:
+        raise ValueError("evaluation sequence needs at least two tokens")
+    # The last byte is a target, not an input. Forwarding it would consume an
+    # extra expert-capacity slot even though its corresponding logit is unused.
+    logits, _ = model.forward(tokens[:-1], train=False)
     tgt = torch.as_tensor(tokens[1:], dtype=torch.long, device=logits.device)
-    return float(torch.nn.functional.cross_entropy(logits[:-1], tgt).item())
+    return float(torch.nn.functional.cross_entropy(logits, tgt).item())
 
 
 def rank_experts(model, eval_batches, min_samples: int, max_batches=None):
+    if min_samples < 1:
+        raise ValueError("min_samples must be >= 1")
+    # All collected batches establish evidence eligibility. max_batches limits
+    # only the expensive scoring work; the caller deliberately uses approximate
+    # ranking on a subset after gathering enough evaluation evidence.
     total = sum(max(len(b) - 1, 0) for b in eval_batches)
-    if total < min_samples: return None, total
+    if total < min_samples:
+        return None, total
     batches = list(eval_batches if max_batches is None else eval_batches[:max_batches])
-    if not batches: return None, total
+    if not batches:
+        return None, total
     base = [eval_loss_on_tokens(model, b) for b in batches]
     from . import model as _m
     scores = {}
@@ -168,9 +181,11 @@ def rank_experts(model, eval_batches, min_samples: int, max_batches=None):
 
 
 def eval_loss_on_tokens_disabled(model, tokens, disabled):
-    logits, _ = model.forward(tokens, train=False, disabled=(disabled,))
+    if len(tokens) < 2:
+        raise ValueError("evaluation sequence needs at least two tokens")
+    logits, _ = model.forward(tokens[:-1], train=False, disabled=(disabled,))
     tgt = torch.as_tensor(tokens[1:], dtype=torch.long, device=logits.device)
-    return float(torch.nn.functional.cross_entropy(logits[:-1], tgt).item())
+    return float(torch.nn.functional.cross_entropy(logits, tgt).item())
 
 
 def prepare_sources(scores: dict, n_needed: int):
