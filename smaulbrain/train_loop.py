@@ -312,12 +312,15 @@ class Trainer:
         steps = 0
         last_saved_step = None
         while True:
-            if max_steps is not None and self.sched.global_step >= max_steps:
-                break
-            # A pending event must be resolved BEFORE any further optimizer update.
+            # Recovery transitions are not optimizer updates. Resolve a saved
+            # pending growth event even when the requested global-step target
+            # has already been reached; otherwise it can remain stuck forever
+            # on repeated runs with the same --max-steps value.
             if self.sched.pending is not None:
                 self._resolve_pending(fail_at=growth_fail_at)
                 continue
+            if max_steps is not None and self.sched.global_step >= max_steps:
+                break
             toks = self.stream.next_tokens(self.args.seq_len)
             loss, grads, info = self.model.loss_and_backward(toks)
             if not math.isfinite(loss):
