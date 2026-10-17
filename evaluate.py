@@ -18,7 +18,7 @@ def _was_provided(argv, option):
 
 def main(argv=None):
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    ap = argparse.ArgumentParser(description="Evaluate SmaulBRAIN V2 checkpoint")
+    ap = argparse.ArgumentParser(description="Evaluate SmaulBRAIN V2 checkpoint", allow_abbrev=False)
     _cli.add_common_args(ap)
     ap.add_argument("--corpus", default=None)
     ap.add_argument("--synth-bytes", type=int, default=1 << 16)
