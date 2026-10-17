@@ -291,3 +291,18 @@ def test_native_recurrent_backward_scan_matches_numpy(tokens, width):
     assert np.allclose(actual_dkv, expected_dkv, rtol=0, atol=0)
     assert np.allclose(actual_dalpha, expected_dalpha, rtol=0, atol=0)
 
+
+
+@pytest.mark.parametrize("scale", [-1.0, float("nan"), float("inf"), float("-inf"), 1e40])
+def test_fp8_quantization_rejects_invalid_scale(scale):
+    with pytest.raises(ValueError, match="scale"):
+        Q.fp8_e4m3_quantize(np.array([1.0, -1.0], dtype=np.float32), scale=scale)
+
+
+def test_fp8_zero_scale_uses_legacy_unit_scale_fallback():
+    values = np.array([1.0, -2.0, 0.0], dtype=np.float32)
+    got, scale = Q.fp8_e4m3_quantize(values, scale=0.0)
+    expected, expected_scale = Q.fp8_e4m3_quantize(values, scale=1.0)
+    assert scale == 1.0
+    assert scale == expected_scale
+    assert np.array_equal(got, expected)
