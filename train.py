@@ -80,9 +80,10 @@ def main(argv=None):
                        ckpt_every=args.ckpt_every, grad_clip=args.grad_clip)
     finally:
         signal.signal(signal.SIGINT, previous_sigint)
-    # Trainer.train() saves as part of graceful-stop handling. Avoid rewriting
-    # large checkpoints a second time after Ctrl+C.
-    if not tr.stop_requested:
+    # With periodic checkpointing enabled, Trainer.train() writes the final
+    # state (unless the final step already had a periodic save). When periodic
+    # saves are disabled, the CLI still writes one checkpoint on normal exit.
+    if not tr.stop_requested and not args.ckpt_every:
         tr.save()
     from smaulbrain import model as _model
     n_exp = len(_model.expert_ids(tr.model.p)) if preset.startswith("moe") else 0
