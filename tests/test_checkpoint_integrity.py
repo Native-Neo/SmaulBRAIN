@@ -177,3 +177,15 @@ def test_checkpoint_rejects_mismatched_factored_optimizer_flag(tmp_path):
     )
     with pytest.raises(ValueError, match="factored flag for embed disagrees"):
         CK.save_checkpoint(str(tmp_path / "bad-factored-flag"), manifest, params, opt_state)
+
+
+def test_checkpoint_rejects_nonfinite_parameter_values(tmp_path):
+    spec = C.PRESETS["dense-tiny"]
+    params = M.build_params(spec, torch.Generator().manual_seed(8))
+    params["embed"][0, 0] = float("nan")
+    manifest = CK.build_manifest(
+        spec.name, C.arch_report(spec), {}, CK.blank_scheduler_state(), 0, {},
+        0, [], {},
+    )
+    with pytest.raises(ValueError, match="embed contains non-finite"):
+        CK.save_checkpoint(str(tmp_path / "nonfinite"), manifest, params, {})
