@@ -4,6 +4,7 @@ Portable scalar C++ only (no AVX2/AVX-512 intrinsics anywhere). If a compiler
 or build fails, the error is explicit and actionable; the Python scalar/numpy
 reference path always remains available.
 """
+import errno
 import os
 import sys
 from functools import lru_cache
@@ -58,7 +59,24 @@ def build_here(build_dir="", verbose: bool = True) -> str:
             if result.returncode != 0:
                 raise RuntimeError(
                     result.stderr.strip() or "native C++ kernel compilation failed")
-            os.replace(temporary, target)
+            try:
+                os.replace(temporary, target)
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                # build_dir may live on another filesystem. Copy to a unique
+                # temporary sibling of the destination, then publish atomically.
+                fd, publish_name = tempfile.mkstemp(
+                    prefix=f"{target.name}.{os.getpid()}.", suffix=".publish.so",
+                    dir=here)
+                os.close(fd)
+                publish_tmp = Path(publish_name)
+                try:
+                    shutil.copyfile(temporary, publish_tmp)
+                    os.chmod(publish_tmp, 0o755)
+                    os.replace(publish_tmp, target)
+                finally:
+                    publish_tmp.unlink(missing_ok=True)
         else:
             temporary.unlink(missing_ok=True)
     except BaseException:
@@ -81,13 +99,23 @@ def try_load():
         import glob
         cands = glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                        "smaul_kernels*"))
-        cands.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        if not cands:
+        compatible = []
+        for path in cands:
+            name = os.path.basename(path)
+            if not name.endswith(".so") or ".tmp." in name or ".publish." in name:
+                continue
+            if "-mavx-" in name and not caps.get("has_avx", False):
+                continue
+            if "-mavx-" not in name and "-msse2-" not in name:
+                continue
+            compatible.append(path)
+        compatible.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        if not compatible:
             return None, {"available": False,
-                          "reason": "native module not built; using portable scalar/numpy path",
+                          "reason": "no compatible native module built; using portable scalar/numpy path",
                           "cpu": caps, "dispatch": _cpu.dispatch_name()}
-        lib = ctypes.CDLL(cands[0])
-        return lib, {"available": True, "path": cands[0], "cpu": caps,
+        lib = ctypes.CDLL(compatible[0])
+        return lib, {"available": True, "path": compatible[0], "cpu": caps,
                      "dispatch": _cpu.dispatch_name()}
     except OSError as e:
         return None, {"available": False, "reason": f"native load failed: {e}",
