@@ -47,6 +47,11 @@ class Trainer:
             loss_beta=args.growth_loss_beta, min_eval_samples=args.growth_min_eval_samples)
         self.log = []
         self.last_metrics = None
+        self.stop_requested = False
+
+    def request_stop(self):
+        """Request a graceful stop after the current optimizer update."""
+        self.stop_requested = True
 
     def _live_experts_dir(self) -> str:
         # Live per-expert disk mirrors are transient and must not live inside
@@ -351,9 +356,14 @@ class Trainer:
                                  "overflow_dropped": int(info.get("overflow_dropped", 0))})
             if ckpt_every and self.sched.global_step % ckpt_every == 0:
                 self.save()
+            if self.stop_requested:
+                # A SIGINT handler only sets this flag. Finish the optimizer
+                # update and any growth transaction before publishing state.
+                self.save()
+                break
             if fail_at == "after_step":
                 raise _Injected(fail_at)
-        if ckpt_every:
+        if ckpt_every and not self.stop_requested:
             self.save()
         return self.log
 
