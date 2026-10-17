@@ -102,7 +102,11 @@ class Trainer:
                  "backward_mode": self.model.backward_mode,
                  "paging": self.args.paging, "seed": self.args.seed,
                  "lr": self.args.lr, "seq_len": self.args.seq_len,
-                 "capacity_factor": self.model.capacity_factor}
+                 "capacity_factor": self.model.capacity_factor,
+                 "synth_bytes": self.args.synth_bytes,
+                 "growth_noise_scale": self.args.growth_noise_scale,
+                 "growth_seed": self.args.growth_seed,
+                 "grad_clip": self.args.grad_clip}
         man = _ckpt.build_manifest(
             spec.name, arch, extra, self.sched.to_record(),
             self.stream.cursor, {"torch_state": self.rng.get_state().tolist()},
@@ -300,7 +304,11 @@ class Trainer:
         arch = _cfg.arch_report(self.spec, n_exp)
         extra = {"forward_quant": model.forward_quant, "backward_mode": model.backward_mode,
                  "paging": self.args.paging, "seed": self.args.seed, "lr": self.args.lr,
-                 "seq_len": self.args.seq_len, "capacity_factor": model.capacity_factor}
+                 "seq_len": self.args.seq_len, "capacity_factor": model.capacity_factor,
+                 "synth_bytes": self.args.synth_bytes,
+                 "growth_noise_scale": self.args.growth_noise_scale,
+                 "growth_seed": self.args.growth_seed,
+                 "grad_clip": self.args.grad_clip}
         man = _ckpt.build_manifest(
             self.spec.name, arch, extra, sched.to_record(), self.stream.cursor,
             {"torch_state": self.rng.get_state().tolist()}, n_exp, list(range(n_exp)),
