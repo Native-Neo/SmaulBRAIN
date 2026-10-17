@@ -58,6 +58,7 @@ class GrowthScheduler:
             "next_periodic_step": self.next_periodic_step,
             "loss_threshold": self.loss_threshold,
             "loss_beta": self.loss_beta,
+            "min_eval_samples": self.min_eval_samples,
             "smooth_loss": self.smooth_loss,
             "loss_armed": self.loss_armed,
             "event_count": self.event_count,
@@ -70,7 +71,8 @@ class GrowthScheduler:
     def from_record(cls, rec: dict):
         s = cls(every_steps=rec.get("growth_every_steps", 10000),
                 loss_nats=rec.get("loss_threshold", 0.5),
-                loss_beta=rec.get("loss_beta", 0.98))
+                loss_beta=rec.get("loss_beta", 0.98),
+                min_eval_samples=rec.get("min_eval_samples", 256))
         s.global_step = int(rec.get("global_step", 0))
         s.smooth_loss = rec.get("smooth_loss")
         s.loss_armed = bool(rec.get("loss_armed", True))
