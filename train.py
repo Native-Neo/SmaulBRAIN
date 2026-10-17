@@ -17,7 +17,7 @@ from smaulbrain import train_loop as _tl
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Train SmaulBRAIN V2 (byte-level recurrent LM)")
     _cli.add_common_args(ap, need_train=True)
-    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--resume", action="store_true", help="require a checkpoint (existing checkpoints auto-resume by default)")
     ap.add_argument("--steps", type=int, default=None,
                     help="number of additional optimizer updates (useful with --resume)")
     args = ap.parse_args(argv)
