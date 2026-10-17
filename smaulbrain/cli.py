@@ -46,6 +46,8 @@ def add_common_args(ap: argparse.ArgumentParser, need_train: bool = False):
 def validate_args(args) -> str:
     preset = _cfg.resolve_preset(args.preset, args.moe, args.dense)
     _cfg.validate_quant_combo(args.forward_quant, args.backward_mode)
+    if args.paging not in _cfg.PAGING_MODES:
+        raise ValueError(f"--paging must be one of {_cfg.PAGING_MODES}")
     args.growth_every_steps = _cfg.parse_growth_every_steps(args.growth_every_steps)
     args.growth_loss_nats = _cfg.parse_growth_loss_nats(args.growth_loss_nats)
     if preset.startswith("dense") and (args.growth_every_steps or args.growth_loss_nats is not None):
