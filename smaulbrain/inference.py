@@ -71,6 +71,8 @@ class InferenceEngine:
 
     def prefill(self, tokens, chunk=0):
         """Consume context once and retain logits predicting its next token."""
+        if isinstance(chunk, bool) or not isinstance(chunk, int) or chunk < 0:
+            raise ValueError("prefill chunk must be an integer >= 0")
         # A completed/partially consumed generation leaves its final sampled
         # token pending so we can avoid one wasted model call at the end. Consume
         # it only when the caller actually continues or appends more context.
