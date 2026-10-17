@@ -42,8 +42,12 @@ class Trainer:
         self.opt = _opt.SmaulOPT(lr=args.lr, beta1=args.beta1, beta2=args.beta2,
                                  eps=args.eps, weight_decay=args.weight_decay)
         self.opt.register(self.model.p)
+        # Dynamic growth is an MoE-only feature. Disable its triggers for
+        # dense models instead of repeatedly reporting a skipped event once a
+        # threshold has been reached.
         self.sched = _growth.GrowthScheduler(
-            every_steps=args.growth_every_steps, loss_nats=args.growth_loss_nats,
+            every_steps=args.growth_every_steps if spec.kind == "moe" else 0,
+            loss_nats=args.growth_loss_nats if spec.kind == "moe" else None,
             loss_beta=args.growth_loss_beta, min_eval_samples=args.growth_min_eval_samples)
         self.log = []
         self.last_metrics = None
@@ -117,6 +121,12 @@ class Trainer:
                 if isinstance(value, torch.Tensor): state[key] = value.to(self.model.device)
         self.opt.register(self.model.p)
         self.sched = _growth.GrowthScheduler.from_record(man["scheduler"])
+        if self.spec.kind == "dense":
+            if self.sched.pending is not None:
+                raise ValueError("dense checkpoint cannot contain a pending MoE growth event")
+            self.sched.every_steps = 0
+            self.sched.next_periodic_step = None
+            self.sched.loss_threshold = None
         rng_state = man.get("rng_state", {})
         if "torch_state" in rng_state:
             self.rng.set_state(torch.tensor(rng_state["torch_state"], dtype=torch.uint8))
