@@ -129,6 +129,8 @@ def test_packed_matmat_and_transpose_match_dense_reference():
 
 
 def test_model_ternary_path_never_unpacks_dense_weights(monkeypatch):
+    if not Q.prepare_ternary_backend():
+        pytest.skip("this invariant applies to the native packed execution path")
     m = _tiny_moe("ternary", "ternary")
     toks = [10, 20, 30, 40, 50]
 
@@ -290,4 +292,14 @@ def test_native_recurrent_backward_scan_matches_numpy(tokens, width):
         ds, states, alpha, actual_dkv, actual_dalpha)
     assert np.allclose(actual_dkv, expected_dkv, rtol=0, atol=0)
     assert np.allclose(actual_dalpha, expected_dalpha, rtol=0, atol=0)
+
+def test_compiler_free_packed_matmat_uses_call_local_blas_fallback(monkeypatch):
+    rng = np.random.default_rng(231)
+    W = rng.standard_normal((23, 17)).astype(np.float32)
+    X = rng.standard_normal((4, 23)).astype(np.float32)
+    packed, scale, shape, _ = Q._pack_ternary_numpy(W)
+    expected = X @ (Q.unpack_codes(packed, shape).astype(np.float32) * scale)
+    monkeypatch.setattr(Q, "prepare_ternary_backend", lambda: False)
+    actual = Q.packed_matmat(X, packed, shape, float(scale))
+    assert np.allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
