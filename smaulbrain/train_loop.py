@@ -300,6 +300,7 @@ class Trainer:
     def train(self, max_steps=None, log_every=10, eval_every=0, ckpt_every=0,
               grad_clip=1.0, fail_at=None, growth_fail_at=None):
         steps = 0
+        last_saved_step = None
         while True:
             if max_steps is not None and self.sched.global_step >= max_steps:
                 break
@@ -365,16 +366,20 @@ class Trainer:
                                  "overflow_dropped": int(info.get("overflow_dropped", 0))})
             if ckpt_every and self.sched.global_step % ckpt_every == 0:
                 self.save()
+                last_saved_step = self.sched.global_step
             if self.stop_requested:
                 # A SIGINT handler only sets this flag. Finish the optimizer
                 # update and any growth transaction before publishing state.
-                self.save()
+                if last_saved_step != self.sched.global_step:
+                    self.save()
+                    last_saved_step = self.sched.global_step
                 break
             if fail_at == "after_step":
                 raise _Injected(fail_at)
         if (ckpt_every and not self.stop_requested
-                and self.sched.global_step % ckpt_every != 0):
-            # A periodic save may already have written the final step.
+                and last_saved_step != self.sched.global_step):
+            # Save a non-periodic final step, and also permit a zero-step run
+            # to create its initial checkpoint.
             self.save()
         return self.log
 
