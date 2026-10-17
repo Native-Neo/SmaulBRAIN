@@ -1,4 +1,6 @@
 """Inference engine using Torch tensors and persistent recurrent state."""
+import math
+
 import torch
 
 
@@ -8,12 +10,12 @@ class InferenceEngine:
         self.temperature = float(temperature)
         self.top_k = int(top_k)
         self.top_p = float(top_p)
-        if not 0 < self.top_p <= 1:
-            raise ValueError("--top-p must be in (0, 1]")
+        if not math.isfinite(self.top_p) or not 0 < self.top_p <= 1:
+            raise ValueError("--top-p must be finite and in (0, 1]")
         if self.top_k < 0:
             raise ValueError("--top-k must be >= 0")
-        if self.temperature < 0:
-            raise ValueError("--temperature must be >= 0")
+        if not math.isfinite(self.temperature) or self.temperature < 0:
+            raise ValueError("--temperature must be finite and >= 0")
         self.generator = torch.Generator(device=getattr(model, "device", "cpu"))
         self.generator.manual_seed(int(seed))
         self.states = model.init_states()
@@ -39,11 +41,22 @@ class InferenceEngine:
         if not toks:
             return self.states
 
+        self._next_logits = None
         size = chunk if chunk and chunk > 0 else len(toks)
         for i in range(0, len(toks), size):
             logits, _ = self.model.forward(toks[i:i + size], states=self.states)
-            if logits.shape[0]:
+            if logits is not None and getattr(logits, "ndim", 0) >= 1 and logits.shape[0]:
                 self._next_logits = logits[-1].detach()
+
+        if self._next_logits is None:
+            # Compatibility path for models/stubs whose forward() advances
+            # recurrent state but does not return logits: prefill all but the
+            # final token, then consume that token exactly once to predict.
+            self.states = self.model.init_states()
+            prefix = toks[:-1]
+            for i in range(0, len(prefix), size):
+                self.model.forward(prefix[i:i + size], states=self.states)
+            self._next_logits = self.model.step_token(toks[-1], self.states)
         return self.states
 
     def _sample(self, logits):
@@ -68,16 +81,20 @@ class InferenceEngine:
         return list(self.generate_stream(prompt_tokens, max_new_tokens, stop_ids))
 
     def generate_stream(self, prompt_tokens, max_new_tokens=64, stop_ids=()):
-        """Yield tokens; prompt prefill logits are used directly, without replaying the prompt's last token."""
+        """Yield tokens without replaying the prompt or advancing past the final output."""
+        if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be an integer >= 0")
+        if max_new_tokens == 0:
+            return
         self.prefill(prompt_tokens)
         stop = set(stop_ids)
-        for _ in range(max_new_tokens):
+        for index in range(max_new_tokens):
             if self._next_logits is None:
                 # Empty context has no next-token logits. Seed the recurrent
                 # state with byte 0 once, matching the previous empty-prompt behavior.
                 self._next_logits = self.model.step_token(0, self.states)
             nxt = self._sample(self._next_logits)
             yield nxt
-            if nxt in stop:
+            if nxt in stop or index + 1 == max_new_tokens:
                 break
             self._next_logits = self.model.step_token(nxt, self.states)
