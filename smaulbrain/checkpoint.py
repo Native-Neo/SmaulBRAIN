@@ -1,5 +1,5 @@
 """Atomic, checksummed PyTorch checkpoints with fallback recovery."""
-import hashlib, json, os, shutil, tempfile
+import hashlib, json, os, shutil, tempfile, uuid
 import torch
 from . import vocab as _vocab
 from smaulbrain import CHECKPOINT_VERSION
