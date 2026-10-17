@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 concurrency:
-  # Push and pull_request events for the same PR branch share one suite.
-  group: full-test-suite-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}
+  # Cancel obsolete runs for the same branch while keeping other branches independent.
+  group: full-test-suite-${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
