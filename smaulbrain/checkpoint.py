@@ -50,12 +50,31 @@ def _write_tree(target_dir,manifest,params,opt_state):
 
 def _publish_dir(tmp,target_dir):
     target_dir=os.path.normpath(target_dir)
-    if not os.path.exists(target_dir):os.replace(tmp,target_dir); return
+    if not os.path.exists(target_dir):
+        os.replace(tmp,target_dir)
+        return
     bak=target_dir+".bak"
-    if os.path.exists(bak):shutil.rmtree(bak)
-    os.rename(target_dir,bak)
-    try:os.rename(tmp,target_dir)
-    except BaseException:os.rename(bak,target_dir); raise
+    old_dir=None
+    if not os.path.exists(bak):
+        # First replacement: retain the current generation as the recovery
+        # directory until the new generation has been published.
+        os.replace(target_dir,bak)
+    else:
+        # A backup already exists and may be the only valid generation.
+        # Never delete it before the new checkpoint is safely in place.
+        old_dir=target_dir+".old."+uuid.uuid4().hex
+        os.replace(target_dir,old_dir)
+    try:
+        os.replace(tmp,target_dir)
+    except BaseException:
+        if old_dir is not None:
+            if not os.path.exists(target_dir):
+                os.replace(old_dir,target_dir)
+        elif os.path.exists(bak) and not os.path.exists(target_dir):
+            os.replace(bak,target_dir)
+        raise
+    if old_dir is not None:
+        shutil.rmtree(old_dir,ignore_errors=True)
     shutil.rmtree(bak,ignore_errors=True)
 
 
