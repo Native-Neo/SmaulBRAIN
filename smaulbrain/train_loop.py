@@ -88,6 +88,7 @@ class Trainer:
             {"class": "SmaulOPT", "lr": self.opt.lr, "beta1": self.opt.beta1,
              "beta2": self.opt.beta2, "eps": self.opt.eps,
              "weight_decay": self.opt.weight_decay})
+        man["data_stream"] = dict(self.stream.identity)
         # Checkpoint writing is synchronous, so the serializer can read live
         # arrays directly. Avoid duplicating the entire parameter dict and the
         # optimizer's potentially multi-gigabyte moment tensors before writing.
@@ -122,7 +123,8 @@ class Trainer:
         # Legacy NumPy RNG state is intentionally not replayed; resumed model and optimizer
         # tensors are exact, while newly introduced random experts use their recorded seed.
         self.stream.load_state_dict({"cursor": man["data_cursor"], "path": self.stream.path,
-                                     "size": self.stream.size})
+                                     "size": self.stream.size,
+                                     "identity": man.get("data_stream")})
         # rebuild paging store
         if self.spec.kind == "moe":
             n_exp = man["n_experts_current"]
@@ -261,6 +263,7 @@ class Trainer:
             {"class": "SmaulOPT", "lr": opt.lr, "beta1": opt.beta1, "beta2": opt.beta2,
              "eps": opt.eps, "weight_decay": opt.weight_decay,
              "factored": {k: bool(s["factored"]) for k, s in opt.state.items()}})
+        man["data_stream"] = dict(self.stream.identity)
         # optimizer state carried by name; router state carried per-column below
         # _write_tree consumes array references synchronously; avoid a second
         # copy of every optimizer tensor at the growth commit checkpoint.
