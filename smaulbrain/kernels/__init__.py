@@ -75,6 +75,7 @@ def build_here(build_dir="", verbose: bool = True) -> str:
                     shutil.copyfile(temporary, publish_tmp)
                     os.chmod(publish_tmp, 0o755)
                     os.replace(publish_tmp, target)
+                    temporary.unlink(missing_ok=True)
                 finally:
                     publish_tmp.unlink(missing_ok=True)
         else:
