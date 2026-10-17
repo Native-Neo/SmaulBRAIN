@@ -97,3 +97,19 @@ def test_paging_v_modes_error_without_backend():
     for mode in ("V", "D2V", "R2V"):
         with pytest.raises(P.PagingError):
             P.ExpertStore(mode, 1, ram_weights={0: {}}, disk_dir="/tmp")
+
+
+@pytest.mark.parametrize("capacity", [0, -1, float("nan"), float("inf"), float("-inf")])
+def test_router_rejects_invalid_capacity_factor(capacity):
+    r = _router()
+    with pytest.raises(ValueError, match="capacity_factor"):
+        r.route(np.zeros((2, 8), dtype=np.float32), top_k=2,
+                capacity_factor=capacity)
+
+
+def test_router_rejects_wrong_input_rank_or_width():
+    r = _router()
+    with pytest.raises(ValueError, match="shape"):
+        r.route(np.zeros(8, dtype=np.float32), top_k=2)
+    with pytest.raises(ValueError, match="shape"):
+        r.route(np.zeros((2, 7), dtype=np.float32), top_k=2)
