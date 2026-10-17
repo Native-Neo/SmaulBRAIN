@@ -20,10 +20,12 @@ class InferenceEngine:
         self.generator.manual_seed(int(seed))
         self.states = model.init_states()
         self._next_logits = None
+        self._pending_token = None
 
     def reset(self):
         self.states = self.model.init_states()
         self._next_logits = None
+        self._pending_token = None
 
     def export_states(self):
         return self.model.serialize_states(self.states)
@@ -34,9 +36,16 @@ class InferenceEngine:
             for i in range(len(blob))
         ]
         self._next_logits = None
+        self._pending_token = None
 
     def prefill(self, tokens, chunk=0):
         """Consume context once and retain logits predicting its next token."""
+        # A completed/partially consumed generation leaves its final sampled
+        # token pending so we can avoid one wasted model call at the end. Consume
+        # it only when the caller actually continues or appends more context.
+        if self._pending_token is not None:
+            self._next_logits = self.model.step_token(self._pending_token, self.states)
+            self._pending_token = None
         toks = list(tokens)
         if not toks:
             return self.states
@@ -105,7 +114,12 @@ class InferenceEngine:
                 # state with byte 0 once, matching the previous empty-prompt behavior.
                 self._next_logits = self.model.step_token(0, self.states)
             nxt = self._sample(self._next_logits)
+            # Record before yielding so early consumer cancellation still
+            # leaves recurrent state resumable. The token is cleared only if
+            # the generator continues and actually advances the model through it.
+            self._pending_token = nxt
             yield nxt
             if nxt in stop or index + 1 == max_new_tokens:
                 break
             self._next_logits = self.model.step_token(nxt, self.states)
+            self._pending_token = None
