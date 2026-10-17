@@ -26,13 +26,24 @@ def main(argv=None):
     ap.add_argument("--prefill-chunk", type=int, default=0)
     ap.add_argument("--stop-eos", action="store_true")
     args = ap.parse_args(argv)
+    if args.max_new_tokens < 0:
+        ap.error("--max-new-tokens must be >= 0")
+    if args.prefill_chunk < 0:
+        ap.error("--prefill-chunk must be >= 0")
+    if args.temperature < 0 or not __import__("math").isfinite(args.temperature):
+        ap.error("--temperature must be a finite number >= 0")
+    if args.top_k < 0:
+        ap.error("--top-k must be >= 0")
+    if not 0 < args.top_p <= 1 or not __import__("math").isfinite(args.top_p):
+        ap.error("--top-p must be finite and in (0, 1]")
     try:
         preset = _cli.validate_args(args)
     except ValueError as e:
         ap.error(str(e))
     spec = _cfg.PRESETS[preset]
     man_path = os.path.join(args.checkpoint, "manifest.json")
-    if not os.path.exists(man_path):
+    backup_manifest = os.path.join(os.path.normpath(args.checkpoint) + ".bak", "manifest.json")
+    if not os.path.exists(man_path) and not os.path.exists(backup_manifest):
         print(f"error: no checkpoint at {args.checkpoint}", file=sys.stderr)
         return 2
     from smaulbrain import checkpoint as _ckpt
@@ -51,13 +62,17 @@ def main(argv=None):
             store = _paging.ExpertStore(args.paging, n_exp, ram_weights=ram)
         else:
             import tempfile
-            dd = tempfile.mkdtemp(prefix="smaul-infer-")
+            temp_expert_dir = tempfile.TemporaryDirectory(prefix="smaul-infer-")
+            dd = temp_expert_dir.name
             import torch
             for e in range(n_exp):
                 torch.save({"Win": blob["params"][f"expert.{e}.Win"].detach().cpu(),
                             "Wout": blob["params"][f"expert.{e}.Wout"].detach().cpu()},
                            os.path.join(dd, f"expert_{e}.pt"))
-            store = _paging.ExpertStore(args.paging, n_exp, disk_dir=dd)
+            store = _paging.ExpertStore(
+                args.paging, n_exp, disk_dir=dd,
+                ram_cache_max_experts=args.paging_cache_experts,
+                staging_max_bytes=args.paging_staging_bytes)
     m = _model.Model(spec, dict(blob["params"]), forward_quant=args.forward_quant,
                      backward_mode=args.backward_mode, paging_mode=args.paging,
                      paging_store=store, device=args.device)
