@@ -1,4 +1,6 @@
 """Evidence-based expert pruning with atomic checkpoint replacement."""
+import math
+
 import torch
 
 from . import checkpoint as _ckpt
@@ -15,7 +17,12 @@ def rank_for_prune(params: dict, scores: dict, n_remove: int, top_k: int, n_expe
     if n_experts - n_remove < top_k:
         raise ValueError(f"removal would leave {n_experts - n_remove} experts, "
                          f"violating top_k={top_k}")
-    order = sorted(scores.items(), key=lambda kv: (kv[1], kv[0]))
+    expected = set(range(n_experts))
+    if set(scores) != expected:
+        raise ValueError("expert quality scores must cover the complete dense registry")
+    if any(not math.isfinite(float(score)) for score in scores.values()):
+        raise ValueError("expert quality scores must all be finite")
+    order = sorted(scores.items(), key=lambda kv: (float(kv[1]), kv[0]))
     return [eid for eid, _ in order[:n_remove]]
 
 
@@ -89,6 +96,12 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
          "prev_count": len(eids), "new_count": len(keep)})
     # router optimizer state is shape-bound: drop it so it re-initializes
     renamed.pop("router", None)
+    # Factored-state flags are keyed by parameter name and must follow the
+    # compacted expert registry. The router state is intentionally reset.
+    man2.setdefault("optimizer", {})["factored"] = {
+        name: bool("R" in state and "C" in state)
+        for name, state in renamed.items()
+    }
     # Validate the candidate before touching the on-disk checkpoint. Saving
     # first and smoke-testing afterward can destroy the last usable checkpoint
     # if a shape/configuration problem makes inference fail.
