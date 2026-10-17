@@ -190,10 +190,13 @@ class Model(nn.Module):
 
     def _moe(self,X,disabled=()):
         p=self.p; router=_moe.Router.__new__(_moe.Router); router.W=p["router"]
-        idx,weights,info,_=router.route(X,self.spec.top_k,self.capacity_factor,disabled)
+        idx,weights,info,cache=router.route(X,self.spec.top_k,self.capacity_factor,disabled)
         Y=X.new_zeros(X.shape)
-        for eid in torch.unique(idx,sorted=True).tolist():
-            flatpos=torch.nonzero(idx.reshape(-1)==eid,as_tuple=False).flatten()
+        flat_idx=idx.reshape(-1)
+        kept=cache[-1].reshape(-1)
+        for eid in torch.unique(flat_idx[kept],sorted=True).tolist():
+            # Do not run experts for assignments already rejected by capacity.
+            flatpos=torch.nonzero((flat_idx==eid)&kept,as_tuple=False).flatten()
             rows=torch.div(flatpos,self.spec.top_k,rounding_mode="floor"); cols=flatpos%self.spec.top_k
             if self.store is not None:self.store.pin(eid)
             try:
