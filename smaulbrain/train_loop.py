@@ -386,10 +386,11 @@ class Trainer:
                 break
             if fail_at == "after_step":
                 raise _Injected(fail_at)
-        if (ckpt_every and not self.stop_requested
-                and last_saved_step != self.sched.global_step):
-            # Save a non-periodic final step, and also permit a zero-step run
-            # to create its initial checkpoint.
+        if (last_saved_step != self.sched.global_step
+                and (ckpt_every or self.stop_requested)):
+            # Save a non-periodic final step and ensure a stop request that
+            # arrives at the loop boundary still leaves a recoverable state.
+            # A zero-step run with periodic saves enabled also gets a checkpoint.
             self.save()
         return self.log
 
