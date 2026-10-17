@@ -103,3 +103,46 @@ def test_checkpoint_publish_failure_preserves_existing_valid_backup(tmp_path, mo
     assert (backup / "manifest.json").is_file()
     loaded = CK.load_checkpoint(str(target))
     assert loaded["dir"] == str(backup)
+
+
+def test_checkpoint_rejects_wrong_dense_projection_shape(tmp_path):
+    spec = C.PRESETS["dense-tiny"]
+    params = M.build_params(spec, torch.Generator().manual_seed(4))
+    params["L0.attn.Wr"] = torch.zeros((spec.d_model + 1, spec.d_model))
+    manifest = CK.build_manifest(
+        spec.name,
+        C.arch_report(spec),
+        {},
+        CK.blank_scheduler_state(),
+        0,
+        {},
+        0,
+        [],
+        {},
+    )
+    with pytest.raises(ValueError, match="L0.attn.Wr.*expected"):
+        CK.save_checkpoint(str(tmp_path / "bad-shape"), manifest, params, {})
+
+
+def test_checkpoint_rejects_optimizer_moment_shape_mismatch(tmp_path):
+    spec = C.PRESETS["dense-tiny"]
+    params = M.build_params(spec, torch.Generator().manual_seed(5))
+    bad_state = {
+        "embed": {
+            "m": torch.zeros((spec.vocab_size, spec.d_model + 1)),
+            "v": torch.zeros((spec.vocab_size, spec.d_model + 1)),
+        }
+    }
+    manifest = CK.build_manifest(
+        spec.name,
+        C.arch_report(spec),
+        {},
+        CK.blank_scheduler_state(),
+        0,
+        {},
+        0,
+        [],
+        {},
+    )
+    with pytest.raises(ValueError, match="optimizer m shape for embed"):
+        CK.save_checkpoint(str(tmp_path / "bad-optimizer"), manifest, params, bad_state)
