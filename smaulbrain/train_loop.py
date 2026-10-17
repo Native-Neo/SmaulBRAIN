@@ -284,11 +284,25 @@ class Trainer:
                  "scores": pend["ranking"]["scores"],
                  "mutation": dict(pend["mutation"], n_exact_unperturbed=n_exact),
                  "detail": detail, "status": "committed"}
+        # Prepare the in-memory scheduler/router transition, but roll it back
+        # if the atomic Phase-B checkpoint cannot be published. The on-disk
+        # Phase-A checkpoint must remain resumable and the same Trainer instance
+        # must not be left with grown optimizer state and the old model.
+        scheduler_before_commit = sched.to_record()
+        router_state_before_commit = opt.state.get("router")
         sched.commit_event(entry)
         if fail_at == "during_commit":
             raise _Injected(fail_at)
-        self._resize_router_opt_state(cand)  # part of the committed transition
-        self._save_committed(cand, entry, new_ids)  # Phase B publish
+        self._resize_router_opt_state(cand)
+        try:
+            self._save_committed(cand, entry, new_ids)  # Phase B publish
+        except BaseException:
+            self.sched = _growth.GrowthScheduler.from_record(scheduler_before_commit)
+            if router_state_before_commit is None:
+                self.opt.state.pop("router", None)
+            else:
+                self.opt.state["router"] = router_state_before_commit
+            raise
         entry["duration_s"] = time.perf_counter() - t0
         if fail_at == "after_commit":
             raise _Injected(fail_at)
