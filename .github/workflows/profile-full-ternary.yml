@@ -9,7 +9,7 @@ on:
       - "tests/test_quant.py"
       - ".github/workflows/profile-full-ternary.yml"
   push:
-    branches: ["**"]
+    branches: ["main"]
     paths:
       - "bench.py"
       - "smaulbrain/**"
@@ -20,7 +20,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ternary-profile-${{ github.workflow }}-${{ github.ref }}
+  group: ternary-profile-${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
