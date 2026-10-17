@@ -93,15 +93,16 @@ def expert_param_count(spec: PresetSpec) -> int:
     return 2 * spec.d_model * spec.expert_hidden
 
 
-def shared_param_total(spec: PresetSpec) -> int:
-    """Non-expert trainable params of an MoE model (embed+recurrent+norms+router)."""
+def shared_param_total(spec: PresetSpec, n_experts=None) -> int:
+    """Non-expert trainable params, including the current router width."""
     d, L, V = spec.d_model, spec.n_layers, spec.vocab_size
     per_layer = 4 * d * d + 4 * d  # attention+decay+bonus+2 norms, no FFN (experts replace it)
     # each MoE layer keeps a small gate projection d*d for expert-input mixing? No:
     # channel mixing lives inside experts, so shared per-layer has no FFN params.
     embed = V * d
     final_norm = d
-    router = d * spec.n_experts_init
+    n = spec.n_experts_init if n_experts is None else int(n_experts)
+    router = d * n
     return embed + final_norm + L * per_layer + router
 
 
@@ -109,7 +110,7 @@ def whole_model_total(spec: PresetSpec, n_experts=None) -> int:
     if spec.kind == "dense":
         return dense_param_total(spec)
     n = spec.n_experts_init if n_experts is None else n_experts
-    return shared_param_total(spec) + n * expert_param_count(spec)
+    return shared_param_total(spec, n) + n * expert_param_count(spec)
 
 
 def resolve_preset(cli_preset: str, moe: bool, dense: bool) -> str:
@@ -191,7 +192,7 @@ def arch_report(spec: PresetSpec, n_experts_current=None) -> dict:
         rep["top_k"] = spec.top_k
         rep["expert_hidden"] = spec.expert_hidden
         rep["per_expert_params"] = expert_param_count(spec)
-        rep["shared_params"] = shared_param_total(spec)
+        rep["shared_params"] = shared_param_total(spec, n)
         rep["router_params"] = d * n
-        rep["total_params"] = shared_param_total(spec) + n * expert_param_count(spec)
+        rep["total_params"] = rep["shared_params"] + n * expert_param_count(spec)
     return rep
