@@ -243,7 +243,7 @@ class Model(nn.Module):
         for (eid,suffix),leaf in self._paged_leaves.items():
             target=p[f"expert.{eid}.{suffix}"]
             if leaf.grad is not None:
-                if target.grad is None: target.grad=leaf.grad.detach().clone()
+                if target.grad is None: target.grad=leaf.grad.detach()
                 else: target.grad.add_(leaf.grad.detach())
         # Keep the gradient storage itself alive through the returned dict; zero_grad(set_to_none=True) below only detaches it from parameters, so cloning every full-size gradient is unnecessary.
         grads={k:v.grad.detach() for k,v in p.items() if v.grad is not None}
