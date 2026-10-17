@@ -65,7 +65,12 @@ def main(argv=None):
     m = _model.Model(spec, params, forward_quant=args.forward_quant,
                      backward_mode=args.backward_mode, device=args.device)
     model_init_s = time.perf_counter() - init_t0
-    toks = torch.randint(0, 256, (args.seq_len,), generator=torch.Generator(device="cpu").manual_seed(1)).tolist()
+    toks = torch.randint(0, 256, (args.seq_len,),
+                         generator=torch.Generator(device="cpu").manual_seed(1)).tolist()
+    train_toks = torch.randint(
+        0, 256, (args.seq_len + 1,),
+        generator=torch.Generator(device="cpu").manual_seed(2),
+    ).tolist()
     res = {"hw": {"cpu": _cpu.detect(), "dispatch": _cpu.dispatch_name()},
            "preset": preset, "params": m.report()["total_params"],
            "seq_len": args.seq_len, "forward_quant": args.forward_quant,
@@ -116,7 +121,7 @@ def main(argv=None):
         backward_times, optimizer_times, losses = [], [], []
         for _ in range(args.steps):
             t0 = time.perf_counter()
-            loss, grads, _ = m.loss_and_backward(toks)
+            loss, grads, _ = m.loss_and_backward(train_toks)
             backward_times.append(time.perf_counter() - t0)
             losses.append(float(loss))
             res["rss_after_bwd_mb"] = rss_mb()
