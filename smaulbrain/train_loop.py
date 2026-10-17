@@ -149,7 +149,8 @@ class Trainer:
             for key, value in list(state.items()):
                 if isinstance(value, torch.Tensor):
                     state[key] = value.to(self.model.device)
-        self.opt.register(self.model.p)
+        # Missing moment state is initialized lazily by SmaulOPT on the first
+        # gradient for a parameter. Do not allocate buffers for unused experts.
         self.sched = _growth.GrowthScheduler.from_record(man["scheduler"])
         if self.spec.kind == "dense":
             if self.sched.pending is not None:
