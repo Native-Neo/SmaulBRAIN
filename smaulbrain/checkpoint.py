@@ -163,7 +163,7 @@ def load_checkpoint(ckpt_dir):
     for candidate in candidates:
         try:
             return _load_checkpoint_dir(candidate)
-        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+        except Exception as exc:
             failures.append((candidate,exc))
     details="; ".join(f"{path}: {error}" for path,error in failures)
     raise RuntimeError(f"no valid checkpoint found (primary/backup recovery failed): {details}") from failures[-1][1]
