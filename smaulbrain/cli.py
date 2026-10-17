@@ -73,7 +73,7 @@ def validate_args(args) -> str:
         raise ValueError("--paging-staging-bytes must be >= 1")
     if not math.isfinite(args.expert_capacity_factor) or args.expert_capacity_factor <= 0:
         raise ValueError("--expert-capacity-factor must be finite and > 0")
-    if need_train:
+    if hasattr(args, "max_steps"):
         if args.max_steps < 0:
             raise ValueError("--max-steps must be >= 0")
         if not args.corpus and args.synth_bytes < args.seq_len + 1:
