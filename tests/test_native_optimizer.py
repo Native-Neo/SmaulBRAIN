@@ -35,7 +35,7 @@ def test_native_factored_step_matches_torch(monkeypatch, wd):
 def test_native_factored_optimizer_declines_unsupported_weight_dtype():
     from smaulbrain import _native_opt
 
-    opt = SmaulOPT()
+    opt = smaulopt.SmaulOPT()
     w = torch.zeros((32, 32), dtype=torch.bfloat16)
     st = {
         "m": torch.zeros_like(w),
