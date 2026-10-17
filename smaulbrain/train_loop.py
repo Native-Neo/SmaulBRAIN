@@ -52,6 +52,7 @@ class Trainer:
         self.log = []
         self.last_metrics = None
         self.stop_requested = False
+        self.last_checkpoint_step = None
 
     def request_stop(self):
         """Request a graceful stop after the current optimizer update."""
@@ -104,11 +105,13 @@ class Trainer:
     def save(self, pending_phase=False):
         man, params, opt_state = self._payload()
         _ckpt.save_checkpoint(self.args.checkpoint, man, params, opt_state)
+        self.last_checkpoint_step = int(man["scheduler"]["global_step"])
         return man
 
     def load(self, ckpt_dir):
         blob = _ckpt.load_checkpoint(ckpt_dir)
         man = blob["manifest"]
+        self.last_checkpoint_step = int(man.get("scheduler", {}).get("global_step", 0))
         if man["preset"] != self.spec.name:
             raise ValueError(f"checkpoint preset {man['preset']} != {self.spec.name}")
         self.model.p = {k: v for k, v in blob["params"].items()}
