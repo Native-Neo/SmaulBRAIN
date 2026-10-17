@@ -344,8 +344,16 @@ class Trainer:
         # expert first receives a gradient; registering the entire pool here
         # would eagerly allocate buffers for every unused expert.
         if model.store is not None:
-            for nid in new_ids:
-                model.store.register_expert(nid, _expert_dict(cand, nid))
+            if model.store.mode in ("R", "V", "R2V"):
+                # ParameterList replacement creates new Parameter objects.
+                # Rebind all RAM-resident experts, not only newly grown IDs.
+                for eid in _model.expert_ids(cand):
+                    model.store.register_expert(eid, _expert_dict(cand, eid))
+            else:
+                # Existing disk mirrors were kept in sync by write_back after
+                # each optimizer step; only new expert backing files are needed.
+                for nid in new_ids:
+                    model.store.register_expert(nid, _expert_dict(cand, nid))
             model.store.n_experts = len(_model.expert_ids(cand))
             model.store.invalidate_all()
         model.packed.invalidate()
