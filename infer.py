@@ -2,6 +2,7 @@
 """SmaulBRAIN V2 inference entry point (training-independent path)."""
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -30,11 +31,11 @@ def main(argv=None):
         ap.error("--max-new-tokens must be >= 0")
     if args.prefill_chunk < 0:
         ap.error("--prefill-chunk must be >= 0")
-    if args.temperature < 0 or not __import__("math").isfinite(args.temperature):
+    if args.temperature < 0 or not math.isfinite(args.temperature):
         ap.error("--temperature must be a finite number >= 0")
     if args.top_k < 0:
         ap.error("--top-k must be >= 0")
-    if not 0 < args.top_p <= 1 or not __import__("math").isfinite(args.top_p):
+    if not 0 < args.top_p <= 1 or not math.isfinite(args.top_p):
         ap.error("--top-p must be finite and in (0, 1]")
     try:
         preset = _cli.validate_args(args)
