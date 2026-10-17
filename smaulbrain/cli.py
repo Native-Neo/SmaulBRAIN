@@ -1,5 +1,6 @@
 """Centralized CLI: every entry point uses these definitions + validation."""
 import argparse
+import math
 
 from . import config as _cfg
 
@@ -11,7 +12,7 @@ def add_common_args(ap: argparse.ArgumentParser, need_train: bool = False):
     ap.add_argument("--dense", action="store_true")
     ap.add_argument("--paging", default="R", choices=list(_cfg.PAGING_MODES))
     ap.add_argument("--paging-cache-experts", type=int, default=8)
-    ap.add_argument("--paging-staging-bytes", type=int, default=1 << 24)
+    ap.add_argument("--paging-staging-bytes", type=int, default=1 << 26)
     ap.add_argument("--forward-quant", default="fp32", choices=list(_cfg.FORWARD_QUANT_CHOICES))
     ap.add_argument("--backward-mode", default="fp32", choices=list(_cfg.BACKWARD_MODE_CHOICES))
     ap.add_argument("--device", default="cpu", help="cpu (accelerator optional, must not break CPU)")
@@ -50,8 +51,37 @@ def validate_args(args) -> str:
     if preset.startswith("dense") and (args.growth_every_steps or args.growth_loss_nats is not None):
         # Growth flags accepted but MoE growth is disabled for dense models.
         pass
+    if args.seq_len < 1:
+        raise ValueError("--seq-len must be >= 1")
+    if not math.isfinite(args.lr) or args.lr <= 0:
+        raise ValueError("--lr must be a finite number > 0")
+    if not 0 <= args.beta1 < 1 or not 0 <= args.beta2 < 1:
+        raise ValueError("--beta1 and --beta2 must be in [0, 1)")
+    if not math.isfinite(args.eps) or args.eps <= 0:
+        raise ValueError("--eps must be a finite number > 0")
+    if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
+        raise ValueError("--weight-decay must be a finite number >= 0")
+    if not math.isfinite(args.growth_loss_beta) or not 0 <= args.growth_loss_beta < 1:
+        raise ValueError("--growth-loss-beta must be finite and in [0, 1)")
+    if args.growth_min_eval_samples < 1:
+        raise ValueError("--growth-min-eval-samples must be >= 1")
+    if not math.isfinite(args.growth_noise_scale) or args.growth_noise_scale < 0:
+        raise ValueError("--growth-noise-scale must be finite and >= 0")
     if args.paging_cache_experts < 1:
         raise ValueError("--paging-cache-experts must be >= 1")
-    if args.expert_capacity_factor <= 0:
-        raise ValueError("--expert-capacity-factor must be > 0")
+    if args.paging_staging_bytes < 1:
+        raise ValueError("--paging-staging-bytes must be >= 1")
+    if not math.isfinite(args.expert_capacity_factor) or args.expert_capacity_factor <= 0:
+        raise ValueError("--expert-capacity-factor must be finite and > 0")
+    if need_train:
+        if args.max_steps < 0:
+            raise ValueError("--max-steps must be >= 0")
+        if not args.corpus and args.synth_bytes < args.seq_len + 1:
+            raise ValueError("--synth-bytes must be at least --seq-len + 1 when --corpus is not set")
+        if not math.isfinite(args.grad_clip) or args.grad_clip <= 0:
+            raise ValueError("--grad-clip must be a finite number > 0")
+        if args.log_every < 0:
+            raise ValueError("--log-every must be >= 0")
+        if args.ckpt_every < 0:
+            raise ValueError("--ckpt-every must be >= 0")
     return preset
