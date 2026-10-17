@@ -67,7 +67,7 @@ def main(argv=None):
 
     def _request_graceful_stop(signum, frame):
         if not tr.stop_requested:
-            print("\\nCtrl+C received; finishing this optimizer update, then saving checkpoint...",
+            print("\nCtrl+C received; finishing this optimizer update, then saving checkpoint...",
                   file=sys.stderr, flush=True)
         tr.request_stop()
 
