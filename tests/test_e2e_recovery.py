@@ -67,6 +67,11 @@ def test_full_growth_counts_and_mutation_shape():
     tr = _trainer("moe-tiny", ckpt, growth_every_steps=1,
                   growth_min_eval_samples=16)
     tr.train(max_steps=1)
+    # Candidate adoption replaces Parameter objects; the resident RAM store
+    # must point at the new objects for every expert, not just new IDs.
+    for eid in M.expert_ids(tr.model.p):
+        assert tr.model.store.ram_weights[eid]["Win"] is tr.model.p[f"expert.{eid}.Win"]
+        assert tr.model.store.ram_weights[eid]["Wout"] is tr.model.p[f"expert.{eid}.Wout"]
     e = tr.sched.history[0]
     assert e["prev_count"] == 32 and e["new_count"] == 34
     detail = e["detail"]
