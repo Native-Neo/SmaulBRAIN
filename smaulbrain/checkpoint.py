@@ -99,7 +99,7 @@ def save_checkpoint(target_dir,manifest,params,opt_state):
     pending=manifest.get("scheduler",{}).get("pending")
     if pending is not None and pending.get("id") in ids:raise ValueError("pending event id already committed")
     _check_consistency(manifest,params)
-    _check_optimizer_state(params,opt_state)
+    _check_optimizer_state(params,opt_state,manifest.get("optimizer", {}).get("factored"))
     return _write_tree(target_dir,manifest,params,opt_state)
 
 
@@ -181,20 +181,33 @@ def _check_consistency(manifest,params):
     arch = manifest.get("arch", {})
     if arch.get("vocab_size", spec.vocab_size) != spec.vocab_size:
         raise ValueError("manifest vocab_size disagrees with selected preset")
+    expected_report = _cfg.arch_report(spec, n if spec.kind == "moe" else None)
+    for key in ("experts_current", "router_params", "shared_params", "per_expert_params",
+                "total_params", "recurrent_state_total", "recurrent_state_bytes_fp32"):
+        if key in arch and arch[key] != expected_report.get(key):
+            raise ValueError(f"manifest {key} disagrees with parameter registry")
 
 
-
-def _check_optimizer_state(params,opt_state):
+def _check_optimizer_state(params, opt_state, factored_flags=None):
     """Reject optimizer buffers that cannot safely update the loaded tensors."""
     if not isinstance(opt_state, dict):
         raise ValueError("optimizer state must be a mapping")
+    if factored_flags is not None and not isinstance(factored_flags, dict):
+        raise ValueError("optimizer factored flags must be a mapping")
+    if factored_flags and not set(factored_flags).issubset(opt_state):
+        extra = sorted(set(factored_flags) - set(opt_state))
+        raise ValueError(f"optimizer factored flags reference missing states: {extra[:5]}")
     for name, state in opt_state.items():
         if name not in params:
             raise ValueError(f"optimizer state references missing parameter {name!r}")
         if not isinstance(state, dict):
             raise ValueError(f"optimizer state for {name} must be a mapping")
         shape = tuple(params[name].shape)
-        for slot in ("m", "v"):
+        if not isinstance(state.get("m"), torch.Tensor) or tuple(state["m"].shape) != shape:
+            value = state.get("m")
+            got = tuple(value.shape) if isinstance(value, torch.Tensor) else type(value).__name__
+            raise ValueError(f"optimizer m shape for {name} is {got}, expected {shape}")
+        for slot in ("v",):
             value = state.get(slot)
             if value is not None:
                 if not isinstance(value, torch.Tensor) or tuple(value.shape) != shape:
@@ -202,7 +215,14 @@ def _check_optimizer_state(params,opt_state):
                     raise ValueError(
                         f"optimizer {slot} shape for {name} is {got}, expected {shape}"
                     )
-        factored = "R" in state or "C" in state
+        has_r, has_c = "R" in state, "C" in state
+        if has_r != has_c:
+            raise ValueError(f"optimizer factored state for {name} must contain both R and C")
+        factored = has_r and has_c
+        if factored and "v" in state:
+            raise ValueError(f"optimizer state for {name} cannot contain both factored and full moments")
+        if not factored and "v" not in state:
+            raise ValueError(f"optimizer state for {name} is missing full moment v")
         if factored:
             if len(shape) != 2:
                 raise ValueError(f"factored optimizer state attached to non-matrix parameter {name}")
@@ -213,6 +233,14 @@ def _check_optimizer_state(params,opt_state):
                     raise ValueError(
                         f"optimizer {slot} shape for {name} is {got}, expected {expected}"
                     )
+        if factored_flags is not None and name in factored_flags:
+            flag = factored_flags[name]
+            if not isinstance(flag, bool):
+                raise ValueError(f"optimizer factored flag for {name} must be boolean")
+            if flag != factored:
+                raise ValueError(
+                    f"optimizer factored flag for {name} disagrees with saved state"
+                )
 
 
 
@@ -244,7 +272,7 @@ def _load_checkpoint_dir(ckpt_dir):
         for k,v in flat.items():name,_,sub=k.partition("::");opt_state.setdefault(name,{})[sub]=v
     params={k:(v if isinstance(v,torch.Tensor) else torch.as_tensor(v)) for k,v in params.items()}
     _check_consistency(man,params)
-    _check_optimizer_state(params,opt_state)
+    _check_optimizer_state(params,opt_state,man.get("optimizer", {}).get("factored"))
     return {"manifest":man,"params":params,"opt_state":opt_state,"dir":ckpt_dir}
 
 
