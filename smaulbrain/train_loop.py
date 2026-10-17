@@ -315,6 +315,13 @@ class Trainer:
         steps = 0
         last_saved_step = None
         while True:
+            # A SIGINT between iterations should not make us start another
+            # optimizer update. For a stop requested before the first call to
+            # train(), allow one update to finish, matching request_stop's API.
+            if self.stop_requested and steps > 0:
+                if self.sched.pending is not None:
+                    self.save()
+                break
             # Recovery transitions are not optimizer updates. Resolve a saved
             # pending growth event even when the requested global-step target
             # has already been reached; otherwise it can remain stuck forever
