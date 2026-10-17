@@ -69,7 +69,7 @@ def test_checkpoint_rejects_router_width_mismatch(tmp_path):
         {},
     )
 
-    with pytest.raises(ValueError, match="router shape disagrees"):
+    with pytest.raises(ValueError, match="checkpoint parameter router.*expected"):
         CK.save_checkpoint(str(tmp_path / "invalid"), manifest, params, {})
 
 
