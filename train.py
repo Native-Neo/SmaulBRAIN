@@ -89,7 +89,7 @@ def _apply_explicit_growth_overrides(trainer, args, argv):
 
 def main(argv=None):
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    ap = argparse.ArgumentParser(description="Train SmaulBRAIN V2 (byte-level recurrent LM)")
+    ap = argparse.ArgumentParser(description="Train SmaulBRAIN V2 (byte-level recurrent LM)", allow_abbrev=False)
     _cli.add_common_args(ap, need_train=True)
     ap.add_argument(
         "--resume", action="store_true",
