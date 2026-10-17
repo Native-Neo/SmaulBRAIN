@@ -45,6 +45,25 @@ def test_chunked_prefill_preserves_next_token_logits():
     assert model.step_inputs == [3]
 
 
+def test_successive_generate_calls_continue_after_previous_output():
+    model = _CountingModel()
+    engine = InferenceEngine(model, temperature=0.0)
+
+    assert engine.generate([40, 41], max_new_tokens=3) == [2, 3, 4]
+    assert engine.generate([], max_new_tokens=2) == [5, 6]
+    assert model.step_inputs == [2, 3, 4, 5]
+
+
+def test_partial_stream_can_be_resumed():
+    model = _CountingModel()
+    engine = InferenceEngine(model, temperature=0.0)
+    stream = engine.generate_stream([40, 41], max_new_tokens=5)
+
+    assert next(stream) == 2
+    stream.close()
+    assert engine.generate([], max_new_tokens=2) == [3, 4]
+
+
 def test_top_k_keeps_exactly_k_candidates_when_logits_are_tied():
     model = _CountingModel()
     engine = InferenceEngine(model, temperature=1.0, top_k=1, seed=0)
