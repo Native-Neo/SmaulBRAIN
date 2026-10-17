@@ -156,10 +156,17 @@ def eval_loss_on_tokens(model, tokens) -> float:
 
 
 def rank_experts(model, eval_batches, min_samples: int, max_batches=None):
-    total = sum(max(len(b) - 1, 0) for b in eval_batches)
-    if total < min_samples: return None, total
+    if min_samples < 1:
+        raise ValueError("min_samples must be >= 1")
     batches = list(eval_batches if max_batches is None else eval_batches[:max_batches])
-    if not batches: return None, total
+    # Evidence must be counted only from batches that actually contribute to
+    # the scores. Otherwise max_batches=1 can pass the threshold using tokens
+    # from ignored batches and rank experts on too little data.
+    total = sum(max(len(b) - 1, 0) for b in batches)
+    if total < min_samples:
+        return None, total
+    if not batches:
+        return None, total
     base = [eval_loss_on_tokens(model, b) for b in batches]
     from . import model as _m
     scores = {}
