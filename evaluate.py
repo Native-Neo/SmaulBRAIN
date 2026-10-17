@@ -29,16 +29,15 @@ def main(argv=None):
     blob = _ckpt.load_checkpoint(args.checkpoint)
     spec = _cfg.PRESETS[preset]
     m = _model.Model(spec, dict(blob["params"]), forward_quant=args.forward_quant,
-                     backward_mode=args.backward_mode)
+                     backward_mode=args.backward_mode, device=args.device)
     stream = (_data.ByteStream(path=args.corpus) if args.corpus
               else _data.ByteStream(data=_data.synth_bytes(args.synth_bytes, args.seed + 1)))
     batches = [stream.next_tokens(args.seq_len) for _ in range(args.eval_batches)]
     losses = [_growth.eval_loss_on_tokens(m, b) for b in batches]
-    import numpy as _np
     print(json.dumps({
         "preset": preset,
-        "nats_per_byte_mean": float(_np.mean(losses)),
-        "nats_per_byte_min": float(_np.min(losses)),
+        "nats_per_byte_mean": sum(losses) / len(losses) if losses else 0.0,
+        "nats_per_byte_min": min(losses) if losses else 0.0,
         "batches": len(batches),
     }, indent=2))
     return 0

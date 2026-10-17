@@ -52,15 +52,15 @@ def main(argv=None):
         else:
             import tempfile
             dd = tempfile.mkdtemp(prefix="smaul-infer-")
-            import numpy as _np
+            import torch
             for e in range(n_exp):
-                _np.savez(os.path.join(dd, f"expert_{e}.npz"),
-                          **{"Win": blob["params"][f"expert.{e}.Win"],
-                             "Wout": blob["params"][f"expert.{e}.Wout"]})
+                torch.save({"Win": blob["params"][f"expert.{e}.Win"].detach().cpu(),
+                            "Wout": blob["params"][f"expert.{e}.Wout"].detach().cpu()},
+                           os.path.join(dd, f"expert_{e}.pt"))
             store = _paging.ExpertStore(args.paging, n_exp, disk_dir=dd)
     m = _model.Model(spec, dict(blob["params"]), forward_quant=args.forward_quant,
                      backward_mode=args.backward_mode, paging_mode=args.paging,
-                     paging_store=store)
+                     paging_store=store, device=args.device)
     eng = _inf.InferenceEngine(m, seed=args.seed, temperature=args.temperature,
                                top_k=args.top_k, top_p=args.top_p)
     if args.prompt_file:

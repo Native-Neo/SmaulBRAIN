@@ -2,6 +2,7 @@
 import types
 
 import numpy as np
+import torch
 import pytest
 
 from smaulbrain import checkpoint as CK
@@ -73,9 +74,9 @@ def test_full_growth_counts_and_mutation_shape():
     assert len(mutated) == 2 * 2  # both tiny clones mutated, 2 tensors each
     # new experts trainable: one more step changes them
     new_keys = [f"expert.{i}.{s}" for i in e["new_ids"] for s in ("Win", "Wout")]
-    before = {k: tr.model.p[k].copy() for k in new_keys}
+    before = {k: tr.model.p[k].detach().clone() for k in new_keys}
     tr.train(max_steps=2)
-    assert any(not np.array_equal(tr.model.p[k], before[k]) for k in new_keys)
+    assert any(not torch.equal(tr.model.p[k], before[k]) for k in new_keys)
 
 
 def test_growth_mutation_full_preset_counts():
@@ -169,7 +170,7 @@ def test_prune_lifecycle_and_regrow(tmp_path):
     assert _expert_count(tr2) == 32
     assert man["arch"]["experts_current"] == 32
     logits, _ = tr2.model.forward([65, 66, 67, 68], train=False)
-    assert np.all(np.isfinite(logits))
+    assert torch.isfinite(logits).all().item()
 
 
 def test_full_lifecycle_dense_and_moe(tmp_path):

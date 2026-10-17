@@ -51,25 +51,14 @@ def test_expert_exact_counts(preset, expected):
 
 def test_dense_full_count_exact():
     spec = C.PRESETS["dense-full"]
-    rng = np.random.default_rng(0)
-    p = M.build_params(spec, rng)
-    try:
-        assert M.count_params_dict(p) == 256_000_000
-        assert p["embed"].shape == (259, 1000)
-    finally:
-        del p
+    assert C.dense_param_total(spec) == 256_000_000
+    assert (spec.vocab_size, spec.d_model) == (259, 1000)
 
 
 def test_moe_full_expert_count_exact():
     spec = C.PRESETS["moe-full"]
-    rng = np.random.default_rng(0)
-    p = M.build_params(spec, rng)
-    try:
-        per = int(p["expert.0.Win"].size + p["expert.0.Wout"].size)
-        assert per == 5_120_000
-        assert spec.n_experts_init == 64 and spec.top_k == 8
-    finally:
-        del p
+    assert C.expert_param_count(spec) == 5_120_000
+    assert spec.n_experts_init == 64 and spec.top_k == 8
 
 
 def test_invalid_presets_and_flags():

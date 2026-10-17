@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import torch
 
 from smaulbrain import config as C
 from smaulbrain import model as M
@@ -47,10 +48,10 @@ def test_supported_quant_combos_run(f, b):
     m = _tiny_moe(f, b)
     toks = [10, 20, 30, 40, 50]
     logits, _ = m.forward(toks)
-    assert np.all(np.isfinite(logits))
+    assert torch.isfinite(logits).all().item()
     loss, grads, _ = m.loss_and_backward(toks)
     assert np.isfinite(loss)
-    assert any(np.abs(g).sum() > 0 for g in grads.values())
+    assert any(g.abs().sum().item() > 0 for g in grads.values())
 
 
 def test_unsupported_combo_rejected():
@@ -91,7 +92,7 @@ def test_batch_one_packed_matmat_fast_path_matches_dense(din, dout):
     packed, scale, shape, _ = Q.pack_ternary(W)
     dense_q = Q.unpack_ternary(packed, shape, scale)
     actual = Q.packed_matmat(x, packed, shape, scale)
-    expected = x @ dense_q
+    expected = torch.from_numpy(x) @ dense_q
     assert actual.shape == (dout,)
     # Long reductions accumulate in a different order from NumPy/BLAS.
     tol = 3e-4 if din >= 512 else 2e-5
@@ -107,7 +108,7 @@ def test_moe_forward_skips_unused_diagnostic_reductions(monkeypatch):
     monkeypatch.setattr(_moe, "balance_aux_loss", forbidden)
     monkeypatch.setattr(_moe, "expert_output_stats", forbidden)
     logits, _ = m.forward([10, 20, 30], train=False)
-    assert np.all(np.isfinite(logits))
+    assert torch.isfinite(logits).all().item()
 
 
 def test_packed_matmat_and_transpose_match_dense_reference():
@@ -119,10 +120,10 @@ def test_packed_matmat_and_transpose_match_dense_reference():
     dY = rng.standard_normal((5, 32)).astype(np.float32)
     packed, scale, shape, _ = Q.pack_ternary(W)
     dense_q = Q.unpack_ternary(packed, shape, scale)
-    expected_y = X @ dense_q
-    expected_dx = dY @ dense_q.T
-    actual_y = Q.packed_matmat(X, packed, shape, scale)
-    actual_dx = Q.packed_matmat_transpose(dY, packed, shape, scale)
+    expected_y = torch.from_numpy(X) @ dense_q
+    expected_dx = torch.from_numpy(dY) @ dense_q.T
+    actual_y = Q.packed_matmat(torch.from_numpy(X), packed, shape, scale)
+    actual_dx = Q.packed_matmat_transpose(torch.from_numpy(dY), packed, shape, scale)
     assert np.allclose(actual_y, expected_y, atol=2e-5, rtol=2e-5)
     assert np.allclose(actual_dx, expected_dx, atol=2e-5, rtol=2e-5)
 
@@ -136,10 +137,10 @@ def test_model_ternary_path_never_unpacks_dense_weights(monkeypatch):
 
     monkeypatch.setattr(Q, "unpack_codes", forbidden)
     logits, _ = m.forward(toks, train=False)
-    assert np.all(np.isfinite(logits))
+    assert torch.isfinite(logits).all().item()
     loss, grads, _ = m.loss_and_backward(toks)
     assert np.isfinite(loss)
-    assert all(np.all(np.isfinite(g)) for g in grads.values())
+    assert all(torch.isfinite(g).all().item() for g in grads.values())
 
 
 def _legacy_fp8_scalar_reference(W, scale=None):
@@ -193,19 +194,19 @@ def test_fp8_auto_scale_ignores_nonfinite_values():
     W = np.array([1.0, -3.0, np.nan, np.inf, -np.inf], dtype=np.float32)
     Wq, scale = Q.fp8_e4m3_quantize(W)
     assert np.isfinite(scale) and scale > 0
-    assert np.isfinite(Wq[0]) and np.isfinite(Wq[1])
-    assert np.isnan(Wq[2])
-    assert np.isposinf(Wq[3])
-    assert np.isneginf(Wq[4])
+    assert torch.isfinite(Wq[:2]).all().item()
+    assert torch.isnan(Wq[2]).item()
+    assert torch.isposinf(Wq[3]).item()
+    assert torch.isneginf(Wq[4]).item()
 
 
 def test_fp8_format_properties():
     W = np.array([0.0, 1.0, -1.0, 1000.0, -1000.0, np.nan], dtype=np.float32)
     Wq, scale = Q.fp8_e4m3_quantize(W)
     assert scale > 0
-    assert abs(float(Wq[1]) - 1.0) / 1.0 < 0.1  # small values near-exact
-    assert abs(float(Wq[3])) <= Q.FP8_E4M3_MAX * float(scale) + 1e-6  # saturation
-    assert np.isnan(Wq[5])  # exceptional values preserved
+    assert abs(float(Wq[1].item()) - 1.0) / 1.0 < 0.1  # small values near-exact
+    assert abs(float(Wq[3].item())) <= Q.FP8_E4M3_MAX * float(scale) + 1e-6  # saturation
+    assert torch.isnan(Wq[5]).item()  # exceptional values preserved
     assert Q.fp8_error_bound(float(scale)) >= 0
 
 

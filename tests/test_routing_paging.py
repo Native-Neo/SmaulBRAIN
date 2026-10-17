@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import torch
 
 from smaulbrain import moe as MOE
 from smaulbrain import paging as P
@@ -55,17 +56,17 @@ def test_router_gradient_finite_difference():
     dW = rng.standard_normal(w.shape).astype(np.float32)
     dX, dR = r.backward(dW, cache)
     eps = 1e-3
-    num = np.zeros_like(r.W)
+    num = np.zeros(tuple(r.W.shape), dtype=np.float32)
     for i in range(r.W.shape[0]):
         for j in range(r.W.shape[1]):
-            W0 = r.W.copy()
-            r.W[i, j] = W0[i, j] + eps
+            W0 = r.W.detach().clone()
+            with torch.no_grad(): r.W[i, j] = W0[i, j] + eps
             _, w1, _, _ = r.route(X, top_k=2, capacity_factor=99.0)
-            r.W[i, j] = W0[i, j] - eps
+            with torch.no_grad(): r.W[i, j] = W0[i, j] - eps
             _, w0, _, _ = r.route(X, top_k=2, capacity_factor=99.0)
-            r.W[:] = W0
-            num[i, j] = float(np.sum((w1 - w0) * dW) / (2 * eps))
-    assert np.allclose(dR, num, atol=5e-2)
+            with torch.no_grad(): r.W.copy_(W0)
+            num[i, j] = float(((w1 - w0) * torch.from_numpy(dW)).sum() / (2 * eps))
+    assert np.allclose(dR.numpy(), num, atol=5e-2)
 
 
 def test_paging_r_and_d2r():
@@ -76,19 +77,17 @@ def test_paging_r_and_d2r():
 
 
 def test_paging_d2r_eviction_and_accounting(tmp_path):
-    import numpy as _np
+    import os
     dd = str(tmp_path)
     for e in range(3):
-        _np.savez(f"{dd}/expert_{e}.npz", Win=_np.ones((2, 2), dtype=_np.float32),
-                  Wout=_np.ones((2, 2), dtype=_np.float32))
+        torch.save({"Win": torch.ones((2, 2)), "Wout": torch.ones((2, 2))}, os.path.join(dd, f"expert_{e}.pt"))
     s = P.ExpertStore("D2R", 3, disk_dir=dd, ram_cache_max_experts=1)
     s.get(0); s.get(1); s.get(0)
     st = s.stats()
     assert st["misses"] == 3 and st["hits"] == 0
     assert st["evictions"] >= 1 and st["bytes_transferred"] > 0
-    s.write_back(0, {"Win": _np.zeros((2, 2), dtype=_np.float32),
-                     "Wout": _np.zeros((2, 2), dtype=_np.float32)})
-    assert s.get(0)["Win"].sum() == 0  # cache invalidated, reloaded fresh
+    s.write_back(0, {"Win": torch.zeros((2, 2)), "Wout": torch.zeros((2, 2))})
+    assert s.get(0)["Win"].sum().item() == 0  # cache invalidated, reloaded fresh
 
 
 def test_paging_v_modes_error_without_backend():

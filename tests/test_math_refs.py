@@ -82,7 +82,7 @@ def test_chunked_and_restored_state_equivalence():
     assert np.allclose(np.concatenate(outs), Ofull, atol=1e-5)
     # restored state: recompute suffix from serialized mid-state
     _, (smid, _) = attn.forward(X[:4])
-    O2, _ = attn.forward(X[4:], s0=smid.copy())
+    O2, _ = attn.forward(X[4:], s0=smid.clone())
     assert np.allclose(O2, Ofull[4:], atol=1e-5)
 
 

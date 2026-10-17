@@ -1,5 +1,6 @@
 """Streaming byte-level dataset: never requires the corpus in RAM."""
 import os
+import torch
 
 
 class ByteStream:
@@ -62,10 +63,11 @@ class ByteStream:
 
 
 def synth_bytes(n: int, seed: int, period: int = 64) -> bytes:
-    rng = __import__("numpy").random.default_rng(seed)
+    rng = torch.Generator().manual_seed(int(seed))
     base = bytes((i * 37 + 11) % 251 + 2 for i in range(period))
     out = bytearray()
     while len(out) < n:
-        out += base
-        out += rng.integers(0, 256, size=period // 4).astype("uint8").tobytes()
+        out.extend(base)
+        noise = torch.randint(0, 256, (max(1, period // 4),), generator=rng, dtype=torch.uint8)
+        out.extend(noise.tolist())
     return bytes(out[:n])

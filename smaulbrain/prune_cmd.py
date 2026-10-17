@@ -1,5 +1,5 @@
 """Evidence-based expert pruning with atomic checkpoint replacement."""
-import numpy as np
+import torch
 
 from . import checkpoint as _ckpt
 from . import growth as _growth
@@ -54,7 +54,7 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
             new_params[f"expert.{remap[old]}.{suffix}"] = params[f"expert.{old}.{suffix}"]
     # shrink router rows? router is d x E: drop pruned columns
     R = params["router"]
-    new_params["router"] = R[:, keep].copy()
+    new_params["router"] = R[:, keep].clone()
     # optimizer state: drop pruned experts, rebuild router entry
     opt_state = blob["opt_state"]
     new_opt = {k: v for k, v in opt_state.items()
@@ -82,6 +82,6 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
     blob2 = _ckpt.load_checkpoint(ckpt_dir)
     m2 = _model.Model(spec, blob2["params"])
     logits, _ = m2.forward([65, 66, 67, 68], train=False)
-    if not np.all(np.isfinite(logits)):
+    if not torch.isfinite(logits).all().item():
         raise RuntimeError("pruned model failed validation")
     return report

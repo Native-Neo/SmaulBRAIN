@@ -9,8 +9,8 @@ After each successful optimizer update, in order:
 """
 import os
 import time
-
-import numpy as np
+import math
+import torch
 
 from . import checkpoint as _ckpt
 from . import config as _cfg
@@ -30,24 +30,23 @@ class Trainer:
         self.args = args
         self.stream = stream
         self.eval_stream = eval_stream
-        self.rng = np.random.default_rng(args.seed)
+        self.rng = torch.Generator(device="cpu").manual_seed(int(args.seed))
         n_exp = spec.n_experts_init if spec.kind == "moe" else 0
-        params = _model.build_params(spec, self.rng, n_exp)
-        store = None
-        if spec.kind == "moe":
-            store = self._make_store(args.paging, n_exp, params, None)
+        params = _model.build_params(spec, self.rng, n_exp, device=getattr(args, "device", "cpu"))
         self.model = _model.Model(spec, params, forward_quant=args.forward_quant,
-                                  backward_mode=args.backward_mode,
-                                  paging_mode=args.paging,
-                                  paging_store=store,
-                                  capacity_factor=args.expert_capacity_factor)
+                                  backward_mode=args.backward_mode, paging_mode=args.paging,
+                                  paging_store=None, capacity_factor=args.expert_capacity_factor,
+                                  device=getattr(args, "device", "cpu"))
+        if spec.kind == "moe":
+            self.model.store = self._make_store(args.paging, n_exp, self.model.p, None)
         self.opt = _opt.SmaulOPT(lr=args.lr, beta1=args.beta1, beta2=args.beta2,
                                  eps=args.eps, weight_decay=args.weight_decay)
-        self.opt.register(params)
+        self.opt.register(self.model.p)
         self.sched = _growth.GrowthScheduler(
             every_steps=args.growth_every_steps, loss_nats=args.growth_loss_nats,
             loss_beta=args.growth_loss_beta, min_eval_samples=args.growth_min_eval_samples)
         self.log = []
+        self.last_metrics = None
 
     def _live_experts_dir(self) -> str:
         # Live per-expert disk mirrors are transient and must not live inside
@@ -62,7 +61,7 @@ class Trainer:
         os.makedirs(dd, exist_ok=True)
         for e in range(n_exp):
             w = _expert_dict(params, e)
-            np.savez(os.path.join(dd, f"expert_{e}.npz"), **w)
+            torch.save({k:v.detach().cpu() for k,v in w.items()}, os.path.join(dd, f"expert_{e}.pt"))
         return _paging.ExpertStore(mode, n_exp, disk_dir=dd,
                                    ram_cache_max_experts=self.args.paging_cache_experts,
                                    staging_max_bytes=self.args.paging_staging_bytes)
@@ -79,7 +78,7 @@ class Trainer:
                  "capacity_factor": self.model.capacity_factor}
         man = _ckpt.build_manifest(
             spec.name, arch, extra, self.sched.to_record(),
-            self.stream.cursor, {"bit_generator": self.rng.bit_generator.state},
+            self.stream.cursor, {"torch_state": self.rng.get_state().tolist()},
             n_exp, list(range(n_exp)),
             {"class": "SmaulOPT", "lr": self.opt.lr, "beta1": self.opt.beta1,
              "beta2": self.opt.beta2, "eps": self.opt.eps,
@@ -87,19 +86,13 @@ class Trainer:
         # Checkpoint writing is synchronous, so the serializer can read live
         # arrays directly. Avoid duplicating the entire parameter dict and the
         # optimizer's potentially multi-gigabyte moment tensors before writing.
-        opt_state = {
-            k: {sk: sv for sk, sv in state.items() if not isinstance(sv, bool)}
-            for k, state in self.opt.state.items()
-        }
-        opt_state["_factored_flags"] = {
-            k: np.asarray([state["factored"]]) for k, state in self.opt.state.items()
-        }
+        opt_state = {k: {sk: sv for sk, sv in state.items() if sk != "factored"}
+                     for k, state in self.opt.state.items()}
+        man["optimizer"]["factored"] = {k: bool(state["factored"]) for k,state in self.opt.state.items()}
         return man, self.model.p, opt_state
 
     def save(self, pending_phase=False):
         man, params, opt_state = self._payload()
-        flags = opt_state.pop("_factored_flags")
-        man["optimizer"]["factored"] = {k: bool(v[0]) for k, v in flags.items()}
         _ckpt.save_checkpoint(self.args.checkpoint, man, params, opt_state)
         return man
 
@@ -113,9 +106,16 @@ class Trainer:
         self.model.fp8.invalidate()
         flags = man.get("optimizer", {}).get("factored", {})
         self.opt.load_state_dict(blob["opt_state"], flags)
+        for state in self.opt.state.values():
+            for key,value in list(state.items()):
+                if isinstance(value, torch.Tensor): state[key] = value.to(self.model.device)
         self.opt.register(self.model.p)
         self.sched = _growth.GrowthScheduler.from_record(man["scheduler"])
-        self.rng.bit_generator.state = man["rng_state"]["bit_generator"]
+        rng_state = man.get("rng_state", {})
+        if "torch_state" in rng_state:
+            self.rng.set_state(torch.tensor(rng_state["torch_state"], dtype=torch.uint8))
+        # Legacy NumPy RNG state is intentionally not replayed; resumed model and optimizer
+        # tensors are exact, while newly introduced random experts use their recorded seed.
         self.stream.load_state_dict({"cursor": man["data_cursor"], "path": self.stream.path,
                                      "size": self.stream.size})
         # rebuild paging store
@@ -128,7 +128,8 @@ class Trainer:
                 dd = self._live_experts_dir()
                 os.makedirs(dd, exist_ok=True)
                 for e in range(n_exp):
-                    np.savez(os.path.join(dd, f"expert_{e}.npz"), **_expert_dict(self.model.p, e))
+                    torch.save({k:v.detach().cpu() for k,v in _expert_dict(self.model.p, e).items()},
+                               os.path.join(dd, f"expert_{e}.pt"))
                 self.model.store = _paging.ExpertStore(
                     self.args.paging, n_exp, disk_dir=dd,
                     ram_cache_max_experts=self.args.paging_cache_experts,
@@ -214,7 +215,7 @@ class Trainer:
                              capacity_factor=self.model.capacity_factor)
         toks = self._eval_batches(n_batches=1)[0]
         logits, _ = probe.forward(toks, train=False)
-        if not np.all(np.isfinite(logits)):
+        if not torch.isfinite(logits).all().item():
             raise RuntimeError("candidate validation failed: non-finite logits")
         _loss, _grads, _ = probe.loss_and_backward(toks)
         if fail_at == "during_optinit":
@@ -251,7 +252,7 @@ class Trainer:
                  "seq_len": self.args.seq_len, "capacity_factor": model.capacity_factor}
         man = _ckpt.build_manifest(
             self.spec.name, arch, extra, sched.to_record(), self.stream.cursor,
-            {"bit_generator": self.rng.bit_generator.state}, n_exp, list(range(n_exp)),
+            {"torch_state": self.rng.get_state().tolist()}, n_exp, list(range(n_exp)),
             {"class": "SmaulOPT", "lr": opt.lr, "beta1": opt.beta1, "beta2": opt.beta2,
              "eps": opt.eps, "weight_decay": opt.weight_decay,
              "factored": {k: bool(s["factored"]) for k, s in opt.state.items()}})
@@ -263,19 +264,17 @@ class Trainer:
         _ckpt.save_checkpoint(self.args.checkpoint, man, cand, opt_state)
 
     def _resize_router_opt_state(self, cand):
-        import numpy as _np
         opt = self.opt
         old = opt.state.get("router")
         new_router = cand["router"]
         if old is None:
             return
         old_cols = int(old["m"].shape[1])
-        new_m = _np.zeros_like(new_router)
+        new_m = torch.zeros_like(new_router)
         new_m[:, :old_cols] = old["m"]
-        new_C = _np.zeros(new_router.shape[1], dtype=_np.float32)
+        new_C = torch.zeros(new_router.shape[1], dtype=new_router.dtype, device=new_router.device)
         new_C[:old_cols] = old["C"]
-        opt.state["router"] = {"m": new_m, "R": old["R"].copy(), "C": new_C,
-                               "factored": True}
+        opt.state["router"] = {"m": new_m, "R": old["R"].clone(), "C": new_C, "factored": True}
 
     def _adopt_candidate(self, cand, new_ids):
         model, opt = self.model, self.opt
@@ -302,17 +301,16 @@ class Trainer:
                 continue
             toks = self.stream.next_tokens(self.args.seq_len)
             loss, grads, info = self.model.loss_and_backward(toks)
-            if not np.isfinite(loss):
+            if not math.isfinite(loss):
                 raise RuntimeError(f"non-finite loss at step {self.sched.global_step}")
             # gradient clipping (global norm)
-            total_sq = sum(float(np.sum(g * g, dtype=np.float64))
-                           for g in grads.values())
-            total = float(np.sqrt(total_sq))
-            if not np.isfinite(total):
+            total_sq = sum(float(g.detach().double().square().sum().item()) for g in grads.values())
+            total = math.sqrt(total_sq)
+            if not math.isfinite(total):
                 raise RuntimeError(f"non-finite gradient norm at step {self.sched.global_step}")
             if total > grad_clip and total > 0:
                 scale = grad_clip / total
-                grads = {k: (g * scale).astype(np.float32) for k, g in grads.items()}
+                grads = {k: g * scale for k, g in grads.items()}
             # Training never consumes per-parameter update norms; skip their
             # extra full-array reductions unless an explicit caller requests them.
             self.opt.step(self.model.p, grads, collect_norms=False)
@@ -330,6 +328,9 @@ class Trainer:
                     self.model.store.write_back(eid, _expert_dict(self.model.p, eid))
             # 1-4: step counter, smoothing, triggers, single pending creation
             reason = self.sched.note_optimizer_step(loss)
+            self.last_metrics = {"step": self.sched.global_step, "loss": float(loss),
+                                 "smooth_loss": self.sched.smooth_loss,
+                                 "overflow_dropped": int(info.get("overflow_dropped", 0))}
             if reason is not None and self.sched.pending is None:
                 if self.spec.kind != "moe":
                     self.log.append({"event": "growth-skipped-dense",

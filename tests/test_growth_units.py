@@ -78,5 +78,5 @@ def test_gaussian_mutation_exactness_and_seed():
     p3 = dict(params)
     G.clone_with_mutation(p3, [0], [2], 0.01, seed=7, n_exact_unperturbed=1)
     assert np.array_equal(p3["expert.2.Win"], W)  # exact unperturbed copy
-    diff = p1["expert.1.Win"].astype(float) - W.astype(float)
+    diff = p1["expert.1.Win"].double().numpy() - W.astype(float)
     assert abs(diff.mean()) < 0.2 and diff.std() > 0  # zero-mean additive noise

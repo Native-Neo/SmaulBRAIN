@@ -9,6 +9,9 @@ import json
 import os
 import sys
 import time
+import statistics
+
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -54,14 +57,13 @@ def main(argv=None):
     if spec.name in ("dense-full", "moe-full"):
         print("note: full presets are memory-heavy; running forward-only micro-bench",
               file=sys.stderr)
-    import numpy as _np
     init_t0 = time.perf_counter()
-    rng = _np.random.default_rng(args.seed)
-    params = _model.build_params(spec, rng)
+    rng = torch.Generator(device="cpu").manual_seed(args.seed)
+    params = _model.build_params(spec, rng, device=args.device)
     m = _model.Model(spec, params, forward_quant=args.forward_quant,
-                     backward_mode=args.backward_mode)
+                     backward_mode=args.backward_mode, device=args.device)
     model_init_s = time.perf_counter() - init_t0
-    toks = list(_np.random.default_rng(1).integers(0, 256, size=args.seq_len))
+    toks = torch.randint(0, 256, (args.seq_len,), generator=torch.Generator(device="cpu").manual_seed(1)).tolist()
     res = {"hw": {"cpu": _cpu.detect(), "dispatch": _cpu.dispatch_name()},
            "preset": preset, "params": m.report()["total_params"],
            "seq_len": args.seq_len, "forward_quant": args.forward_quant,
@@ -78,11 +80,11 @@ def main(argv=None):
         t0 = time.perf_counter()
         m.forward(toks)
         warm_times.append(time.perf_counter() - t0)
-    res["warm_forward_s"] = float(_np.median(warm_times))
+    res["warm_forward_s"] = float(statistics.median(warm_times))
     res["warm_forward_samples_s"] = warm_times
     res["packed_cache_builds"] = m.packed.builds
     res["packed_cache_hits"] = m.packed.reuse_hits
-    res["packed_cache_bytes"] = int(sum(v["packed"].nbytes for v in m.packed.d.values()))
+    res["packed_cache_bytes"] = int(sum(v["packed"].nbytes if hasattr(v["packed"], "nbytes") else v["packed"].numel() * v["packed"].element_size() for v in m.packed.d.values()))
 
     # Measure inference before the optimizer mutates parameters, so the
     # quantized cache always matches the weights being benchmarked.
@@ -99,9 +101,9 @@ def main(argv=None):
         t2 = time.perf_counter()
         prefill_times.append(t1 - t0)
         decode_rates.append(n / max(t2 - t1, 1e-9))
-    res["prefill_s"] = float(_np.median(prefill_times))
+    res["prefill_s"] = float(statistics.median(prefill_times))
     res["prefill_samples_s"] = prefill_times
-    res["decode_tokens_per_s"] = float(_np.median(decode_rates))
+    res["decode_tokens_per_s"] = float(statistics.median(decode_rates))
     res["decode_tokens_per_s_samples"] = decode_rates
     res["recurrent_state_bytes"] = spec.n_layers * spec.d_model * 4
 
@@ -113,9 +115,9 @@ def main(argv=None):
         res["rss_after_bwd_mb"] = rss_mb()
         from smaulbrain import smaulopt as _opt
         opt = _opt.SmaulOPT()
-        opt.register(params)
+        opt.register(m.p)
         t0 = time.perf_counter()
-        opt.step(params, grads)
+        opt.step(m.p, grads)
         res["opt_step_s"] = time.perf_counter() - t0
     print(json.dumps(res, indent=2))
     if args.out:

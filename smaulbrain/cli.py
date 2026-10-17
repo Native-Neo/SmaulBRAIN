@@ -17,7 +17,7 @@ def add_common_args(ap: argparse.ArgumentParser, need_train: bool = False):
     ap.add_argument("--device", default="cpu", help="cpu (accelerator optional, must not break CPU)")
     ap.add_argument("--checkpoint", default="checkpoints/run")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--seq-len", type=int, default=64)
+    ap.add_argument("--seq-len", type=int, default=2048)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--beta1", type=float, default=0.9)
     ap.add_argument("--beta2", type=float, default=0.98)

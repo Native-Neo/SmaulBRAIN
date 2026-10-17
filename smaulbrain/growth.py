@@ -17,13 +17,19 @@ Deterministic tie-break by expert id. Usage counts are reported but never
 the ranking key.
 """
 import time
-
-import numpy as np
+import math
+import torch
 
 from . import config as _cfg
 
 GROWTH_FULL_ADD = 8
 GROWTH_TINY_ADD = 2
+
+def _add_count_for(spec):
+    return GROWTH_FULL_ADD if spec.name == "moe-full" else GROWTH_TINY_ADD
+
+def _as_torch(value):
+    return value if isinstance(value, torch.Tensor) else torch.as_tensor(value, dtype=torch.float32)
 
 
 class GrowthScheduler:
@@ -79,7 +85,7 @@ class GrowthScheduler:
     def note_optimizer_step(self, loss_nats):
         """Update smoothing + evaluate triggers. Returns reason or None."""
         self.global_step += 1
-        if loss_nats is not None and np.isfinite(loss_nats):
+        if loss_nats is not None and math.isfinite(loss_nats):
             b = self.loss_beta
             self.smooth_loss = (float(loss_nats) if self.smooth_loss is None
                                 else b * self.smooth_loss + (1 - b) * float(loss_nats))
@@ -87,12 +93,12 @@ class GrowthScheduler:
                     and self.global_step >= self.next_periodic_step)
         loss_due = False
         if (self.loss_threshold is not None and self.loss_armed
-                and self.smooth_loss is not None and np.isfinite(self.smooth_loss)):
+                and self.smooth_loss is not None and math.isfinite(self.smooth_loss)):
             if self.smooth_loss <= float(self.loss_threshold):
                 loss_due = True
         # rearm: loss strictly above threshold re-arms for a future crossing
         if (self.loss_threshold is not None and not self.loss_armed
-                and self.smooth_loss is not None and np.isfinite(self.smooth_loss)
+                and self.smooth_loss is not None and math.isfinite(self.smooth_loss)
                 and self.smooth_loss > float(self.loss_threshold)):
             self.loss_armed = True
         if step_due and loss_due:
@@ -143,121 +149,76 @@ class GrowthScheduler:
 
 def eval_loss_on_tokens(model, tokens) -> float:
     logits, _ = model.forward(tokens, train=False)
-    inp = np.asarray(tokens[:-1])
-    tgt = np.asarray(tokens[1:])
-    m = logits[:-1].max(axis=1, keepdims=True)
-    logsum = m + np.log(np.exp(logits[:-1] - m).sum(axis=1, keepdims=True))
-    nll = logsum.squeeze(1) - logits[:-1][np.arange(len(tgt)), tgt]
-    return float(nll.mean())
+    tgt = torch.as_tensor(tokens[1:], dtype=torch.long, device=logits.device)
+    return float(torch.nn.functional.cross_entropy(logits[:-1], tgt).item())
 
 
 def rank_experts(model, eval_batches, min_samples: int, max_batches=None):
-    """Return expert ablation deltas and evidence count.
-
-    max_batches limits the batches used to score ablations. The full supplied
-    sample count still gates whether a ranking event has enough evidence, but
-    limiting score batches is approximate: expert ordering may differ from a
-    multi-batch estimate. None retains the exact all-batches reference behavior.
-    """
     total = sum(max(len(b) - 1, 0) for b in eval_batches)
-    if total < min_samples:
-        return None, total
-    score_batches = list(eval_batches if max_batches is None else eval_batches[:max_batches])
-    if not score_batches:
-        return None, total
-    base_losses = [eval_loss_on_tokens(model, b) for b in score_batches]
+    if total < min_samples: return None, total
+    batches = list(eval_batches if max_batches is None else eval_batches[:max_batches])
+    if not batches: return None, total
+    base = [eval_loss_on_tokens(model, b) for b in batches]
     from . import model as _m
-    eids = _m.expert_ids(model.p)
     scores = {}
-    for eid in eids:
-        masked = []
-        for b in score_batches:
-            logits, _ = model.forward(b, train=False, disabled=(eid,))
-            tgt = np.asarray(b[1:])
-            lg = logits[:-1]
-            m = lg.max(axis=1, keepdims=True)
-            ls = m + np.log(np.exp(lg - m).sum(axis=1, keepdims=True))
-            masked.append(float((ls.squeeze(1) - lg[np.arange(len(tgt)), tgt]).mean()))
-        scores[eid] = float(np.mean(masked) - np.mean(base_losses))
+    for eid in _m.expert_ids(model.p):
+        masked = [eval_loss_on_tokens_disabled(model, b, eid) for b in batches]
+        scores[eid] = float(sum(masked) / len(masked) - sum(base) / len(base))
     return scores, total
 
 
-# ---------------- growth transaction ----------------
-
-def _add_count_for(spec) -> int:
-    return GROWTH_FULL_ADD if spec.name == "moe-full" else GROWTH_TINY_ADD
+def eval_loss_on_tokens_disabled(model, tokens, disabled):
+    logits, _ = model.forward(tokens, train=False, disabled=(disabled,))
+    tgt = torch.as_tensor(tokens[1:], dtype=torch.long, device=logits.device)
+    return float(torch.nn.functional.cross_entropy(logits[:-1], tgt).item())
 
 
 def prepare_sources(scores: dict, n_needed: int):
     order = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
-    if len(order) < n_needed:
-        return None
-    # require finite scores; unreliable (NaN) sources block the event
-    if any(not np.isfinite(s) for _, s in order[:n_needed]):
-        return None
+    if len(order) < n_needed or any(not math.isfinite(float(s)) for _, s in order[:n_needed]): return None
     return [eid for eid, _ in order[:n_needed]]
 
 
-def clone_with_mutation(params: dict, sources: list, new_ids: list,
-                        noise_scale: float, seed: int, n_exact_unperturbed: int):
-    """Element-wise additive Gaussian mutation. First `n_exact_unperturbed`
-    clones (of the best-ranked sources) are exact copies."""
-    rng = np.random.default_rng(seed)
-    detail = []
+def clone_with_mutation(params: dict, sources: list, new_ids: list, noise_scale: float, seed: int, n_exact_unperturbed: int):
+    rng = torch.Generator(device="cpu").manual_seed(int(seed)); detail = []
     for rank, (src, new) in enumerate(zip(sources, new_ids)):
         for suffix in ("Win", "Wout"):
-            skey, nkey = f"expert.{src}.{suffix}", f"expert.{new}.{suffix}"
-            W = params[skey]
+            skey, nkey = f"expert.{src}.{suffix}", f"expert.{new}.{suffix}"; W = _as_torch(params[skey])
             if rank < n_exact_unperturbed:
-                params[nkey] = W.copy()
-                detail.append({"expert": new, "source": src, "tensor": suffix,
-                               "mutated": False})
+                params[nkey] = W.detach().clone()
+                detail.append({"expert":new,"source":src,"tensor":suffix,"mutated":False})
             else:
-                rms = float(np.sqrt(np.mean(W.astype(np.float64) ** 2)))
+                rms = float(W.detach().double().square().mean().sqrt().item())
                 sigma = noise_scale * (rms if rms > 0 else 1.0)
-                eps = rng.standard_normal(W.shape).astype(np.float64) * sigma
-                params[nkey] = (W.astype(np.float64) + eps).astype(np.float32)
-                detail.append({"expert": new, "source": src, "tensor": suffix,
-                               "mutated": True, "sigma": sigma})
+                noise = torch.randn(tuple(W.shape), generator=rng, dtype=W.dtype).to(W.device)
+                params[nkey] = W.detach() + noise * sigma
+                detail.append({"expert":new,"source":src,"tensor":suffix,"mutated":True,"sigma":sigma})
     return detail
 
 
-def grow_candidate(params: dict, router_W: np.ndarray, sources: list, new_ids: list,
-                   noise_scale: float, seed: int, n_exact_unperturbed: int,
-                   fail_at=None):
-    """Build grown params + grown router in isolated candidate dicts."""
-    if fail_at == "during_clone":
-        raise RuntimeError("injected failure during_clone")
-    cand = {k: v.copy() for k, v in params.items()}
-    if fail_at == "during_mutate":
-        raise RuntimeError("injected failure during_mutate")
-    detail = clone_with_mutation(cand, sources, new_ids, noise_scale, seed,
-                                 n_exact_unperturbed)
-    rng = np.random.default_rng(seed + 999)
-    old_e = router_W.shape[1]
-    new_e = old_e + len(new_ids)
-    new_router = np.empty((router_W.shape[0], new_e), dtype=np.float32)
-    new_router[:, :old_e] = router_W
-    for i, src in enumerate(sources):
-        col = router_W[:, src].astype(np.float64)
-        col_rms = float(np.sqrt(np.mean(col ** 2)))
-        pert = rng.standard_normal(col.shape) * (0.01 * (col_rms or 1.0))
-        new_router[:, old_e + i] = (col + pert).astype(np.float32)
-    cand["router"] = new_router
-    return cand, detail
+def grow_candidate(params: dict, router_W, sources: list, new_ids: list, noise_scale: float, seed: int,
+                   n_exact_unperturbed: int, fail_at=None):
+    if fail_at == "during_clone": raise RuntimeError("injected failure during_clone")
+    cand = {k:_as_torch(v).detach().clone() for k,v in params.items()}
+    router_W = _as_torch(router_W)
+    if fail_at == "during_mutate": raise RuntimeError("injected failure during_mutate")
+    detail = clone_with_mutation(cand,sources,new_ids,noise_scale,seed,n_exact_unperturbed)
+    rng = torch.Generator(device="cpu").manual_seed(int(seed)+999); old_e=router_W.shape[1]; new_e=old_e+len(new_ids)
+    router=torch.empty((router_W.shape[0],new_e),dtype=router_W.dtype,device=router_W.device)
+    router[:,:old_e]=router_W.detach()
+    for i,src in enumerate(sources):
+        col=router_W[:,src].detach(); rms=float(col.double().square().mean().sqrt().item())
+        noise=torch.randn(tuple(col.shape), generator=rng, dtype=col.dtype).to(col.device)
+        router[:,old_e+i]=col+noise*(0.01*(rms or 1.0))
+    cand["router"]=router
+    return cand,detail
 
 
-def validate_candidate(spec, cand_params, opt_names) -> None:
-    from . import model as _m
-    eids = sorted(int(k.split(".")[1]) for k in cand_params if k.endswith(".Win"))
-    if eids != list(range(len(eids))):
-        raise ValueError("candidate expert registry not dense")
+def validate_candidate(spec,cand_params,opt_names) -> None:
+    eids=sorted(int(k.split(".")[1]) for k in cand_params if k.endswith(".Win"))
+    if eids != list(range(len(eids))): raise ValueError("candidate expert registry not dense")
     for eid in eids:
-        n = int(cand_params[f"expert.{eid}.Win"].size + cand_params[f"expert.{eid}.Wout"].size)
-        if n != _cfg.EXPECTED_EXPERT_PARAMS[spec.name]:
-            raise ValueError(f"candidate expert {eid} has {n} params")
-    r = cand_params["router"]
-    if r.shape[1] != len(eids):
-        raise ValueError("candidate router width disagrees with registry")
-    if not all(np.all(np.isfinite(cand_params[k])) for k in cand_params):
-        raise ValueError("candidate contains non-finite values")
+        n=cand_params[f"expert.{eid}.Win"].numel()+cand_params[f"expert.{eid}.Wout"].numel()
+        if n != _cfg.EXPECTED_EXPERT_PARAMS[spec.name]: raise ValueError(f"candidate expert {eid} has {n} params")
+    if cand_params["router"].shape[1] != len(eids): raise ValueError("candidate router width disagrees with registry")
+    if not all(torch.isfinite(v).all().item() for v in cand_params.values()): raise ValueError("candidate contains non-finite values")

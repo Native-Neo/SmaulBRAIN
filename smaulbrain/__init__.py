@@ -1,3 +1,3 @@
 """SmaulBRAIN V2 package."""
-__version__ = "2.0.0"
-CHECKPOINT_VERSION = "smaulbrain-v2:1"
+__version__ = "3.0.0"
+CHECKPOINT_VERSION = "smaulbrain-pytorch-v1:1"
