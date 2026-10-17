@@ -11,7 +11,7 @@ def accelerator_available():
 
 
 class ExpertStore:
-    def __init__(self,mode,n_experts,ram_weights=None,disk_dir=None,ram_cache_max_experts=8,staging_max_bytes=1<<24):
+    def __init__(self,mode,n_experts,ram_weights=None,disk_dir=None,ram_cache_max_experts=8,staging_max_bytes=1<<26):
         if mode not in ("R","V","D2R","D2V","R2V"):raise ValueError(f"unknown paging mode {mode!r}")
         self.mode=mode;self.n_experts=n_experts;self.ram_weights=ram_weights or {};self.disk_dir=disk_dir
         self.ram_cache_max_experts=int(ram_cache_max_experts);self.staging_max_bytes=int(staging_max_bytes)
