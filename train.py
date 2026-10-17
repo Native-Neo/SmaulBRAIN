@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import signal
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -34,12 +35,14 @@ def main(argv=None):
     else:
         stream = _data.ByteStream(data=_data.synth_bytes(args.synth_bytes, args.seed))
     tr = _tl.Trainer(spec, args, stream)
-    if args.resume:
-        if not os.path.exists(os.path.join(args.checkpoint, "manifest.json")):
-            print(f"error: nothing to resume at {args.checkpoint}", file=sys.stderr)
-            return 2
+    checkpoint_exists = os.path.exists(os.path.join(args.checkpoint, "manifest.json"))
+    if args.resume and not checkpoint_exists:
+        print(f"error: nothing to resume at {args.checkpoint}", file=sys.stderr)
+        return 2
+    if checkpoint_exists:
         man = tr.load(args.checkpoint)
-        print(f"resumed {preset} at global_step={man['scheduler']['global_step']} "
+        action = "resumed" if args.resume else "auto-resumed"
+        print(f"{action} {preset} at global_step={man['scheduler']['global_step']} "
               f"experts={man['n_experts_current']}")
         saved = man.get("config", {})
         for key, current in (("forward_quant", args.forward_quant),
@@ -50,10 +53,6 @@ def main(argv=None):
             if previous is not None and previous != current:
                 print(f"warning: checkpoint {key}={previous!r}, requested {current!r}; "
                       "resuming with changed settings can disrupt training", file=sys.stderr)
-    else:
-        if os.path.exists(os.path.join(args.checkpoint, "manifest.json")):
-            print(f"error: checkpoint exists at {args.checkpoint} (use --resume)", file=sys.stderr)
-            return 2
     rep = tr.model.report()
     print(json.dumps({"preset": preset, "total_params": rep["total_params"],
                       "per_expert": rep.get("per_expert_params"),
@@ -64,8 +63,20 @@ def main(argv=None):
     if target_step <= start_step:
         print(f"warning: no training steps will run (global_step={start_step}, "
               f"max_steps={target_step}); use --steps N for additional updates", file=sys.stderr)
-    log = tr.train(max_steps=target_step, log_every=args.log_every,
-                   ckpt_every=args.ckpt_every, grad_clip=args.grad_clip)
+    previous_sigint = signal.getsignal(signal.SIGINT)
+
+    def _request_graceful_stop(signum, frame):
+        if not tr.stop_requested:
+            print("\\nCtrl+C received; finishing this optimizer update, then saving checkpoint...",
+                  file=sys.stderr, flush=True)
+        tr.request_stop()
+
+    signal.signal(signal.SIGINT, _request_graceful_stop)
+    try:
+        log = tr.train(max_steps=target_step, log_every=args.log_every,
+                       ckpt_every=args.ckpt_every, grad_clip=args.grad_clip)
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint)
     tr.save()
     from smaulbrain import model as _model
     n_exp = len(_model.expert_ids(tr.model.p)) if preset.startswith("moe") else 0
@@ -80,7 +91,7 @@ def main(argv=None):
                       "last_overflow_fraction": (dropped / assignments if assignments and dropped is not None else None)}, indent=2))
     for entry in log[-5:]:
         print(json.dumps(entry))
-    return 0
+    return 130 if tr.stop_requested else 0
 
 
 if __name__ == "__main__":
