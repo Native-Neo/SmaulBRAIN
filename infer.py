@@ -21,7 +21,7 @@ def _was_provided(argv, option):
 
 def main(argv=None):
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    ap = argparse.ArgumentParser(description="Run SmaulBRAIN V2 inference")
+    ap = argparse.ArgumentParser(description="Run SmaulBRAIN V2 inference", allow_abbrev=False)
     _cli.add_common_args(ap)
     ap.add_argument("--prompt", default="Hello")
     ap.add_argument("--prompt-file", default=None)
