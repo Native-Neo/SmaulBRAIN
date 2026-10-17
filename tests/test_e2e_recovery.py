@@ -216,3 +216,22 @@ def test_stop_request_at_loop_boundary_still_saves_without_periodic_saves(tmp_pa
 
     saved = CK.load_checkpoint(ckpt)
     assert saved["manifest"]["scheduler"]["global_step"] == 0
+
+
+def test_pending_growth_resolves_when_max_steps_is_already_reached(tmp_path):
+    ckpt = str(tmp_path / "pending-at-target")
+    tr = _trainer("moe-tiny", ckpt, growth_min_eval_samples=16)
+    tr.train(max_steps=1)
+    tr.sched.create_pending("step")
+    tr.save()
+
+    resumed = _trainer("moe-tiny", ckpt, growth_min_eval_samples=16)
+    resumed.load(ckpt)
+    resumed.train(max_steps=1)
+
+    assert resumed.sched.global_step == 1
+    assert resumed.sched.pending is None
+    assert _expert_count(resumed) == 34
+    saved = CK.load_checkpoint(ckpt)
+    assert saved["manifest"]["scheduler"]["pending"] is None
+    assert saved["manifest"]["scheduler"]["global_step"] == 1
