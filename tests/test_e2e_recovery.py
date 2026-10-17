@@ -205,3 +205,14 @@ def test_graceful_stop_finishes_update_and_saves(tmp_path):
     tr2.load(ckpt)
     tr2.train(max_steps=2)
     assert tr2.sched.global_step == 2
+
+
+def test_stop_request_at_loop_boundary_still_saves_without_periodic_saves(tmp_path):
+    ckpt = str(tmp_path / "stop-at-boundary")
+    tr = _trainer("moe-tiny", ckpt)
+    tr.request_stop()
+
+    tr.train(max_steps=0, ckpt_every=0)
+
+    saved = CK.load_checkpoint(ckpt)
+    assert saved["manifest"]["scheduler"]["global_step"] == 0
