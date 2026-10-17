@@ -97,7 +97,9 @@ def test_export_import_preserves_sampling_rng_for_continuation():
     e1.generate([], max_new_tokens=4)
     saved = e1.export_states()
 
-    e2 = _eng(seed=999, **kwargs)
+    # State transfer covers recurrent/sampler state, not model weights; use
+    # the same deterministic initialization for both engines.
+    e2 = _eng(seed=5, **kwargs)
     e2.import_states(saved)
 
     assert e1.generate([], max_new_tokens=8) == e2.generate([], max_new_tokens=8)
