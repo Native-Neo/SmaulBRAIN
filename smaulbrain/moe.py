@@ -18,8 +18,15 @@ class Router:
 
     def route(self, X, top_k: int, capacity_factor: float = 1.25, disabled=()):
         X = torch.as_tensor(X, dtype=torch.float32, device=self.W.device)
+        if X.ndim != 2 or X.shape[1] != self.W.shape[0]:
+            raise ValueError(
+                f"router inputs must have shape (tokens, {self.W.shape[0]}), got {tuple(X.shape)}"
+            )
         if not torch.isfinite(X).all(): raise ValueError("non-finite router inputs")
-        if top_k < 1: raise ValueError(f"top_k must be >= 1, got {top_k}")
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+            raise ValueError(f"top_k must be an integer >= 1, got {top_k!r}")
+        if not math.isfinite(float(capacity_factor)) or float(capacity_factor) <= 0:
+            raise ValueError("capacity_factor must be finite and > 0")
         disabled = sorted(set(int(i) for i in disabled))
         enabled = self.n_experts - len(disabled)
         if top_k > enabled: raise ValueError(f"top_k={top_k} exceeds enabled experts={enabled}")
