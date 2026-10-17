@@ -2,7 +2,7 @@ name: Fast full-ternary-QAT checks
 
 on:
   push:
-    branches: ["**"]
+    branches: ["main"]
     paths:
       - "smaulbrain/**"
       - "tests/test_quant.py"
@@ -11,6 +11,11 @@ on:
       - "tests/test_native_optimizer.py"
       - "tests/test_model_moe_capacity.py"
       - "tests/test_checkpoint_integrity.py"
+      - "tests/test_cli_checkpoint_defaults.py"
+      - "tests/test_resume_saved_config.py"
+      - "tests/test_inference_generation.py"
+      - "tests/test_inference_native.py"
+      - "tests/test_data_identity.py"
       - "train.py"
       - "infer.py"
       - ".github/workflows/test-full-ternary-fast.yml"
@@ -29,6 +34,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: fast-ternary-${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
   fast-ternary-tests:
@@ -62,3 +71,8 @@ jobs:
           tests/test_native_optimizer.py
           tests/test_model_moe_capacity.py
           tests/test_checkpoint_integrity.py
+          tests/test_cli_checkpoint_defaults.py
+          tests/test_resume_saved_config.py
+          tests/test_inference_generation.py
+          tests/test_inference_native.py
+          tests/test_data_identity.py
