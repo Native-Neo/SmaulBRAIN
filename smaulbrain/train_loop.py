@@ -340,7 +340,9 @@ class Trainer:
     def _adopt_candidate(self, cand, new_ids):
         model, opt = self.model, self.opt
         model.p = cand
-        opt.register(cand)  # zero-init state for the new experts
+        # New expert moments are allocated by the optimizer only when that
+        # expert first receives a gradient; registering the entire pool here
+        # would eagerly allocate buffers for every unused expert.
         if model.store is not None:
             for nid in new_ids:
                 model.store.register_expert(nid, _expert_dict(cand, nid))
