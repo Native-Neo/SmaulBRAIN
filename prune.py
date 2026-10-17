@@ -23,6 +23,10 @@ def main(argv=None):
     ap.add_argument("--synth-bytes", type=int, default=1 << 16)
     ap.add_argument("--eval-batches", type=int, default=8)
     args = ap.parse_args(argv)
+    if args.eval_batches < 1:
+        ap.error("--eval-batches must be >= 1")
+    if args.synth_bytes < args.seq_len + 1 and not args.corpus:
+        ap.error("--synth-bytes must be at least --seq-len + 1 when --corpus is not set")
     try:
         _cli.validate_args(args)
     except ValueError as e:
