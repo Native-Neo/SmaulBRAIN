@@ -30,8 +30,17 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
     params = blob["params"]
     eids = _model.expert_ids(params)
     # quality evidence from current model
-    m = _model.Model(spec, params, forward_quant=man["config"].get("forward_quant", "fp32"),
-                     backward_mode=man["config"].get("backward_mode", "fp32"))
+    config = man.get("config", {})
+    forward_quant = config.get("forward_quant", "fp32")
+    backward_mode = config.get("backward_mode", "fp32")
+    capacity_factor = float(config.get("capacity_factor", 1.25))
+    m = _model.Model(
+        spec,
+        params,
+        forward_quant=forward_quant,
+        backward_mode=backward_mode,
+        capacity_factor=capacity_factor,
+    )
     scores, nsamp = _growth.rank_experts(m, eval_batches, min_samples)
     if scores is None:
         raise RuntimeError(f"insufficient quality evidence ({nsamp} < {min_samples}); "
@@ -40,6 +49,9 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
     report = {"candidates": victims,
               "scores": {str(v): scores[v] for v in victims},
               "samples": nsamp,
+              "capacity_factor": capacity_factor,
+              "forward_quant": forward_quant,
+              "backward_mode": backward_mode,
               "prev_count": len(eids), "new_count": len(eids) - len(victims)}
     if dry_run:
         return report
@@ -80,7 +92,13 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
     _ckpt.save_checkpoint(ckpt_dir, man2, new_params, renamed)
     # validate: reload + inference smoke
     blob2 = _ckpt.load_checkpoint(ckpt_dir)
-    m2 = _model.Model(spec, blob2["params"])
+    m2 = _model.Model(
+        spec,
+        blob2["params"],
+        forward_quant=forward_quant,
+        backward_mode=backward_mode,
+        capacity_factor=capacity_factor,
+    )
     logits, _ = m2.forward([65, 66, 67, 68], train=False)
     if not torch.isfinite(logits).all().item():
         raise RuntimeError("pruned model failed validation")
