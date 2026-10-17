@@ -71,3 +71,35 @@ def test_checkpoint_rejects_router_width_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="router shape disagrees"):
         CK.save_checkpoint(str(tmp_path / "invalid"), manifest, params, {})
+
+
+def test_checkpoint_publish_failure_preserves_existing_valid_backup(tmp_path, monkeypatch):
+    target = _write_checkpoint(tmp_path / "checkpoint-failure")
+    backup = target.parent / "checkpoint-failure.bak"
+    shutil.copytree(target, backup)
+
+    params_path = target / "params.pt"
+    damaged = bytearray(params_path.read_bytes())
+    damaged[len(damaged) // 2] ^= 0xFF
+    params_path.write_bytes(damaged)
+
+    new_tmp = tmp_path / ".new-checkpoint"
+    new_tmp.mkdir()
+    (new_tmp / "sentinel").write_text("new generation")
+    real_replace = CK.os.replace
+    failed = {"done": False}
+
+    def fail_publish_once(src, dst):
+        if str(src) == str(new_tmp) and str(dst) == str(target) and not failed["done"]:
+            failed["done"] = True
+            raise OSError("injected final publish failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(CK.os, "replace", fail_publish_once)
+    with pytest.raises(OSError, match="injected final publish failure"):
+        CK._publish_dir(str(new_tmp), str(target))
+
+    assert (target / "params.pt").is_file()
+    assert (backup / "manifest.json").is_file()
+    loaded = CK.load_checkpoint(str(target))
+    assert loaded["dir"] == str(backup)
