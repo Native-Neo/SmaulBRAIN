@@ -247,7 +247,9 @@ def main(argv=None):
     from smaulbrain import model as _model
     n_exp = len(_model.expert_ids(tr.model.p)) if preset.startswith("moe") else 0
     metrics = tr.last_metrics or {}
-    assignments = max(0, args.seq_len - 1) * spec.n_layers * spec.top_k if spec.kind == "moe" else 0
+    # ByteStream returns seq_len+1 tokens for next-byte targets; the model
+    # consumes the first seq_len positions, so every layer routes seq_len tokens.
+    assignments = args.seq_len * spec.n_layers * spec.top_k if spec.kind == "moe" else 0
     dropped = metrics.get("overflow_dropped")
     print(json.dumps({
         "done": True,
