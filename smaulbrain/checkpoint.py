@@ -177,9 +177,11 @@ def _check_consistency(manifest,params):
             )
         if not value.is_floating_point():
             raise ValueError(f"checkpoint parameter {key} must use a floating-point dtype")
+        if not value.is_contiguous():
+            raise ValueError(f"checkpoint parameter {key} must be contiguous")
         # Bound the temporary finite-check mask; never create a model-sized
-        # boolean tensor while validating a large checkpoint on low-RAM CPUs.
-        flat = value.detach().reshape(-1)
+        # boolean tensor or a flattening copy while validating a low-RAM model.
+        flat = value.detach().view(-1)
         for offset in range(0, flat.numel(), 1 << 20):
             if not torch.isfinite(flat[offset:offset + (1 << 20)]).all().item():
                 raise ValueError(f"checkpoint parameter {key} contains non-finite values")
