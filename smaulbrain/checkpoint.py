@@ -84,16 +84,38 @@ def save_checkpoint(target_dir,manifest,params,opt_state):
 
 
 def _check_consistency(manifest,params):
-    n=manifest.get("n_experts_current"); reg=manifest.get("expert_registry",[])
-    if n is not None and reg and len(reg)!=n:raise ValueError("expert registry length disagrees with n_experts_current")
-    if n is not None and manifest.get("preset","").startswith("moe"):
-        eids=sorted({int(k.split(".")[1]) for k in params if k.startswith("expert.") and k.endswith(".Win")})
-        if eids!=list(range(len(eids))):raise ValueError("expert params are not a dense 0..E-1 registry")
-        if len(eids)!=n:raise ValueError("param expert count disagrees with manifest")
+    n=manifest.get("n_experts_current")
+    reg=manifest.get("expert_registry",[])
+    if n is not None and (not isinstance(n,int) or n < 0):
+        raise ValueError("invalid n_experts_current")
+    if n is not None and reg and len(reg)!=n:
+        raise ValueError("expert registry length disagrees with n_experts_current")
+    preset=manifest.get("preset","")
+    if n is not None and preset.startswith("moe"):
+        win_ids=sorted({int(k.split(".")[1]) for k in params
+                        if k.startswith("expert.") and k.endswith(".Win")})
+        wout_ids=sorted({int(k.split(".")[1]) for k in params
+                         if k.startswith("expert.") and k.endswith(".Wout")})
+        expected=list(range(n))
+        if win_ids!=expected or wout_ids!=expected:
+            raise ValueError("expert Win/Wout tensors must form a dense, matching 0..E-1 registry")
+        if "router" not in params or params["router"].ndim!=2 or params["router"].shape[1]!=n:
+            raise ValueError("router shape disagrees with n_experts_current")
+        arch=manifest.get("arch",{})
+        d=arch.get("d_model")
+        h=arch.get("expert_hidden")
+        if d is not None and params["router"].shape[0]!=d:
+            raise ValueError("router input dimension disagrees with manifest architecture")
+        if d is not None and h is not None:
+            for eid in expected:
+                if tuple(params[f"expert.{eid}.Win"].shape)!=(d,h):
+                    raise ValueError(f"expert {eid} Win shape disagrees with manifest architecture")
+                if tuple(params[f"expert.{eid}.Wout"].shape)!=(h,d):
+                    raise ValueError(f"expert {eid} Wout shape disagrees with manifest architecture")
 
 
-def load_checkpoint(ckpt_dir):
-    ckpt_dir=_resolve_checkpoint_dir(ckpt_dir); mp=os.path.join(ckpt_dir,"manifest.json")
+def _load_checkpoint_dir(ckpt_dir):
+    mp=os.path.join(ckpt_dir,"manifest.json")
     if not os.path.exists(mp):raise FileNotFoundError(f"no manifest at {mp}")
     with open(mp) as f:man=json.load(f)
     version=man.get("version")
@@ -103,7 +125,8 @@ def load_checkpoint(ckpt_dir):
         for name in names:
             path=os.path.join(ckpt_dir,name)
             if not os.path.exists(path):raise FileNotFoundError(f"checkpoint missing {name} (incomplete write?)")
-            if man.get("files",{}).get(name) not in (None,_sha256(path)):raise ValueError(f"integrity mismatch for {name}")
+            expected_hash=man.get("files",{}).get(name)
+            if not isinstance(expected_hash,str) or expected_hash!=_sha256(path):raise ValueError(f"missing or invalid integrity hash for {name}")
         params=torch.load(os.path.join(ckpt_dir,"params.pt"),map_location="cpu",weights_only=True)
         opt_state=torch.load(os.path.join(ckpt_dir,"optim.pt"),map_location="cpu",weights_only=True)
     else:
@@ -120,3 +143,27 @@ def load_checkpoint(ckpt_dir):
     params={k:(v if isinstance(v,torch.Tensor) else torch.as_tensor(v)) for k,v in params.items()}
     _check_consistency(man,params)
     return {"manifest":man,"params":params,"opt_state":opt_state,"dir":ckpt_dir}
+
+
+
+def load_checkpoint(ckpt_dir):
+    """Load the primary checkpoint, falling back to a valid backup on corruption."""
+    primary=os.path.normpath(ckpt_dir)
+    backup=primary+".bak"
+    candidates=[]
+    for candidate in (primary,backup):
+        if os.path.isfile(os.path.join(candidate,"manifest.json")):
+            candidates.append(candidate)
+    if not candidates:
+        raise FileNotFoundError(
+            f"no checkpoint manifest at {os.path.join(primary, 'manifest.json')} "
+            f"or {os.path.join(backup, 'manifest.json')}"
+        )
+    failures=[]
+    for candidate in candidates:
+        try:
+            return _load_checkpoint_dir(candidate)
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+            failures.append((candidate,exc))
+    details="; ".join(f"{path}: {error}" for path,error in failures)
+    raise RuntimeError(f"no valid checkpoint found (primary/backup recovery failed): {details}") from failures[-1][1]
