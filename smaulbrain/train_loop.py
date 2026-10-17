@@ -103,10 +103,10 @@ class Trainer:
                  "paging": self.args.paging, "seed": self.args.seed,
                  "lr": self.args.lr, "seq_len": self.args.seq_len,
                  "capacity_factor": self.model.capacity_factor,
-                 "synth_bytes": self.args.synth_bytes,
+                 "synth_bytes": getattr(self.args, "synth_bytes", None),
                  "growth_noise_scale": self.args.growth_noise_scale,
                  "growth_seed": self.args.growth_seed,
-                 "grad_clip": self.args.grad_clip}
+                 "grad_clip": getattr(self.args, "grad_clip", None)}
         man = _ckpt.build_manifest(
             spec.name, arch, extra, self.sched.to_record(),
             self.stream.cursor, {"torch_state": self.rng.get_state().tolist()},
