@@ -3,22 +3,32 @@ import torch
 from smaulbrain.growth import rank_experts
 
 
-class _ModelThatMustNotBeRanked:
-    p = {"expert.0.Win": torch.zeros(1)}
+class _ApproximateRankModel:
+    def __init__(self):
+        self.p = {"expert.0.Win": torch.zeros(1)}
+        self.calls = 0
 
-    def forward(self, *args, **kwargs):
-        raise AssertionError("ranking should stop before scoring insufficient evidence")
+    def forward(self, tokens, train=False, disabled=()):
+        self.calls += 1
+        logits = torch.zeros((len(tokens), 16))
+        if disabled:
+            logits[:, int(disabled[0])] = 1.0
+        return logits, None
 
 
-def test_rank_experts_does_not_count_ignored_batches_as_evidence():
-    batches = [[1, 2, 3, 4, 5] for _ in range(4)]
+def test_ranking_uses_all_batches_for_evidence_but_scores_subset():
+    batches = [list(range(start, start + 5)) for start in (0, 5, 10, 0)]
+    model = _ApproximateRankModel()
 
     scores, samples = rank_experts(
-        _ModelThatMustNotBeRanked(),
+        model,
         batches,
         min_samples=10,
         max_batches=1,
     )
 
-    assert scores is None
-    assert samples == 4
+    assert samples == 16
+    assert scores is not None and set(scores) == {0}
+    # One baseline and one masked score; the remaining batches gate evidence
+    # but do not incur extra forward passes.
+    assert model.calls == 2
