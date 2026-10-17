@@ -18,7 +18,7 @@ def _was_provided(argv, option):
 
 def main(argv=None):
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    ap = argparse.ArgumentParser(description="Prune worst MoE experts (evidence-based)")
+    ap = argparse.ArgumentParser(description="Prune worst MoE experts (evidence-based)", allow_abbrev=False)
     _cli.add_common_args(ap)
     ap.add_argument("--rm-worst", type=int, required=True)
     ap.add_argument("--dry-run", action="store_true")
