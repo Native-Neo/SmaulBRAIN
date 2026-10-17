@@ -240,3 +240,36 @@ def test_pending_growth_resolves_when_max_steps_is_already_reached(tmp_path):
     saved = CK.load_checkpoint(ckpt)
     assert saved["manifest"]["scheduler"]["pending"] is None
     assert saved["manifest"]["scheduler"]["global_step"] == 1
+
+
+def test_phase_b_publish_failure_rolls_back_live_growth_state_and_can_retry(tmp_path):
+    ckpt = str(tmp_path / "phase-b-publish-failure")
+    tr = _trainer("moe-tiny", ckpt, growth_every_steps=1,
+                  growth_min_eval_samples=16)
+    publish = tr._save_committed
+
+    def fail_publish(*args, **kwargs):
+        raise OSError("injected disk-full during Phase-B publish")
+
+    tr._save_committed = fail_publish
+    with pytest.raises(OSError, match="disk-full"):
+        tr.train(max_steps=1)
+
+    assert tr.sched.global_step == 1
+    assert tr.sched.pending is not None
+    assert tr.sched.history == []
+    assert _expert_count(tr) == 32
+    assert tr.opt.state["router"]["m"].shape == tr.model.p["router"].shape
+    persisted = CK.load_checkpoint(ckpt)
+    assert persisted["manifest"]["n_experts_current"] == 32
+    assert persisted["manifest"]["scheduler"]["pending"] is not None
+
+    tr._save_committed = publish
+    tr.train(max_steps=1)
+
+    assert tr.sched.pending is None
+    assert [event["id"] for event in tr.sched.history] == [1]
+    assert _expert_count(tr) == 34
+    persisted = CK.load_checkpoint(ckpt)
+    assert persisted["manifest"]["n_experts_current"] == 34
+    assert persisted["manifest"]["scheduler"]["pending"] is None
