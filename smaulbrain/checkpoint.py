@@ -99,38 +99,121 @@ def save_checkpoint(target_dir,manifest,params,opt_state):
     pending=manifest.get("scheduler",{}).get("pending")
     if pending is not None and pending.get("id") in ids:raise ValueError("pending event id already committed")
     _check_consistency(manifest,params)
+    _check_optimizer_state(params,opt_state)
     return _write_tree(target_dir,manifest,params,opt_state)
 
 
 def _check_consistency(manifest,params):
-    n=manifest.get("n_experts_current")
-    reg=manifest.get("expert_registry",[])
-    if n is not None and (not isinstance(n,int) or n < 0):
-        raise ValueError("invalid n_experts_current")
-    if n is not None and reg and len(reg)!=n:
-        raise ValueError("expert registry length disagrees with n_experts_current")
-    preset=manifest.get("preset","")
-    if n is not None and preset.startswith("moe"):
-        win_ids=sorted({int(k.split(".")[1]) for k in params
-                        if k.startswith("expert.") and k.endswith(".Win")})
-        wout_ids=sorted({int(k.split(".")[1]) for k in params
-                         if k.startswith("expert.") and k.endswith(".Wout")})
-        expected=list(range(n))
-        if win_ids!=expected or wout_ids!=expected:
-            raise ValueError("expert Win/Wout tensors must form a dense, matching 0..E-1 registry")
-        if "router" not in params or params["router"].ndim!=2 or params["router"].shape[1]!=n:
-            raise ValueError("router shape disagrees with n_experts_current")
-        arch=manifest.get("arch",{})
-        d=arch.get("d_model")
-        h=arch.get("expert_hidden")
-        if d is not None and params["router"].shape[0]!=d:
-            raise ValueError("router input dimension disagrees with manifest architecture")
-        if d is not None and h is not None:
-            for eid in expected:
-                if tuple(params[f"expert.{eid}.Win"].shape)!=(d,h):
-                    raise ValueError(f"expert {eid} Win shape disagrees with manifest architecture")
-                if tuple(params[f"expert.{eid}.Wout"].shape)!=(h,d):
-                    raise ValueError(f"expert {eid} Wout shape disagrees with manifest architecture")
+    from . import config as _cfg
+
+    preset = manifest.get("preset", "")
+    if preset not in _cfg.PRESETS:
+        raise ValueError(f"unknown checkpoint preset {preset!r}")
+    spec = _cfg.PRESETS[preset]
+    n = manifest.get("n_experts_current")
+    if spec.kind == "moe":
+        if n is None:
+            n = spec.n_experts_init
+        if isinstance(n, bool) or not isinstance(n, int) or n < spec.top_k:
+            raise ValueError("invalid n_experts_current for MoE preset")
+        expected_eids = list(range(n))
+        registry = manifest.get("expert_registry", [])
+        if registry and registry != expected_eids:
+            raise ValueError("expert registry disagrees with dense expert indices")
+        arch = manifest.get("arch", {})
+        if arch.get("d_model", spec.d_model) != spec.d_model:
+            raise ValueError("manifest d_model disagrees with selected preset")
+        if arch.get("n_layers", spec.n_layers) != spec.n_layers:
+            raise ValueError("manifest n_layers disagrees with selected preset")
+        if arch.get("expert_hidden", spec.expert_hidden) != spec.expert_hidden:
+            raise ValueError("manifest expert_hidden disagrees with selected preset")
+    else:
+        if n not in (None, 0):
+            raise ValueError("dense checkpoint cannot contain MoE experts")
+        n = 0
+        arch = manifest.get("arch", {})
+        if arch.get("d_model", spec.d_model) != spec.d_model:
+            raise ValueError("manifest d_model disagrees with selected preset")
+        if arch.get("n_layers", spec.n_layers) != spec.n_layers:
+            raise ValueError("manifest n_layers disagrees with selected preset")
+
+    expected = {
+        "embed": (spec.vocab_size, spec.d_model),
+        "final_norm": (spec.d_model,),
+    }
+    for layer in range(spec.n_layers):
+        prefix = f"L{layer}."
+        for name in ("Wr", "Wk", "Wv", "Wo"):
+            expected[prefix + "attn." + name] = (spec.d_model, spec.d_model)
+        for name in ("w", "u"):
+            expected[prefix + "attn." + name] = (spec.d_model,)
+        expected[prefix + "n1"] = (spec.d_model,)
+        expected[prefix + "n2"] = (spec.d_model,)
+        if spec.kind == "dense":
+            expected[prefix + "ffn.Wa"] = (spec.d_model, spec.ffn_hidden)
+            expected[prefix + "ffn.Wb"] = (spec.d_model, spec.ffn_hidden)
+            expected[prefix + "ffn.Wc"] = (spec.ffn_hidden, spec.d_model)
+    if spec.kind == "moe":
+        expected["router"] = (spec.d_model, n)
+        for eid in range(n):
+            expected[f"expert.{eid}.Win"] = (spec.d_model, spec.expert_hidden)
+            expected[f"expert.{eid}.Wout"] = (spec.expert_hidden, spec.d_model)
+
+    actual_keys = set(params)
+    expected_keys = set(expected)
+    missing = sorted(expected_keys - actual_keys)
+    extra = sorted(actual_keys - expected_keys)
+    if missing or extra:
+        raise ValueError(
+            f"checkpoint parameter registry mismatch: missing={missing[:5]}, extra={extra[:5]}"
+        )
+    for key, shape in expected.items():
+        value = params[key]
+        if not isinstance(value, torch.Tensor):
+            raise ValueError(f"checkpoint parameter {key} is not a tensor")
+        if tuple(value.shape) != shape:
+            raise ValueError(
+                f"checkpoint parameter {key} has shape {tuple(value.shape)}, expected {shape}"
+            )
+    vocab = manifest.get("vocab", {})
+    if vocab and vocab.get("vocab_size", spec.vocab_size) != spec.vocab_size:
+        raise ValueError("checkpoint vocabulary size disagrees with selected preset")
+    arch = manifest.get("arch", {})
+    if arch.get("vocab_size", spec.vocab_size) != spec.vocab_size:
+        raise ValueError("manifest vocab_size disagrees with selected preset")
+
+
+
+def _check_optimizer_state(params,opt_state):
+    """Reject optimizer buffers that cannot safely update the loaded tensors."""
+    if not isinstance(opt_state, dict):
+        raise ValueError("optimizer state must be a mapping")
+    for name, state in opt_state.items():
+        if name not in params:
+            raise ValueError(f"optimizer state references missing parameter {name!r}")
+        if not isinstance(state, dict):
+            raise ValueError(f"optimizer state for {name} must be a mapping")
+        shape = tuple(params[name].shape)
+        for slot in ("m", "v"):
+            value = state.get(slot)
+            if value is not None:
+                if not isinstance(value, torch.Tensor) or tuple(value.shape) != shape:
+                    got = tuple(value.shape) if isinstance(value, torch.Tensor) else type(value).__name__
+                    raise ValueError(
+                        f"optimizer {slot} shape for {name} is {got}, expected {shape}"
+                    )
+        factored = "R" in state or "C" in state
+        if factored:
+            if len(shape) != 2:
+                raise ValueError(f"factored optimizer state attached to non-matrix parameter {name}")
+            for slot, expected in (("R", (shape[0],)), ("C", (shape[1],))):
+                value = state.get(slot)
+                if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected:
+                    got = tuple(value.shape) if isinstance(value, torch.Tensor) else type(value).__name__
+                    raise ValueError(
+                        f"optimizer {slot} shape for {name} is {got}, expected {expected}"
+                    )
+
 
 
 def _load_checkpoint_dir(ckpt_dir):
@@ -161,6 +244,7 @@ def _load_checkpoint_dir(ckpt_dir):
         for k,v in flat.items():name,_,sub=k.partition("::");opt_state.setdefault(name,{})[sub]=v
     params={k:(v if isinstance(v,torch.Tensor) else torch.as_tensor(v)) for k,v in params.items()}
     _check_consistency(man,params)
+    _check_optimizer_state(params,opt_state)
     return {"manifest":man,"params":params,"opt_state":opt_state,"dir":ckpt_dir}
 
 
