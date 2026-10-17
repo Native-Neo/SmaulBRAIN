@@ -25,26 +25,41 @@ def _expert_dict(params: dict, eid: int) -> dict:
 
 
 class Trainer:
-    def __init__(self, spec, args, stream, eval_stream=None):
+    def __init__(self, spec, args, stream, eval_stream=None, checkpoint_blob=None):
         self.spec = spec
         self.args = args
         self.stream = stream
         self.eval_stream = eval_stream
         self.rng = torch.Generator(device="cpu").manual_seed(int(args.seed))
-        n_exp = spec.n_experts_init if spec.kind == "moe" else 0
-        params = _model.build_params(spec, self.rng, n_exp, device=getattr(args, "device", "cpu"))
-        self.model = _model.Model(spec, params, forward_quant=args.forward_quant,
-                                  backward_mode=args.backward_mode, paging_mode=args.paging,
-                                  paging_store=None, capacity_factor=args.expert_capacity_factor,
-                                  device=getattr(args, "device", "cpu"))
-        if spec.kind == "moe":
+        if checkpoint_blob is not None:
+            if checkpoint_blob["manifest"].get("preset") != spec.name:
+                raise ValueError(
+                    f"checkpoint preset {checkpoint_blob['manifest'].get('preset')} != {spec.name}"
+                )
+            params = checkpoint_blob["params"]
+            n_exp = len(_model.expert_ids(params)) if spec.kind == "moe" else 0
+        else:
+            n_exp = spec.n_experts_init if spec.kind == "moe" else 0
+            params = _model.build_params(
+                spec, self.rng, n_exp, device=getattr(args, "device", "cpu")
+            )
+        self.model = _model.Model(
+            spec, params,
+            forward_quant=args.forward_quant,
+            backward_mode=args.backward_mode,
+            paging_mode=args.paging,
+            paging_store=None,
+            capacity_factor=args.expert_capacity_factor,
+            device=getattr(args, "device", "cpu"),
+        )
+        if spec.kind == "moe" and checkpoint_blob is None:
             self.model.store = self._make_store(args.paging, n_exp, self.model.p, None)
-        self.opt = _opt.SmaulOPT(lr=args.lr, beta1=args.beta1, beta2=args.beta2,
-                                 eps=args.eps, weight_decay=args.weight_decay)
-        self.opt.register(self.model.p)
-        # Dynamic growth is an MoE-only feature. Disable its triggers for
-        # dense models instead of repeatedly reporting a skipped event once a
-        # threshold has been reached.
+        self.opt = _opt.SmaulOPT(
+            lr=args.lr, beta1=args.beta1, beta2=args.beta2,
+            eps=args.eps, weight_decay=args.weight_decay,
+        )
+        # Optimizer moments are initialized lazily on the first gradient. Avoid
+        # allocating a second model-sized state set just to replace it on resume.
         self.sched = _growth.GrowthScheduler(
             every_steps=args.growth_every_steps if spec.kind == "moe" else 0,
             loss_nats=args.growth_loss_nats if spec.kind == "moe" else None,
@@ -53,6 +68,8 @@ class Trainer:
         self.last_metrics = None
         self.stop_requested = False
         self.last_checkpoint_step = None
+        if checkpoint_blob is not None:
+            self.load_blob(checkpoint_blob, params_already_loaded=True)
 
     def request_stop(self):
         """Request a graceful stop after the current optimizer update."""
@@ -110,18 +127,24 @@ class Trainer:
 
     def load(self, ckpt_dir):
         blob = _ckpt.load_checkpoint(ckpt_dir)
+        return self.load_blob(blob, params_already_loaded=False)
+
+    def load_blob(self, blob, params_already_loaded=False):
+        """Restore all trainer state from an already validated checkpoint blob."""
         man = blob["manifest"]
         self.last_checkpoint_step = int(man.get("scheduler", {}).get("global_step", 0))
         if man["preset"] != self.spec.name:
             raise ValueError(f"checkpoint preset {man['preset']} != {self.spec.name}")
-        self.model.p = {k: v for k, v in blob["params"].items()}
+        if not params_already_loaded:
+            self.model.p = {k: v for k, v in blob["params"].items()}
         self.model.packed.invalidate()
         self.model.fp8.invalidate()
         flags = man.get("optimizer", {}).get("factored", {})
         self.opt.load_state_dict(blob["opt_state"], flags)
         for state in self.opt.state.values():
-            for key,value in list(state.items()):
-                if isinstance(value, torch.Tensor): state[key] = value.to(self.model.device)
+            for key, value in list(state.items()):
+                if isinstance(value, torch.Tensor):
+                    state[key] = value.to(self.model.device)
         self.opt.register(self.model.p)
         self.sched = _growth.GrowthScheduler.from_record(man["scheduler"])
         if self.spec.kind == "dense":
@@ -135,25 +158,33 @@ class Trainer:
             self.rng.set_state(torch.tensor(rng_state["torch_state"], dtype=torch.uint8))
         # Legacy NumPy RNG state is intentionally not replayed; resumed model and optimizer
         # tensors are exact, while newly introduced random experts use their recorded seed.
-        self.stream.load_state_dict({"cursor": man["data_cursor"], "path": self.stream.path,
-                                     "size": self.stream.size,
-                                     "identity": man.get("data_stream")})
-        # rebuild paging store
+        self.stream.load_state_dict({
+            "cursor": man["data_cursor"],
+            "path": self.stream.path,
+            "size": self.stream.size,
+            "identity": man.get("data_stream"),
+        })
+        # Rebuild paging store from the canonical checkpoint tensors.
         if self.spec.kind == "moe":
             n_exp = man["n_experts_current"]
             if self.args.paging in ("R", "V", "R2V"):
                 ram = {e: _expert_dict(self.model.p, e) for e in range(n_exp)}
-                self.model.store = _paging.ExpertStore(self.args.paging, n_exp, ram_weights=ram)
+                self.model.store = _paging.ExpertStore(
+                    self.args.paging, n_exp, ram_weights=ram
+                )
             else:
                 dd = self._live_experts_dir()
                 os.makedirs(dd, exist_ok=True)
                 for e in range(n_exp):
-                    torch.save({k:v.detach().cpu() for k,v in _expert_dict(self.model.p, e).items()},
-                               os.path.join(dd, f"expert_{e}.pt"))
+                    torch.save({
+                        k: v.detach().cpu()
+                        for k, v in _expert_dict(self.model.p, e).items()
+                    }, os.path.join(dd, f"expert_{e}.pt"))
                 self.model.store = _paging.ExpertStore(
                     self.args.paging, n_exp, disk_dir=dd,
                     ram_cache_max_experts=self.args.paging_cache_experts,
-                    staging_max_bytes=self.args.paging_staging_bytes)
+                    staging_max_bytes=self.args.paging_staging_bytes,
+                )
         return man
 
     # -- growth resolution (no optimizer step may intervene) --
