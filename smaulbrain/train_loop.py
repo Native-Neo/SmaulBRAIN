@@ -372,7 +372,9 @@ class Trainer:
                 break
             if fail_at == "after_step":
                 raise _Injected(fail_at)
-        if ckpt_every and not self.stop_requested:
+        if (ckpt_every and not self.stop_requested
+                and self.sched.global_step % ckpt_every != 0):
+            # A periodic save may already have written the final step.
             self.save()
         return self.log
 
