@@ -19,6 +19,8 @@ def main(argv=None):
     ap.add_argument("--synth-bytes", type=int, default=1 << 16)
     ap.add_argument("--eval-batches", type=int, default=16)
     args = ap.parse_args(argv)
+    if args.eval_batches < 1:
+        ap.error("--eval-batches must be >= 1")
     try:
         preset = _cli.validate_args(args)
     except ValueError as e:
@@ -27,6 +29,10 @@ def main(argv=None):
     from smaulbrain import growth as _growth
     from smaulbrain import model as _model
     blob = _ckpt.load_checkpoint(args.checkpoint)
+    if blob["manifest"].get("preset") != preset:
+        print(f"error: checkpoint preset {blob['manifest'].get('preset')} != {preset}",
+              file=sys.stderr)
+        return 2
     spec = _cfg.PRESETS[preset]
     m = _model.Model(spec, dict(blob["params"]), forward_quant=args.forward_quant,
                      backward_mode=args.backward_mode, device=args.device)
