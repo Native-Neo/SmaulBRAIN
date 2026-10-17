@@ -60,9 +60,17 @@ class InferenceEngine:
         return self.states
 
     def _sample(self, logits):
+        logits = torch.as_tensor(logits)
+        if logits.ndim != 1 or logits.numel() == 0:
+            raise ValueError("sampling logits must be a non-empty 1-D tensor")
+        if not torch.isfinite(logits).all().item():
+            raise RuntimeError("cannot sample from non-finite model logits")
         if self.temperature == 0:
             return int(torch.argmax(logits).item())
-        l = logits.float() / self.temperature
+        # Subtract the maximum before temperature scaling so even very small
+        # positive temperatures cannot overflow the maximum logit to +inf.
+        l = logits.double()
+        l = (l - l.max()) / self.temperature
         if self.top_k > 0:
             k = min(self.top_k, l.numel())
             # Mask by rank, not by cutoff value: cutoff-based filtering
