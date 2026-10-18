@@ -61,8 +61,8 @@ def test_native_kernels_optional_but_defined():
     # V2 owns a focused packed-ternary kernel. V1's broad kernels.cpp path is
     # intentionally not required by this independent implementation.
     from pathlib import Path
-    root = Path(__file__).resolve().parents[1]
-    cpp = root / "smaulbrain" / "_ternary_kernels.cpp"
+    import smaulbrain
+    cpp = Path(smaulbrain.__file__).resolve().parent / "_ternary_kernels.cpp"
     assert cpp.is_file()
     src = cpp.read_text()
     for sym in ("smaulbrain_ternary_matmat",
