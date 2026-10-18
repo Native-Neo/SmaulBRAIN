@@ -5,6 +5,12 @@ A PyTorch/autograd port of the SmaulBRAIN byte-level recurrent language model. T
 ## Install
 
 ```bash
+pip install smaulbrain-core
+```
+
+For development from a checkout:
+
+```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
