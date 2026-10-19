@@ -47,6 +47,7 @@ def main(argv=None):
     for option, attr, key in (
         ("--forward-quant", "forward_quant", "forward_quant"),
         ("--backward-mode", "backward_mode", "backward_mode"),
+        ("--paging", "paging", "paging"),
         ("--seed", "seed", "seed"),
         ("--seq-len", "seq_len", "seq_len"),
         ("--expert-capacity-factor", "expert_capacity_factor", "capacity_factor"),
@@ -54,7 +55,8 @@ def main(argv=None):
         value = saved.get(key)
         if value is not None and not _was_provided(raw_argv, option):
             setattr(args, attr, value)
-
+    if saved.get("synth_bytes") is not None and not _was_provided(raw_argv, "--synth-bytes"):
+        args.synth_bytes = int(saved["synth_bytes"])
     if args.device == "cpu" and args.paging in ("V", "D2V", "R2V"):
         args.paging = "R"
 
