@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SmaulBRAIN V2 training entry point."""
+"""SmaulBRAIN v2.1.0 training entry point."""
 import argparse
 import json
 import os
@@ -14,7 +14,7 @@ from smaulbrain import train_loop as _tl
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Train SmaulBRAIN V2 (byte-level recurrent LM)")
+    ap = argparse.ArgumentParser(description="Train SmaulBRAIN v2.1.0 (byte-level recurrent LM)")
     _cli.add_common_args(ap, need_train=True)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--steps", type=int, default=None,

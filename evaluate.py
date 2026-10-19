@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SmaulBRAIN V2 evaluation: cross-entropy (nats/byte) + expert stats."""
+"""SmaulBRAIN v2.1.0 evaluation: cross-entropy (nats/byte) + expert stats."""
 import argparse
 import json
 import os
@@ -18,7 +18,7 @@ def _was_provided(argv, option):
 
 def main(argv=None):
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    ap = argparse.ArgumentParser(description="Evaluate SmaulBRAIN V2 checkpoint",
+    ap = argparse.ArgumentParser(description="Evaluate SmaulBRAIN v2.1.0 checkpoint",
                                  allow_abbrev=False)
     _cli.add_common_args(ap)
     ap.add_argument("--corpus", default=None)
