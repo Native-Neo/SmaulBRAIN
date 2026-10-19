@@ -70,7 +70,7 @@ def main(argv=None):
     from smaulbrain import model as _model
     n_exp = len(_model.expert_ids(tr.model.p)) if preset.startswith("moe") else 0
     metrics = tr.last_metrics or {}
-    assignments = max(0, args.seq_len - 1) * spec.n_layers * spec.top_k if spec.kind == "moe" else 0
+    assignments = args.seq_len * spec.n_layers * spec.top_k if spec.kind == "moe" else 0
     dropped = metrics.get("overflow_dropped")
     print(json.dumps({"done": True, "global_step": tr.sched.global_step,
                       "steps_this_run": tr.sched.global_step - start_step,
