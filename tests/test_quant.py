@@ -298,8 +298,9 @@ def test_compiler_free_packed_matmat_uses_call_local_blas_fallback(monkeypatch):
     W = rng.standard_normal((23, 17)).astype(np.float32)
     X = rng.standard_normal((4, 23)).astype(np.float32)
     packed, scale, shape, _ = Q._pack_ternary_numpy(W)
-    expected = X @ (Q.unpack_codes(packed, shape).astype(np.float32) * scale)
+    expected = X @ (Q.unpack_codes(packed, shape).float().numpy() * scale)
     monkeypatch.setattr(Q, "prepare_ternary_backend", lambda: False)
     actual = Q.packed_matmat(X, packed, shape, float(scale))
-    assert np.allclose(actual, expected, rtol=1e-6, atol=1e-6)
+    assert np.allclose(actual.numpy() if hasattr(actual, "numpy") else actual,
+                      expected, rtol=1e-6, atol=1e-6)
 
