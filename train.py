@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SmaulBRAIN v2.1.0 training entry point."""
+"""SmaulBRAIN v2.1.1 training entry point."""
 import argparse
 import json
 import os
@@ -19,7 +19,7 @@ def _was_provided(argv, option):
 
 def main(argv=None):
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    ap = argparse.ArgumentParser(description="Train SmaulBRAIN v2.1.0 (byte-level recurrent LM)",
+    ap = argparse.ArgumentParser(description="Train SmaulBRAIN v2.1.1 (byte-level recurrent LM)",
                                  allow_abbrev=False)
     _cli.add_common_args(ap, need_train=True)
     ap.add_argument("--resume", action="store_true",

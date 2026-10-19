@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SmaulBRAIN v2.1.0 benchmarks: real measurements on this hardware.
+"""SmaulBRAIN v2.1.1 benchmarks: real measurements on this hardware.
 
 Records hardware, CPU features, preset, batch/seq, dtype, quant/paging modes.
 Usage: python bench.py [--preset moe-tiny] [--seq-len 64] [--steps 5]

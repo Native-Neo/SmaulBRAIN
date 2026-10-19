@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SmaulBRAIN v2.1.0 expert pruning: python prune.py --rm-worst 8."""
+"""SmaulBRAIN v2.1.1 expert pruning: python prune.py --rm-worst 8."""
 import argparse
 import json
 import os
