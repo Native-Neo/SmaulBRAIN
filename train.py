@@ -127,7 +127,9 @@ def main(argv=None):
                              ("seq_len", args.seq_len),
                              ("capacity_factor", args.expert_capacity_factor),
                              ("paging", args.paging),
-                             ("seed", args.seed)):
+                             ("seed", args.seed),
+                             ("mtp_depth", args.mtp_depth),
+                             ("mtp_loss_weight", args.mtp_loss_weight)):
             previous = saved_config.get(key)
             if previous is not None and previous != current:
                 print(f"warning: checkpoint {key}={previous!r}, requested {current!r}; "
