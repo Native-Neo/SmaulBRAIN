@@ -38,6 +38,10 @@ def main(argv=None):
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--levels", type=int, default=4)
     parser.add_argument("--codebook-size", type=int, default=64)
+    parser.add_argument("--d-model", type=int, default=None)
+    parser.add_argument("--layers", type=int, default=None)
+    parser.add_argument("--experts", type=int, default=None)
+    parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument(
         "--stage", choices=("tokenizer", "generator", "both"), default="both",
         help="NCM training stage; both is the normal end-to-end mode",
@@ -97,6 +101,14 @@ def main(argv=None):
         "--device", args.device,
         "--seed", str(args.seed),
     ]
+    for option, value in (
+        ("--d-model", args.d_model),
+        ("--layers", args.layers),
+        ("--experts", args.experts),
+        ("--top-k", args.top_k),
+    ):
+        if value is not None:
+            ncm_args.extend([option, str(value)])
 
     if args.corpus:
         ncm_args.extend(["--data", args.corpus])
