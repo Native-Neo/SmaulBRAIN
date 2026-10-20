@@ -88,6 +88,27 @@ positions in parallel within each hierarchy level. This is experimental and
 does not alter the default training or inference paths. See [docs/NCM.md](docs/NCM.md)
 for the scope, smoke test, and benchmarking requirements.
 
+## Experimental NCM architecture
+
+An isolated Next-Concept Modeling prototype lives in `ncm.py`, with a
+streamed two-stage training command and end-to-end generation benchmark. It uses
+cumulative coarse-to-fine reconstruction, block-diagonal per-level attention,
+conditioning corruption, and optional prompt-conditioned continuation. The
+default SmaulBRAIN model and its checkpoints remain unchanged.
+
+```bash
+python ncm_train.py --data ./data/corpus --output ./ncm-checkpoints \
+  --stage both --steps 1000 --batch-size 2 --seq-len 128
+python ncm_bench.py --checkpoint-dir ./ncm-checkpoints \
+  --prompt "Once upon a time, " --new-bytes 128 --runs 5
+python -m pytest -q tests/test_ncm.py
+```
+
+Parquet input needs `pyarrow`. See [docs/NCM.md](docs/NCM.md) for training
+details and fair benchmarking guidance. This is a compact research prototype,
+not a reproduction of the paper's complete system; speed and quality gains
+must be measured before considering integration into the default model.
+
 ## Compatibility and limits
 
 New checkpoints use PyTorch `.pt` tensors with integrity checks and atomic publication. Legacy `smaulbrain-v2:1` NumPy checkpoints and per-expert `.npz` files are imported, but legacy NumPy RNG continuation is not bit-for-bit replayed. Full presets need substantial RAM; count checks do not allocate full models. See `AUDIT.md` and `docs/systems.md` before selecting paging/quantization settings. CPU regression tests do not certify CUDA behavior or convergence/performance for full-size models.
