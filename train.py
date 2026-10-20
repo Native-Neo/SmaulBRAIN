@@ -47,10 +47,6 @@ def main(argv=None):
         help="NCM training stage; both is the normal end-to-end mode",
     )
     parser.add_argument("--save-every", type=int, default=100)
-    parser.add_argument(
-        "--log-every", type=int, default=1,
-        help="print training metrics every N optimizer steps (default: every step)",
-    )
     args = parser.parse_args(raw_argv)
 
     if args.steps is not None and args.steps < 1:
