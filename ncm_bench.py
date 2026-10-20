@@ -8,7 +8,10 @@ from pathlib import Path
 
 import torch
 
-from ncm import NCMConfig, NCMGenerator, ResidualVQTokenizer, level_length
+from ncm import (
+    NCMConfig, NCMGenerator, ResidualVQTokenizer, level_length,
+    migrate_ternary_state_dict,
+)
 
 
 def main(argv=None) -> int:
@@ -34,10 +37,16 @@ def main(argv=None) -> int:
     )
     config = NCMConfig(**tokenizer_state["config"])
     tokenizer = ResidualVQTokenizer(config).to(device)
-    tokenizer.load_state_dict(tokenizer_state["model"])
+    tokenizer_model_state, _ = migrate_ternary_state_dict(
+        tokenizer, tokenizer_state["model"]
+    )
+    tokenizer.load_state_dict(tokenizer_model_state)
     tokenizer.eval()
     generator = NCMGenerator(config, tokenizer).to(device)
-    generator.load_state_dict(generator_state["model"])
+    generator_model_state, _ = migrate_ternary_state_dict(
+        generator, generator_state["model"]
+    )
+    generator.load_state_dict(generator_model_state)
     tokenizer_parameters = sum(parameter.numel() for parameter in tokenizer.parameters())
     generator_parameters = sum(parameter.numel() for parameter in generator.parameters())
     generator.eval()
