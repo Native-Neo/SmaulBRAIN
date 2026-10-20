@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 
 from ncm import NCMConfig, NCMGenerator, ResidualVQTokenizer, ncm_loss
+from smaulbrain import config as _preset_config
 
 
 TEXT_COLUMNS = (
@@ -25,8 +26,15 @@ TEXT_COLUMNS = (
 
 
 def corpus_chunks(path: Path):
-    paths = sorted(p for p in path.rglob("*") if p.is_file()) if path.is_dir() else [path]
-    paths = [p for p in paths if p.suffix.lower() in {".txt", ".md", ".text", ".jsonl", ".parquet"}]
+    supported = {".txt", ".md", ".text", ".jsonl", ".parquet", ".bin", ".dat", ".corpus"}
+    if path.is_dir():
+        paths = sorted(
+            p for p in path.rglob("*")
+            if p.is_file() and p.suffix.lower() in supported
+        )
+    else:
+        # A directly supplied corpus file is raw byte input regardless of extension.
+        paths = [path]
     if not paths:
         raise ValueError(f"No supported text or Parquet files found under {path}")
     for file_path in paths:
@@ -120,7 +128,7 @@ class ByteBatchStream:
 class SmaulTrainingOptimizer:
     """Adapt SmaulOPT's named-tensor API to PyTorch module training."""
 
-    def __init__(self, model, lr: float):
+    def __init__(self, model, lr: float, weight_decay: float = 0.0):
         from smaulbrain.smaulopt import SmaulOPT
 
         self.params = {
@@ -130,7 +138,7 @@ class SmaulTrainingOptimizer:
         }
         if not self.params:
             raise ValueError("SmaulOPT requires at least one trainable parameter")
-        self.optimizer = SmaulOPT(lr=lr)
+        self.optimizer = SmaulOPT(lr=lr, weight_decay=weight_decay)
         self.optimizer.register(self.params)
 
     def zero_grad(self, set_to_none: bool = True) -> None:
@@ -241,12 +249,22 @@ def main(argv=None) -> int:
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seq-len", type=int, default=128)
-    parser.add_argument("--d-model", type=int, default=64)
+    parser.add_argument(
+        "--preset", default="custom",
+        choices=("custom", "tiny", "full", "dense-tiny", "dense-full", "moe-tiny", "moe-full"),
+        help="use one of the four repository presets, or custom NCM dimensions",
+    )
+    parser.add_argument("--moe", action="store_true", help="interpret preset tiny/full as MoE")
+    parser.add_argument("--dense", action="store_true", help="interpret preset tiny/full as dense")
+    parser.add_argument("--d-model", type=int, default=None)
     parser.add_argument("--levels", type=int, default=4)
     parser.add_argument("--codebook-size", type=int, default=64)
-    parser.add_argument("--layers", type=int, default=2)
-    parser.add_argument("--experts", type=int, default=4, help="size of the shared expert pool")
-    parser.add_argument("--top-k", type=int, default=2, help="experts activated per position")
+    parser.add_argument("--layers", type=int, default=None)
+    parser.add_argument("--experts", type=int, default=None, help="override preset expert count")
+    parser.add_argument("--top-k", type=int, default=None, help="override preset experts activated per position")
+    parser.add_argument("--forward-quant", choices=("fp32", "fp8", "ternary"), default="fp32")
+    parser.add_argument("--backward-mode", choices=("fp32", "fp8", "ternary"), default="fp32")
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument(
         "--heads", type=int, default=4,
         help="legacy compatibility option; ignored by the recurrent NCM generator",
@@ -255,26 +273,71 @@ def main(argv=None) -> int:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args(argv)
-    if min(args.steps, args.save_every, args.batch_size, args.seq_len, args.d_model,
-           args.levels, args.codebook_size, args.layers, args.heads,
-           args.experts, args.top_k) < 1:
-        parser.error("steps, save-every, batch-size and model dimensions must be positive")
-    if args.top_k > args.experts:
-        parser.error("--top-k cannot exceed --experts")
+    if min(args.steps, args.save_every, args.batch_size, args.seq_len,
+           args.levels, args.codebook_size, args.heads) < 1:
+        parser.error("steps, save-every, batch-size, sequence length, levels and codebook size must be positive")
     if args.seq_len < 2:
         parser.error("seq-len must be >= 2")
+    if args.weight_decay < 0:
+        parser.error("--weight-decay must be >= 0")
     if not args.data.exists():
         parser.error(f"data path does not exist: {args.data}")
+    try:
+        preset = (
+            _preset_config.resolve_preset(args.preset, args.moe, args.dense)
+            if args.preset != "custom" else None
+        )
+        if args.preset == "custom" and (args.moe or args.dense):
+            raise ValueError("--moe/--dense aliases require --preset tiny or full")
+        _preset_config.validate_quant_combo(args.forward_quant, args.backward_mode)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    config = NCMConfig(
-        vocab_size=256, d_model=args.d_model, codebook_size=args.codebook_size,
-        levels=args.levels, n_layers=args.layers, n_heads=args.heads,
-        n_experts=args.experts, top_k=args.top_k,
-        max_seq_len=args.seq_len, dropout=0.0,
-    )
+    if preset is None:
+        d_model = args.d_model or 64
+        layers = args.layers or 2
+        experts = args.experts or 4
+        top_k = args.top_k or 2
+        if min(d_model, layers, experts, top_k) < 1 or top_k > experts:
+            parser.error("custom model dimensions must be positive and --top-k cannot exceed --experts")
+        config = NCMConfig(
+            vocab_size=256, d_model=d_model, codebook_size=args.codebook_size,
+            levels=args.levels, n_layers=layers, n_heads=args.heads,
+            n_experts=experts, top_k=top_k, max_seq_len=args.seq_len,
+            dropout=0.0, preset="custom", forward_quant=args.forward_quant,
+            backward_mode=args.backward_mode,
+        )
+    else:
+        spec = _preset_config.PRESETS[preset]
+        d_model = args.d_model or spec.d_model
+        layers = args.layers or spec.n_layers
+        if spec.kind == "moe":
+            experts = args.experts or spec.n_experts_init
+            top_k = args.top_k or spec.top_k
+            if min(experts, top_k) < 1 or top_k > experts:
+                parser.error("preset MoE requires positive expert count and top_k <= experts")
+            config = NCMConfig(
+                vocab_size=256, d_model=d_model, codebook_size=args.codebook_size,
+                levels=args.levels, n_layers=layers, n_heads=args.heads,
+                n_experts=experts, top_k=top_k, expert_hidden=spec.expert_hidden,
+                max_seq_len=args.seq_len, dropout=0.0, model_kind="moe",
+                preset=preset, forward_quant=args.forward_quant,
+                backward_mode=args.backward_mode,
+            )
+        else:
+            if args.experts is not None or args.top_k is not None:
+                parser.error("dense presets do not support --experts or --top-k")
+            config = NCMConfig(
+                vocab_size=256, d_model=d_model, codebook_size=args.codebook_size,
+                levels=args.levels, n_layers=layers, n_heads=args.heads,
+                n_experts=0, top_k=0, ffn_hidden=spec.ffn_hidden,
+                max_seq_len=args.seq_len, dropout=0.0, model_kind="dense",
+                preset=preset, forward_quant=args.forward_quant,
+                backward_mode=args.backward_mode,
+            )
     stream = ByteBatchStream(args.data, args.seq_len, args.batch_size, 4 << 20)
     tokenizer_path = args.output / "tokenizer.pt"
     generator_path = args.output / "generator.pt"
@@ -283,7 +346,7 @@ def main(argv=None) -> int:
 
     if args.stage in ("tokenizer", "both"):
         tokenizer = ResidualVQTokenizer(config).to(device)
-        optimizer = SmaulTrainingOptimizer(tokenizer, args.lr)
+        optimizer = SmaulTrainingOptimizer(tokenizer, args.lr, args.weight_decay)
         start = load_stage_checkpoint(tokenizer_train_path, tokenizer, optimizer, device)
         tokenizer.train()
         start_time = time.perf_counter()
@@ -311,7 +374,11 @@ def main(argv=None) -> int:
         if not tokenizer_path.exists():
             parser.error(f"missing tokenizer checkpoint: {tokenizer_path}")
         tokenizer_state = torch.load(tokenizer_path, map_location=device, weights_only=False)
-        if tokenizer_state["config"] != config.__dict__:
+        try:
+            saved_config = NCMConfig(**tokenizer_state["config"])
+        except (TypeError, ValueError) as exc:
+            parser.error(f"invalid tokenizer checkpoint configuration: {exc}")
+        if saved_config != config:
             parser.error("CLI model settings do not match the saved tokenizer configuration")
         tokenizer = ResidualVQTokenizer(config).to(device)
         tokenizer.load_state_dict(tokenizer_state["model"])
@@ -338,7 +405,7 @@ def main(argv=None) -> int:
             f"total_architecture_parameters: {tokenizer_count + generator_count:,}",
             flush=True,
         )
-        optimizer = SmaulTrainingOptimizer(generator, args.lr)
+        optimizer = SmaulTrainingOptimizer(generator, args.lr, args.weight_decay)
         start = load_stage_checkpoint(generator_train_path, generator, optimizer, device)
         generator.train()
         start_time = time.perf_counter()
