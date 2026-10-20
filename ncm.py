@@ -308,9 +308,9 @@ class NCMGenerator(nn.Module):
     """Predict every code level in one training pass; generate one level per step.
 
     Inputs are cumulative reconstructions of *earlier* levels, not the target
-    level's ground-truth IDs. Target codes are labels only. Block-diagonal
-    attention lets positions interact within their level; each level's input
-    already summarizes all coarser reconstructions.
+    level's ground-truth IDs. Target codes are labels only. Independent
+    recurrent scans keep levels isolated while allowing all positions within
+    each level to be predicted in parallel.
     """
 
     def __init__(self, config: NCMConfig, tokenizer: ResidualVQTokenizer):
