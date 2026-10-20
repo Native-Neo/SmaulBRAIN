@@ -84,13 +84,13 @@ Growth controls include `--growth-every-steps`, `--growth-loss-nats`, `--growth-
 
 The isolated Next-Concept Modeling prototype in `ncm.py` uses a multiscale
 residual-VQ byte tokenizer and a **SmaulBRAIN-style recurrent generator**:
-bidirectional recurrent linear attention, RMSNorm, residual connections, and
-gated SiLU channel mixing. The chunked vectorized recurrence avoids a
-time-by-time attention matrix while keeping all positions within each code
-level parallel. It is an NCM-specific bidirectional adaptation, not a replacement
-for SmaulBRAIN's usual causal recurrent model. The shared MoE expert pool is not
-yet integrated into this prototype. Default SmaulBRAIN training, inference, and
-checkpoints are unchanged.
+bidirectional recurrent linear attention, RMSNorm, residual connections, and a
+single sparse router/expert pool shared across recurrent layers. The chunked
+vectorized recurrence avoids a time-by-time attention matrix while keeping all
+positions within each code level parallel. It is an NCM-specific bidirectional
+adaptation, not a replacement for SmaulBRAIN's usual causal recurrent model.
+The small defaults use four experts with top-2 routing. Default SmaulBRAIN
+training, inference, and checkpoints are unchanged.
 
 Use a fresh output directory because the recurrent generator's weights are
 incompatible with older Transformer-based NCM generator checkpoints:
