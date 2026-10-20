@@ -44,9 +44,20 @@ are inherited from the original four preset definitions, but NCM tokenizer and
 hierarchy parameters change the total parameter counts.
 
 The NCM linear layers support FP32, software FP8 E4M3 emulation, and packed
-ternary forward operations. Ternary forward uses the repository's packed
-matrix kernels; it does not reconstruct a dense FP32 weight matrix for the
-forward multiplication. SmaulOPT updates the trainable master parameters.
+ternary operations. With `--forward-quant ternary`, linear matrix weights are
+persisted as packed 2-bit ternary codes (four values per byte). They are not
+held in FP32 master-weight tensors, and the trainer does not accumulate dense
+FP32 weight-gradient tensors for those matrices. Forward and input-gradient
+matrix products use the packed ternary kernels. Backpropagation calculates a
+transient dense gradient signal, then queues sparse gradient-sign updates that
+modify the packed codes directly after backward. Biases, embeddings, codebooks,
+and normalization parameters remain floating point.
+
+This direct-discrete ternary update rule is experimental and is not conventional
+straight-through-estimator QAT. Its convergence and generated-text quality must
+be evaluated on real runs. Legacy FP32-master ternary checkpoints are converted
+to packed ternary weights on load; optimizer moments for the converted matrices
+are reset.
 
 The prototype is intentionally smaller than the paper's VQ-VAE and generator.
 It does not yet reproduce the paper's learned quantizer schedules, exact
