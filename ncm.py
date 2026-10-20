@@ -192,9 +192,10 @@ class SmaulRecurrentBlock(nn.Module):
         offset = 0
         for length in segment_lengths:
             segment = key_value[:, offset:offset + length]
-            forward_state = self._scan(segment, decay_rate)
-            reverse_state = self._scan(segment.flip(dims=(1,)), decay_rate).flip(dims=(1,))
-            contexts.append(0.5 * (forward_state + reverse_state))
+            # One scan over [forward; reversed] halves tensor-op launches.
+            batch = segment.shape[0]
+            both = self._scan(torch.cat((segment, segment.flip(dims=(1,))), dim=0), decay_rate)
+            contexts.append(0.5 * (both[:batch] + both[batch:].flip(dims=(1,))))
             offset += length
         context = torch.cat(contexts, dim=1)
         attended = self.W_o(read_gate * (context + self.bonus * key_value))
