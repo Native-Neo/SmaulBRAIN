@@ -1,5 +1,7 @@
+import pytest
 import torch
 
+import ncm
 from ncm_train import ByteBatchStream, SmaulTrainingOptimizer, build_ncm_config
 from ncm import (
     NCMConfig, NCMGenerator, NCMLinear, NCMTransformer, ResidualVQTokenizer,
@@ -174,7 +176,8 @@ def test_generator_uses_smaul_recurrent_blocks_instead_of_transformers():
     assert NCMTransformer is NCMGenerator
 
 
-def test_chunked_recurrent_scan_matches_the_recurrence_equation():
+def test_chunked_recurrent_scan_matches_the_recurrence_equation(monkeypatch):
+    monkeypatch.setattr(ncm._quant, "prepare_ternary_backend", lambda: False)
     block = SmaulRecurrentBlock(dimension=3)
     values = torch.randn(2, 173, 3, requires_grad=True)
     rate = torch.tensor([0.01, 0.03, 0.08])
@@ -255,6 +258,8 @@ def _naive_scan(values, rate):
 
 
 def test_native_recurrent_scan_backward_matches_autograd_reference():
+    if not ncm._quant.prepare_ternary_backend():
+        pytest.skip("native recurrent scan backend is unavailable")
     torch.manual_seed(23)
     block = SmaulRecurrentBlock(dimension=3)
     values = torch.randn(2, 173, 3, requires_grad=True)
