@@ -1,7 +1,7 @@
 """Experimental coarse-to-fine Next-Concept Modeling for SmaulBRAIN.
 
 The default SmaulBRAIN model is not changed. Train ResidualVQTokenizer first,
-freeze it, then train NCMTransformer against its code hierarchies.
+freeze it, then train NCMGenerator against its code hierarchies.
 """
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ class NCMConfig:
     levels: int = 4
     n_layers: int = 4
     n_heads: int = 4
+    n_experts: int = 4
+    top_k: int = 2
     max_seq_len: int = 1024
     dropout: float = 0.0
     commitment_weight: float = 0.25
@@ -30,8 +32,10 @@ class NCMConfig:
     def __post_init__(self) -> None:
         if self.vocab_size < 2 or self.codebook_size < 2:
             raise ValueError("vocab_size and codebook_size must be >= 2")
-        if min(self.d_model, self.levels, self.n_layers, self.n_heads) < 1:
-            raise ValueError("model dimensions and levels must be positive")
+        if min(self.d_model, self.levels, self.n_layers, self.n_heads, self.n_experts) < 1:
+            raise ValueError("model dimensions, levels, and experts must be positive")
+        if not 1 <= self.top_k <= self.n_experts:
+            raise ValueError("top_k must be between 1 and n_experts")
         # n_heads remains accepted for older CLI/checkpoint configs. The
         # recurrent NCM generator does not split channels into attention heads.
         if self.max_seq_len < 2:
@@ -73,6 +77,52 @@ class RMSNorm(nn.Module):
         return x * scale.to(dtype=x.dtype) * self.weight.to(dtype=x.dtype)
 
 
+class SmaulExpert(nn.Module):
+    """One SmaulBRAIN-style GELU expert with bias-free projections."""
+
+    def __init__(self, dimension: int, hidden_dimension: int):
+        super().__init__()
+        self.W_in = nn.Linear(dimension, hidden_dimension, bias=False)
+        self.W_out = nn.Linear(hidden_dimension, dimension, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.W_out(F.gelu(self.W_in(x)))
+
+
+class SmaulSharedMoE(nn.Module):
+    """One sparse router and expert pool shared by every recurrent block."""
+
+    def __init__(self, dimension: int, n_experts: int, top_k: int):
+        super().__init__()
+        if n_experts < 1 or not 1 <= top_k <= n_experts:
+            raise ValueError("top_k must be between 1 and n_experts")
+        self.n_experts = n_experts
+        self.top_k = top_k
+        self.router = nn.Linear(dimension, n_experts, bias=False)
+        self.experts = nn.ModuleList(
+            SmaulExpert(dimension, 4 * dimension) for _ in range(n_experts)
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        original_shape = x.shape
+        flat = x.reshape(-1, original_shape[-1])
+        route_logits = self.router(flat)
+        chosen_logits, chosen_experts = route_logits.topk(self.top_k, dim=-1)
+        route_weights = torch.softmax(chosen_logits, dim=-1)
+        output = torch.zeros_like(flat)
+
+        # Only run an expert for tokens routed to it; the pool itself is shared
+        # by all NCM levels and all recurrent layers.
+        for expert_id, expert in enumerate(self.experts):
+            token_indices, slots = torch.where(chosen_experts == expert_id)
+            if token_indices.numel() == 0:
+                continue
+            expert_output = expert(flat.index_select(0, token_indices))
+            weights = route_weights[token_indices, slots].unsqueeze(-1)
+            output = output.index_add(0, token_indices, expert_output * weights)
+        return output.reshape(original_shape)
+
+
 class SmaulRecurrentBlock(nn.Module):
     """Bidirectional, parallel-scan adaptation of SmaulBRAIN's recurrent block.
 
@@ -86,7 +136,7 @@ class SmaulRecurrentBlock(nn.Module):
 
     _SCAN_CHUNK = 32
 
-    def __init__(self, dimension: int, feedforward_dimension: int):
+    def __init__(self, dimension: int):
         super().__init__()
         self.norm_attention = RMSNorm(dimension)
         self.norm_channel = RMSNorm(dimension)
@@ -98,9 +148,6 @@ class SmaulRecurrentBlock(nn.Module):
         # The bounded rate keeps the vectorized scan numerically stable.
         self.decay_logit = nn.Parameter(torch.full((dimension,), -4.0))
         self.bonus = nn.Parameter(torch.ones(dimension))
-        self.channel_a = nn.Linear(dimension, feedforward_dimension, bias=False)
-        self.channel_b = nn.Linear(dimension, feedforward_dimension, bias=False)
-        self.channel_out = nn.Linear(feedforward_dimension, dimension, bias=False)
 
     def _scan(self, values: Tensor, decay_rate: Tensor) -> Tensor:
         """Evaluate the recurrent state with stable, bounded-size vectorized scans."""
@@ -123,7 +170,10 @@ class SmaulRecurrentBlock(nn.Module):
             output_chunks.append(scanned)
         return torch.cat(output_chunks, dim=1).to(dtype=values.dtype)
 
-    def forward(self, x: Tensor, segment_lengths: Sequence[int]) -> Tensor:
+    def forward(
+        self, x: Tensor, segment_lengths: Sequence[int],
+        channel_mixer: SmaulSharedMoE,
+    ) -> Tensor:
         if sum(segment_lengths) != x.shape[1] or any(length < 1 for length in segment_lengths):
             raise ValueError("segment_lengths must be positive and sum to the sequence length")
 
@@ -148,10 +198,7 @@ class SmaulRecurrentBlock(nn.Module):
         x = x + attended
 
         channel_input = self.norm_channel(x)
-        channel_output = self.channel_out(
-            F.silu(self.channel_a(channel_input)) * self.channel_b(channel_input)
-        )
-        return x + channel_output
+        return x + channel_mixer(channel_input)
 
 
 class ResidualVQTokenizer(nn.Module):
@@ -279,9 +326,13 @@ class NCMGenerator(nn.Module):
         self.prefix_projection = nn.Linear(config.d_model, config.d_model)
         self.level_embeddings = nn.Embedding(config.levels, config.d_model)
         self.position_embeddings = nn.Embedding(config.max_seq_len, config.d_model)
+        # A single router/expert pool is shared across every recurrent layer,
+        # matching the shared-pool option in the normal SmaulBRAIN MoE design.
+        self.channel_mixer = SmaulSharedMoE(
+            config.d_model, config.n_experts, config.top_k
+        )
         self.blocks = nn.ModuleList(
-            SmaulRecurrentBlock(config.d_model, 4 * config.d_model)
-            for _ in range(config.n_layers)
+            SmaulRecurrentBlock(config.d_model) for _ in range(config.n_layers)
         )
         self.final_norm = RMSNorm(config.d_model)
         self.output_heads = nn.ModuleList(
@@ -362,7 +413,7 @@ class NCMGenerator(nn.Module):
         segment_lengths = [part.shape[1] for part in segments]
         hidden = torch.cat(segments, dim=1)
         for block in self.blocks:
-            hidden = block(hidden, segment_lengths)
+            hidden = block(hidden, segment_lengths, self.channel_mixer)
         hidden = self.final_norm(hidden)
 
         encoded_segments = torch.split(hidden, segment_lengths, dim=1)
@@ -425,7 +476,7 @@ class NCMGenerator(nn.Module):
             hidden = torch.cat((prefix, current), dim=1)
         segment_lengths = [hidden.shape[1]]
         for block in self.blocks:
-            hidden = block(hidden, segment_lengths)
+            hidden = block(hidden, segment_lengths, self.channel_mixer)
         hidden = self.final_norm(hidden)
         if prefix_length:
             hidden = hidden[:, prefix_length:]
