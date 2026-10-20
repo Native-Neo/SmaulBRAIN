@@ -41,6 +41,9 @@ def corpus_chunks(path: Path):
                 key=lambda name: (TEXT_COLUMNS.index(name.lower()) if name.lower() in TEXT_COLUMNS
                                   else len(TEXT_COLUMNS)),
             )
+            preferred = [name for name in ordered if name.lower() in TEXT_COLUMNS]
+            if preferred:
+                ordered = preferred
             for batch in parquet.iter_batches(batch_size=128, columns=ordered):
                 columns = {name.lower(): batch.column(name).to_pylist() for name in ordered}
                 for row in range(batch.num_rows):
@@ -94,7 +97,7 @@ class ByteBatchStream:
             raise ValueError("Corpus must contain at least seq_len + 1 bytes")
 
     def next(self, device: torch.device) -> Tensor:
-        self._fill(min(self.buffer_bytes, self.seq_len + 1))
+        self._fill(self.buffer_bytes)
         max_start = len(self.buffer) - self.seq_len
         starts = [random.randrange(max_start + 1) for _ in range(self.batch_size)]
         batch = torch.tensor(
