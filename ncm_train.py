@@ -157,6 +157,8 @@ def main(argv=None) -> int:
     parser.add_argument("--levels", type=int, default=4)
     parser.add_argument("--codebook-size", type=int, default=64)
     parser.add_argument("--layers", type=int, default=2)
+    parser.add_argument("--experts", type=int, default=4, help="size of the shared expert pool")
+    parser.add_argument("--top-k", type=int, default=2, help="experts activated per position")
     parser.add_argument(
         "--heads", type=int, default=4,
         help="legacy compatibility option; ignored by the recurrent NCM generator",
@@ -166,8 +168,11 @@ def main(argv=None) -> int:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args(argv)
     if min(args.steps, args.save_every, args.batch_size, args.seq_len, args.d_model,
-           args.levels, args.codebook_size, args.layers, args.heads) < 1:
+           args.levels, args.codebook_size, args.layers, args.heads,
+           args.experts, args.top_k) < 1:
         parser.error("steps, save-every, batch-size and model dimensions must be positive")
+    if args.top_k > args.experts:
+        parser.error("--top-k cannot exceed --experts")
     if args.seq_len < 2:
         parser.error("seq-len must be >= 2")
     if not args.data.exists():
@@ -179,6 +184,7 @@ def main(argv=None) -> int:
     config = NCMConfig(
         vocab_size=256, d_model=args.d_model, codebook_size=args.codebook_size,
         levels=args.levels, n_layers=args.layers, n_heads=args.heads,
+        n_experts=args.experts, top_k=args.top_k,
         max_seq_len=args.seq_len, dropout=0.0,
     )
     stream = ByteBatchStream(args.data, args.seq_len, args.batch_size, 4 << 20)
