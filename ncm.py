@@ -276,6 +276,65 @@ class NCMTransformer(nn.Module):
             offset += length
         return logits
 
+    def predict_level(
+        self, codes: Sequence[Tensor], level: int,
+        *, prefix_tokens: Tensor | None = None,
+    ) -> Tensor:
+        """Predict only one level, avoiding work on unrelated levels at inference."""
+        if not 0 <= level < self.config.levels:
+            raise ValueError("level is outside the configured hierarchy")
+        if len(codes) != self.config.levels:
+            raise ValueError("one code tensor is required per level")
+        batch = codes[0].shape[0]
+        length = codes[-1].shape[1]
+        if length > self.config.max_seq_len:
+            raise ValueError("sequence exceeds config.max_seq_len")
+        device = codes[0].device
+        cumulative = self.tokenizer.byte_embedding.weight.new_zeros(
+            batch, length, self.config.d_model, device=device
+        )
+        for prior_level in range(level):
+            prior_length = level_length(length, prior_level, self.config.levels)
+            ids = codes[prior_level]
+            if ids.shape != (batch, prior_length):
+                raise ValueError(
+                    f"level {prior_level} codes must have shape [batch, {prior_length}]"
+                )
+            cumulative = cumulative + resize_sequence(
+                self.tokenizer.codebooks[prior_level](ids), length
+            )
+        current = resize_sequence(
+            cumulative, codes[level].shape[1], mode="area"
+        )
+        current = self.input_projection(current)
+        positions = torch.arange(current.shape[1], device=device)
+        current = current + self.position_embeddings(positions).unsqueeze(0)
+        current = current + self.level_embeddings.weight[level].view(1, 1, -1)
+        if prefix_tokens is None:
+            hidden = self.blocks(current)
+        else:
+            if prefix_tokens.ndim != 2 or prefix_tokens.shape[0] != batch:
+                raise ValueError("prefix_tokens must have shape [batch, prefix_length]")
+            if not 1 <= prefix_tokens.shape[1] <= self.config.max_seq_len:
+                raise ValueError("prefix length must be within [1, max_seq_len]")
+            prefix_features = self.tokenizer.encoder(
+                self.tokenizer.byte_embedding(prefix_tokens)
+            )
+            prefix_positions = torch.arange(prefix_tokens.shape[1], device=device)
+            prefix = self.prefix_projection(prefix_features)
+            prefix = prefix + self.position_embeddings(prefix_positions).unsqueeze(0)
+            prefix_length = prefix.shape[1]
+            joined = torch.cat((prefix, current), dim=1)
+            mask = torch.zeros(
+                prefix_length + current.shape[1],
+                prefix_length + current.shape[1],
+                dtype=torch.bool, device=device,
+            )
+            mask[:prefix_length, prefix_length:] = True
+            hidden = self.blocks(joined, mask=mask)[:, prefix_length:]
+        hidden = self.final_norm(hidden)
+        return self.output_heads[level](hidden)
+
     @torch.no_grad()
     def generate_codes(
         self, lengths: Sequence[int], device: torch.device | str = "cpu",
@@ -298,7 +357,7 @@ class NCMTransformer(nn.Module):
             torch.zeros(batch_size, n, dtype=torch.long, device=device) for n in lengths
         ]
         for level in range(self.config.levels):
-            logits = self.forward(codes, prefix_tokens=prefix_tokens, corrupt=False)[level]
+            logits = self.predict_level(codes, level, prefix_tokens=prefix_tokens)
             if temperature == 0:
                 codes[level] = logits.argmax(dim=-1)
             else:
