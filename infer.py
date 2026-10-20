@@ -16,7 +16,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from smaulbrain import cli as _cli
 from smaulbrain import config as _cfg
-from ncm import NCMConfig, NCMGenerator, ResidualVQTokenizer
+from ncm import (
+    NCMConfig, NCMGenerator, ResidualVQTokenizer, migrate_ternary_state_dict,
+)
 
 
 def _was_provided(argv, option):
@@ -124,10 +126,16 @@ def main(argv=None):
         _cfg.validate_quant_combo(config.forward_quant, config.backward_mode)
 
         tokenizer = ResidualVQTokenizer(config).to(args.device)
-        tokenizer.load_state_dict(tokenizer_state["model"])
+        tokenizer_model_state, _ = migrate_ternary_state_dict(
+            tokenizer, tokenizer_state["model"]
+        )
+        tokenizer.load_state_dict(tokenizer_model_state)
         tokenizer.eval()
         generator = NCMGenerator(config, tokenizer).to(args.device)
-        generator.load_state_dict(generator_state["model"])
+        generator_model_state, _ = migrate_ternary_state_dict(
+            generator, generator_state["model"]
+        )
+        generator.load_state_dict(generator_model_state)
         generator.eval()
     except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
         parser.error(f"unable to load NCM checkpoint: {exc}")
