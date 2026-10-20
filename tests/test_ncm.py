@@ -81,7 +81,7 @@ def test_prompt_conditioning_has_valid_shape_and_backpropagates():
     prefix = torch.randint(0, 256, (2, 4))
     logits = model(codes, prefix_tokens=prefix)
     assert [x.shape for x in logits] == [(2, 3, 16), (2, 5, 16), (2, 9, 16)]
-    loss = ncm_loss(model, codes)
+    loss = ncm_loss(model, codes, prefix_tokens=prefix)
     loss.backward()
     assert any(p.grad is not None for p in model.prefix_projection.parameters())
     generated = model.generate(9, prefix_tokens=prefix[:1])
