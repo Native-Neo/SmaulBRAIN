@@ -144,8 +144,51 @@ class _NCMQuantizedLinear(torch.autograd.Function):
         )
 
 
+class _DirectTernaryLinear(torch.autograd.Function):
+    """Linear autograd using packed ternary weights and direct discrete updates.
+
+    No dense master-weight Parameter or dense weight-gradient buffer is retained.
+    The backward pass computes a transient weight-gradient matrix, then applies
+    sparse sign updates directly to the ternary codes and immediately repacks them.
+    """
+
+    @staticmethod
+    def forward(ctx, x, bias, module):
+        original_shape = x.shape
+        x_flat = x.reshape(-1, x.shape[-1])
+        packed = module.ternary_packed
+        scale = float(module.ternary_scale.item())
+        shape = (module.in_features, module.out_features)
+        ctx.module = module
+        ctx.packed = packed
+        ctx.scale = scale
+        ctx.packed_shape = shape
+        ctx.input_shape = original_shape
+        ctx.has_bias = bias is not None
+        ctx.save_for_backward(x_flat)
+        output = _quant.packed_matmat(x_flat, packed, shape, scale)
+        if bias is not None:
+            output = output + bias
+        return output.reshape(*original_shape[:-1], module.out_features)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (x_flat,) = ctx.saved_tensors
+        dy = grad_output.reshape(-1, grad_output.shape[-1])
+        dx = _quant.packed_matmat_transpose(
+            dy, ctx.packed, ctx.packed_shape, ctx.scale
+        )
+        dbias = dy.sum(dim=0) if ctx.has_bias else None
+        # Ternary codes are the trainable weights. Keep the dense gradient only
+        # for this update; never attach it to a full-sized FP32 .grad tensor.
+        if ctx.module.training and ctx.module.ternary_update_rate > 0:
+            grad_codes = (dy.t() @ x_flat).t()
+            ctx.module._update_ternary_codes(grad_codes)
+        return dx.reshape(ctx.input_shape).to(dtype=x_flat.dtype), dbias, None
+
+
 class NCMLinear(nn.Linear):
-    """Linear layer supporting the repository's FP32, FP8, and packed-ternary paths."""
+    """Linear layer with optional FP32, FP8, or directly trained packed-ternary weights."""
 
     def __init__(self, in_features, out_features, bias=True,
                  forward_quant="fp32", backward_mode="fp32"):
@@ -157,6 +200,66 @@ class NCMLinear(nn.Linear):
         self._cached_packed_scale = 1.0
         self._cached_packed_shape = None
         self._cached_fp8_weight = None
+        self.ternary_update_rate = 3e-4
+
+        if self.forward_quant == "ternary":
+            # The initialized FP32 tensor exists only during this conversion.
+            # Persistent trainable weight storage is the packed 2-bit code tensor.
+            packed, scale, shape, _ = _quant.pack_ternary(
+                self.weight.detach().t().contiguous()
+            )
+            self.register_buffer("ternary_packed", packed.to(dtype=torch.uint8))
+            self.register_buffer(
+                "ternary_scale", torch.tensor(float(scale), dtype=torch.float32)
+            )
+            self.register_buffer("ternary_updates", torch.zeros((), dtype=torch.long))
+            self._ternary_shape = tuple(shape)
+            del self._parameters["weight"]
+
+    def _update_ternary_codes(self, gradient_codes: Tensor) -> None:
+        """Apply gradient-directed stochastic coordinate updates without a master weight."""
+        rate = float(self.ternary_update_rate)
+        if rate <= 0:
+            return
+
+        gradient = gradient_codes.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        if gradient.shape != self._ternary_shape or not torch.isfinite(gradient).all():
+            return
+        importance = gradient.abs()
+        mean_importance = float(importance.mean())
+        if not mean_importance > 0:
+            return
+
+        # Sample more often where the loss gradient is larger. Each selected
+        # element moves by one ternary level, clamped to {-1, 0, +1}.
+        probabilities = (importance * (rate / mean_importance)).clamp_(max=1.0)
+        selected = torch.rand(importance.shape) < probabilities
+        selected &= importance > 0
+        if not bool(selected.any()):
+            return
+
+        codes = _quant.unpack_codes(self.ternary_packed, self._ternary_shape).to(torch.int8)
+        direction = -gradient[selected].sign().to(torch.int8)
+        updated = (
+            codes[selected].to(torch.int16) + direction.to(torch.int16)
+        ).clamp_(-1, 1).to(torch.int8)
+        changed = updated != codes[selected]
+        if not bool(changed.any()):
+            return
+        selected_indices = selected.nonzero(as_tuple=True)
+        selected_codes = codes[selected_indices]
+        selected_codes[changed] = updated[changed]
+        codes[selected_indices] = selected_codes
+
+        # Packing {-1, 0, +1} directly yields canonical 2-bit codes. Its
+        # returned scale is one; preserve the learned-at-initialization layer scale.
+        new_packed, _, new_shape, _ = _quant.pack_ternary(
+            codes.to(dtype=torch.float32).contiguous()
+        )
+        if tuple(new_shape) != self._ternary_shape:
+            raise RuntimeError("ternary weight shape changed during direct update")
+        self.ternary_packed = new_packed.to(dtype=torch.uint8)
+        self.ternary_updates.add_(changed.sum().to(dtype=self.ternary_updates.dtype))
 
     def _quantized_weight(self):
         version = self.weight._version
@@ -168,27 +271,47 @@ class NCMLinear(nn.Linear):
         self._cached_packed_shape = None
         if self.forward_quant == "fp8":
             self._cached_fp8_weight, _ = _quant.fp8_e4m3_quantize(self.weight.detach())
-        elif self.forward_quant == "ternary":
-            _quant.prepare_ternary_backend()
-            (
-                self._cached_packed,
-                self._cached_packed_scale,
-                self._cached_packed_shape,
-                _,
-            ) = _quant.pack_ternary_tiled(self.weight.detach().t())
 
     def forward(self, x: Tensor) -> Tensor:
         if self.forward_quant == "fp32":
             return F.linear(x, self.weight, self.bias)
+        if self.forward_quant == "ternary":
+            return _DirectTernaryLinear.apply(x, self.bias, self)
         self._quantized_weight()
         fp8_weight = self._cached_fp8_weight
-        if fp8_weight is None:
-            fp8_weight = self.weight.new_empty(0)
         return _NCMQuantizedLinear.apply(
             x, self.weight, self.bias, self.forward_quant, self.backward_mode,
-            self._cached_packed, self._cached_packed_scale,
-            self._cached_packed_shape, fp8_weight,
+            None, 1.0, None, fp8_weight,
         )
+
+
+def migrate_ternary_state_dict(model: nn.Module, state_dict: dict) -> tuple[dict, bool]:
+    """Convert legacy FP32-master ternary checkpoints to packed direct-ternary state."""
+    converted = dict(state_dict)
+    migrated = False
+    for module_name, module in model.named_modules():
+        if not isinstance(module, NCMLinear) or module.forward_quant != "ternary":
+            continue
+        prefix = f"{module_name}." if module_name else ""
+        old_weight_key = prefix + "weight"
+        packed_key = prefix + "ternary_packed"
+        if old_weight_key not in converted or packed_key in converted:
+            continue
+        weight = converted.pop(old_weight_key)
+        packed, scale, shape, _ = _quant.pack_ternary(
+            weight.detach().t().contiguous()
+        )
+        if tuple(shape) != module._ternary_shape:
+            raise ValueError(f"legacy ternary checkpoint shape mismatch at {old_weight_key}")
+        converted[packed_key] = packed.to(dtype=torch.uint8)
+        converted[prefix + "ternary_scale"] = torch.tensor(
+            float(scale), dtype=torch.float32
+        )
+        converted.setdefault(
+            prefix + "ternary_updates", module.ternary_updates.detach().clone()
+        )
+        migrated = True
+    return converted, migrated
 
 
 def level_length(length: int, level: int, levels: int) -> int:
