@@ -248,7 +248,9 @@ class NCMTransformer(nn.Module):
             prefix_features = self.tokenizer.encoder(
                 self.tokenizer.byte_embedding(prefix_tokens)
             )
+            prefix_positions = torch.arange(prefix_tokens.shape[1], device=inputs.device)
             prefix = self.prefix_projection(prefix_features)
+            prefix = prefix + self.position_embeddings(prefix_positions).unsqueeze(0)
             inputs = torch.cat((prefix, inputs), dim=1)
         total = level_ids.numel()
         target_mask = level_ids[:, None] != level_ids[None, :]
