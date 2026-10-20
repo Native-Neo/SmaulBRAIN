@@ -109,28 +109,10 @@ class SmaulSharedMoE(nn.Module):
         route_logits = self.router(flat)
         chosen_logits, chosen_experts = route_logits.topk(self.top_k, dim=-1)
         route_weights = torch.softmax(chosen_logits, dim=-1)
-        if self.n_experts <= 8 and not self.training:
-            # In evaluation, batched expert operations reduce Python dispatch overhead.
-            # During training, use sparse routing below: evaluating every expert for
-            # every token doubles the expert work when top_k=2 out of 4 and retains
-            # unnecessary autograd operations for outputs discarded by the top-k.
-            expert_in = torch.stack(
-                [expert.W_in.weight for expert in self.experts], dim=0
-            )
-            expert_out = torch.stack(
-                [expert.W_out.weight for expert in self.experts], dim=0
-            )
-            hidden = torch.einsum("nd,ehd->neh", flat, expert_in)
-            hidden = F.gelu(hidden)
-            expert_outputs = torch.einsum("neh,edh->ned", hidden, expert_out)
-            selected = expert_outputs.gather(
-                1, chosen_experts.unsqueeze(-1).expand(-1, -1, original_shape[-1])
-            )
-            output = (selected * route_weights.unsqueeze(-1)).sum(dim=1)
-            return output.reshape(original_shape)
-
         output = torch.zeros_like(flat)
-        # For larger pools, preserve sparse execution to avoid evaluating every expert.
+        # Sparse dispatch is faster than evaluating every expert in training and
+        # inference (measured on CPU, 4 experts/top-2: 41.4 -> 25.6 ms per 128-byte
+        # generation at d_model=128), so both modes share it.
         for expert_id, expert in enumerate(self.experts):
             token_indices, slots = torch.where(chosen_experts == expert_id)
             if token_indices.numel() == 0:
