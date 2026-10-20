@@ -80,6 +80,9 @@ class ResidualVQTokenizer(nn.Module):
             nn.Embedding(config.codebook_size, config.d_model)
             for _ in range(config.levels)
         )
+        self.register_buffer(
+            "_codebook_initialized", torch.zeros(config.levels, dtype=torch.bool)
+        )
         self.decoder = nn.Sequential(
             nn.Linear(config.d_model, config.d_model), nn.GELU(),
             nn.Linear(config.d_model, config.vocab_size),
@@ -87,6 +90,15 @@ class ResidualVQTokenizer(nn.Module):
 
     def _quantize(self, residual: Tensor, level: int) -> tuple[Tensor, Tensor, Tensor]:
         codebook = self.codebooks[level].weight
+        if self.training and not bool(self._codebook_initialized[level]):
+            # Seed code vectors from actual residuals to reduce early codebook collapse.
+            with torch.no_grad():
+                samples = residual.detach().reshape(-1, residual.shape[-1])
+                choices = torch.randint(
+                    samples.shape[0], (self.config.codebook_size,), device=samples.device
+                )
+                codebook.copy_(samples[choices].to(codebook.dtype))
+                self._codebook_initialized[level] = True
         flat = residual.reshape(-1, residual.shape[-1]).float()
         weights = codebook.float()
         distances = (
