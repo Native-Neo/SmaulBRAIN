@@ -3,7 +3,7 @@ import torch
 from ncm_train import ByteBatchStream
 from ncm import (
     NCMConfig, NCMGenerator, NCMTransformer, ResidualVQTokenizer,
-    SmaulRecurrentBlock, ncm_loss,
+    SmaulRecurrentBlock, SmaulSharedMoE, ncm_loss,
 )
 
 
@@ -131,7 +131,7 @@ def test_generator_uses_smaul_recurrent_blocks_instead_of_transformers():
 
 
 def test_chunked_recurrent_scan_matches_the_recurrence_equation():
-    block = SmaulRecurrentBlock(dimension=3, feedforward_dimension=12)
+    block = SmaulRecurrentBlock(dimension=3)
     values = torch.randn(2, 73, 3, requires_grad=True)
     rate = torch.tensor([0.01, 0.03, 0.08])
     actual = block._scan(values, rate)
@@ -155,3 +155,24 @@ def test_recurrent_config_does_not_require_attention_head_splitting():
     config = NCMConfig(d_model=10, n_heads=4)
     model = NCMGenerator(config, ResidualVQTokenizer(config))
     assert model.config.d_model == 10
+
+
+
+def test_shared_moe_pool_routes_tokens_and_receives_gradients():
+    config = tiny_config()
+    tokenizer = ResidualVQTokenizer(config)
+    model = NCMGenerator(config, tokenizer)
+
+    assert isinstance(model.channel_mixer, SmaulSharedMoE)
+    assert sum(isinstance(module, SmaulSharedMoE) for module in model.modules()) == 1
+    assert model.channel_mixer.n_experts == config.n_experts
+    assert model.channel_mixer.top_k == config.top_k
+
+    codes = tokenizer.encode(torch.randint(0, 256, (2, 9)))
+    loss = ncm_loss(model, codes)
+    loss.backward()
+
+    router_gradient = model.channel_mixer.router.weight.grad
+    assert router_gradient is not None
+    assert torch.isfinite(router_gradient).all()
+    assert float(router_gradient.abs().sum()) > 0.0
