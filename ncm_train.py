@@ -244,10 +244,10 @@ def build_ncm_config(
         "backward_mode": backward_mode,
     }
     if resolved is None:
-        dimension = d_model or 64
-        layer_count = layers or 2
-        expert_count = experts or 4
-        route_count = top_k or 2
+        dimension = 64 if d_model is None else d_model
+        layer_count = 2 if layers is None else layers
+        expert_count = 4 if experts is None else experts
+        route_count = 2 if top_k is None else top_k
         if min(dimension, layer_count, expert_count, route_count) < 1:
             raise ValueError("custom dimensions and expert counts must be positive")
         if route_count > expert_count:
@@ -258,13 +258,13 @@ def build_ncm_config(
         )
 
     spec = _preset_config.PRESETS[resolved]
-    dimension = d_model or spec.d_model
-    layer_count = layers or spec.n_layers
+    dimension = spec.d_model if d_model is None else d_model
+    layer_count = spec.n_layers if layers is None else layers
     if dimension < 1 or layer_count < 1:
         raise ValueError("model dimensions and layers must be positive")
     if spec.kind == "moe":
-        expert_count = experts or spec.n_experts_init
-        route_count = top_k or spec.top_k
+        expert_count = spec.n_experts_init if experts is None else experts
+        route_count = spec.top_k if top_k is None else top_k
         if min(expert_count, route_count) < 1 or route_count > expert_count:
             raise ValueError("preset MoE requires positive expert count and top_k <= experts")
         return NCMConfig(
