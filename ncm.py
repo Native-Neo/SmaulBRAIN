@@ -183,7 +183,7 @@ class _DirectTernaryLinear(torch.autograd.Function):
         # for this update; never attach it to a full-sized FP32 .grad tensor.
         if ctx.module.training and ctx.module.ternary_update_rate > 0:
             grad_codes = (dy.t() @ x_flat).t()
-            ctx.module._update_ternary_codes(grad_codes)
+            ctx.module._record_ternary_update(grad_codes)
         return dx.reshape(ctx.input_shape).to(dtype=x_flat.dtype), dbias, None
 
 
@@ -214,15 +214,19 @@ class NCMLinear(nn.Linear):
             )
             self.register_buffer("ternary_updates", torch.zeros((), dtype=torch.long))
             self._ternary_shape = tuple(shape)
+            self._pending_ternary_indices = []
+            self._pending_ternary_directions = []
             del self._parameters["weight"]
 
-    def _update_ternary_codes(self, gradient_codes: Tensor) -> None:
-        """Apply gradient-directed stochastic coordinate updates without a master weight."""
+    def _record_ternary_update(self, gradient_codes: Tensor) -> None:
+        """Queue sparse gradient-sign updates; do not repack during each backward call."""
         rate = float(self.ternary_update_rate)
         if rate <= 0:
             return
 
-        gradient = gradient_codes.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        gradient = gradient_codes.detach().to(
+            device="cpu", dtype=torch.float32
+        ).contiguous()
         if gradient.shape != self._ternary_shape or not torch.isfinite(gradient).all():
             return
         importance = gradient.abs()
@@ -230,36 +234,77 @@ class NCMLinear(nn.Linear):
         if not mean_importance > 0:
             return
 
-        # Sample more often where the loss gradient is larger. Each selected
-        # element moves by one ternary level, clamped to {-1, 0, +1}.
+        # Larger gradients are sampled more often. Queue indices, not a dense
+        # gradient or optimizer tensor, and apply the queued updates after backward.
         probabilities = (importance * (rate / mean_importance)).clamp_(max=1.0)
         selected = torch.rand(importance.shape) < probabilities
         selected &= importance > 0
-        if not bool(selected.any()):
+        indices = selected.reshape(-1).nonzero(as_tuple=False).flatten()
+        if indices.numel() == 0:
             return
+        directions = -gradient.reshape(-1)[indices].sign().to(torch.int8)
+        self._pending_ternary_indices.append(indices.to(torch.int32))
+        self._pending_ternary_directions.append(directions)
 
-        codes = _quant.unpack_codes(self.ternary_packed, self._ternary_shape).to(torch.int8)
-        direction = -gradient[selected].sign().to(torch.int8)
-        updated = (
-            codes[selected].to(torch.int16) + direction.to(torch.int16)
-        ).clamp_(-1, 1).to(torch.int8)
-        changed = updated != codes[selected]
+    @torch.no_grad()
+    def _apply_pending_ternary_updates(self) -> None:
+        """Apply queued coordinate updates directly to packed 2-bit codes."""
+        if not self._pending_ternary_indices:
+            return
+        indices = torch.cat(self._pending_ternary_indices).to(torch.long)
+        directions = torch.cat(self._pending_ternary_directions).to(torch.int16)
+        self._pending_ternary_indices.clear()
+        self._pending_ternary_directions.clear()
+
+        # Several recurrent levels may use the same shared expert in one step.
+        # Combine their votes so each selected weight moves at most one ternary level.
+        unique_indices, inverse = torch.unique(indices, sorted=True, return_inverse=True)
+        votes = torch.zeros(unique_indices.numel(), dtype=torch.int16)
+        votes.scatter_add_(0, inverse, directions)
+        directions = votes.sign()
+        active = directions != 0
+        if not bool(active.any()):
+            return
+        unique_indices = unique_indices[active]
+        directions = directions[active]
+
+        packed = self.ternary_packed.reshape(-1)
+        byte_indices = torch.div(unique_indices, 4, rounding_mode="floor")
+        shifts = (unique_indices.remainder(4) * 2).to(torch.int16)
+        old_bytes = packed[byte_indices].to(torch.int16)
+        old_raw = torch.bitwise_and(
+            torch.bitwise_right_shift(old_bytes, shifts), 0x3
+        )
+        # Canonical encoding is {-1,0,+1} -> {0,1,2}. Code 3 is unused.
+        new_raw = (old_raw + directions).clamp_(0, 2)
+        changed = new_raw != old_raw
         if not bool(changed.any()):
             return
-        selected_indices = selected.nonzero(as_tuple=True)
-        selected_codes = codes[selected_indices]
-        selected_codes[changed] = updated[changed]
-        codes[selected_indices] = selected_codes
+        byte_indices = byte_indices[changed]
+        shifts = shifts[changed]
+        new_raw = new_raw[changed]
 
-        # Packing {-1, 0, +1} directly yields canonical 2-bit codes. Its
-        # returned scale is one; preserve the learned-at-initialization layer scale.
-        new_packed, _, new_shape, _ = _quant.pack_ternary(
-            codes.to(dtype=torch.float32).contiguous()
+        # Merge different trits sharing a byte before writing, avoiding duplicate
+        # advanced-index writes that could otherwise overwrite a neighbor update.
+        unique_bytes, byte_inverse = torch.unique(
+            byte_indices, sorted=True, return_inverse=True
         )
-        if tuple(new_shape) != self._ternary_shape:
-            raise RuntimeError("ternary weight shape changed during direct update")
-        self.ternary_packed = new_packed.to(dtype=torch.uint8)
+        masks = torch.bitwise_left_shift(
+            torch.full_like(shifts, 0x3), shifts
+        )
+        values = torch.bitwise_left_shift(new_raw, shifts)
+        clear_masks = torch.zeros(unique_bytes.numel(), dtype=torch.int16)
+        set_values = torch.zeros(unique_bytes.numel(), dtype=torch.int16)
+        clear_masks.scatter_add_(0, byte_inverse, masks)
+        set_values.scatter_add_(0, byte_inverse, values)
+        old = packed[unique_bytes].to(torch.int16)
+        updated_bytes = torch.bitwise_or(
+            torch.bitwise_and(old, torch.bitwise_not(clear_masks)),
+            set_values,
+        ).to(torch.uint8)
+        packed[unique_bytes] = updated_bytes
         self.ternary_updates.add_(changed.sum().to(dtype=self.ternary_updates.dtype))
+
 
     def _quantized_weight(self):
         version = self.weight._version
@@ -312,6 +357,13 @@ def migrate_ternary_state_dict(model: nn.Module, state_dict: dict) -> tuple[dict
         )
         migrated = True
     return converted, migrated
+
+
+def apply_direct_ternary_updates(model: nn.Module) -> None:
+    """Flush pending sparse ternary updates once per completed backward pass."""
+    for module in model.modules():
+        if isinstance(module, NCMLinear) and module.forward_quant == "ternary":
+            module._apply_pending_ternary_updates()
 
 
 def level_length(length: int, level: int, levels: int) -> int:
