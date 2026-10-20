@@ -135,7 +135,7 @@ def test_generator_uses_smaul_recurrent_blocks_instead_of_transformers():
 
 def test_chunked_recurrent_scan_matches_the_recurrence_equation():
     block = SmaulRecurrentBlock(dimension=3)
-    values = torch.randn(2, 73, 3, requires_grad=True)
+    values = torch.randn(2, 173, 3, requires_grad=True)
     rate = torch.tensor([0.01, 0.03, 0.08])
     actual = block._scan(values, rate)
 
@@ -159,6 +159,28 @@ def test_recurrent_config_does_not_require_attention_head_splitting():
     model = NCMGenerator(config, ResidualVQTokenizer(config))
     assert model.config.d_model == 10
 
+
+
+def test_vectorized_small_moe_matches_sparse_routing_reference():
+    torch.manual_seed(7)
+    moe = SmaulSharedMoE(dimension=8, n_experts=4, top_k=2)
+    inputs = torch.randn(2, 7, 8)
+    actual = moe(inputs)
+
+    flat = inputs.reshape(-1, 8)
+    route_logits = moe.router(flat)
+    chosen_logits, chosen_experts = route_logits.topk(2, dim=-1)
+    route_weights = torch.softmax(chosen_logits, dim=-1)
+    expected = torch.zeros_like(flat)
+    for expert_id, expert in enumerate(moe.experts):
+        token_indices, slots = torch.where(chosen_experts == expert_id)
+        if token_indices.numel() == 0:
+            continue
+        expert_output = expert(flat.index_select(0, token_indices))
+        weights = route_weights[token_indices, slots].unsqueeze(-1)
+        expected = expected.index_add(0, token_indices, expert_output * weights)
+
+    assert torch.allclose(actual, expected.reshape_as(inputs), atol=1e-6, rtol=1e-6)
 
 
 def test_shared_moe_pool_routes_tokens_and_receives_gradients():
