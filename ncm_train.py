@@ -207,6 +207,79 @@ class SmaulTrainingOptimizer:
         raise ValueError("Unrecognized optimizer checkpoint; expected SmaulOPT state")
 
 
+def build_ncm_config(
+    preset: str = "custom",
+    *,
+    seq_len: int = 128,
+    levels: int = 4,
+    codebook_size: int = 64,
+    heads: int = 4,
+    d_model: int | None = None,
+    layers: int | None = None,
+    experts: int | None = None,
+    top_k: int | None = None,
+    moe: bool = False,
+    dense: bool = False,
+    forward_quant: str = "fp32",
+    backward_mode: str = "fp32",
+) -> NCMConfig:
+    """Build an NCM configuration from one of the four repository presets or custom sizing."""
+    resolved = (
+        _preset_config.resolve_preset(preset, moe, dense)
+        if preset != "custom" else None
+    )
+    if preset == "custom" and (moe or dense):
+        raise ValueError("--moe/--dense aliases require --preset tiny or full")
+    _preset_config.validate_quant_combo(forward_quant, backward_mode)
+
+    common = {
+        "vocab_size": 256,
+        "codebook_size": codebook_size,
+        "levels": levels,
+        "n_heads": heads,
+        "max_seq_len": seq_len,
+        "dropout": 0.0,
+        "forward_quant": forward_quant,
+        "backward_mode": backward_mode,
+    }
+    if resolved is None:
+        dimension = d_model or 64
+        layer_count = layers or 2
+        expert_count = experts or 4
+        route_count = top_k or 2
+        if min(dimension, layer_count, expert_count, route_count) < 1:
+            raise ValueError("custom dimensions and expert counts must be positive")
+        if route_count > expert_count:
+            raise ValueError("--top-k cannot exceed --experts")
+        return NCMConfig(
+            **common, d_model=dimension, n_layers=layer_count,
+            n_experts=expert_count, top_k=route_count, preset="custom",
+        )
+
+    spec = _preset_config.PRESETS[resolved]
+    dimension = d_model or spec.d_model
+    layer_count = layers or spec.n_layers
+    if dimension < 1 or layer_count < 1:
+        raise ValueError("model dimensions and layers must be positive")
+    if spec.kind == "moe":
+        expert_count = experts or spec.n_experts_init
+        route_count = top_k or spec.top_k
+        if min(expert_count, route_count) < 1 or route_count > expert_count:
+            raise ValueError("preset MoE requires positive expert count and top_k <= experts")
+        return NCMConfig(
+            **common, d_model=dimension, n_layers=layer_count,
+            model_kind="moe", n_experts=expert_count, top_k=route_count,
+            expert_hidden=spec.expert_hidden, preset=resolved,
+        )
+    if experts is not None or top_k is not None:
+        raise ValueError("dense presets do not support --experts or --top-k")
+    return NCMConfig(
+        **common, d_model=dimension, n_layers=layer_count,
+        model_kind="dense", n_experts=0, top_k=0,
+        ffn_hidden=spec.ffn_hidden, preset=resolved,
+    )
+
+
 def save_checkpoint(path: Path, model, optimizer, config, step: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
@@ -283,61 +356,19 @@ def main(argv=None) -> int:
     if not args.data.exists():
         parser.error(f"data path does not exist: {args.data}")
     try:
-        preset = (
-            _preset_config.resolve_preset(args.preset, args.moe, args.dense)
-            if args.preset != "custom" else None
+        config = build_ncm_config(
+            args.preset, seq_len=args.seq_len, levels=args.levels,
+            codebook_size=args.codebook_size, heads=args.heads,
+            d_model=args.d_model, layers=args.layers, experts=args.experts,
+            top_k=args.top_k, moe=args.moe, dense=args.dense,
+            forward_quant=args.forward_quant, backward_mode=args.backward_mode,
         )
-        if args.preset == "custom" and (args.moe or args.dense):
-            raise ValueError("--moe/--dense aliases require --preset tiny or full")
-        _preset_config.validate_quant_combo(args.forward_quant, args.backward_mode)
     except ValueError as exc:
         parser.error(str(exc))
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    if preset is None:
-        d_model = args.d_model or 64
-        layers = args.layers or 2
-        experts = args.experts or 4
-        top_k = args.top_k or 2
-        if min(d_model, layers, experts, top_k) < 1 or top_k > experts:
-            parser.error("custom model dimensions must be positive and --top-k cannot exceed --experts")
-        config = NCMConfig(
-            vocab_size=256, d_model=d_model, codebook_size=args.codebook_size,
-            levels=args.levels, n_layers=layers, n_heads=args.heads,
-            n_experts=experts, top_k=top_k, max_seq_len=args.seq_len,
-            dropout=0.0, preset="custom", forward_quant=args.forward_quant,
-            backward_mode=args.backward_mode,
-        )
-    else:
-        spec = _preset_config.PRESETS[preset]
-        d_model = args.d_model or spec.d_model
-        layers = args.layers or spec.n_layers
-        if spec.kind == "moe":
-            experts = args.experts or spec.n_experts_init
-            top_k = args.top_k or spec.top_k
-            if min(experts, top_k) < 1 or top_k > experts:
-                parser.error("preset MoE requires positive expert count and top_k <= experts")
-            config = NCMConfig(
-                vocab_size=256, d_model=d_model, codebook_size=args.codebook_size,
-                levels=args.levels, n_layers=layers, n_heads=args.heads,
-                n_experts=experts, top_k=top_k, expert_hidden=spec.expert_hidden,
-                max_seq_len=args.seq_len, dropout=0.0, model_kind="moe",
-                preset=preset, forward_quant=args.forward_quant,
-                backward_mode=args.backward_mode,
-            )
-        else:
-            if args.experts is not None or args.top_k is not None:
-                parser.error("dense presets do not support --experts or --top-k")
-            config = NCMConfig(
-                vocab_size=256, d_model=d_model, codebook_size=args.codebook_size,
-                levels=args.levels, n_layers=layers, n_heads=args.heads,
-                n_experts=0, top_k=0, ffn_hidden=spec.ffn_hidden,
-                max_seq_len=args.seq_len, dropout=0.0, model_kind="dense",
-                preset=preset, forward_quant=args.forward_quant,
-                backward_mode=args.backward_mode,
-            )
     stream = ByteBatchStream(args.data, args.seq_len, args.batch_size, 4 << 20)
     tokenizer_path = args.output / "tokenizer.pt"
     generator_path = args.output / "generator.pt"
