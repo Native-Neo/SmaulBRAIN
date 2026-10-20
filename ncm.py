@@ -109,10 +109,11 @@ class SmaulSharedMoE(nn.Module):
         route_logits = self.router(flat)
         chosen_logits, chosen_experts = route_logits.topk(self.top_k, dim=-1)
         route_weights = torch.softmax(chosen_logits, dim=-1)
-        if self.n_experts <= 8:
-            # For the tiny CPU-friendly NCM pool, use batched tensor operations
-            # instead of Python loops with torch.where/index_add for every expert.
-            # Compute experts together, then retain only each token's top-k outputs.
+        if self.n_experts <= 8 and not self.training:
+            # In evaluation, batched expert operations reduce Python dispatch overhead.
+            # During training, use sparse routing below: evaluating every expert for
+            # every token doubles the expert work when top_k=2 out of 4 and retains
+            # unnecessary autograd operations for outputs discarded by the top-k.
             expert_in = torch.stack(
                 [expert.W_in.weight for expert in self.experts], dim=0
             )
