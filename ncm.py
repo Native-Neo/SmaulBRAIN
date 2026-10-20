@@ -1,7 +1,7 @@
-"""Experimental coarse-to-fine Next-Concept Modeling for SmaulBRAIN.
+"""Default coarse-to-fine Next-Concept Modeling runtime for SmaulBRAIN.
 
-The default SmaulBRAIN model is not changed. Train ResidualVQTokenizer first,
-freeze it, then train NCMGenerator against its code hierarchies.
+Train ResidualVQTokenizer first, freeze it, then train NCMGenerator against its
+multiscale code hierarchies. The CLI entry points use this architecture by default.
 """
 from __future__ import annotations
 
