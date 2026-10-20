@@ -28,6 +28,9 @@ def test_tokenizer_emits_multiscale_codes_and_reconstructs_shape():
 
     assert logits.shape == (2, 9, 256)
     assert torch.isfinite(loss)
+    assert set(tokenizer.last_loss_components) == {"reconstruction", "quantization", "total"}
+    assert all(torch.isfinite(value) for value in tokenizer.last_loss_components.values())
+    assert torch.allclose(tokenizer.last_loss_components["total"], loss.detach())
     assert [x.shape for x in codes] == [(2, 3), (2, 5), (2, 9)]
     assert all(int(x.min()) >= 0 and int(x.max()) < config.codebook_size for x in codes)
     decoded = tokenizer.decode(codes, output_length=9)
