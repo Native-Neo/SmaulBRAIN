@@ -4,7 +4,7 @@ from ncm_train import ByteBatchStream, SmaulTrainingOptimizer, build_ncm_config
 from ncm import (
     NCMConfig, NCMGenerator, NCMLinear, NCMTransformer, ResidualVQTokenizer,
     SmaulDenseFFN, SmaulRecurrentBlock, SmaulSharedMoE,
-    apply_direct_ternary_updates, ncm_loss,
+    apply_direct_ternary_updates, migrate_ternary_state_dict, ncm_loss,
 )
 
 
@@ -338,6 +338,24 @@ def test_ncm_linear_ternary_forward_and_backward_use_packed_weights():
     assert not torch.equal(layer.ternary_packed, packed_before)
     assert int(layer.ternary_updates) > 0
     assert layer._cached_fp8_weight is None
+
+
+def test_legacy_fp32_master_ternary_checkpoint_migrates_to_packed_codes():
+    layer = NCMLinear(5, 4, forward_quant="ternary", backward_mode="ternary")
+    legacy_state = {
+        "weight": torch.randn(4, 5),
+        "bias": torch.randn(4),
+    }
+
+    converted, migrated = migrate_ternary_state_dict(layer, legacy_state)
+
+    assert migrated
+    assert "weight" not in converted
+    assert converted["ternary_packed"].dtype == torch.uint8
+    assert converted["ternary_packed"].numel() == 5
+    assert float(converted["ternary_scale"]) > 0
+    layer.load_state_dict(converted)
+    assert "weight" not in dict(layer.named_parameters())
 
 
 def test_tokenizer_ternary_qat_has_gradients_for_trainable_parameters():
