@@ -148,8 +148,9 @@ class _DirectTernaryLinear(torch.autograd.Function):
     """Linear autograd using packed ternary weights and direct discrete updates.
 
     No dense master-weight Parameter or dense weight-gradient buffer is retained.
-    The backward pass computes a transient weight-gradient matrix, then applies
-    sparse sign updates directly to the ternary codes and immediately repacks them.
+    The backward pass computes a transient weight-gradient matrix and queues
+    sparse sign updates, which are applied directly to the packed bitfield after
+    backward without reconstructing or repacking a dense weight matrix.
     """
 
     @staticmethod
