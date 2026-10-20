@@ -117,13 +117,86 @@ class ByteBatchStream:
         return batch
 
 
-def make_adamw(parameters, lr: float) -> torch.optim.AdamW:
-    """AdamW, fused when this build supports it (CPU: 2.43 -> 0.61 ms/step measured)."""
-    parameters = list(parameters)
-    try:
-        return torch.optim.AdamW(parameters, lr=lr, fused=True)
-    except (RuntimeError, ValueError):
-        return torch.optim.AdamW(parameters, lr=lr)
+class SmaulTrainingOptimizer:
+    """Adapt SmaulOPT's named-tensor API to PyTorch module training."""
+
+    def __init__(self, model, lr: float):
+        from smaulbrain.smaulopt import SmaulOPT
+
+        self.params = {
+            name: parameter
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        if not self.params:
+            raise ValueError("SmaulOPT requires at least one trainable parameter")
+        self.optimizer = SmaulOPT(lr=lr)
+        self.optimizer.register(self.params)
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        for parameter in self.params.values():
+            if set_to_none:
+                parameter.grad = None
+            elif parameter.grad is not None:
+                parameter.grad.zero_()
+
+    def step(self) -> None:
+        gradients = {
+            name: parameter.grad
+            for name, parameter in self.params.items()
+            if parameter.grad is not None
+        }
+        self.optimizer.step(self.params, gradients, collect_norms=False)
+
+    def state_dict(self) -> dict:
+        return {
+            "type": "SmaulOPT",
+            "state": self.optimizer.state_dict(),
+            "factored": {
+                name: bool(state["factored"])
+                for name, state in self.optimizer.state.items()
+            },
+            "n_updates": self.optimizer.n_updates,
+            "hyperparameters": {
+                "lr": self.optimizer.lr,
+                "beta1": self.optimizer.beta1,
+                "beta2": self.optimizer.beta2,
+                "eps": self.optimizer.eps,
+                "weight_decay": self.optimizer.weight_decay,
+            },
+        }
+
+    def load_state_dict(self, payload: dict) -> None:
+        if payload.get("type") == "SmaulOPT":
+            for name in ("lr", "beta1", "beta2", "eps", "weight_decay"):
+                if name in payload.get("hyperparameters", {}):
+                    setattr(
+                        self.optimizer,
+                        name,
+                        float(payload["hyperparameters"][name]),
+                    )
+            self.optimizer.load_state_dict(
+                payload.get("state", {}),
+                payload.get("factored", {}),
+            )
+            self.optimizer.n_updates = int(payload.get("n_updates", 0))
+            self.optimizer.register(self.params)
+            return
+
+        # Older NCM checkpoints contain torch.optim.AdamW state. Its moments
+        # cannot be converted faithfully to SmaulOPT's factored second moments.
+        # Keep the model weights and training step, but start fresh optimizer state.
+        if isinstance(payload, dict) and "state" in payload and "param_groups" in payload:
+            print(
+                "warning: checkpoint uses AdamW; preserving model weights and step "
+                "but initializing fresh SmaulOPT optimizer state",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.optimizer.register(self.params)
+            return
+
+        raise ValueError("Unrecognized optimizer checkpoint; expected SmaulOPT state")
 
 
 def save_checkpoint(path: Path, model, optimizer, config, step: int) -> None:
@@ -210,7 +283,7 @@ def main(argv=None) -> int:
 
     if args.stage in ("tokenizer", "both"):
         tokenizer = ResidualVQTokenizer(config).to(device)
-        optimizer = make_adamw(tokenizer.parameters(), args.lr)
+        optimizer = SmaulTrainingOptimizer(tokenizer, args.lr)
         start = load_stage_checkpoint(tokenizer_train_path, tokenizer, optimizer, device)
         tokenizer.train()
         start_time = time.perf_counter()
@@ -265,9 +338,7 @@ def main(argv=None) -> int:
             f"total_architecture_parameters: {tokenizer_count + generator_count:,}",
             flush=True,
         )
-        optimizer = make_adamw(
-            (p for p in generator.parameters() if p.requires_grad), args.lr
-        )
+        optimizer = SmaulTrainingOptimizer(generator, args.lr)
         start = load_stage_checkpoint(generator_train_path, generator, optimizer, device)
         generator.train()
         start_time = time.perf_counter()
