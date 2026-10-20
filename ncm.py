@@ -130,8 +130,8 @@ class SmaulRecurrentBlock(nn.Module):
     k[t] * v[t], with a reverse scan added so every position in an NCM level
     can use context from both sides while the whole level is predicted at once.
     A chunked closed-form scan avoids a Python loop over every position and
-    never constructs a time-by-time attention matrix. Channel mixing uses the
-    SmaulBRAIN gated SiLU FFN; both sublayers are pre-normalized with RMSNorm.
+    never constructs a time-by-time attention matrix. Channel mixing is handled
+    by the single shared sparse expert pool; both sublayers use pre-RMSNorm.
     """
 
     _SCAN_CHUNK = 32
