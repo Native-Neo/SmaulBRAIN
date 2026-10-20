@@ -8,7 +8,7 @@ from pathlib import Path
 
 import torch
 
-from ncm import NCMConfig, NCMTransformer, ResidualVQTokenizer, level_length
+from ncm import NCMConfig, NCMGenerator, ResidualVQTokenizer, level_length
 
 
 def main(argv=None) -> int:
@@ -36,8 +36,10 @@ def main(argv=None) -> int:
     tokenizer = ResidualVQTokenizer(config).to(device)
     tokenizer.load_state_dict(tokenizer_state["model"])
     tokenizer.eval()
-    generator = NCMTransformer(config, tokenizer).to(device)
+    generator = NCMGenerator(config, tokenizer).to(device)
     generator.load_state_dict(generator_state["model"])
+    tokenizer_parameters = sum(parameter.numel() for parameter in tokenizer.parameters())
+    generator_parameters = sum(parameter.numel() for parameter in generator.parameters())
     generator.eval()
     prompt_ids = list(args.prompt.encode("utf-8"))
     if not prompt_ids:
@@ -69,6 +71,9 @@ def main(argv=None) -> int:
     elapsed = sum(timings) / len(timings)
     generated = bytes(output[0].tolist())
     print(f"device: {device}")
+    print(f"tokenizer_parameters: {tokenizer_parameters:,}")
+    print(f"generator_parameters: {generator_parameters:,}")
+    print(f"total_architecture_parameters: {tokenizer_parameters + generator_parameters:,}")
     print(f"prompt_bytes: {len(prompt_ids)}")
     print(f"generated_bytes: {len(generated)}")
     level_lengths = [
