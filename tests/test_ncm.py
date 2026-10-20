@@ -1,5 +1,6 @@
 import torch
 
+from ncm_train import ByteBatchStream
 from ncm import NCMConfig, NCMTransformer, ResidualVQTokenizer, ncm_loss
 
 
@@ -100,6 +101,16 @@ def test_prompt_conditioning_has_valid_shape_and_backpropagates():
     assert any(p.grad is not None for p in model.prefix_projection.parameters())
     generated = model.generate(9, prefix_tokens=prefix)
     assert generated.shape == (2, 9)
+
+
+def test_streaming_byte_batcher_reads_text_without_loading_whole_file(tmp_path):
+    corpus = tmp_path / "sample.txt"
+    corpus.write_bytes(bytes(range(128)) * 8)
+    stream = ByteBatchStream(corpus, seq_len=16, batch_size=2, buffer_bytes=64)
+    batch = stream.next(torch.device("cpu"))
+    assert batch.shape == (2, 16)
+    assert batch.dtype == torch.long
+    assert int(batch.min()) >= 0 and int(batch.max()) < 256
 
 
 def test_config_rejects_invalid_attention_dimensions():
