@@ -134,12 +134,18 @@ def load_stage_checkpoint(path: Path, model, optimizer, device) -> int:
     try:
         model.load_state_dict(state["model"])
     except RuntimeError as exc:
-        raise RuntimeError(
-            f"Checkpoint {path} is incompatible with {type(model).__name__}. "
-            "The recurrent NCM generator uses different weights from the older "
-            "Transformer-based prototype; choose a fresh --output directory "
-            "to start a new run."
-        ) from exc
+        if isinstance(model, ResidualVQTokenizer):
+            reason = (
+                "The tokenizer architecture changed; choose a fresh --output "
+                "directory to start a new run."
+            )
+        else:
+            reason = (
+                "The recurrent NCM generator uses different weights from the "
+                "older Transformer-based prototype; choose a fresh --output "
+                "directory to start a new run."
+            )
+        raise RuntimeError(f"Checkpoint {path} is incompatible: {reason}") from exc
     optimizer.load_state_dict(state["optimizer"])
     return int(state.get("step", 0))
 
