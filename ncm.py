@@ -32,8 +32,8 @@ class NCMConfig:
             raise ValueError("vocab_size and codebook_size must be >= 2")
         if min(self.d_model, self.levels, self.n_layers, self.n_heads) < 1:
             raise ValueError("model dimensions and levels must be positive")
-        if self.d_model % self.n_heads:
-            raise ValueError("d_model must be divisible by n_heads")
+        # n_heads remains accepted for older CLI/checkpoint configs. The
+        # recurrent NCM generator does not split channels into attention heads.
         if self.max_seq_len < 2:
             raise ValueError("max_seq_len must be >= 2")
         if not 0 <= self.dropout < 1:
@@ -58,6 +58,100 @@ def resize_sequence(x: Tensor, length: int, mode: str = "linear") -> Tensor:
     return F.interpolate(
         x.transpose(1, 2), size=length, mode="linear", align_corners=False
     ).transpose(1, 2)
+
+
+class RMSNorm(nn.Module):
+    """SmaulBRAIN-style RMS normalization with epsilon 1e-6."""
+
+    def __init__(self, dimension: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dimension))
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        scale = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + self.eps)
+        return x * scale.to(dtype=x.dtype) * self.weight.to(dtype=x.dtype)
+
+
+class SmaulRecurrentBlock(nn.Module):
+    """Bidirectional, parallel-scan adaptation of SmaulBRAIN's recurrent block.
+
+    Attention uses the elementwise recurrent state s[t] = decay * s[t-1] +
+    k[t] * v[t], with a reverse scan added so every position in an NCM level
+    can use context from both sides while the whole level is predicted at once.
+    A chunked closed-form scan avoids a Python loop over every position and
+    never constructs a time-by-time attention matrix. Channel mixing uses the
+    SmaulBRAIN gated SiLU FFN; both sublayers are pre-normalized with RMSNorm.
+    """
+
+    _SCAN_CHUNK = 32
+
+    def __init__(self, dimension: int, feedforward_dimension: int):
+        super().__init__()
+        self.norm_attention = RMSNorm(dimension)
+        self.norm_channel = RMSNorm(dimension)
+        self.W_r = nn.Linear(dimension, dimension, bias=False)
+        self.W_k = nn.Linear(dimension, dimension, bias=False)
+        self.W_v = nn.Linear(dimension, dimension, bias=False)
+        self.W_o = nn.Linear(dimension, dimension, bias=False)
+        # softplus(-4) starts near a 0.018 decay rate, retaining useful state.
+        # The bounded rate keeps the vectorized scan numerically stable.
+        self.decay_logit = nn.Parameter(torch.full((dimension,), -4.0))
+        self.bonus = nn.Parameter(torch.ones(dimension))
+        self.channel_a = nn.Linear(dimension, feedforward_dimension, bias=False)
+        self.channel_b = nn.Linear(dimension, feedforward_dimension, bias=False)
+        self.channel_out = nn.Linear(feedforward_dimension, dimension, bias=False)
+
+    def _scan(self, values: Tensor, decay_rate: Tensor) -> Tensor:
+        """Evaluate the recurrent state with stable, bounded-size vectorized scans."""
+        if values.shape[1] == 0:
+            return values
+        values_fp32 = values.float()
+        rate = decay_rate.float()
+        state = values_fp32.new_zeros(values.shape[0], values.shape[2])
+        output_chunks = []
+        for start in range(0, values.shape[1], self._SCAN_CHUNK):
+            chunk = values_fp32[:, start:start + self._SCAN_CHUNK]
+            steps = torch.arange(
+                1, chunk.shape[1] + 1, dtype=torch.float32, device=values.device
+            ).unsqueeze(1)
+            powers = torch.exp(-steps * rate.unsqueeze(0))
+            weighted_prefix = (chunk / powers.unsqueeze(0)).cumsum(dim=1)
+            scanned = weighted_prefix * powers.unsqueeze(0)
+            scanned = scanned + powers.unsqueeze(0) * state.unsqueeze(1)
+            state = scanned[:, -1, :]
+            output_chunks.append(scanned)
+        return torch.cat(output_chunks, dim=1).to(dtype=values.dtype)
+
+    def forward(self, x: Tensor, segment_lengths: Sequence[int]) -> Tensor:
+        if sum(segment_lengths) != x.shape[1] or any(length < 1 for length in segment_lengths):
+            raise ValueError("segment_lengths must be positive and sum to the sequence length")
+
+        normalized = self.norm_attention(x)
+        read_gate = torch.sigmoid(self.W_r(normalized))
+        keys = self.W_k(normalized)
+        values = self.W_v(normalized)
+        key_value = keys * values
+        decay_rate = F.softplus(self.decay_logit).clamp(min=1e-4, max=0.1)
+
+        # Reset recurrent state at each independent NCM level/prompt segment.
+        contexts = []
+        offset = 0
+        for length in segment_lengths:
+            segment = key_value[:, offset:offset + length]
+            forward_state = self._scan(segment, decay_rate)
+            reverse_state = self._scan(segment.flip(dims=(1,)), decay_rate).flip(dims=(1,))
+            contexts.append(0.5 * (forward_state + reverse_state))
+            offset += length
+        context = torch.cat(contexts, dim=1)
+        attended = self.W_o(read_gate * (context + self.bonus * key_value))
+        x = x + attended
+
+        channel_input = self.norm_channel(x)
+        channel_output = self.channel_out(
+            F.silu(self.channel_a(channel_input)) * self.channel_b(channel_input)
+        )
+        return x + channel_output
 
 
 class ResidualVQTokenizer(nn.Module):
@@ -163,7 +257,7 @@ class ResidualVQTokenizer(nn.Module):
         return self.decoder(cumulative).argmax(dim=-1)
 
 
-class NCMTransformer(nn.Module):
+class NCMGenerator(nn.Module):
     """Predict every code level in one training pass; generate one level per step.
 
     Inputs are cumulative reconstructions of *earlier* levels, not the target
@@ -185,15 +279,11 @@ class NCMTransformer(nn.Module):
         self.prefix_projection = nn.Linear(config.d_model, config.d_model)
         self.level_embeddings = nn.Embedding(config.levels, config.d_model)
         self.position_embeddings = nn.Embedding(config.max_seq_len, config.d_model)
-        layer = nn.TransformerEncoderLayer(
-            d_model=config.d_model, nhead=config.n_heads,
-            dim_feedforward=4 * config.d_model, dropout=config.dropout,
-            activation="gelu", batch_first=True, norm_first=True,
+        self.blocks = nn.ModuleList(
+            SmaulRecurrentBlock(config.d_model, 4 * config.d_model)
+            for _ in range(config.n_layers)
         )
-        self.blocks = nn.TransformerEncoder(
-            layer, num_layers=config.n_layers, enable_nested_tensor=False
-        )
-        self.final_norm = nn.LayerNorm(config.d_model)
+        self.final_norm = RMSNorm(config.d_model)
         self.output_heads = nn.ModuleList(
             nn.Linear(config.d_model, config.codebook_size)
             for _ in range(config.levels)
@@ -247,11 +337,9 @@ class NCMTransformer(nn.Module):
         corrupt: bool = True,
     ) -> list[Tensor]:
         inputs, lengths = self._build_level_inputs(codes, corrupt)
-        level_ids = torch.cat([
-            torch.full((n,), i, device=inputs.device, dtype=torch.long)
-            for i, n in enumerate(lengths)
-        ])
+        level_inputs = list(torch.split(inputs, lengths, dim=1))
         prefix = None
+        prefix_length = 0
         if prefix_tokens is not None:
             if prefix_tokens.ndim != 2 or prefix_tokens.shape[0] != inputs.shape[0]:
                 raise ValueError("prefix_tokens must have shape [batch, prefix_length]")
@@ -263,29 +351,26 @@ class NCMTransformer(nn.Module):
             prefix_positions = torch.arange(prefix_tokens.shape[1], device=inputs.device)
             prefix = self.prefix_projection(prefix_features)
             prefix = prefix + self.position_embeddings(prefix_positions).unsqueeze(0)
-            inputs = torch.cat((prefix, inputs), dim=1)
-        total = level_ids.numel()
-        target_mask = level_ids[:, None] != level_ids[None, :]
-        if prefix is None:
-            mask = target_mask
-        else:
             prefix_length = prefix.shape[1]
-            mask = torch.zeros(
-                prefix_length + total, prefix_length + total,
-                dtype=torch.bool, device=inputs.device,
-            )
-            # Prefix queries cannot see target positions.
-            mask[:prefix_length, prefix_length:] = True
-            # Targets can see the prefix and their own level, but not other levels.
-            mask[prefix_length:, prefix_length:] = target_mask
-        hidden = self.final_norm(self.blocks(inputs, mask=mask))
-        if prefix is not None:
-            hidden = hidden[:, prefix.shape[1]:]
+
+        # Each level gets its own recurrent state. When conditioning on a prompt,
+        # repeat the known prefix for each level so no level can leak into another.
+        segments = [
+            torch.cat((prefix, part), dim=1) if prefix is not None else part
+            for part in level_inputs
+        ]
+        segment_lengths = [part.shape[1] for part in segments]
+        hidden = torch.cat(segments, dim=1)
+        for block in self.blocks:
+            hidden = block(hidden, segment_lengths)
+        hidden = self.final_norm(hidden)
+
+        encoded_segments = torch.split(hidden, segment_lengths, dim=1)
         logits: list[Tensor] = []
-        offset = 0
-        for level, length in enumerate(lengths):
-            logits.append(self.output_heads[level](hidden[:, offset:offset + length]))
-            offset += length
+        for level, encoded in enumerate(encoded_segments):
+            if prefix is not None:
+                encoded = encoded[:, prefix_length:]
+            logits.append(self.output_heads[level](encoded))
         return logits
 
     def predict_level(
@@ -322,8 +407,9 @@ class NCMTransformer(nn.Module):
         positions = torch.arange(current.shape[1], device=device)
         current = current + self.position_embeddings(positions).unsqueeze(0)
         current = current + self.level_embeddings.weight[level].view(1, 1, -1)
+        prefix_length = 0
         if prefix_tokens is None:
-            hidden = self.blocks(current)
+            hidden = current
         else:
             if prefix_tokens.ndim != 2 or prefix_tokens.shape[0] != batch:
                 raise ValueError("prefix_tokens must have shape [batch, prefix_length]")
@@ -336,15 +422,13 @@ class NCMTransformer(nn.Module):
             prefix = self.prefix_projection(prefix_features)
             prefix = prefix + self.position_embeddings(prefix_positions).unsqueeze(0)
             prefix_length = prefix.shape[1]
-            joined = torch.cat((prefix, current), dim=1)
-            mask = torch.zeros(
-                prefix_length + current.shape[1],
-                prefix_length + current.shape[1],
-                dtype=torch.bool, device=device,
-            )
-            mask[:prefix_length, prefix_length:] = True
-            hidden = self.blocks(joined, mask=mask)[:, prefix_length:]
+            hidden = torch.cat((prefix, current), dim=1)
+        segment_lengths = [hidden.shape[1]]
+        for block in self.blocks:
+            hidden = block(hidden, segment_lengths)
         hidden = self.final_norm(hidden)
+        if prefix_length:
+            hidden = hidden[:, prefix_length:]
         return self.output_heads[level](hidden)
 
     @torch.no_grad()
@@ -397,8 +481,13 @@ class NCMTransformer(nn.Module):
         return self.tokenizer.decode(codes, output_length)
 
 
+# Compatibility alias for existing scripts and user code that imported the old name.
+# The implementation below is recurrent and contains no TransformerEncoder layers.
+NCMTransformer = NCMGenerator
+
+
 def ncm_loss(
-    model: NCMTransformer, codes: Sequence[Tensor],
+    model: NCMGenerator, codes: Sequence[Tensor],
     *, prefix_tokens: Tensor | None = None,
 ) -> Tensor:
     """Length-normalized multilevel CE; alpha=1 weights each level equally."""
