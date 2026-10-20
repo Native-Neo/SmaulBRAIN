@@ -15,7 +15,7 @@ existing checkpoints.
 3. **Train a SmaulBRAIN-style recurrent generator.** Each level's input is the
    resized cumulative reconstruction of *earlier* levels, never its own target
    IDs. The generator uses recurrent linear attention with learned decay and
-   bonus, RMSNorm, residual connections, and gated SiLU channel mixing. A
+   bonus, RMSNorm, residual connections, and a shared sparse router/expert pool. A
    chunked vectorized scan computes recurrent states without a time-by-time
    attention matrix. Each level has an independent recurrent state; prompt
    features are repeated for each level to prevent information leaking between
@@ -30,7 +30,7 @@ attention: it scans each known level both forward and backward, so every
 position can use same-level context while all codes in that level are predicted
 in parallel. The original SmaulBRAIN autoregressive model uses its causal
 recurrent state in the forward direction. This NCM-specific variant preserves
-the recurrent state equation, RMSNorm and gated SiLU channel mixer, but is not
+the recurrent state equation, RMSNorm and the shared routed expert pool, but is not
 a byte-for-byte reuse of the normal SmaulBRAIN model. One router and one expert pool are shared across every recurrent block.
 The compact training defaults use four experts with top-2 routing; tune
 --experts and --top-k together for other hardware/model-size budgets.
