@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 import torch
+from torch import Tensor
 
 from ncm import NCMConfig, NCMTransformer, ResidualVQTokenizer, ncm_loss
 
