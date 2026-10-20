@@ -202,7 +202,7 @@ def test_recurrent_config_does_not_require_attention_head_splitting():
 
 
 
-def test_vectorized_small_moe_matches_sparse_routing_reference():
+def test_grouped_small_moe_matches_sparse_routing_reference():
     torch.manual_seed(7)
     moe = SmaulSharedMoE(dimension=8, n_experts=4, top_k=2).eval()
     inputs = torch.randn(2, 7, 8)
@@ -252,6 +252,32 @@ def _naive_scan(values, rate):
         state = decay * state + values[:, step]
         out.append(state)
     return torch.stack(out, dim=1)
+
+
+def test_native_recurrent_scan_backward_matches_autograd_reference():
+    torch.manual_seed(23)
+    block = SmaulRecurrentBlock(dimension=3)
+    values = torch.randn(2, 173, 3, requires_grad=True)
+    rate = torch.tensor([0.01, 0.03, 0.08], requires_grad=True)
+    reference_values = values.detach().clone().requires_grad_(True)
+    reference_rate = rate.detach().clone().requires_grad_(True)
+    weights = torch.randn_like(values)
+
+    actual = block._scan(values, rate)
+    state = torch.zeros(2, 3)
+    expected_parts = []
+    alpha = torch.exp(-reference_rate)
+    for position in range(reference_values.shape[1]):
+        state = alpha * state + reference_values[:, position, :]
+        expected_parts.append(state)
+    expected = torch.stack(expected_parts, dim=1)
+
+    (actual * weights).sum().backward()
+    (expected * weights).sum().backward()
+
+    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(values.grad, reference_values.grad, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(rate.grad, reference_rate.grad, atol=2e-5, rtol=2e-5)
 
 
 def test_block_bidirectional_scan_matches_naive_recurrence_across_chunks():
