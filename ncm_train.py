@@ -209,8 +209,14 @@ def main(argv=None) -> int:
             if (step + 1) % args.save_every == 0 or step + 1 == start + args.steps:
                 save_checkpoint(tokenizer_train_path, tokenizer, optimizer, config, step + 1)
                 torch.save({"config": config.__dict__, "model": tokenizer.state_dict()}, tokenizer_path)
-                print(f"tokenizer step={step + 1} loss={loss.item():.4f} "
-                      f"elapsed={time.perf_counter() - start_time:.1f}s", flush=True)
+                components = tokenizer.last_loss_components
+                print(
+                    f"tokenizer step={step + 1} loss={loss.item():.4f} "
+                    f"recon={components['reconstruction'].item():.4f} "
+                    f"quant={components['quantization'].item():.4f} "
+                    f"elapsed={time.perf_counter() - start_time:.1f}s",
+                    flush=True,
+                )
         if not tokenizer_path.exists():
             torch.save({"config": config.__dict__, "model": tokenizer.state_dict()}, tokenizer_path)
     else:
