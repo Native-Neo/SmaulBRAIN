@@ -323,7 +323,10 @@ def main(argv=None) -> int:
                         help="additional optimizer steps per stage (overrides --max-steps; default: 1000)")
     parser.add_argument("--max-steps", type=int, default=None,
                         help="target global step per stage")
-    parser.add_argument("--save-every", type=int, default=100)
+    parser.add_argument("--save-every", type=int, default=100,
+                        help="write checkpoints every N optimizer steps")
+    parser.add_argument("--log-every", type=int, default=1,
+                        help="print training metrics every N optimizer steps")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument(
@@ -356,9 +359,9 @@ def main(argv=None) -> int:
         parser.error("--steps must be >= 1")
     if args.steps is None and args.max_steps < 1:
         parser.error("--max-steps must be >= 1")
-    if min(args.save_every, args.batch_size, args.seq_len,
+    if min(args.save_every, args.log_every, args.batch_size, args.seq_len,
            args.levels, args.codebook_size, args.heads) < 1:
-        parser.error("save-every, batch-size, sequence length, levels and codebook size must be positive")
+        parser.error("save-every, log-every, batch-size, sequence length, levels and codebook size must be positive")
     if args.seq_len < 2:
         parser.error("seq-len must be >= 2")
     if args.weight_decay < 0:
@@ -409,6 +412,7 @@ def main(argv=None) -> int:
             if (step + 1) % args.save_every == 0 or step + 1 == end:
                 save_checkpoint(tokenizer_train_path, tokenizer, optimizer, config, step + 1)
                 torch.save({"config": config.__dict__, "model": tokenizer.state_dict()}, tokenizer_path)
+            if (step + 1) % args.log_every == 0 or step + 1 == end:
                 components = tokenizer.last_loss_components
                 print(
                     f"tokenizer step={step + 1} loss={loss.item():.4f} "
@@ -477,6 +481,7 @@ def main(argv=None) -> int:
             if (step + 1) % args.save_every == 0 or step + 1 == end:
                 save_checkpoint(generator_train_path, generator, optimizer, config, step + 1)
                 torch.save({"config": config.__dict__, "model": generator.state_dict()}, generator_path)
+            if (step + 1) % args.log_every == 0 or step + 1 == end:
                 print(f"generator step={step + 1} loss={loss.item():.4f} "
                       f"elapsed={time.perf_counter() - start_time:.1f}s", flush=True)
     print(json.dumps({
