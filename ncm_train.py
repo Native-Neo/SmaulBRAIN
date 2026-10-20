@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 from torch import Tensor
 
-from ncm import NCMConfig, NCMTransformer, ResidualVQTokenizer, ncm_loss
+from ncm import NCMConfig, NCMGenerator, ResidualVQTokenizer, ncm_loss
 
 
 TEXT_COLUMNS = (
@@ -131,7 +131,15 @@ def load_stage_checkpoint(path: Path, model, optimizer, device) -> int:
     if not path.exists():
         return 0
     state = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(state["model"])
+    try:
+        model.load_state_dict(state["model"])
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Checkpoint {path} is incompatible with {type(model).__name__}. "
+            "The recurrent NCM generator uses different weights from the older "
+            "Transformer-based prototype; choose a fresh --output directory "
+            "to start a new run."
+        ) from exc
     optimizer.load_state_dict(state["optimizer"])
     return int(state.get("step", 0))
 
@@ -149,7 +157,10 @@ def main(argv=None) -> int:
     parser.add_argument("--levels", type=int, default=4)
     parser.add_argument("--codebook-size", type=int, default=64)
     parser.add_argument("--layers", type=int, default=2)
-    parser.add_argument("--heads", type=int, default=4)
+    parser.add_argument(
+        "--heads", type=int, default=4,
+        help="legacy compatibility option; ignored by the recurrent NCM generator",
+    )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
@@ -159,8 +170,6 @@ def main(argv=None) -> int:
         parser.error("steps, save-every, batch-size and model dimensions must be positive")
     if args.seq_len < 2:
         parser.error("seq-len must be >= 2")
-    if args.d_model % args.heads:
-        parser.error("d-model must be divisible by heads")
     if not args.data.exists():
         parser.error(f"data path does not exist: {args.data}")
 
@@ -207,6 +216,9 @@ def main(argv=None) -> int:
         tokenizer = ResidualVQTokenizer(config).to(device)
         tokenizer.load_state_dict(tokenizer_state["model"])
 
+    tokenizer_count = sum(parameter.numel() for parameter in tokenizer.parameters())
+    print(f"tokenizer_parameters: {tokenizer_count:,}", flush=True)
+
     if args.stage in ("generator", "both"):
         if args.stage == "both":
             tokenizer_state = torch.load(tokenizer_path, map_location=device, weights_only=False)
@@ -214,7 +226,18 @@ def main(argv=None) -> int:
         tokenizer.eval()
         for parameter in tokenizer.parameters():
             parameter.requires_grad_(False)
-        generator = NCMTransformer(config, tokenizer).to(device)
+        generator = NCMGenerator(config, tokenizer).to(device)
+        generator_count = sum(parameter.numel() for parameter in generator.parameters())
+        trainable_count = sum(
+            parameter.numel() for parameter in generator.parameters()
+            if parameter.requires_grad
+        )
+        print(
+            f"generator_parameters: {generator_count:,} "
+            f"trainable_generator_parameters: {trainable_count:,} "
+            f"total_architecture_parameters: {tokenizer_count + generator_count:,}",
+            flush=True,
+        )
         optimizer = torch.optim.AdamW(
             (p for p in generator.parameters() if p.requires_grad), lr=args.lr
         )
