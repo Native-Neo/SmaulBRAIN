@@ -31,8 +31,9 @@ position can use same-level context while all codes in that level are predicted
 in parallel. The original SmaulBRAIN autoregressive model uses its causal
 recurrent state in the forward direction. This NCM-specific variant preserves
 the recurrent state equation, RMSNorm and gated SiLU channel mixer, but is not
-a byte-for-byte reuse of the normal SmaulBRAIN model. The shared expert pool
-is not yet wired into this small NCM prototype.
+a byte-for-byte reuse of the normal SmaulBRAIN model. One router and one expert pool are shared across every recurrent block.
+The compact training defaults use four experts with top-2 routing; tune
+--experts and --top-k together for other hardware/model-size budgets.
 
 The prototype is intentionally smaller than the paper's VQ-VAE and generator.
 It does not yet reproduce the paper's learned quantizer schedules, exact
@@ -53,7 +54,7 @@ Train both stages from a directory of text/JSONL/Parquet files:
 
 ```bash
 python ncm_train.py --data ./data/corpus --output ./ncm-recurrent-checkpoints \
-  --stage both --steps 1000 --batch-size 2 --seq-len 128
+  --stage both --steps 1000 --batch-size 2 --seq-len 128 --experts 4 --top-k 2
 ```
 
 The reader streams bounded chunks and does not load the entire corpus into RAM.
@@ -71,8 +72,10 @@ stages separately with --stage tokenizer and --stage generator if needed; the
 generator stage requires a matching tokenizer.pt.
 
 Defaults are deliberately small for low-memory experimentation. Increase
---d-model, --layers, --levels, and --codebook-size only after a small
-run fits your RAM/VRAM.
+--d-model, --layers, --levels, --codebook-size, or --experts only after a small
+run fits your RAM/VRAM. --top-k must not exceed --experts. The old --heads
+argument is accepted for command compatibility but has no effect on recurrent
+blocks.
 
 ## Benchmark
 
