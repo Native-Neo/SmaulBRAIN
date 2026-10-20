@@ -216,9 +216,13 @@ def main(argv=None) -> int:
         start_time = time.perf_counter()
         for step in range(start, start + args.steps):
             batch = stream.next(device)
+            # Train continuation: condition on the first half, predict the second half.
+            split = max(1, batch.shape[1] // 2)
+            prefix_tokens = batch[:, :split]
+            target_tokens = batch[:, split:]
             with torch.no_grad():
-                codes = tokenizer.encode(batch)
-            loss = ncm_loss(generator, codes)
+                codes = tokenizer.encode(target_tokens)
+            loss = ncm_loss(generator, codes, prefix_tokens=prefix_tokens)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
