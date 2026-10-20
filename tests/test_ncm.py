@@ -84,8 +84,8 @@ def test_prompt_conditioning_has_valid_shape_and_backpropagates():
     loss = ncm_loss(model, codes, prefix_tokens=prefix)
     loss.backward()
     assert any(p.grad is not None for p in model.prefix_projection.parameters())
-    generated = model.generate(9, prefix_tokens=prefix[:1])
-    assert generated.shape == (1, 9)
+    generated = model.generate(9, prefix_tokens=prefix)
+    assert generated.shape == (2, 9)
 
 
 def test_config_rejects_invalid_attention_dimensions():
