@@ -16,7 +16,10 @@ from pathlib import Path
 import torch
 from torch import Tensor
 
-from ncm import NCMConfig, NCMGenerator, ResidualVQTokenizer, ncm_loss
+from ncm import (
+    NCMConfig, NCMGenerator, NCMLinear, ResidualVQTokenizer,
+    migrate_ternary_state_dict, ncm_loss,
+)
 from smaulbrain import config as _preset_config
 
 
@@ -295,9 +298,10 @@ def load_stage_checkpoint(path: Path, model, optimizer, device) -> int:
     if not path.exists():
         return 0
     state = torch.load(path, map_location=device, weights_only=False)
+    model_state, migrated_ternary = migrate_ternary_state_dict(model, state["model"])
     try:
-        model.load_state_dict(state["model"])
-    except RuntimeError as exc:
+        model.load_state_dict(model_state)
+    except (RuntimeError, ValueError) as exc:
         if isinstance(model, ResidualVQTokenizer):
             reason = (
                 "The tokenizer architecture changed; choose a fresh --output "
@@ -310,8 +314,41 @@ def load_stage_checkpoint(path: Path, model, optimizer, device) -> int:
                 "directory to start a new run."
             )
         raise RuntimeError(f"Checkpoint {path} is incompatible: {reason}") from exc
-    optimizer.load_state_dict(state["optimizer"])
+    if migrated_ternary:
+        print(
+            "warning: migrated FP32-master ternary weights to packed discrete "
+            "codes; resetting optimizer state because the old full-precision "
+            "weight moments do not apply to direct ternary updates",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        optimizer.load_state_dict(state["optimizer"])
     return int(state.get("step", 0))
+
+
+def configure_direct_ternary_updates(model, learning_rate: float) -> None:
+    """Configure the sparse direct-discrete update rate for packed ternary matrices."""
+    update_rate = min(3e-3, max(1e-5, float(learning_rate)))
+    for module in model.modules():
+        if isinstance(module, NCMLinear) and module.forward_quant == "ternary":
+            module.ternary_update_rate = update_rate
+
+
+def architecture_parameter_count(model, *, trainable_only: bool = False) -> int:
+    """Count logical parameters, including matrix entries stored as packed ternary codes."""
+    total = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if not trainable_only or parameter.requires_grad
+    )
+    total += sum(
+        module.in_features * module.out_features
+        for module in model.modules()
+        if isinstance(module, NCMLinear)
+        and module.forward_quant == "ternary"
+    )
+    return total
 
 
 def main(argv=None) -> int:
@@ -395,6 +432,7 @@ def main(argv=None) -> int:
 
     if args.stage == "tokenizer" or (args.stage == "both" and not generator_train_path.exists()):
         tokenizer = ResidualVQTokenizer(config).to(device)
+        configure_direct_ternary_updates(tokenizer, args.lr)
         optimizer = SmaulTrainingOptimizer(tokenizer, args.lr, args.weight_decay)
         start = load_stage_checkpoint(tokenizer_train_path, tokenizer, optimizer, device)
         end = start + args.steps if args.steps is not None else max(start, args.max_steps)
@@ -434,9 +472,18 @@ def main(argv=None) -> int:
         if saved_config != config:
             parser.error("CLI model settings do not match the saved tokenizer configuration")
         tokenizer = ResidualVQTokenizer(config).to(device)
-        tokenizer.load_state_dict(tokenizer_state["model"])
+        tokenizer_model_state, migrated_ternary = migrate_ternary_state_dict(
+            tokenizer, tokenizer_state["model"]
+        )
+        tokenizer.load_state_dict(tokenizer_model_state)
+        if migrated_ternary:
+            print(
+                "Migrated tokenizer FP32-master ternary weights to packed discrete codes.",
+                file=sys.stderr,
+                flush=True,
+            )
 
-    tokenizer_count = sum(parameter.numel() for parameter in tokenizer.parameters())
+    tokenizer_count = architecture_parameter_count(tokenizer)
     print(f"tokenizer_parameters: {tokenizer_count:,}", flush=True)
 
     if args.stage in ("generator", "both"):
@@ -447,11 +494,9 @@ def main(argv=None) -> int:
         for parameter in tokenizer.parameters():
             parameter.requires_grad_(False)
         generator = NCMGenerator(config, tokenizer).to(device)
-        generator_count = sum(parameter.numel() for parameter in generator.parameters())
-        trainable_count = sum(
-            parameter.numel() for parameter in generator.parameters()
-            if parameter.requires_grad
-        )
+        configure_direct_ternary_updates(generator, args.lr)
+        generator_count = architecture_parameter_count(generator)
+        trainable_count = architecture_parameter_count(generator, trainable_only=True)
         print(
             f"generator_parameters: {generator_count:,} "
             f"trainable_generator_parameters: {trainable_count:,} "
