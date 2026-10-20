@@ -95,11 +95,19 @@ counts, dense FFN sizes, expert pool sizes, top-k values, and expert hidden
 widths; tokenizer and hierarchy parameters mean NCM total parameter counts
 differ from the original model's exact counts.
 
-The default optimizer is **SmaulOPT**. NCM linear layers support the repository's
-`fp32`, `fp8`, and packed `ternary` forward paths, including the supported
-backward-mode combinations. Ternary forward uses packed matrix kernels without
-reconstructing a dense FP32 weight matrix; the trainable master weights and
-weight gradients remain available for optimization.
+The default optimizer for floating-point parameters is **SmaulOPT**. NCM
+linear layers support `fp32`, `fp8`, and packed `ternary` paths. When
+`--forward-quant ternary` is selected, the linear matrix weights are stored as
+packed 2-bit ternary codes; there is no persistent FP32 master-weight tensor or
+dense accumulated weight-gradient tensor for those matrices. Backpropagation
+computes a transient gradient signal and queues sparse gradient-sign updates
+that modify the packed codes directly after the backward pass. Biases,
+embeddings, codebooks, and normalization parameters remain floating point.
+
+Direct ternary updates are an experimental discrete optimizer, not conventional
+STE/QAT, and their convergence and generated-text quality must be measured.
+Loading an older FP32-master ternary checkpoint converts its linear weights to
+packed codes and resets the old optimizer moments for those weights.
 
 Train from a raw-byte corpus, text files, JSONL, or Parquet:
 
