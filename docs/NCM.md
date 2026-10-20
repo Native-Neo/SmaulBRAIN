@@ -20,6 +20,13 @@ existing checkpoints.
    attention matrix. Each level has an independent recurrent state; prompt
    features are repeated for each level to prevent information leaking between
    levels. Conditioning corruption changes input conditioning IDs, not labels.
+The tokenizer now applies RMSNorm to the learned byte features and the
+cumulative reconstruction before its byte decoder. Training logs reconstruction
+cross-entropy separately from the averaged vector-quantization/commitment loss,
+so a rising total can be traced to its component instead of appearing as one
+opaque number. This is a stabilization measure to evaluate, not a guarantee
+that the tokenizer has converged.
+
 4. **Generate coarse to fine.** Each level costs one sequential generator call;
    all positions in that level are predicted in parallel. The frozen tokenizer
    decoder maps the final hierarchy back to byte IDs. Prefix-conditioned
