@@ -56,8 +56,8 @@ and normalization parameters remain floating point.
 This direct-discrete ternary update rule is experimental and is not conventional
 straight-through-estimator QAT. Its convergence and generated-text quality must
 be evaluated on real runs. Legacy FP32-master ternary checkpoints are converted
-to packed ternary weights on load; optimizer moments for the converted matrices
-are reset.
+to packed ternary weights on load; that stage's optimizer state is reset because
+the old state is incompatible with direct-discrete updates.
 
 The prototype is intentionally smaller than the paper's VQ-VAE and generator.
 It does not yet reproduce the paper's learned quantizer schedules, exact
