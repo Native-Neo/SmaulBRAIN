@@ -143,6 +143,25 @@ class ResidualVQTokenizer(nn.Module):
         )
         return logits, reconstruction_loss + vq_loss, codes
 
+    @torch.no_grad()
+    def decode(self, codes: Sequence[Tensor], output_length: int) -> Tensor:
+        """Decode a code hierarchy to byte IDs using the learned tokenizer decoder."""
+        if len(codes) != self.config.levels:
+            raise ValueError("one code tensor is required per level")
+        if not 1 <= output_length <= self.config.max_seq_len:
+            raise ValueError("output_length must be within [1, max_seq_len]")
+        batch = codes[0].shape[0]
+        decoded = self.byte_embedding.weight.new_zeros(
+            batch, output_length, self.config.d_model
+        )
+        for level, ids in enumerate(codes):
+            expected = _level_length(output_length, level, self.config.levels)
+            if ids.ndim != 2 or ids.shape != (batch, expected):
+                raise ValueError(f"level {level} codes must have shape [batch, {expected}]")
+            quantized = self.codebooks[level](ids)
+            decoded = decoded + _resize_sequence(quantized, output_length)
+        return self.decoder(decoded).argmax(dim=-1)
+
 
 class NCMTransformer(nn.Module):
     """Predict all code positions in parallel, conditioned on coarser levels.
