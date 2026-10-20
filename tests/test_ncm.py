@@ -20,6 +20,49 @@ def tiny_config():
     )
 
 
+def test_ncm_training_optimizer_uses_smaulopt_and_restores_state():
+    from ncm_train import SmaulTrainingOptimizer
+    from smaulbrain.smaulopt import SmaulOPT
+
+    model = torch.nn.Linear(4, 3)
+    optimizer = SmaulTrainingOptimizer(model, lr=1e-3)
+    assert isinstance(optimizer.optimizer, SmaulOPT)
+
+    before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    loss = model(torch.randn(2, 4)).square().mean()
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    assert any(
+        not torch.equal(parameter, before[name])
+        for name, parameter in model.named_parameters()
+    )
+    assert all(parameter.grad is None for parameter in model.parameters())
+
+    checkpoint = optimizer.state_dict()
+    restored = SmaulTrainingOptimizer(model, lr=9e-4)
+    restored.load_state_dict(checkpoint)
+    assert restored.optimizer.lr == 1e-3
+    assert restored.optimizer.n_updates == 1
+    assert restored.optimizer.state.keys() == optimizer.optimizer.state.keys()
+
+
+def test_ncm_smaulopt_resumes_legacy_adamw_checkpoint_with_fresh_state(capsys):
+    from ncm_train import SmaulTrainingOptimizer
+
+    model = torch.nn.Linear(4, 3)
+    legacy_optimizer = torch.optim.AdamW(model.parameters())
+    legacy_state = legacy_optimizer.state_dict()
+
+    optimizer = SmaulTrainingOptimizer(model, lr=1e-3)
+    optimizer.load_state_dict(legacy_state)
+
+    assert optimizer.optimizer.n_updates == 0
+    assert optimizer.optimizer.state
+    assert "checkpoint uses AdamW" in capsys.readouterr().err
+
+
 def test_tokenizer_emits_multiscale_codes_and_reconstructs_shape():
     config = tiny_config()
     tokenizer = ResidualVQTokenizer(config)
