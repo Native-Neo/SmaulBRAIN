@@ -25,11 +25,9 @@ def test_default_cli_trains_and_infers_with_packed_ternary(tmp_path, capsys):
         "--backward-mode", "ternary",
     ]) == 0
     training_output = capsys.readouterr().out
-    summary_line = next(
-        line for line in reversed(training_output.splitlines())
-        if line.startswith("{") and '"optimizer"' in line
-    )
-    summary = json.loads(summary_line)
+    summary_start = training_output.rfind('{\n  "done": true,')
+    assert summary_start >= 0
+    summary = json.loads(training_output[summary_start:])
     assert summary["optimizer"] == "SmaulOPT"
     assert summary["tokenizer_steps_this_run"] == 1
     assert summary["generator_steps_this_run"] == 1
