@@ -6,7 +6,6 @@ multiscale code hierarchies. The CLI entry points use this architecture by defau
 from __future__ import annotations
 
 from dataclasses import dataclass
-import random
 from typing import Sequence
 
 import numpy as np
@@ -233,7 +232,8 @@ class NCMLinear(nn.Linear):
         # installed smaulbrain-core packages.
         sampler = getattr(_quant, "sample_ternary_gradient_updates", None)
         if sampler is not None and gradient_codes.device.type == "cpu":
-            sampled = sampler(gradient_codes, rate, random.getrandbits(64))
+            seed = int(torch.randint(0, 2**63 - 1, (), dtype=torch.int64).item())
+            sampled = sampler(gradient_codes, rate, seed)
             if sampled is not None:
                 indices, directions = sampled
                 if indices.numel():
