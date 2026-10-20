@@ -291,8 +291,11 @@ class NCMTransformer(nn.Module):
             raise ValueError("level lengths must be nondecreasing")
         if temperature < 0 or top_k < 0:
             raise ValueError("temperature and top_k must be >= 0")
+        batch_size = prefix_tokens.shape[0] if prefix_tokens is not None else 1
+        if prefix_tokens is not None:
+            device = prefix_tokens.device
         codes = [
-            torch.zeros(1, n, dtype=torch.long, device=device) for n in lengths
+            torch.zeros(batch_size, n, dtype=torch.long, device=device) for n in lengths
         ]
         for level in range(self.config.levels):
             logits = self.forward(codes, prefix_tokens=prefix_tokens, corrupt=False)[level]
