@@ -163,7 +163,7 @@ def test_recurrent_config_does_not_require_attention_head_splitting():
 
 def test_vectorized_small_moe_matches_sparse_routing_reference():
     torch.manual_seed(7)
-    moe = SmaulSharedMoE(dimension=8, n_experts=4, top_k=2)
+    moe = SmaulSharedMoE(dimension=8, n_experts=4, top_k=2).eval()
     inputs = torch.randn(2, 7, 8)
     actual = moe(inputs)
 
