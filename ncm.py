@@ -271,7 +271,9 @@ class NCMLinear(nn.Linear):
         packed = self.ternary_packed.reshape(-1)
         byte_indices = torch.div(unique_indices, 4, rounding_mode="floor")
         shifts = (unique_indices.remainder(4) * 2).to(torch.int16)
-        old_bytes = packed[byte_indices].to(torch.int16)
+        old_bytes = packed[byte_indices.to(packed.device)].to(
+            device="cpu", dtype=torch.int16
+        )
         old_raw = torch.bitwise_and(
             torch.bitwise_right_shift(old_bytes, shifts), 0x3
         )
@@ -297,13 +299,18 @@ class NCMLinear(nn.Linear):
         set_values = torch.zeros(unique_bytes.numel(), dtype=torch.int16)
         clear_masks.scatter_add_(0, byte_inverse, masks)
         set_values.scatter_add_(0, byte_inverse, values)
-        old = packed[unique_bytes].to(torch.int16)
+        old = packed[unique_bytes.to(packed.device)].to(
+            device="cpu", dtype=torch.int16
+        )
         updated_bytes = torch.bitwise_or(
             torch.bitwise_and(old, torch.bitwise_not(clear_masks)),
             set_values,
         ).to(torch.uint8)
-        packed[unique_bytes] = updated_bytes
-        self.ternary_updates.add_(changed.sum().to(dtype=self.ternary_updates.dtype))
+        packed[unique_bytes.to(packed.device)] = updated_bytes.to(packed.device)
+        self.ternary_updates.add_(
+            changed.sum().to(device=self.ternary_updates.device,
+                             dtype=self.ternary_updates.dtype)
+        )
 
 
     def _quantized_weight(self):
