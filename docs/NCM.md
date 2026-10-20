@@ -1,9 +1,11 @@
-# Experimental NCM path
+# Default NCM runtime
 
-This is an isolated research implementation inspired by the paper and official
-[HazyResearch/ncm repository](https://github.com/HazyResearch/ncm). It does not
-change the default SmaulBRAIN model, training command, inference command, or
-existing checkpoints.
+The `train.py` and `infer.py` entry points use this Next-Concept Modeling
+(NCM) adaptation by default. It is inspired by the paper and official
+[HazyResearch/ncm repository](https://github.com/HazyResearch/ncm), but remains
+a compact implementation rather than a reproduction of the paper's full recipe.
+NCM checkpoints use `tokenizer.pt` and `generator.pt` rather than the legacy
+SmaulBRAIN `manifest.json` format.
 
 ## What the architecture does
 
@@ -35,12 +37,16 @@ that the tokenizer has converged.
 The generator is a **bidirectional adaptation** of SmaulBRAIN's recurrent
 attention: it scans each known level both forward and backward, so every
 position can use same-level context while all codes in that level are predicted
-in parallel. The original SmaulBRAIN autoregressive model uses its causal
-recurrent state in the forward direction. This NCM-specific variant preserves
-the recurrent state equation, RMSNorm and the shared routed expert pool, but is not
-a byte-for-byte reuse of the normal SmaulBRAIN model. One router and one expert pool are shared across every recurrent block.
-The compact training defaults use four experts with top-2 routing; tune
---experts and --top-k together for other hardware/model-size budgets.
+in parallel. The standard autoregressive model uses a causal forward state.
+For MoE presets, one router and expert pool are shared across every recurrent
+block. Dense presets use a per-layer SwiGLU channel mixer. Preset dimensions
+are inherited from the original four preset definitions, but NCM tokenizer and
+hierarchy parameters change the total parameter counts.
+
+The NCM linear layers support FP32, software FP8 E4M3 emulation, and packed
+ternary forward operations. Ternary forward uses the repository's packed
+matrix kernels; it does not reconstruct a dense FP32 weight matrix for the
+forward multiplication. SmaulOPT updates the trainable master parameters.
 
 The prototype is intentionally smaller than the paper's VQ-VAE and generator.
 It does not yet reproduce the paper's learned quantizer schedules, exact
@@ -57,12 +63,22 @@ pip install -r requirements.txt
 pip install pyarrow
 ```
 
-Train both stages from a directory of text/JSONL/Parquet files:
+The supported presets are `dense-tiny`, `dense-full`, `moe-tiny`, and
+`moe-full`. `train.py` is the default entry point; it trains the tokenizer
+and generator and uses SmaulOPT:
 
 ```bash
-python ncm_train.py --data ./data/corpus --output ./ncm-recurrent-checkpoints \
-  --stage both --steps 1000 --batch-size 2 --seq-len 128 --experts 4 --top-k 2
+python train.py --preset moe-tiny --corpus ./data/corpus.bin \
+  --steps 100 --checkpoint checkpoints/ncm-run
+python train.py --preset moe-tiny --corpus ./data/corpus.bin \
+  --steps 100 --checkpoint checkpoints/ncm-ternary \
+  --forward-quant ternary --backward-mode ternary
+python infer.py --checkpoint checkpoints/ncm-run \
+  --prompt "Once upon a time, " --max-new-tokens 128
 ```
+
+Direct experiments remain available through `ncm_train.py`, where `--preset
+custom` allows small custom dimensions for fast tests and profiling.
 
 The reader streams bounded chunks and does not load the entire corpus into RAM.
 For Parquet files it prefers columns named text, content, response, output,
@@ -91,9 +107,11 @@ python ncm_bench.py --checkpoint-dir ./ncm-recurrent-checkpoints \
   --prompt "Once upon a time, " --new-bytes 128 --runs 5
 ```
 
-The new recurrent generator's checkpoints are not compatible with older
-Transformer-based NCM generator checkpoints; use a new output directory when
-retraining. The existing tokenizer architecture is unchanged.
+NCM checkpoints are separate from the legacy SmaulBRAIN checkpoint
+format and from older Transformer-based NCM generator checkpoints. Use a fresh
+checkpoint directory when changing model preset or architecture. Quantization
+mode can be selected at training or inference; changing it does not change
+parameter shapes, but ternary/FP8 arithmetic may change outputs.
 
 This reports end-to-end latency including multilevel generation and decoding.
 For a meaningful comparison against the existing autoregressive SmaulBRAIN

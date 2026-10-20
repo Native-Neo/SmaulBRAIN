@@ -1,9 +1,9 @@
 import torch
 
-from ncm_train import ByteBatchStream, make_adamw
+from ncm_train import ByteBatchStream, SmaulTrainingOptimizer, build_ncm_config
 from ncm import (
-    NCMConfig, NCMGenerator, NCMTransformer, ResidualVQTokenizer,
-    SmaulRecurrentBlock, SmaulSharedMoE, ncm_loss,
+    NCMConfig, NCMGenerator, NCMLinear, NCMTransformer, ResidualVQTokenizer,
+    SmaulDenseFFN, SmaulRecurrentBlock, SmaulSharedMoE, ncm_loss,
 )
 
 
@@ -21,7 +21,6 @@ def tiny_config():
 
 
 def test_ncm_training_optimizer_uses_smaulopt_and_restores_state():
-    from ncm_train import SmaulTrainingOptimizer
     from smaulbrain.smaulopt import SmaulOPT
 
     model = torch.nn.Linear(4, 3)
@@ -49,8 +48,6 @@ def test_ncm_training_optimizer_uses_smaulopt_and_restores_state():
 
 
 def test_ncm_smaulopt_resumes_legacy_adamw_checkpoint_with_fresh_state(capsys):
-    from ncm_train import SmaulTrainingOptimizer
-
     model = torch.nn.Linear(4, 3)
     legacy_optimizer = torch.optim.AdamW(model.parameters())
     legacy_state = legacy_optimizer.state_dict()
@@ -284,20 +281,70 @@ def test_block_bidirectional_scan_matches_naive_recurrence_across_chunks():
     assert torch.allclose(actual, expected, atol=1e-4, rtol=1e-4)
 
 
-def test_make_adamw_matches_reference_adamw_step():
-    torch.manual_seed(5)
-    reference = torch.nn.Linear(6, 3)
-    candidate = torch.nn.Linear(6, 3)
-    candidate.load_state_dict(reference.state_dict())
-    ref_opt = torch.optim.AdamW(reference.parameters(), lr=1e-2)
-    new_opt = make_adamw((p for p in candidate.parameters()), 1e-2)
-    inputs = torch.randn(4, 6)
-    for _ in range(3):
-        for model, opt in ((reference, ref_opt), (candidate, new_opt)):
-            opt.zero_grad(set_to_none=True)
-            model(inputs).square().mean().backward()
-            opt.step()
-    for a, b in zip(reference.parameters(), candidate.parameters()):
-        assert torch.allclose(a, b, atol=1e-6, rtol=1e-5)
-    # Optimizer state stays loadable into a plain AdamW (checkpoint compatibility).
-    torch.optim.AdamW(reference.parameters(), lr=1e-2).load_state_dict(new_opt.state_dict())
+def test_all_four_presets_map_to_ncm_architectures():
+    expected = {
+        "dense-tiny": ("dense", 32, 15, 128, 0, 0),
+        "dense-full": ("dense", 1000, 19, 3152, 0, 0),
+        "moe-tiny": ("moe", 64, 4, 0, 32, 2),
+        "moe-full": ("moe", 512, 6, 0, 64, 8),
+    }
+    for preset, values in expected.items():
+        config = build_ncm_config(preset, seq_len=128)
+        actual = (
+            config.model_kind, config.d_model, config.n_layers,
+            config.ffn_hidden if config.model_kind == "dense" else 0,
+            config.n_experts, config.top_k,
+        )
+        assert actual == values
+        assert config.preset == preset
+
+
+def test_dense_preset_uses_per_layer_swiglu_and_backpropagates():
+    config = build_ncm_config(
+        "dense-tiny", seq_len=16, d_model=8, layers=1,
+        levels=3, codebook_size=16,
+    )
+    tokenizer = ResidualVQTokenizer(config)
+    model = NCMGenerator(config, tokenizer)
+    assert model.channel_mixer is None
+    assert len(model.dense_mixers) == config.n_layers
+    assert isinstance(model.dense_mixers[0], SmaulDenseFFN)
+    codes = tokenizer.encode(torch.randint(0, 256, (2, 9)))
+    loss = ncm_loss(model, codes)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert model.dense_mixers[0].W_a.weight.grad is not None
+
+
+def test_ncm_linear_ternary_forward_and_backward_use_packed_weights():
+    torch.manual_seed(11)
+    layer = NCMLinear(
+        5, 4, forward_quant="ternary", backward_mode="ternary"
+    )
+    inputs = torch.randn(2, 3, 5, requires_grad=True)
+    output = layer(inputs)
+    output.square().mean().backward()
+
+    assert output.shape == (2, 3, 4)
+    assert torch.isfinite(output).all()
+    assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
+    assert layer.weight.grad is not None and torch.isfinite(layer.weight.grad).all()
+    assert layer._cached_packed is not None
+    assert layer._cached_fp8_weight is None
+
+
+def test_tokenizer_ternary_qat_has_gradients_for_trainable_parameters():
+    config = NCMConfig(
+        d_model=8, codebook_size=8, levels=2, max_seq_len=16,
+        forward_quant="ternary", backward_mode="ternary",
+    )
+    tokenizer = ResidualVQTokenizer(config)
+    inputs = torch.randint(0, 256, (2, 9))
+    _, loss, _ = tokenizer(inputs)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert any(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for name, parameter in tokenizer.named_parameters()
+        if isinstance(dict(tokenizer.named_modules()).get(name.rsplit(".", 1)[0]), NCMLinear)
+    )

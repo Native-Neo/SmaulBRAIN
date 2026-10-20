@@ -80,34 +80,45 @@ Growth controls include `--growth-every-steps`, `--growth-loss-nats`, `--growth-
 - `tests/`: numerical references, hot-path checks, routing/quantization, optimizer, lifecycle and recovery tests.
 - `AUDIT.md`: conversion map, results, and known limitations.
 
-## Experimental NCM architecture
+## Default CLI architecture: NCM
 
-The isolated Next-Concept Modeling prototype in `ncm.py` uses a multiscale
-residual-VQ byte tokenizer and a **SmaulBRAIN-style recurrent generator**:
-bidirectional recurrent linear attention, RMSNorm, residual connections, and a
-single sparse router/expert pool shared across recurrent layers. The chunked
-vectorized recurrence avoids a time-by-time attention matrix while keeping all
-positions within each code level parallel. It is an NCM-specific bidirectional
-adaptation, not a replacement for SmaulBRAIN's usual causal recurrent model.
-The small defaults use four experts with top-2 routing. Default SmaulBRAIN
-training, inference, and checkpoints are unchanged.
+`train.py` and `infer.py` now use the coarse-to-fine Next-Concept Modeling
+architecture by default. It combines a multiscale residual-VQ byte tokenizer
+with a bidirectional recurrent generator, RMSNorm, residual connections, and
+either a dense SwiGLU mixer or a shared sparse MoE pool. Positions within each
+code level are predicted in parallel. This is an NCM-specific adaptation, not
+the original causal next-byte model, and it has a separate checkpoint format.
 
-Use a fresh output directory because the recurrent generator's weights are
-incompatible with older Transformer-based NCM generator checkpoints:
+All four repository presets are supported: `dense-tiny`, `dense-full`,
+`moe-tiny`, and `moe-full`. They reuse the existing preset widths, layer
+counts, dense FFN sizes, expert pool sizes, top-k values, and expert hidden
+widths; tokenizer and hierarchy parameters mean NCM total parameter counts
+differ from the original model's exact counts.
+
+The default optimizer is **SmaulOPT**. NCM linear layers support the repository's
+`fp32`, `fp8`, and packed `ternary` forward paths, including the supported
+backward-mode combinations. Ternary forward uses packed matrix kernels without
+reconstructing a dense FP32 weight matrix; the trainable master weights and
+weight gradients remain available for optimization.
+
+Train from a raw-byte corpus, text files, JSONL, or Parquet:
 
 ```bash
-python ncm_train.py --data ./data/corpus --output ./ncm-recurrent-checkpoints \
-  --stage both --steps 1000 --batch-size 2 --seq-len 128 --experts 4 --top-k 2
-python ncm_bench.py --checkpoint-dir ./ncm-recurrent-checkpoints \
-  --prompt "Once upon a time, " --new-bytes 128 --runs 5
-python -m pytest -q tests/test_ncm.py
+python train.py --preset moe-tiny --corpus ./data/corpus.bin \
+  --steps 100 --checkpoint checkpoints/ncm-run
+python train.py --preset moe-tiny --corpus ./data/corpus.bin \
+  --steps 100 --checkpoint checkpoints/ncm-ternary \
+  --forward-quant ternary --backward-mode ternary
+python infer.py --checkpoint checkpoints/ncm-run \
+  --prompt "Once upon a time, " --max-new-tokens 128
 ```
 
-Parquet input needs `pyarrow`. See [docs/NCM.md](docs/NCM.md) for training
-details and fair benchmarking guidance. NCM code-ID loss is not numerically
-comparable with SmaulBRAIN's byte-level cross-entropy. This remains a compact
-research prototype; verify held-out text quality and end-to-end speed before
-drawing conclusions.
+Training saves tokenizer and generator checkpoints separately and automatically
+resumes saved training stages. For Parquet input, install `pyarrow`. The older
+`ncm_train.py` and `ncm_bench.py` commands remain available for direct
+experiments. The prototype is smaller and simpler than the paper's full recipe;
+validate held-out text quality and end-to-end speed rather than treating the
+paper's reported speedups as guaranteed.
 
 ## Compatibility and limits
 
