@@ -319,7 +319,10 @@ def main(argv=None) -> int:
     parser.add_argument("--data", required=True, type=Path, help="text/JSONL/Parquet file or directory")
     parser.add_argument("--output", type=Path, default=Path("ncm-checkpoints"))
     parser.add_argument("--stage", choices=("tokenizer", "generator", "both"), default="both")
-    parser.add_argument("--steps", type=int, default=1000, help="optimizer steps per stage")
+    parser.add_argument("--steps", type=int, default=None,
+                        help="additional optimizer steps per stage (overrides --max-steps; default: 1000)")
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="target global step per stage")
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seq-len", type=int, default=128)
@@ -347,9 +350,15 @@ def main(argv=None) -> int:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args(argv)
-    if min(args.steps, args.save_every, args.batch_size, args.seq_len,
+    if args.steps is None and args.max_steps is None:
+        args.steps = 1000
+    if args.steps is not None and args.steps < 1:
+        parser.error("--steps must be >= 1")
+    if args.steps is None and args.max_steps < 1:
+        parser.error("--max-steps must be >= 1")
+    if min(args.save_every, args.batch_size, args.seq_len,
            args.levels, args.codebook_size, args.heads) < 1:
-        parser.error("steps, save-every, batch-size, sequence length, levels and codebook size must be positive")
+        parser.error("save-every, batch-size, sequence length, levels and codebook size must be positive")
     if args.seq_len < 2:
         parser.error("seq-len must be >= 2")
     if args.weight_decay < 0:
@@ -381,13 +390,14 @@ def main(argv=None) -> int:
     last_tokenizer_loss = None
     last_generator_loss = None
 
-    if args.stage in ("tokenizer", "both"):
+    if args.stage == "tokenizer" or (args.stage == "both" and not generator_train_path.exists()):
         tokenizer = ResidualVQTokenizer(config).to(device)
         optimizer = SmaulTrainingOptimizer(tokenizer, args.lr, args.weight_decay)
         start = load_stage_checkpoint(tokenizer_train_path, tokenizer, optimizer, device)
+        end = start + args.steps if args.steps is not None else max(start, args.max_steps)
         tokenizer.train()
         start_time = time.perf_counter()
-        for step in range(start, start + args.steps):
+        for step in range(start, end):
             batch = stream.next(device)
             _, loss, _ = tokenizer(batch)
             optimizer.zero_grad(set_to_none=True)
@@ -396,7 +406,7 @@ def main(argv=None) -> int:
             optimizer.step()
             tokenizer_steps_this_run += 1
             last_tokenizer_loss = float(loss.detach())
-            if (step + 1) % args.save_every == 0 or step + 1 == start + args.steps:
+            if (step + 1) % args.save_every == 0 or step + 1 == end:
                 save_checkpoint(tokenizer_train_path, tokenizer, optimizer, config, step + 1)
                 torch.save({"config": config.__dict__, "model": tokenizer.state_dict()}, tokenizer_path)
                 components = tokenizer.last_loss_components
@@ -446,9 +456,10 @@ def main(argv=None) -> int:
         )
         optimizer = SmaulTrainingOptimizer(generator, args.lr, args.weight_decay)
         start = load_stage_checkpoint(generator_train_path, generator, optimizer, device)
+        end = start + args.steps if args.steps is not None else max(start, args.max_steps)
         generator.train()
         start_time = time.perf_counter()
-        for step in range(start, start + args.steps):
+        for step in range(start, end):
             batch = stream.next(device)
             # Train continuation: condition on the first half, predict the second half.
             split = max(1, batch.shape[1] // 2)
@@ -463,7 +474,7 @@ def main(argv=None) -> int:
             optimizer.step()
             generator_steps_this_run += 1
             last_generator_loss = float(loss.detach())
-            if (step + 1) % args.save_every == 0 or step + 1 == start + args.steps:
+            if (step + 1) % args.save_every == 0 or step + 1 == end:
                 save_checkpoint(generator_train_path, generator, optimizer, config, step + 1)
                 torch.save({"config": config.__dict__, "model": generator.state_dict()}, generator_path)
                 print(f"generator step={step + 1} loss={loss.item():.4f} "
@@ -474,7 +485,7 @@ def main(argv=None) -> int:
         "optimizer": "SmaulOPT",
         "tokenizer_steps_this_run": tokenizer_steps_this_run,
         "generator_steps_this_run": generator_steps_this_run,
-        "steps_this_run": args.steps,
+        "steps_this_run": max(tokenizer_steps_this_run, generator_steps_this_run),
         "last_loss": (
             last_generator_loss
             if last_generator_loss is not None

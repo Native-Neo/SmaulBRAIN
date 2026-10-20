@@ -56,6 +56,7 @@ def main(argv=None):
         allow_abbrev=False,
     )
     _cli.add_common_args(parser)
+    parser.set_defaults(seed=None)
     parser.add_argument("--prompt", default="Hello")
     parser.add_argument("--prompt-file", default=None)
     parser.add_argument("--max-new-tokens", type=int, default=64)
@@ -101,10 +102,10 @@ def main(argv=None):
 
     try:
         tokenizer_state = torch.load(
-            tokenizer_path, map_location=args.device, weights_only=False
+            tokenizer_path, map_location=args.device, weights_only=True
         )
         generator_state = torch.load(
-            generator_path, map_location=args.device, weights_only=False
+            generator_path, map_location=args.device, weights_only=True
         )
         saved_config = NCMConfig(**tokenizer_state["config"])
         generator_config = NCMConfig(**generator_state["config"])
@@ -148,6 +149,8 @@ def main(argv=None):
             f"--max-new-tokens cannot exceed the checkpoint limit {config.max_seq_len}"
         )
 
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
     prefix = torch.tensor(
         [list(prompt_bytes)], dtype=torch.long, device=torch.device(args.device)
     )

@@ -78,7 +78,7 @@ Growth controls include `--growth-every-steps`, `--growth-loss-nats`, `--growth-
 - `smaulbrain/inference.py`, `data.py`, `vocab.py`: sampling, byte streams, encoding.
 - `train.py`, `infer.py`, `evaluate.py`, `prune.py`, `bench.py`, `bench_router.py`: CLI tools.
 - `tests/`: numerical references, hot-path checks, routing/quantization, optimizer, lifecycle and recovery tests.
-- `AUDIT.md`: conversion map, results, and known limitations.
+- `docs/NCM.md`, `docs/systems.md`: NCM architecture, runtime settings, and known limitations.
 
 ## Default CLI architecture: NCM
 
@@ -122,4 +122,4 @@ paper's reported speedups as guaranteed.
 
 ## Compatibility and limits
 
-New checkpoints use PyTorch `.pt` tensors with integrity checks and atomic publication. Legacy `smaulbrain-v2:1` NumPy checkpoints and per-expert `.npz` files are imported, but legacy NumPy RNG continuation is not bit-for-bit replayed. Full presets need substantial RAM; count checks do not allocate full models. See `AUDIT.md` and `docs/systems.md` before selecting paging/quantization settings. CPU regression tests do not certify CUDA behavior or convergence/performance for full-size models.
+New checkpoints use PyTorch `.pt` tensors with integrity checks and atomic publication. Legacy `smaulbrain-v2:1` NumPy checkpoints and per-expert `.npz` files are imported, but legacy NumPy RNG continuation is not bit-for-bit replayed. Full presets need substantial RAM; count checks do not allocate full models. See `docs/NCM.md` and `docs/systems.md` before selecting paging/quantization settings. CPU regression tests do not certify CUDA behavior or convergence/performance for full-size models.

@@ -49,10 +49,10 @@ def main(argv=None):
     parser.add_argument("--save-every", type=int, default=100)
     args = parser.parse_args(raw_argv)
 
-    if args.steps is not None and args.steps < 0:
-        parser.error("--steps must be >= 0")
-    if args.max_steps < 0:
-        parser.error("--max-steps must be >= 0")
+    if args.steps is not None and args.steps < 1:
+        parser.error("--steps must be >= 1")
+    if args.steps is None and args.max_steps < 1:
+        parser.error("--max-steps must be >= 1")
     if min(args.batch_size, args.levels, args.codebook_size, args.save_every) < 1:
         parser.error("batch-size, levels, codebook-size and save-every must be positive")
 
@@ -87,7 +87,7 @@ def main(argv=None):
     ncm_args = [
         "--output", str(checkpoint),
         "--stage", args.stage,
-        "--steps", str(updates),
+        "--steps" if args.steps is not None else "--max-steps", str(updates),
         "--save-every", str(args.save_every),
         "--batch-size", str(args.batch_size),
         "--seq-len", str(args.seq_len),

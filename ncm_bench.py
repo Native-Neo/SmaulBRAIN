@@ -27,10 +27,10 @@ def main(argv=None) -> int:
 
     device = torch.device(args.device)
     tokenizer_state = torch.load(
-        args.checkpoint_dir / "tokenizer.pt", map_location=device, weights_only=False
+        args.checkpoint_dir / "tokenizer.pt", map_location=device, weights_only=True
     )
     generator_state = torch.load(
-        args.checkpoint_dir / "generator.pt", map_location=device, weights_only=False
+        args.checkpoint_dir / "generator.pt", map_location=device, weights_only=True
     )
     config = NCMConfig(**tokenizer_state["config"])
     tokenizer = ResidualVQTokenizer(config).to(device)
