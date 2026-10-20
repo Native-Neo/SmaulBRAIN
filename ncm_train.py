@@ -7,6 +7,7 @@ Data is streamed in bounded chunks; the entire corpus is never loaded into RAM.
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import sys
 import time
@@ -375,6 +376,11 @@ def main(argv=None) -> int:
     tokenizer_train_path = args.output / "tokenizer-training.pt"
     generator_train_path = args.output / "generator-training.pt"
 
+    tokenizer_steps_this_run = 0
+    generator_steps_this_run = 0
+    last_tokenizer_loss = None
+    last_generator_loss = None
+
     if args.stage in ("tokenizer", "both"):
         tokenizer = ResidualVQTokenizer(config).to(device)
         optimizer = SmaulTrainingOptimizer(tokenizer, args.lr, args.weight_decay)
@@ -388,6 +394,8 @@ def main(argv=None) -> int:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(tokenizer.parameters(), 1.0)
             optimizer.step()
+            tokenizer_steps_this_run += 1
+            last_tokenizer_loss = float(loss.detach())
             if (step + 1) % args.save_every == 0 or step + 1 == start + args.steps:
                 save_checkpoint(tokenizer_train_path, tokenizer, optimizer, config, step + 1)
                 torch.save({"config": config.__dict__, "model": tokenizer.state_dict()}, tokenizer_path)
@@ -453,11 +461,26 @@ def main(argv=None) -> int:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
             optimizer.step()
+            generator_steps_this_run += 1
+            last_generator_loss = float(loss.detach())
             if (step + 1) % args.save_every == 0 or step + 1 == start + args.steps:
                 save_checkpoint(generator_train_path, generator, optimizer, config, step + 1)
                 torch.save({"config": config.__dict__, "model": generator.state_dict()}, generator_path)
                 print(f"generator step={step + 1} loss={loss.item():.4f} "
                       f"elapsed={time.perf_counter() - start_time:.1f}s", flush=True)
+    print(json.dumps({
+        "done": True,
+        "preset": config.preset,
+        "optimizer": "SmaulOPT",
+        "tokenizer_steps_this_run": tokenizer_steps_this_run,
+        "generator_steps_this_run": generator_steps_this_run,
+        "steps_this_run": args.steps,
+        "last_loss": (
+            last_generator_loss
+            if last_generator_loss is not None
+            else last_tokenizer_loss
+        ),
+    }, indent=2), flush=True)
     return 0
 
 
