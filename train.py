@@ -47,14 +47,18 @@ def main(argv=None):
         help="NCM training stage; both is the normal end-to-end mode",
     )
     parser.add_argument("--save-every", type=int, default=100)
+    parser.add_argument(
+        "--log-every", type=int, default=1,
+        help="print training metrics every N optimizer steps (default: every step)",
+    )
     args = parser.parse_args(raw_argv)
 
     if args.steps is not None and args.steps < 1:
         parser.error("--steps must be >= 1")
     if args.steps is None and args.max_steps < 1:
         parser.error("--max-steps must be >= 1")
-    if min(args.batch_size, args.levels, args.codebook_size, args.save_every) < 1:
-        parser.error("batch-size, levels, codebook-size and save-every must be positive")
+    if min(args.batch_size, args.levels, args.codebook_size, args.save_every, args.log_every) < 1:
+        parser.error("batch-size, levels, codebook-size, save-every and log-every must be positive")
 
     try:
         preset = _cli.validate_args(args)
@@ -89,6 +93,7 @@ def main(argv=None):
         "--stage", args.stage,
         "--steps" if args.steps is not None else "--max-steps", str(updates),
         "--save-every", str(args.save_every),
+        "--log-every", str(args.log_every),
         "--batch-size", str(args.batch_size),
         "--seq-len", str(args.seq_len),
         "--preset", preset,
