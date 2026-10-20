@@ -217,6 +217,9 @@ class ResidualVQTokenizer(nn.Module):
             nn.Linear(config.d_model, config.d_model), nn.GELU(),
             nn.Linear(config.d_model, config.d_model),
         )
+        # Keep latent RMS bounded as the encoder learns; residual codebooks and
+        # the reconstruction head should not see unbounded latent magnitudes.
+        self.feature_norm = RMSNorm(config.d_model)
         self.codebooks = nn.ModuleList(
             nn.Embedding(config.codebook_size, config.d_model)
             for _ in range(config.levels)
@@ -224,10 +227,12 @@ class ResidualVQTokenizer(nn.Module):
         self.register_buffer(
             "_codebook_initialized", torch.zeros(config.levels, dtype=torch.bool)
         )
+        self.decoder_norm = RMSNorm(config.d_model)
         self.decoder = nn.Sequential(
             nn.Linear(config.d_model, config.d_model), nn.GELU(),
             nn.Linear(config.d_model, config.vocab_size),
         )
+        self.last_loss_components: dict[str, Tensor] = {}
 
     def _quantize(self, residual: Tensor, level: int) -> tuple[Tensor, Tensor, Tensor]:
         codebook = self.codebooks[level].weight
@@ -258,7 +263,7 @@ class ResidualVQTokenizer(nn.Module):
             raise ValueError("byte_ids must have shape [batch, time]")
         if not 1 <= byte_ids.shape[1] <= self.config.max_seq_len:
             raise ValueError("sequence length must be within [1, max_seq_len]")
-        features = self.encoder(self.byte_embedding(byte_ids))
+        features = self.feature_norm(self.encoder(self.byte_embedding(byte_ids)))
         cumulative = features.new_zeros(features.shape)
         codes: list[Tensor] = []
         vq_loss = features.new_zeros(())
@@ -272,11 +277,20 @@ class ResidualVQTokenizer(nn.Module):
             codes.append(ids)
             cumulative = cumulative + resize_sequence(quantized, byte_ids.shape[1])
             vq_loss = vq_loss + level_loss
-        logits = self.decoder(cumulative)
+        logits = self.decoder(self.decoder_norm(cumulative))
         reconstruction = F.cross_entropy(
             logits.reshape(-1, self.config.vocab_size), byte_ids.reshape(-1)
         )
-        return logits, reconstruction + vq_loss / self.config.levels, codes
+        mean_vq_loss = vq_loss / self.config.levels
+        total_loss = reconstruction + mean_vq_loss
+        # Detached diagnostics let the trainer report each term without holding
+        # extra autograd graphs or synchronizing a GPU on every training step.
+        self.last_loss_components = {
+            "reconstruction": reconstruction.detach(),
+            "quantization": mean_vq_loss.detach(),
+            "total": total_loss.detach(),
+        }
+        return logits, total_loss, codes
 
     @torch.no_grad()
     def encode(self, byte_ids: Tensor) -> list[Tensor]:
