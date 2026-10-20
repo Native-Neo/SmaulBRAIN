@@ -321,15 +321,20 @@ def test_ncm_linear_ternary_forward_and_backward_use_packed_weights():
     layer = NCMLinear(
         5, 4, forward_quant="ternary", backward_mode="ternary"
     )
+    layer.ternary_update_rate = 0.5
     inputs = torch.randn(2, 3, 5, requires_grad=True)
+    packed_before = layer.ternary_packed.clone()
     output = layer(inputs)
     output.square().mean().backward()
 
     assert output.shape == (2, 3, 4)
     assert torch.isfinite(output).all()
     assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
-    assert layer.weight.grad is not None and torch.isfinite(layer.weight.grad).all()
-    assert layer._cached_packed is not None
+    assert "weight" not in dict(layer.named_parameters())
+    assert layer.ternary_packed.dtype == torch.uint8
+    assert layer.ternary_packed.numel() == 5  # 20 ternary weights, four codes per byte.
+    assert not torch.equal(layer.ternary_packed, packed_before)
+    assert int(layer.ternary_updates) > 0
     assert layer._cached_fp8_weight is None
 
 
