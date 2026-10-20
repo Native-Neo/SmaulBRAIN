@@ -82,32 +82,32 @@ Growth controls include `--growth-every-steps`, `--growth-loss-nats`, `--growth-
 
 ## Experimental NCM architecture
 
-An isolated Next-Concept Modeling prototype is available in `ncm.py`. It includes
-a multiscale residual-VQ byte tokenizer and a transformer that predicts code
-positions in parallel within each hierarchy level. This is experimental and
-does not alter the default training or inference paths. See [docs/NCM.md](docs/NCM.md)
-for the scope, smoke test, and benchmarking requirements.
+The isolated Next-Concept Modeling prototype in `ncm.py` uses a multiscale
+residual-VQ byte tokenizer and a **SmaulBRAIN-style recurrent generator**:
+bidirectional recurrent linear attention, RMSNorm, residual connections, and
+gated SiLU channel mixing. The chunked vectorized recurrence avoids a
+time-by-time attention matrix while keeping all positions within each code
+level parallel. It is an NCM-specific bidirectional adaptation, not a replacement
+for SmaulBRAIN's usual causal recurrent model. The shared MoE expert pool is not
+yet integrated into this prototype. Default SmaulBRAIN training, inference, and
+checkpoints are unchanged.
 
-## Experimental NCM architecture
-
-An isolated Next-Concept Modeling prototype lives in `ncm.py`, with a
-streamed two-stage training command and end-to-end generation benchmark. It uses
-cumulative coarse-to-fine reconstruction, block-diagonal per-level attention,
-conditioning corruption, and optional prompt-conditioned continuation. The
-default SmaulBRAIN model and its checkpoints remain unchanged.
+Use a fresh output directory because the recurrent generator's weights are
+incompatible with older Transformer-based NCM generator checkpoints:
 
 ```bash
-python ncm_train.py --data ./data/corpus --output ./ncm-checkpoints \
+python ncm_train.py --data ./data/corpus --output ./ncm-recurrent-checkpoints \
   --stage both --steps 1000 --batch-size 2 --seq-len 128
-python ncm_bench.py --checkpoint-dir ./ncm-checkpoints \
+python ncm_bench.py --checkpoint-dir ./ncm-recurrent-checkpoints \
   --prompt "Once upon a time, " --new-bytes 128 --runs 5
 python -m pytest -q tests/test_ncm.py
 ```
 
 Parquet input needs `pyarrow`. See [docs/NCM.md](docs/NCM.md) for training
-details and fair benchmarking guidance. This is a compact research prototype,
-not a reproduction of the paper's complete system; speed and quality gains
-must be measured before considering integration into the default model.
+details and fair benchmarking guidance. NCM code-ID loss is not numerically
+comparable with SmaulBRAIN's byte-level cross-entropy. This remains a compact
+research prototype; verify held-out text quality and end-to-end speed before
+drawing conclusions.
 
 ## Compatibility and limits
 
