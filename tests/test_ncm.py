@@ -3,7 +3,8 @@ import torch
 from ncm_train import ByteBatchStream, SmaulTrainingOptimizer, build_ncm_config
 from ncm import (
     NCMConfig, NCMGenerator, NCMLinear, NCMTransformer, ResidualVQTokenizer,
-    SmaulDenseFFN, SmaulRecurrentBlock, SmaulSharedMoE, ncm_loss,
+    SmaulDenseFFN, SmaulRecurrentBlock, SmaulSharedMoE,
+    apply_direct_ternary_updates, ncm_loss,
 )
 
 
@@ -326,6 +327,7 @@ def test_ncm_linear_ternary_forward_and_backward_use_packed_weights():
     packed_before = layer.ternary_packed.clone()
     output = layer(inputs)
     output.square().mean().backward()
+    apply_direct_ternary_updates(layer)
 
     assert output.shape == (2, 3, 4)
     assert torch.isfinite(output).all()
