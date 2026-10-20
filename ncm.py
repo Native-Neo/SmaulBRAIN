@@ -321,9 +321,12 @@ class NCMTransformer(nn.Module):
         return self.tokenizer.decode(codes, output_length)
 
 
-def ncm_loss(model: NCMTransformer, codes: Sequence[Tensor]) -> Tensor:
+def ncm_loss(
+    model: NCMTransformer, codes: Sequence[Tensor],
+    *, prefix_tokens: Tensor | None = None,
+) -> Tensor:
     """Length-normalized multilevel CE; alpha=1 weights each level equally."""
-    logits = model(codes, corrupt=True)
+    logits = model(codes, prefix_tokens=prefix_tokens, corrupt=True)
     losses = [
         F.cross_entropy(pred.reshape(-1, pred.shape[-1]), target.reshape(-1))
         for pred, target in zip(logits, codes)
