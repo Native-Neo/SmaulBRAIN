@@ -109,10 +109,27 @@ class SmaulSharedMoE(nn.Module):
         route_logits = self.router(flat)
         chosen_logits, chosen_experts = route_logits.topk(self.top_k, dim=-1)
         route_weights = torch.softmax(chosen_logits, dim=-1)
-        output = torch.zeros_like(flat)
+        if self.n_experts <= 8:
+            # For the tiny CPU-friendly NCM pool, use batched tensor operations
+            # instead of Python loops with torch.where/index_add for every expert.
+            # Compute experts together, then retain only each token's top-k outputs.
+            expert_in = torch.stack(
+                [expert.W_in.weight for expert in self.experts], dim=0
+            )
+            expert_out = torch.stack(
+                [expert.W_out.weight for expert in self.experts], dim=0
+            )
+            hidden = torch.einsum("nd,ehd->neh", flat, expert_in)
+            hidden = F.gelu(hidden)
+            expert_outputs = torch.einsum("neh,edh->ned", hidden, expert_out)
+            selected = expert_outputs.gather(
+                1, chosen_experts.unsqueeze(-1).expand(-1, -1, original_shape[-1])
+            )
+            output = (selected * route_weights.unsqueeze(-1)).sum(dim=1)
+            return output.reshape(original_shape)
 
-        # Only run an expert for tokens routed to it; the pool itself is shared
-        # by all NCM levels and all recurrent layers.
+        output = torch.zeros_like(flat)
+        # For larger pools, preserve sparse execution to avoid evaluating every expert.
         for expert_id, expert in enumerate(self.experts):
             token_indices, slots = torch.where(chosen_experts == expert_id)
             if token_indices.numel() == 0:
@@ -134,7 +151,10 @@ class SmaulRecurrentBlock(nn.Module):
     by the single shared sparse expert pool; both sublayers use pre-RMSNorm.
     """
 
-    _SCAN_CHUNK = 32
+    # NCM's normal code levels are short (often <=128 positions). Larger
+    # chunks reduce Python/Tensor-op launch overhead; long contexts still use
+    # bounded chunks to keep the closed-form recurrence numerically stable.
+    _SCAN_CHUNK = 128
 
     def __init__(self, dimension: int):
         super().__init__()
@@ -315,7 +335,7 @@ class ResidualVQTokenizer(nn.Module):
             if ids.shape != (batch, expected):
                 raise ValueError(f"level {level} codes must have shape [batch, {expected}]")
             cumulative = cumulative + resize_sequence(self.codebooks[level](ids), output_length)
-        return self.decoder(cumulative).argmax(dim=-1)
+        return self.decoder(self.decoder_norm(cumulative)).argmax(dim=-1)
 
 
 class NCMGenerator(nn.Module):
@@ -410,8 +430,8 @@ class NCMGenerator(nn.Module):
                 raise ValueError("prefix_tokens must have shape [batch, prefix_length]")
             if not 1 <= prefix_tokens.shape[1] <= self.config.max_seq_len:
                 raise ValueError("prefix length must be within [1, max_seq_len]")
-            prefix_features = self.tokenizer.encoder(
-                self.tokenizer.byte_embedding(prefix_tokens)
+            prefix_features = self.tokenizer.feature_norm(
+                self.tokenizer.encoder(self.tokenizer.byte_embedding(prefix_tokens))
             )
             prefix_positions = torch.arange(prefix_tokens.shape[1], device=inputs.device)
             prefix = self.prefix_projection(prefix_features)
@@ -480,8 +500,8 @@ class NCMGenerator(nn.Module):
                 raise ValueError("prefix_tokens must have shape [batch, prefix_length]")
             if not 1 <= prefix_tokens.shape[1] <= self.config.max_seq_len:
                 raise ValueError("prefix length must be within [1, max_seq_len]")
-            prefix_features = self.tokenizer.encoder(
-                self.tokenizer.byte_embedding(prefix_tokens)
+            prefix_features = self.tokenizer.feature_norm(
+                self.tokenizer.encoder(self.tokenizer.byte_embedding(prefix_tokens))
             )
             prefix_positions = torch.arange(prefix_tokens.shape[1], device=device)
             prefix = self.prefix_projection(prefix_features)
