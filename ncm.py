@@ -12,6 +12,8 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from smaulbrain import quant as _quant
+
 
 @dataclass(frozen=True)
 class NCMConfig:
@@ -28,16 +30,48 @@ class NCMConfig:
     commitment_weight: float = 0.25
     conditioning_corruption: float = 0.15
     level_loss_alpha: float = 1.0
+    model_kind: str = "moe"
+    ffn_hidden: int = 0
+    expert_hidden: int = 0
+    preset: str = "custom"
+    forward_quant: str = "fp32"
+    backward_mode: str = "fp32"
 
     def __post_init__(self) -> None:
         if self.vocab_size < 2 or self.codebook_size < 2:
             raise ValueError("vocab_size and codebook_size must be >= 2")
-        if min(self.d_model, self.levels, self.n_layers, self.n_heads, self.n_experts) < 1:
-            raise ValueError("model dimensions, levels, and experts must be positive")
-        if not 1 <= self.top_k <= self.n_experts:
-            raise ValueError("top_k must be between 1 and n_experts")
-        # n_heads remains accepted for older CLI/checkpoint configs. The
-        # recurrent NCM generator does not split channels into attention heads.
+        if min(self.d_model, self.levels, self.n_layers, self.n_heads) < 1:
+            raise ValueError("model dimensions, levels, and heads must be positive")
+        if self.model_kind not in {"dense", "moe"}:
+            raise ValueError("model_kind must be 'dense' or 'moe'")
+        if self.model_kind == "moe":
+            if self.n_experts < 1 or not 1 <= self.top_k <= self.n_experts:
+                raise ValueError("MoE top_k must be between 1 and n_experts")
+            if self.expert_hidden < 0:
+                raise ValueError("expert_hidden must be >= 0")
+            if self.expert_hidden == 0:
+                object.__setattr__(self, "expert_hidden", 4 * self.d_model)
+        else:
+            if self.n_experts != 0 or self.top_k != 0:
+                raise ValueError("dense configurations must set n_experts=0 and top_k=0")
+            if self.ffn_hidden < 0:
+                raise ValueError("ffn_hidden must be >= 0")
+            if self.ffn_hidden == 0:
+                object.__setattr__(self, "ffn_hidden", 4 * self.d_model)
+        if self.forward_quant not in {"fp32", "fp8", "ternary"}:
+            raise ValueError("forward_quant must be fp32, fp8, or ternary")
+        if self.backward_mode not in {"fp32", "fp8", "ternary"}:
+            raise ValueError("backward_mode must be fp32, fp8, or ternary")
+        supported = {
+            ("fp32", "fp32"), ("fp8", "fp8"), ("ternary", "fp32"),
+            ("ternary", "ternary"), ("ternary", "fp8"),
+        }
+        if (self.forward_quant, self.backward_mode) not in supported:
+            raise ValueError(
+                f"unsupported quantization combination: "
+                f"{self.forward_quant}/{self.backward_mode}"
+            )
+        # n_heads remains accepted for old configs; recurrent NCM does not split heads.
         if self.max_seq_len < 2:
             raise ValueError("max_seq_len must be >= 2")
         if not 0 <= self.dropout < 1:
@@ -46,6 +80,115 @@ class NCMConfig:
             raise ValueError("conditioning_corruption must be in [0, 1]")
         if self.level_loss_alpha < 0:
             raise ValueError("level_loss_alpha must be >= 0")
+
+
+class _NCMQuantizedLinear(torch.autograd.Function):
+    """Linear operation with packed ternary forward and no dense weight reconstruction."""
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, forward_quant, backward_mode,
+                packed, scale, packed_shape, fp8_weight):
+        input_shape = x.shape
+        x_flat = x.reshape(-1, x.shape[-1])
+        ctx.forward_quant = forward_quant
+        ctx.backward_mode = backward_mode
+        ctx.packed = packed
+        ctx.scale = scale
+        ctx.packed_shape = packed_shape
+        ctx.has_bias = bias is not None
+        ctx.input_shape = input_shape
+        ctx.save_for_backward(x_flat, weight, fp8_weight)
+
+        if forward_quant == "fp8":
+            output = x_flat @ fp8_weight.t()
+        elif forward_quant == "ternary":
+            output = _quant.packed_matmat(x_flat, packed, packed_shape, scale)
+        else:
+            output = x_flat @ weight.t()
+        if bias is not None:
+            output = output + bias
+        return output.reshape(*input_shape[:-1], weight.shape[0])
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight, fp8_weight = ctx.saved_tensors
+        dy = grad_output.reshape(-1, grad_output.shape[-1])
+        mode = ctx.backward_mode
+        kind = ctx.forward_quant
+
+        if kind == "ternary":
+            dx = _quant.packed_matmat_transpose(
+                dy, ctx.packed, ctx.packed_shape, ctx.scale
+            )
+        elif kind == "fp8":
+            if mode == "fp8":
+                dy_q, _ = _quant.fp8_e4m3_quantize(dy)
+                dx = dy_q @ fp8_weight
+            else:
+                dx = dy @ fp8_weight
+        else:
+            dx = dy @ weight
+
+        if kind != "fp32" and mode == "fp8":
+            dy_for_weight, _ = _quant.fp8_e4m3_quantize(dy)
+            x_for_weight, _ = _quant.fp8_e4m3_quantize(x)
+        else:
+            dy_for_weight, x_for_weight = dy, x
+        dweight = dy_for_weight.t() @ x_for_weight
+        dbias = dy.sum(dim=0) if ctx.has_bias else None
+        return (
+            dx.reshape(ctx.input_shape).to(dtype=x.dtype),
+            dweight.to(dtype=weight.dtype),
+            dbias,
+            None, None, None, None, None, None,
+        )
+
+
+class NCMLinear(nn.Linear):
+    """Linear layer supporting the repository's FP32, FP8, and packed-ternary paths."""
+
+    def __init__(self, in_features, out_features, bias=True,
+                 forward_quant="fp32", backward_mode="fp32"):
+        super().__init__(in_features, out_features, bias=bias)
+        self.forward_quant = forward_quant
+        self.backward_mode = backward_mode
+        self._cached_version = -1
+        self._cached_packed = None
+        self._cached_packed_scale = 1.0
+        self._cached_packed_shape = None
+        self._cached_fp8_weight = None
+
+    def _quantized_weight(self):
+        version = self.weight._version
+        if version == self._cached_version:
+            return
+        self._cached_version = version
+        self._cached_fp8_weight = None
+        self._cached_packed = None
+        self._cached_packed_shape = None
+        if self.forward_quant == "fp8":
+            self._cached_fp8_weight, _ = _quant.fp8_e4m3_quantize(self.weight.detach())
+        elif self.forward_quant == "ternary":
+            _quant.prepare_ternary_backend()
+            (
+                self._cached_packed,
+                self._cached_packed_scale,
+                self._cached_packed_shape,
+                _,
+            ) = _quant.pack_ternary_tiled(self.weight.detach().t())
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.forward_quant == "fp32":
+            return F.linear(x, self.weight, self.bias)
+        self._quantized_weight()
+        fp8_weight = self._cached_fp8_weight
+        if fp8_weight is None:
+            fp8_weight = self.weight.new_empty(0)
+        return _NCMQuantizedLinear.apply(
+            x, self.weight, self.bias, self.forward_quant, self.backward_mode,
+            self._cached_packed, self._cached_packed_scale,
+            self._cached_packed_shape, fp8_weight,
+        )
 
 
 def level_length(length: int, level: int, levels: int) -> int:
@@ -80,10 +223,19 @@ class RMSNorm(nn.Module):
 class SmaulExpert(nn.Module):
     """One SmaulBRAIN-style GELU expert with bias-free projections."""
 
-    def __init__(self, dimension: int, hidden_dimension: int):
+    def __init__(
+        self, dimension: int, hidden_dimension: int,
+        forward_quant: str = "fp32", backward_mode: str = "fp32",
+    ):
         super().__init__()
-        self.W_in = nn.Linear(dimension, hidden_dimension, bias=False)
-        self.W_out = nn.Linear(hidden_dimension, dimension, bias=False)
+        self.W_in = NCMLinear(
+            dimension, hidden_dimension, bias=False,
+            forward_quant=forward_quant, backward_mode=backward_mode,
+        )
+        self.W_out = NCMLinear(
+            hidden_dimension, dimension, bias=False,
+            forward_quant=forward_quant, backward_mode=backward_mode,
+        )
 
     def forward(self, x: Tensor) -> Tensor:
         return self.W_out(F.gelu(self.W_in(x)))
@@ -92,15 +244,26 @@ class SmaulExpert(nn.Module):
 class SmaulSharedMoE(nn.Module):
     """One sparse router and expert pool shared by every recurrent block."""
 
-    def __init__(self, dimension: int, n_experts: int, top_k: int):
+    def __init__(
+        self, dimension: int, n_experts: int, top_k: int,
+        expert_hidden: int = 0, forward_quant: str = "fp32",
+        backward_mode: str = "fp32",
+    ):
         super().__init__()
         if n_experts < 1 or not 1 <= top_k <= n_experts:
             raise ValueError("top_k must be between 1 and n_experts")
+        if expert_hidden < 1:
+            expert_hidden = 4 * dimension
         self.n_experts = n_experts
         self.top_k = top_k
-        self.router = nn.Linear(dimension, n_experts, bias=False)
+        self.router = NCMLinear(
+            dimension, n_experts, bias=False,
+            forward_quant=forward_quant, backward_mode=backward_mode,
+        )
         self.experts = nn.ModuleList(
-            SmaulExpert(dimension, 4 * dimension) for _ in range(n_experts)
+            SmaulExpert(
+                dimension, expert_hidden, forward_quant, backward_mode
+            ) for _ in range(n_experts)
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -139,14 +302,22 @@ class SmaulRecurrentBlock(nn.Module):
     # bounded chunks to keep the closed-form recurrence numerically stable.
     _SCAN_CHUNK = 128
 
-    def __init__(self, dimension: int):
+    def __init__(
+        self, dimension: int, forward_quant: str = "fp32",
+        backward_mode: str = "fp32",
+    ):
         super().__init__()
         self.norm_attention = RMSNorm(dimension)
         self.norm_channel = RMSNorm(dimension)
-        self.W_r = nn.Linear(dimension, dimension, bias=False)
-        self.W_k = nn.Linear(dimension, dimension, bias=False)
-        self.W_v = nn.Linear(dimension, dimension, bias=False)
-        self.W_o = nn.Linear(dimension, dimension, bias=False)
+        linear_args = {
+            "bias": False,
+            "forward_quant": forward_quant,
+            "backward_mode": backward_mode,
+        }
+        self.W_r = NCMLinear(dimension, dimension, **linear_args)
+        self.W_k = NCMLinear(dimension, dimension, **linear_args)
+        self.W_v = NCMLinear(dimension, dimension, **linear_args)
+        self.W_o = NCMLinear(dimension, dimension, **linear_args)
         # softplus(-4) starts near a 0.018 decay rate, retaining useful state.
         # The bounded rate keeps the vectorized scan numerically stable.
         self.decay_logit = nn.Parameter(torch.full((dimension,), -4.0))
@@ -175,7 +346,7 @@ class SmaulRecurrentBlock(nn.Module):
 
     def forward(
         self, x: Tensor, segment_lengths: Sequence[int],
-        channel_mixer: SmaulSharedMoE,
+        channel_mixer: nn.Module,
     ) -> Tensor:
         if sum(segment_lengths) != x.shape[1] or any(length < 1 for length in segment_lengths):
             raise ValueError("segment_lengths must be positive and sum to the sequence length")
@@ -205,6 +376,31 @@ class SmaulRecurrentBlock(nn.Module):
         return x + channel_mixer(channel_input)
 
 
+class SmaulDenseFFN(nn.Module):
+    """SwiGLU channel mixer used by the dense presets."""
+
+    def __init__(
+        self, dimension: int, hidden_dimension: int,
+        forward_quant: str = "fp32", backward_mode: str = "fp32",
+    ):
+        super().__init__()
+        self.W_a = NCMLinear(
+            dimension, hidden_dimension, forward_quant=forward_quant,
+            backward_mode=backward_mode,
+        )
+        self.W_b = NCMLinear(
+            dimension, hidden_dimension, forward_quant=forward_quant,
+            backward_mode=backward_mode,
+        )
+        self.W_c = NCMLinear(
+            hidden_dimension, dimension, forward_quant=forward_quant,
+            backward_mode=backward_mode,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.W_c(F.silu(self.W_a(x)) * self.W_b(x))
+
+
 class ResidualVQTokenizer(nn.Module):
     """Byte-level multiscale residual VQ tokenizer with a reconstruction loss.
 
@@ -218,8 +414,17 @@ class ResidualVQTokenizer(nn.Module):
         self.config = config
         self.byte_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.encoder = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model), nn.GELU(),
-            nn.Linear(config.d_model, config.d_model),
+            NCMLinear(
+                config.d_model, config.d_model,
+                forward_quant=config.forward_quant,
+                backward_mode=config.backward_mode,
+            ),
+            nn.GELU(),
+            NCMLinear(
+                config.d_model, config.d_model,
+                forward_quant=config.forward_quant,
+                backward_mode=config.backward_mode,
+            ),
         )
         # Keep latent RMS bounded as the encoder learns; residual codebooks and
         # the reconstruction head should not see unbounded latent magnitudes.
@@ -233,8 +438,17 @@ class ResidualVQTokenizer(nn.Module):
         )
         self.decoder_norm = RMSNorm(config.d_model)
         self.decoder = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model), nn.GELU(),
-            nn.Linear(config.d_model, config.vocab_size),
+            NCMLinear(
+                config.d_model, config.d_model,
+                forward_quant=config.forward_quant,
+                backward_mode=config.backward_mode,
+            ),
+            nn.GELU(),
+            NCMLinear(
+                config.d_model, config.vocab_size,
+                forward_quant=config.forward_quant,
+                backward_mode=config.backward_mode,
+            ),
         )
         self.last_loss_components: dict[str, Tensor] = {}
 
@@ -340,21 +554,42 @@ class NCMGenerator(nn.Module):
         for parameter in tokenizer.parameters():
             parameter.requires_grad_(False)
         tokenizer.eval()
-        self.input_projection = nn.Linear(config.d_model, config.d_model)
-        self.prefix_projection = nn.Linear(config.d_model, config.d_model)
+        linear_args = {
+            "forward_quant": config.forward_quant,
+            "backward_mode": config.backward_mode,
+        }
+        self.input_projection = NCMLinear(
+            config.d_model, config.d_model, **linear_args
+        )
+        self.prefix_projection = NCMLinear(
+            config.d_model, config.d_model, **linear_args
+        )
         self.level_embeddings = nn.Embedding(config.levels, config.d_model)
         self.position_embeddings = nn.Embedding(config.max_seq_len, config.d_model)
-        # A single router/expert pool is shared across every recurrent layer,
-        # matching the shared-pool option in the normal SmaulBRAIN MoE design.
-        self.channel_mixer = SmaulSharedMoE(
-            config.d_model, config.n_experts, config.top_k
-        )
+        if config.model_kind == "moe":
+            self.channel_mixer = SmaulSharedMoE(
+                config.d_model, config.n_experts, config.top_k,
+                config.expert_hidden, config.forward_quant, config.backward_mode,
+            )
+            self.dense_mixers = None
+        else:
+            self.channel_mixer = None
+            self.dense_mixers = nn.ModuleList(
+                SmaulDenseFFN(
+                    config.d_model, config.ffn_hidden,
+                    config.forward_quant, config.backward_mode,
+                )
+                for _ in range(config.n_layers)
+            )
         self.blocks = nn.ModuleList(
-            SmaulRecurrentBlock(config.d_model) for _ in range(config.n_layers)
+            SmaulRecurrentBlock(
+                config.d_model, config.forward_quant, config.backward_mode
+            )
+            for _ in range(config.n_layers)
         )
         self.final_norm = RMSNorm(config.d_model)
         self.output_heads = nn.ModuleList(
-            nn.Linear(config.d_model, config.codebook_size)
+            NCMLinear(config.d_model, config.codebook_size, **linear_args)
             for _ in range(config.levels)
         )
 
@@ -430,8 +665,13 @@ class NCMGenerator(nn.Module):
         ]
         segment_lengths = [part.shape[1] for part in segments]
         hidden = torch.cat(segments, dim=1)
-        for block in self.blocks:
-            hidden = block(hidden, segment_lengths, self.channel_mixer)
+        for layer_index, block in enumerate(self.blocks):
+            mixer = (
+                self.channel_mixer
+                if self.config.model_kind == "moe"
+                else self.dense_mixers[layer_index]
+            )
+            hidden = block(hidden, segment_lengths, mixer)
         hidden = self.final_norm(hidden)
 
         encoded_segments = torch.split(hidden, segment_lengths, dim=1)
@@ -493,8 +733,13 @@ class NCMGenerator(nn.Module):
             prefix_length = prefix.shape[1]
             hidden = torch.cat((prefix, current), dim=1)
         segment_lengths = [hidden.shape[1]]
-        for block in self.blocks:
-            hidden = block(hidden, segment_lengths, self.channel_mixer)
+        for layer_index, block in enumerate(self.blocks):
+            mixer = (
+                self.channel_mixer
+                if self.config.model_kind == "moe"
+                else self.dense_mixers[layer_index]
+            )
+            hidden = block(hidden, segment_lengths, mixer)
         hidden = self.final_norm(hidden)
         if prefix_length:
             hidden = hidden[:, prefix_length:]
@@ -504,7 +749,7 @@ class NCMGenerator(nn.Module):
     def generate_codes(
         self, lengths: Sequence[int], device: torch.device | str = "cpu",
         temperature: float = 0.0, top_k: int = 0,
-        prefix_tokens: Tensor | None = None,
+        prefix_tokens: Tensor | None = None, top_p: float = 1.0,
     ) -> list[Tensor]:
         """Generate the hierarchy in K sequential calls, parallel within each level."""
         if len(lengths) != self.config.levels:
@@ -515,6 +760,8 @@ class NCMGenerator(nn.Module):
             raise ValueError("level lengths must be nondecreasing")
         if temperature < 0 or top_k < 0:
             raise ValueError("temperature and top_k must be >= 0")
+        if not 0 < top_p <= 1:
+            raise ValueError("top_p must be in (0, 1]")
         batch_size = prefix_tokens.shape[0] if prefix_tokens is not None else 1
         if prefix_tokens is not None:
             device = prefix_tokens.device
@@ -531,6 +778,13 @@ class NCMGenerator(nn.Module):
                     threshold = logits.topk(k, dim=-1).values[..., -1, None]
                     logits = logits.masked_fill(logits < threshold, float("-inf"))
                 probs = torch.softmax(logits / temperature, dim=-1)
+                if top_p < 1.0:
+                    sorted_probs, sorted_indices = probs.sort(dim=-1, descending=True)
+                    remove = sorted_probs.cumsum(dim=-1) - sorted_probs >= top_p
+                    sorted_probs = sorted_probs.masked_fill(remove, 0.0)
+                    filtered = torch.zeros_like(probs)
+                    filtered.scatter_(-1, sorted_indices, sorted_probs)
+                    probs = filtered / filtered.sum(dim=-1, keepdim=True).clamp_min(1e-12)
                 codes[level] = torch.multinomial(
                     probs.reshape(-1, probs.shape[-1]), 1
                 ).reshape(probs.shape[:-1])
@@ -540,13 +794,15 @@ class NCMGenerator(nn.Module):
     def generate(
         self, output_length: int, device: torch.device | str = "cpu",
         temperature: float = 0.0, top_k: int = 0,
-        prefix_tokens: Tensor | None = None,
+        prefix_tokens: Tensor | None = None, top_p: float = 1.0,
     ) -> Tensor:
         lengths = [
             level_length(output_length, level, self.config.levels)
             for level in range(self.config.levels)
         ]
-        codes = self.generate_codes(lengths, device, temperature, top_k, prefix_tokens)
+        codes = self.generate_codes(
+            lengths, device, temperature, top_k, prefix_tokens, top_p=top_p
+        )
         return self.tokenizer.decode(codes, output_length)
 
 
