@@ -22,8 +22,9 @@ def test_default_cli_trains_and_infers_with_packed_ternary(tmp_path, capsys):
         "--levels", "2",
         "--codebook-size", "8",
         "--batch-size", "1",
-        "--steps", "1",
-        "--save-every", "1",
+        "--steps", "2",
+        "--save-every", "2",
+        "--log-every", "1",
         "--corpus", str(corpus),
         "--checkpoint", str(checkpoint),
         "--forward-quant", "ternary",
@@ -34,8 +35,12 @@ def test_default_cli_trains_and_infers_with_packed_ternary(tmp_path, capsys):
     assert summary_start >= 0
     summary = json.loads(training_output[summary_start:])
     assert summary["optimizer"] == "SmaulOPT"
-    assert summary["tokenizer_steps_this_run"] == 1
-    assert summary["generator_steps_this_run"] == 1
+    assert summary["tokenizer_steps_this_run"] == 2
+    assert summary["generator_steps_this_run"] == 2
+    assert "tokenizer step=1 " in training_output
+    assert "tokenizer step=2 " in training_output
+    assert "generator step=1 " in training_output
+    assert "generator step=2 " in training_output
 
     assert infer_main([
         "--checkpoint", str(checkpoint),
