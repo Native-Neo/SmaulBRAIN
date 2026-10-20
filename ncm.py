@@ -1,8 +1,7 @@
-"""Experimental Next-Concept Modeling (NCM) components for SmaulBRAIN.
+"""Experimental coarse-to-fine Next-Concept Modeling for SmaulBRAIN.
 
-This is an isolated research path: the existing byte-level model and checkpoints
-are unchanged. Train the multiscale tokenizer first, freeze it, then train the
-coarse-to-fine code predictor. Requires PyTorch.
+The default SmaulBRAIN model is not changed. Train ResidualVQTokenizer first,
+freeze it, then train NCMTransformer against its code hierarchies.
 """
 from __future__ import annotations
 
@@ -25,40 +24,48 @@ class NCMConfig:
     max_seq_len: int = 1024
     dropout: float = 0.0
     commitment_weight: float = 0.25
+    conditioning_corruption: float = 0.15
+    level_loss_alpha: float = 1.0
 
     def __post_init__(self) -> None:
         if self.vocab_size < 2 or self.codebook_size < 2:
             raise ValueError("vocab_size and codebook_size must be >= 2")
-        if self.d_model < 1 or self.levels < 1 or self.n_layers < 1:
-            raise ValueError("d_model, levels and n_layers must be >= 1")
-        if self.n_heads < 1 or self.d_model % self.n_heads:
+        if min(self.d_model, self.levels, self.n_layers, self.n_heads) < 1:
+            raise ValueError("model dimensions and levels must be positive")
+        if self.d_model % self.n_heads:
             raise ValueError("d_model must be divisible by n_heads")
         if self.max_seq_len < 2:
             raise ValueError("max_seq_len must be >= 2")
-        if not 0.0 <= self.dropout < 1.0:
+        if not 0 <= self.dropout < 1:
             raise ValueError("dropout must be in [0, 1)")
+        if not 0 <= self.conditioning_corruption <= 1:
+            raise ValueError("conditioning_corruption must be in [0, 1]")
+        if self.level_loss_alpha < 0:
+            raise ValueError("level_loss_alpha must be >= 0")
 
 
-def _level_length(length: int, level: int, levels: int) -> int:
-    """Length at this scale, ordered from coarsest level to finest."""
+def level_length(length: int, level: int, levels: int) -> int:
+    """Length at level, from coarsest to finest."""
     divisor = 1 << (levels - level - 1)
     return max(1, (length + divisor - 1) // divisor)
 
 
-def _resize_sequence(x: Tensor, length: int) -> Tensor:
+def resize_sequence(x: Tensor, length: int, mode: str = "linear") -> Tensor:
     if x.shape[1] == length:
         return x
-    return F.interpolate(x.transpose(1, 2), size=length, mode="linear",
-                         align_corners=False).transpose(1, 2)
+    if mode == "area":
+        return F.interpolate(x.transpose(1, 2), size=length, mode="area").transpose(1, 2)
+    return F.interpolate(
+        x.transpose(1, 2), size=length, mode="linear", align_corners=False
+    ).transpose(1, 2)
 
 
 class ResidualVQTokenizer(nn.Module):
-    """Byte-to-multiscale-code tokenizer with residual vector quantization.
+    """Byte-level multiscale residual VQ tokenizer with a reconstruction loss.
 
-    Each successive level has a longer sequence. The decoder combines the
-    upsampled quantized residuals to reconstruct the original byte sequence.
-    This deliberately small implementation is a baseline, not a reproduction
-    of every optimization in the published NCM system.
+    Each level has a separate codebook and a longer sequence than the previous
+    level. Code vectors are upsampled and accumulated before the next residual
+    is quantized. This is a compact baseline, not the paper's full VQ-VAE.
     """
 
     def __init__(self, config: NCMConfig):
@@ -66,8 +73,7 @@ class ResidualVQTokenizer(nn.Module):
         self.config = config
         self.byte_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.encoder = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model),
-            nn.GELU(),
+            nn.Linear(config.d_model, config.d_model), nn.GELU(),
             nn.Linear(config.d_model, config.d_model),
         )
         self.codebooks = nn.ModuleList(
@@ -75,220 +81,229 @@ class ResidualVQTokenizer(nn.Module):
             for _ in range(config.levels)
         )
         self.decoder = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model),
-            nn.GELU(),
+            nn.Linear(config.d_model, config.d_model), nn.GELU(),
             nn.Linear(config.d_model, config.vocab_size),
         )
 
     def _quantize(self, residual: Tensor, level: int) -> tuple[Tensor, Tensor, Tensor]:
-        # Compute distances in float32 for stable nearest-code selection.
         codebook = self.codebooks[level].weight
         flat = residual.reshape(-1, residual.shape[-1]).float()
         weights = codebook.float()
-        distances = (flat.square().sum(1, keepdim=True)
-                     - 2.0 * flat @ weights.t()
-                     + weights.square().sum(1).unsqueeze(0))
+        distances = (
+            flat.square().sum(1, keepdim=True) - 2 * flat @ weights.t()
+            + weights.square().sum(1).unsqueeze(0)
+        )
         ids = distances.argmin(dim=-1).view(residual.shape[:2])
         quantized = self.codebooks[level](ids)
-        codebook_loss = F.mse_loss(quantized, residual.detach())
-        commitment_loss = F.mse_loss(residual, quantized.detach())
+        vq_loss = F.mse_loss(quantized, residual.detach())
+        commitment = F.mse_loss(residual, quantized.detach())
         straight_through = residual + (quantized - residual).detach()
-        return ids, straight_through, codebook_loss + self.config.commitment_weight * commitment_loss
-
-    def encode(self, byte_ids: Tensor) -> list[Tensor]:
-        """Return code IDs per level, coarsest first; input shape is [batch, time]."""
-        if byte_ids.ndim != 2:
-            raise ValueError("byte_ids must have shape [batch, time]")
-        if byte_ids.shape[1] > self.config.max_seq_len:
-            raise ValueError("sequence exceeds config.max_seq_len")
-        with torch.no_grad():
-            features = self.encoder(self.byte_embedding(byte_ids))
-            cumulative = features.new_zeros(features.shape[0], 1, features.shape[-1])
-            codes: list[Tensor] = []
-            for level in range(self.config.levels):
-                size = _level_length(byte_ids.shape[1], level, self.config.levels)
-                target = F.adaptive_avg_pool1d(
-                    features.transpose(1, 2), size
-                ).transpose(1, 2)
-                prior = _resize_sequence(cumulative, size)
-                ids, quantized, _ = self._quantize(target - prior, level)
-                cumulative = prior + self.codebooks[level](ids)
-                codes.append(ids)
-            return codes
+        return ids, straight_through, vq_loss + self.config.commitment_weight * commitment
 
     def forward(self, byte_ids: Tensor) -> tuple[Tensor, Tensor, list[Tensor]]:
         if byte_ids.ndim != 2:
             raise ValueError("byte_ids must have shape [batch, time]")
-        if byte_ids.shape[1] > self.config.max_seq_len:
-            raise ValueError("sequence exceeds config.max_seq_len")
+        if not 1 <= byte_ids.shape[1] <= self.config.max_seq_len:
+            raise ValueError("sequence length must be within [1, max_seq_len]")
         features = self.encoder(self.byte_embedding(byte_ids))
-        cumulative = features.new_zeros(features.shape[0], 1, features.shape[-1])
-        decoded = features.new_zeros(features.shape)
-        vq_loss = features.new_zeros(())
+        cumulative = features.new_zeros(features.shape)
         codes: list[Tensor] = []
+        vq_loss = features.new_zeros(())
         for level in range(self.config.levels):
-            size = _level_length(byte_ids.shape[1], level, self.config.levels)
+            size = level_length(byte_ids.shape[1], level, self.config.levels)
             target = F.adaptive_avg_pool1d(
                 features.transpose(1, 2), size
             ).transpose(1, 2)
-            prior = _resize_sequence(cumulative, size)
+            prior = resize_sequence(cumulative, size)
             ids, quantized, level_loss = self._quantize(target - prior, level)
-            cumulative = prior + quantized
             codes.append(ids)
-            decoded = decoded + _resize_sequence(quantized, byte_ids.shape[1])
+            cumulative = cumulative + resize_sequence(quantized, byte_ids.shape[1])
             vq_loss = vq_loss + level_loss
-        logits = self.decoder(decoded)
-        reconstruction_loss = F.cross_entropy(
+        logits = self.decoder(cumulative)
+        reconstruction = F.cross_entropy(
             logits.reshape(-1, self.config.vocab_size), byte_ids.reshape(-1)
         )
-        return logits, reconstruction_loss + vq_loss, codes
+        return logits, reconstruction + vq_loss / self.config.levels, codes
+
+    @torch.no_grad()
+    def encode(self, byte_ids: Tensor) -> list[Tensor]:
+        was_training = self.training
+        self.eval()
+        _, _, codes = self.forward(byte_ids)
+        self.train(was_training)
+        return codes
 
     @torch.no_grad()
     def decode(self, codes: Sequence[Tensor], output_length: int) -> Tensor:
-        """Decode a code hierarchy to byte IDs using the learned tokenizer decoder."""
         if len(codes) != self.config.levels:
             raise ValueError("one code tensor is required per level")
         if not 1 <= output_length <= self.config.max_seq_len:
             raise ValueError("output_length must be within [1, max_seq_len]")
         batch = codes[0].shape[0]
-        decoded = self.byte_embedding.weight.new_zeros(
+        cumulative = self.byte_embedding.weight.new_zeros(
             batch, output_length, self.config.d_model
         )
         for level, ids in enumerate(codes):
-            expected = _level_length(output_length, level, self.config.levels)
-            if ids.ndim != 2 or ids.shape != (batch, expected):
+            expected = level_length(output_length, level, self.config.levels)
+            if ids.shape != (batch, expected):
                 raise ValueError(f"level {level} codes must have shape [batch, {expected}]")
-            quantized = self.codebooks[level](ids)
-            decoded = decoded + _resize_sequence(quantized, output_length)
-        return self.decoder(decoded).argmax(dim=-1)
+            cumulative = cumulative + resize_sequence(self.codebooks[level](ids), output_length)
+        return self.decoder(cumulative).argmax(dim=-1)
 
 
 class NCMTransformer(nn.Module):
-    """Predict all code positions in parallel, conditioned on coarser levels.
+    """Predict every code level in one training pass; generate one level per step.
 
-    Training computes every level in one transformer invocation. The attention
-    mask prevents a level's targets from leaking into its own predictions:
-    query positions can see code embeddings from strictly coarser levels only.
-    During generation, fill levels from coarse to fine and use predict().
+    Inputs are cumulative reconstructions of *earlier* levels, not the target
+    level's ground-truth IDs. Target codes are labels only. Block-diagonal
+    attention lets positions interact within their level; each level's input
+    already summarizes all coarser reconstructions.
     """
 
-    def __init__(self, config: NCMConfig):
+    def __init__(self, config: NCMConfig, tokenizer: ResidualVQTokenizer):
         super().__init__()
+        if tokenizer.config != config:
+            raise ValueError("tokenizer and generator must use the same NCMConfig")
         self.config = config
-        self.code_embeddings = nn.ModuleList(
-            nn.Embedding(config.codebook_size, config.d_model)
-            for _ in range(config.levels)
-        )
+        self._tokenizer = (tokenizer,)
+        for parameter in tokenizer.parameters():
+            parameter.requires_grad_(False)
+        tokenizer.eval()
+        self.input_projection = nn.Linear(config.d_model, config.d_model)
         self.level_embeddings = nn.Embedding(config.levels, config.d_model)
-        self.role_embeddings = nn.Embedding(2, config.d_model)
         self.position_embeddings = nn.Embedding(config.max_seq_len, config.d_model)
         layer = nn.TransformerEncoderLayer(
-            d_model=config.d_model,
-            nhead=config.n_heads,
-            dim_feedforward=4 * config.d_model,
-            dropout=config.dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+            d_model=config.d_model, nhead=config.n_heads,
+            dim_feedforward=4 * config.d_model, dropout=config.dropout,
+            activation="gelu", batch_first=True, norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(layer, num_layers=config.n_layers,
-                                                  enable_nested_tensor=False)
+        self.blocks = nn.TransformerEncoder(
+            layer, num_layers=config.n_layers, enable_nested_tensor=False
+        )
+        self.final_norm = nn.LayerNorm(config.d_model)
         self.output_heads = nn.ModuleList(
             nn.Linear(config.d_model, config.codebook_size)
             for _ in range(config.levels)
         )
-        self.mask_embedding = nn.Parameter(torch.zeros(config.d_model))
 
-    def _packed(self, code_ids: Sequence[Tensor]) -> tuple[Tensor, Tensor, list[int]]:
-        if len(code_ids) != self.config.levels:
+    @property
+    def tokenizer(self) -> ResidualVQTokenizer:
+        return self._tokenizer[0]
+
+    def _build_level_inputs(
+        self, codes: Sequence[Tensor], corrupt: bool
+    ) -> tuple[Tensor, list[int]]:
+        if len(codes) != self.config.levels:
             raise ValueError("one code tensor is required per level")
-        batch = code_ids[0].shape[0]
-        device = code_ids[0].device
-        context_parts: list[Tensor] = []
-        query_parts: list[Tensor] = []
-        level_parts: list[Tensor] = []
+        batch = codes[0].shape[0]
+        length = codes[-1].shape[1]
+        if length > self.config.max_seq_len:
+            raise ValueError("sequence exceeds config.max_seq_len")
+        device = codes[0].device
+        cumulative = self.tokenizer.byte_embedding.weight.new_zeros(
+            batch, length, self.config.d_model, device=device
+        )
+        parts: list[Tensor] = []
         lengths: list[int] = []
-        for level, ids in enumerate(code_ids):
-            if ids.ndim != 2 or ids.shape[0] != batch:
-                raise ValueError("each code tensor must have shape [batch, level_length]")
-            length = ids.shape[1]
-            if length > self.config.max_seq_len:
-                raise ValueError("code sequence exceeds config.max_seq_len")
-            lengths.append(length)
-            positions = torch.arange(length, device=device)
-            pos = self.position_embeddings(positions).unsqueeze(0)
-            lev = self.level_embeddings.weight[level].view(1, 1, -1)
-            context_parts.append(self.code_embeddings[level](ids) + pos + lev
-                                 + self.role_embeddings.weight[0].view(1, 1, -1))
-            query_parts.append(self.mask_embedding.view(1, 1, -1) + pos + lev
-                               + self.role_embeddings.weight[1].view(1, 1, -1))
-            level_parts.append(torch.full((length,), level, device=device, dtype=torch.long))
-        context = torch.cat(context_parts, dim=1)
-        query = torch.cat(query_parts, dim=1)
-        level_ids = torch.cat(level_parts)
-        total = level_ids.numel()
-        # Context entries are kept as isolated code embeddings. Query positions
-        # attend only to context positions from strictly coarser levels.
-        mask = torch.ones((2 * total, 2 * total), device=device, dtype=torch.bool)
-        diag = torch.arange(total, device=device)
-        mask[diag, diag] = False
-        q_rows = total + diag
-        allowed = level_ids.unsqueeze(0) < level_ids.unsqueeze(1)
-        mask[q_rows.unsqueeze(1), diag.unsqueeze(0)] = ~allowed
-        # Query tokens are masked placeholders, so positions at the same level
-        # may exchange information without seeing their target code IDs.
-        query_levels = level_ids.unsqueeze(1)
-        key_levels = level_ids.unsqueeze(0)
-        mask[total:, total:] = query_levels != key_levels
-        return torch.cat((context, query), dim=1), mask, lengths
+        for level, ids in enumerate(codes):
+            expected = level_length(length, level, self.config.levels)
+            if ids.shape != (batch, expected):
+                raise ValueError(f"level {level} codes must have shape [batch, {expected}]")
+            lengths.append(expected)
+            # The current level's input contains only earlier levels.
+            current = resize_sequence(cumulative, expected, mode="area")
+            positions = torch.arange(expected, device=device)
+            part = self.input_projection(current)
+            part = part + self.position_embeddings(positions).unsqueeze(0)
+            part = part + self.level_embeddings.weight[level].view(1, 1, -1)
+            parts.append(part)
+            # Corrupt conditioning IDs only; the original IDs remain the labels.
+            conditioning_ids = ids
+            if corrupt and self.training and self.config.conditioning_corruption > 0:
+                replace = torch.rand(ids.shape, device=ids.device) < self.config.conditioning_corruption
+                random_ids = torch.randint(
+                    self.config.codebook_size, ids.shape, device=ids.device
+                )
+                conditioning_ids = torch.where(replace, random_ids, ids)
+            quantized = self.tokenizer.codebooks[level](conditioning_ids)
+            cumulative = cumulative + resize_sequence(quantized, length)
+        return torch.cat(parts, dim=1), lengths
 
-    def forward(self, code_ids: Sequence[Tensor]) -> list[Tensor]:
-        packed, mask, lengths = self._packed(code_ids)
-        hidden = self.transformer(packed, mask=mask)
-        offset = sum(lengths)
+    def forward(self, codes: Sequence[Tensor], *, corrupt: bool = True) -> list[Tensor]:
+        inputs, lengths = self._build_level_inputs(codes, corrupt)
+        total = inputs.shape[1]
+        level_ids = torch.cat([
+            torch.full((n,), i, device=inputs.device, dtype=torch.long)
+            for i, n in enumerate(lengths)
+        ])
+        # PyTorch bool masks use True to mean "cannot attend".
+        # Block-diagonal attention avoids leaking same-level labels and prevents
+        # later levels from becoming hidden context for earlier levels.
+        mask = level_ids[:, None] != level_ids[None, :]
+        hidden = self.final_norm(self.blocks(inputs, mask=mask))
         logits: list[Tensor] = []
+        offset = 0
         for level, length in enumerate(lengths):
             logits.append(self.output_heads[level](hidden[:, offset:offset + length]))
             offset += length
         return logits
 
     @torch.no_grad()
-    def predict(self, code_ids: Sequence[Tensor], level: int) -> Tensor:
-        """Predict all positions of one level simultaneously."""
-        if not 0 <= level < self.config.levels:
-            raise ValueError("level is outside the configured hierarchy")
-        return self.forward(code_ids)[level].argmax(dim=-1)
-
-    @torch.no_grad()
-    def generate_codes(self, lengths: Sequence[int], device: torch.device | str = "cpu",
-                       temperature: float = 0.0) -> list[Tensor]:
-        """Generate a complete hierarchy, one level per sequential step."""
+    def generate_codes(
+        self, lengths: Sequence[int], device: torch.device | str = "cpu",
+        temperature: float = 0.0, top_k: int = 0,
+    ) -> list[Tensor]:
+        """Generate the hierarchy in K sequential calls, parallel within each level."""
         if len(lengths) != self.config.levels:
             raise ValueError("one length is required per level")
         if any(n < 1 or n > self.config.max_seq_len for n in lengths):
             raise ValueError("each level length must be within [1, max_seq_len]")
-        if temperature < 0:
-            raise ValueError("temperature must be >= 0")
-        codes = [torch.zeros(1, n, dtype=torch.long, device=device) for n in lengths]
+        if any(lengths[i] > lengths[i + 1] for i in range(len(lengths) - 1)):
+            raise ValueError("level lengths must be nondecreasing")
+        if temperature < 0 or top_k < 0:
+            raise ValueError("temperature and top_k must be >= 0")
+        codes = [
+            torch.zeros(1, n, dtype=torch.long, device=device) for n in lengths
+        ]
         for level in range(self.config.levels):
-            logits = self.forward(codes)[level]
+            logits = self.forward(codes, corrupt=False)[level]
             if temperature == 0:
                 codes[level] = logits.argmax(dim=-1)
             else:
+                if top_k:
+                    k = min(top_k, logits.shape[-1])
+                    threshold = logits.topk(k, dim=-1).values[..., -1, None]
+                    logits = logits.masked_fill(logits < threshold, float("-inf"))
                 probs = torch.softmax(logits / temperature, dim=-1)
                 codes[level] = torch.multinomial(
                     probs.reshape(-1, probs.shape[-1]), 1
                 ).reshape(probs.shape[:-1])
         return codes
 
+    @torch.no_grad()
+    def generate(
+        self, output_length: int, device: torch.device | str = "cpu",
+        temperature: float = 0.0, top_k: int = 0,
+    ) -> Tensor:
+        lengths = [
+            level_length(output_length, level, self.config.levels)
+            for level in range(self.config.levels)
+        ]
+        codes = self.generate_codes(lengths, device, temperature, top_k)
+        return self.tokenizer.decode(codes, output_length)
 
-def ncm_loss(model: NCMTransformer, code_ids: Sequence[Tensor]) -> Tensor:
-    """Mean cross-entropy across all hierarchy levels and positions."""
-    logits = model(code_ids)
-    if len(logits) != len(code_ids):
-        raise RuntimeError("model returned an incomplete hierarchy")
+
+def ncm_loss(model: NCMTransformer, codes: Sequence[Tensor]) -> Tensor:
+    """Length-normalized multilevel CE; alpha=1 weights each level equally."""
+    logits = model(codes, corrupt=True)
     losses = [
         F.cross_entropy(pred.reshape(-1, pred.shape[-1]), target.reshape(-1))
-        for pred, target in zip(logits, code_ids)
+        for pred, target in zip(logits, codes)
     ]
-    return torch.stack(losses).mean()
+    alpha = model.config.level_loss_alpha
+    weights = torch.tensor(
+        [max(1, target.shape[1]) ** (-alpha) for target in codes],
+        device=logits[0].device, dtype=logits[0].dtype,
+    )
+    weights = weights / weights.sum()
+    return sum(weight * loss for weight, loss in zip(weights, losses))
