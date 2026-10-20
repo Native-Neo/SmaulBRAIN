@@ -1,6 +1,6 @@
 import torch
 
-from ncm_train import ByteBatchStream
+from ncm_train import ByteBatchStream, make_adamw
 from ncm import (
     NCMConfig, NCMGenerator, NCMTransformer, ResidualVQTokenizer,
     SmaulRecurrentBlock, SmaulSharedMoE, ncm_loss,
@@ -201,3 +201,60 @@ def test_shared_moe_pool_routes_tokens_and_receives_gradients():
     assert router_gradient is not None
     assert torch.isfinite(router_gradient).all()
     assert float(router_gradient.abs().sum()) > 0.0
+
+
+def _naive_scan(values, rate):
+    decay = torch.exp(-rate)
+    state = torch.zeros_like(values[:, 0])
+    out = []
+    for step in range(values.shape[1]):
+        state = decay * state + values[:, step]
+        out.append(state)
+    return torch.stack(out, dim=1)
+
+
+def test_block_bidirectional_scan_matches_naive_recurrence_across_chunks():
+    torch.manual_seed(3)
+    block = SmaulRecurrentBlock(8).eval()
+    moe = SmaulSharedMoE(dimension=8, n_experts=4, top_k=2).eval()
+    # 300 > _SCAN_CHUNK exercises chunk carry-over; 5 checks segment reset.
+    lengths = [5, 300]
+    x = torch.randn(2, sum(lengths), 8)
+    actual = block(x, lengths, moe)
+
+    with torch.no_grad():
+        normalized = block.norm_attention(x)
+        gate = torch.sigmoid(block.W_r(normalized))
+        key_value = block.W_k(normalized) * block.W_v(normalized)
+        rate = torch.nn.functional.softplus(block.decay_logit).clamp(min=1e-4, max=0.1)
+        contexts, offset = [], 0
+        for length in lengths:
+            seg = key_value[:, offset:offset + length]
+            fwd = _naive_scan(seg, rate)
+            rev = _naive_scan(seg.flip(1), rate).flip(1)
+            contexts.append(0.5 * (fwd + rev))
+            offset += length
+        context = torch.cat(contexts, dim=1)
+        hidden = x + block.W_o(gate * (context + block.bonus * key_value))
+        expected = hidden + moe(block.norm_channel(hidden))
+
+    assert torch.allclose(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_make_adamw_matches_reference_adamw_step():
+    torch.manual_seed(5)
+    reference = torch.nn.Linear(6, 3)
+    candidate = torch.nn.Linear(6, 3)
+    candidate.load_state_dict(reference.state_dict())
+    ref_opt = torch.optim.AdamW(reference.parameters(), lr=1e-2)
+    new_opt = make_adamw((p for p in candidate.parameters()), 1e-2)
+    inputs = torch.randn(4, 6)
+    for _ in range(3):
+        for model, opt in ((reference, ref_opt), (candidate, new_opt)):
+            opt.zero_grad(set_to_none=True)
+            model(inputs).square().mean().backward()
+            opt.step()
+    for a, b in zip(reference.parameters(), candidate.parameters()):
+        assert torch.allclose(a, b, atol=1e-6, rtol=1e-5)
+    # Optimizer state stays loadable into a plain AdamW (checkpoint compatibility).
+    torch.optim.AdamW(reference.parameters(), lr=1e-2).load_state_dict(new_opt.state_dict())
