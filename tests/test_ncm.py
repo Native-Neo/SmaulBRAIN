@@ -61,6 +61,20 @@ def test_current_level_input_does_not_use_its_own_target_codes():
     assert torch.equal(before[:, start:end], after[:, start:end])
 
 
+def test_level_prediction_depends_only_on_earlier_codes():
+    config = tiny_config()
+    tokenizer = ResidualVQTokenizer(config)
+    model = NCMTransformer(config, tokenizer).eval()
+    codes = tokenizer.encode(torch.randint(0, 256, (1, 9)))
+    original = model.predict_level(codes, 1)
+    changed = list(codes)
+    changed[1] = torch.randint(0, config.codebook_size, changed[1].shape)
+    changed[2] = torch.randint(0, config.codebook_size, changed[2].shape)
+    after = model.predict_level(changed, 1)
+    assert original.shape == (1, 5, config.codebook_size)
+    assert torch.equal(original, after)
+
+
 def test_generation_advances_by_levels_and_decodes_bytes():
     config = tiny_config()
     tokenizer = ResidualVQTokenizer(config)
