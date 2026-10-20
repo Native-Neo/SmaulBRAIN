@@ -216,7 +216,11 @@ class NCMTransformer(nn.Module):
         q_rows = total + diag
         allowed = level_ids.unsqueeze(0) < level_ids.unsqueeze(1)
         mask[q_rows.unsqueeze(1), diag.unsqueeze(0)] = ~allowed
-        # Query positions never attend to other query positions.
+        # Query tokens are masked placeholders, so positions at the same level
+        # may exchange information without seeing their target code IDs.
+        query_levels = level_ids.unsqueeze(1)
+        key_levels = level_ids.unsqueeze(0)
+        mask[total:, total:] = query_levels != key_levels
         return torch.cat((context, query), dim=1), mask, lengths
 
     def forward(self, code_ids: Sequence[Tensor]) -> list[Tensor]:
