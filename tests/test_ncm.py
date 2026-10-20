@@ -1,7 +1,10 @@
 import torch
 
 from ncm_train import ByteBatchStream
-from ncm import NCMConfig, NCMTransformer, ResidualVQTokenizer, ncm_loss
+from ncm import (
+    NCMConfig, NCMGenerator, NCMTransformer, ResidualVQTokenizer,
+    SmaulRecurrentBlock, ncm_loss,
+)
 
 
 def tiny_config():
@@ -113,10 +116,42 @@ def test_streaming_byte_batcher_reads_text_without_loading_whole_file(tmp_path):
     assert int(batch.min()) >= 0 and int(batch.max()) < 256
 
 
-def test_config_rejects_invalid_attention_dimensions():
-    try:
-        NCMConfig(d_model=10, n_heads=4)
-    except ValueError as exc:
-        assert "divisible" in str(exc)
-    else:
-        raise AssertionError("invalid attention dimensions were accepted")
+def test_generator_uses_smaul_recurrent_blocks_instead_of_transformers():
+    config = tiny_config()
+    tokenizer = ResidualVQTokenizer(config)
+    model = NCMGenerator(config, tokenizer)
+
+    assert all(isinstance(block, SmaulRecurrentBlock) for block in model.blocks)
+    assert not any(
+        isinstance(module, (torch.nn.TransformerEncoder, torch.nn.TransformerEncoderLayer))
+        for module in model.modules()
+    )
+    # Keep the former public name working for scripts/checkpoints made before this change.
+    assert NCMTransformer is NCMGenerator
+
+
+def test_chunked_recurrent_scan_matches_the_recurrence_equation():
+    block = SmaulRecurrentBlock(dimension=3, feedforward_dimension=12)
+    values = torch.randn(2, 73, 3, requires_grad=True)
+    rate = torch.tensor([0.01, 0.03, 0.08])
+    actual = block._scan(values, rate)
+
+    state = torch.zeros(2, 3)
+    expected = []
+    for position in range(values.shape[1]):
+        state = torch.exp(-rate) * state + values[:, position, :]
+        expected.append(state)
+    expected = torch.stack(expected, dim=1)
+
+    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+    actual.square().mean().backward()
+    assert values.grad is not None
+    assert torch.isfinite(values.grad).all()
+
+
+def test_recurrent_config_does_not_require_attention_head_splitting():
+    # n_heads is accepted only for backward compatibility; recurrent blocks use
+    # the full channel dimension and never split it into Transformer heads.
+    config = NCMConfig(d_model=10, n_heads=4)
+    model = NCMGenerator(config, ResidualVQTokenizer(config))
+    assert model.config.d_model == 10
