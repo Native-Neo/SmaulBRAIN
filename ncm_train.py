@@ -76,22 +76,28 @@ class ByteBatchStream:
         self.batch_size = batch_size
         self.buffer_bytes = max(buffer_bytes, seq_len * batch_size * 4)
         self.buffer = bytearray()
+        self.pending = b""
         self.source = iter(corpus_chunks(path))
         self._fill(self.seq_len + 1)
 
     def _fill(self, minimum: int) -> None:
         while len(self.buffer) < minimum:
-            try:
-                chunk = next(self.source)
-            except StopIteration:
-                self.source = iter(corpus_chunks(self.path))
+            if self.pending:
+                chunk, self.pending = self.pending, b""
+            else:
                 try:
                     chunk = next(self.source)
-                except StopIteration as exc:
-                    raise ValueError("Corpus contains no readable text") from exc
+                except StopIteration:
+                    self.source = iter(corpus_chunks(self.path))
+                    try:
+                        chunk = next(self.source)
+                    except StopIteration as exc:
+                        raise ValueError("Corpus contains no readable text") from exc
             room = self.buffer_bytes - len(self.buffer)
             if room > 0:
                 self.buffer.extend(chunk[:room])
+                if len(chunk) > room:
+                    self.pending = chunk[room:]
             if len(self.buffer) >= self.buffer_bytes:
                 break
         if len(self.buffer) < self.seq_len + 1:
