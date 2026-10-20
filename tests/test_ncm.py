@@ -26,6 +26,9 @@ def test_tokenizer_emits_multiscale_codes_and_reconstructs_shape():
     assert torch.isfinite(loss)
     assert [x.shape for x in codes] == [(2, 3), (2, 5), (2, 9)]
     assert all(int(x.min()) >= 0 and int(x.max()) < config.codebook_size for x in codes)
+    decoded = tokenizer.decode(codes, output_length=9)
+    assert decoded.shape == data.shape
+    assert int(decoded.min()) >= 0 and int(decoded.max()) < config.vocab_size
 
 
 def test_ncm_predicts_every_level_in_one_forward_and_backpropagates():
