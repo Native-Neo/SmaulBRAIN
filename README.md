@@ -107,7 +107,8 @@ embeddings, codebooks, and normalization parameters remain floating point.
 Direct ternary updates are an experimental discrete optimizer, not conventional
 STE/QAT, and their convergence and generated-text quality must be measured.
 Loading an older FP32-master ternary checkpoint converts its linear weights to
-packed codes and resets the old optimizer moments for those weights.
+packed codes and resets that stage's optimizer state, which is incompatible with
+the direct-discrete weight update path.
 
 Train from a raw-byte corpus, text files, JSONL, or Parquet:
 
