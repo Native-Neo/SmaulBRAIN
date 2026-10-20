@@ -97,7 +97,7 @@ incompatible with older Transformer-based NCM generator checkpoints:
 
 ```bash
 python ncm_train.py --data ./data/corpus --output ./ncm-recurrent-checkpoints \
-  --stage both --steps 1000 --batch-size 2 --seq-len 128
+  --stage both --steps 1000 --batch-size 2 --seq-len 128 --experts 4 --top-k 2
 python ncm_bench.py --checkpoint-dir ./ncm-recurrent-checkpoints \
   --prompt "Once upon a time, " --new-bytes 128 --runs 5
 python -m pytest -q tests/test_ncm.py
