@@ -170,6 +170,7 @@ class NCMTransformer(nn.Module):
             parameter.requires_grad_(False)
         tokenizer.eval()
         self.input_projection = nn.Linear(config.d_model, config.d_model)
+        self.prefix_projection = nn.Linear(config.d_model, config.d_model)
         self.level_embeddings = nn.Embedding(config.levels, config.d_model)
         self.position_embeddings = nn.Embedding(config.max_seq_len, config.d_model)
         layer = nn.TransformerEncoderLayer(
@@ -229,18 +230,43 @@ class NCMTransformer(nn.Module):
             cumulative = cumulative + resize_sequence(quantized, length)
         return torch.cat(parts, dim=1), lengths
 
-    def forward(self, codes: Sequence[Tensor], *, corrupt: bool = True) -> list[Tensor]:
+    def forward(
+        self, codes: Sequence[Tensor], *, prefix_tokens: Tensor | None = None,
+        corrupt: bool = True,
+    ) -> list[Tensor]:
         inputs, lengths = self._build_level_inputs(codes, corrupt)
-        total = inputs.shape[1]
         level_ids = torch.cat([
             torch.full((n,), i, device=inputs.device, dtype=torch.long)
             for i, n in enumerate(lengths)
         ])
-        # PyTorch bool masks use True to mean "cannot attend".
-        # Block-diagonal attention avoids leaking same-level labels and prevents
-        # later levels from becoming hidden context for earlier levels.
-        mask = level_ids[:, None] != level_ids[None, :]
+        prefix = None
+        if prefix_tokens is not None:
+            if prefix_tokens.ndim != 2 or prefix_tokens.shape[0] != inputs.shape[0]:
+                raise ValueError("prefix_tokens must have shape [batch, prefix_length]")
+            if not 1 <= prefix_tokens.shape[1] <= self.config.max_seq_len:
+                raise ValueError("prefix length must be within [1, max_seq_len]")
+            prefix_features = self.tokenizer.encoder(
+                self.tokenizer.byte_embedding(prefix_tokens)
+            )
+            prefix = self.prefix_projection(prefix_features)
+            inputs = torch.cat((prefix, inputs), dim=1)
+        total = level_ids.numel()
+        target_mask = level_ids[:, None] != level_ids[None, :]
+        if prefix is None:
+            mask = target_mask
+        else:
+            prefix_length = prefix.shape[1]
+            mask = torch.zeros(
+                prefix_length + total, prefix_length + total,
+                dtype=torch.bool, device=inputs.device,
+            )
+            # Prefix queries cannot see target positions.
+            mask[:prefix_length, prefix_length:] = True
+            # Targets can see the prefix and their own level, but not other levels.
+            mask[prefix_length:, prefix_length:] = target_mask
         hidden = self.final_norm(self.blocks(inputs, mask=mask))
+        if prefix is not None:
+            hidden = hidden[:, prefix.shape[1]:]
         logits: list[Tensor] = []
         offset = 0
         for level, length in enumerate(lengths):
@@ -252,6 +278,7 @@ class NCMTransformer(nn.Module):
     def generate_codes(
         self, lengths: Sequence[int], device: torch.device | str = "cpu",
         temperature: float = 0.0, top_k: int = 0,
+        prefix_tokens: Tensor | None = None,
     ) -> list[Tensor]:
         """Generate the hierarchy in K sequential calls, parallel within each level."""
         if len(lengths) != self.config.levels:
@@ -266,7 +293,7 @@ class NCMTransformer(nn.Module):
             torch.zeros(1, n, dtype=torch.long, device=device) for n in lengths
         ]
         for level in range(self.config.levels):
-            logits = self.forward(codes, corrupt=False)[level]
+            logits = self.forward(codes, prefix_tokens=prefix_tokens, corrupt=False)[level]
             if temperature == 0:
                 codes[level] = logits.argmax(dim=-1)
             else:
@@ -284,12 +311,13 @@ class NCMTransformer(nn.Module):
     def generate(
         self, output_length: int, device: torch.device | str = "cpu",
         temperature: float = 0.0, top_k: int = 0,
+        prefix_tokens: Tensor | None = None,
     ) -> Tensor:
         lengths = [
             level_length(output_length, level, self.config.levels)
             for level in range(self.config.levels)
         ]
-        codes = self.generate_codes(lengths, device, temperature, top_k)
+        codes = self.generate_codes(lengths, device, temperature, top_k, prefix_tokens)
         return self.tokenizer.decode(codes, output_length)
 
 
@@ -302,7 +330,7 @@ def ncm_loss(model: NCMTransformer, codes: Sequence[Tensor]) -> Tensor:
     ]
     alpha = model.config.level_loss_alpha
     weights = torch.tensor(
-        [max(1, target.shape[1]) ** (-alpha) for target in codes],
+        [max(1, target.shape[1]) ** (1.0 - alpha) for target in codes],
         device=logits[0].device, dtype=logits[0].dtype,
     )
     weights = weights / weights.sum()
