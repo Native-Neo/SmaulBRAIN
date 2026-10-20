@@ -8,7 +8,7 @@ from pathlib import Path
 
 import torch
 
-from ncm import NCMConfig, NCMTransformer, ResidualVQTokenizer
+from ncm import NCMConfig, NCMTransformer, ResidualVQTokenizer, level_length
 
 
 def main(argv=None) -> int:
@@ -71,7 +71,14 @@ def main(argv=None) -> int:
     print(f"device: {device}")
     print(f"prompt_bytes: {len(prompt_ids)}")
     print(f"generated_bytes: {len(generated)}")
+    level_lengths = [
+        level_length(args.new_bytes, level, config.levels)
+        for level in range(config.levels)
+    ]
     print(f"hierarchy_levels: {config.levels}")
+    print(f"code_positions_per_level: {level_lengths}")
+    print(f"total_code_positions: {sum(level_lengths)}")
+    print(f"code_positions_per_output_byte: {sum(level_lengths) / len(generated):.3f}")
     print(f"mean_latency_seconds: {elapsed:.6f}")
     print(f"generated_bytes_per_second: {len(generated) / elapsed:.2f}")
     print(f"latency_seconds_per_run: {[round(x, 6) for x in timings]}")
