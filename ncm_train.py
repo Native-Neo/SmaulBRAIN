@@ -18,7 +18,7 @@ from torch import Tensor
 
 from ncm import (
     NCMConfig, NCMGenerator, NCMLinear, ResidualVQTokenizer,
-    migrate_ternary_state_dict, ncm_loss,
+    apply_direct_ternary_updates, migrate_ternary_state_dict, ncm_loss,
 )
 from smaulbrain import config as _preset_config
 
@@ -443,6 +443,7 @@ def main(argv=None) -> int:
             _, loss, _ = tokenizer(batch)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            apply_direct_ternary_updates(tokenizer)
             torch.nn.utils.clip_grad_norm_(tokenizer.parameters(), 1.0)
             optimizer.step()
             tokenizer_steps_this_run += 1
@@ -519,6 +520,7 @@ def main(argv=None) -> int:
             loss = ncm_loss(generator, codes, prefix_tokens=prefix_tokens)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            apply_direct_ternary_updates(generator)
             torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
             optimizer.step()
             generator_steps_this_run += 1
