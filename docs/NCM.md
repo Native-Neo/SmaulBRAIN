@@ -17,11 +17,13 @@ SmaulBRAIN `manifest.json` format.
 3. **Train a SmaulBRAIN-style recurrent generator.** Each level's input is the
    resized cumulative reconstruction of *earlier* levels, never its own target
    IDs. The generator uses recurrent linear attention with learned decay and
-   bonus, RMSNorm, residual connections, and a shared sparse router/expert pool. A
-   chunked vectorized scan computes recurrent states without a time-by-time
-   attention matrix. Each level has an independent recurrent state; prompt
-   features are repeated for each level to prevent information leaking between
-   levels. Conditioning corruption changes input conditioning IDs, not labels.
+   bonus, RMSNorm, residual connections, and a shared sparse router/expert pool. A fused native C++ CPU scan computes
+   recurrent states and their backward gradients without a time-by-time attention
+   matrix when the installed core package provides the native backend; the
+   chunked PyTorch scan remains the portable fallback. Each level has an
+   independent recurrent state; prompt features are repeated for each level to
+   prevent information leaking between levels. Conditioning corruption changes
+   input conditioning IDs, not labels.
 The tokenizer now applies RMSNorm to the learned byte features and the
 cumulative reconstruction before its byte decoder. Training logs reconstruction
 cross-entropy separately from the averaged vector-quantization/commitment loss,
@@ -39,7 +41,11 @@ attention: it scans each known level both forward and backward, so every
 position can use same-level context while all codes in that level are predicted
 in parallel. The standard autoregressive model uses a causal forward state.
 For MoE presets, one router and expert pool are shared across every recurrent
-block. Dense presets use a per-layer SwiGLU channel mixer. Preset dimensions
+block. Dispatch now sorts and groups the routing assignments once per mixer
+call instead of scanning the entire assignment tensor with a separate
+`torch.where` for every expert. Expert MLPs are still evaluated sequentially,
+one expert at a time, to avoid allocating padded all-expert activations. Dense
+presets use a per-layer SwiGLU channel mixer. Preset dimensions
 are inherited from the original four preset definitions, but NCM tokenizer and
 hierarchy parameters change the total parameter counts.
 
@@ -49,9 +55,12 @@ persisted as packed 2-bit ternary codes (four values per byte). They are not
 held in FP32 master-weight tensors, and the trainer does not accumulate dense
 FP32 weight-gradient tensors for those matrices. Forward and input-gradient
 matrix products use the packed ternary kernels. Backpropagation calculates a
-transient dense gradient signal, then queues sparse gradient-sign updates that
-modify the packed codes directly after backward. Biases, embeddings, codebooks,
-and normalization parameters remain floating point.
+transient gradient matrix, then queues sparse gradient-sign updates. When the
+installed core package includes the native update helpers, sampling reads the
+strided gradient directly without Python probability/mask tensors, and a C++
+kernel applies all queued updates to packed codes without concatenating each
+segment. Older package versions retain the portable PyTorch fallback. Biases,
+embeddings, codebooks, and normalization parameters remain floating point.
 
 This direct-discrete ternary update rule is experimental and is not conventional
 straight-through-estimator QAT. Its convergence and generated-text quality must

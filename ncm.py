@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
+import numpy as np
+
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -220,10 +222,24 @@ class NCMLinear(nn.Linear):
             del self._parameters["weight"]
 
     def _record_ternary_update(self, gradient_codes: Tensor) -> None:
-        """Queue sparse gradient-sign updates; do not repack during each backward call."""
+        """Queue sparse gradient-sign updates until backward completes."""
         rate = float(self.ternary_update_rate)
         if rate <= 0:
             return
+
+        # The package C++ path reads the strided GEMM gradient directly and emits
+        # compact sparse updates. The fallback preserves compatibility with older
+        # installed smaulbrain-core packages.
+        sampler = getattr(_quant, "sample_ternary_gradient_updates", None)
+        if sampler is not None and gradient_codes.device.type == "cpu":
+            seed = int(torch.randint(0, 2**63 - 1, (), dtype=torch.int64).item())
+            sampled = sampler(gradient_codes, rate, seed)
+            if sampled is not None:
+                indices, directions = sampled
+                if indices.numel():
+                    self._pending_ternary_indices.append(indices)
+                    self._pending_ternary_directions.append(directions)
+                return
 
         gradient = gradient_codes.detach().to(
             device="cpu", dtype=torch.float32
@@ -234,9 +250,6 @@ class NCMLinear(nn.Linear):
         mean_importance = float(importance.mean())
         if not mean_importance > 0:
             return
-
-        # Larger gradients are sampled more often. Queue indices, not a dense
-        # gradient or optimizer tensor, and apply the queued updates after backward.
         probabilities = (importance * (rate / mean_importance)).clamp_(max=1.0)
         selected = torch.rand(importance.shape) < probabilities
         selected &= importance > 0
@@ -249,16 +262,27 @@ class NCMLinear(nn.Linear):
 
     @torch.no_grad()
     def _apply_pending_ternary_updates(self) -> None:
-        """Apply queued coordinate updates directly to packed 2-bit codes."""
+        """Apply queued sparse coordinate updates directly to packed 2-bit codes."""
         if not self._pending_ternary_indices:
             return
+
+        applier = getattr(_quant, "apply_ternary_update_segments", None)
+        if applier is not None and self.ternary_packed.device.type == "cpu":
+            changed = applier(
+                self.ternary_packed, self._ternary_shape,
+                self._pending_ternary_indices, self._pending_ternary_directions,
+            )
+            if changed is not None:
+                self._pending_ternary_indices.clear()
+                self._pending_ternary_directions.clear()
+                if changed:
+                    self.ternary_updates.add_(changed)
+                return
+
         indices = torch.cat(self._pending_ternary_indices).to(torch.long)
         directions = torch.cat(self._pending_ternary_directions).to(torch.int16)
         self._pending_ternary_indices.clear()
         self._pending_ternary_directions.clear()
-
-        # Several recurrent levels may use the same shared expert in one step.
-        # Combine their votes so each selected weight moves at most one ternary level.
         unique_indices, inverse = torch.unique(indices, sorted=True, return_inverse=True)
         votes = torch.zeros(unique_indices.numel(), dtype=torch.int16)
         votes.scatter_add_(0, inverse, directions)
@@ -278,7 +302,6 @@ class NCMLinear(nn.Linear):
         old_raw = torch.bitwise_and(
             torch.bitwise_right_shift(old_bytes, shifts), 0x3
         )
-        # Canonical encoding is {-1,0,+1} -> {0,1,2}. Code 3 is unused.
         new_raw = (old_raw + directions).clamp_(0, 2)
         changed = new_raw != old_raw
         if not bool(changed.any()):
@@ -286,15 +309,10 @@ class NCMLinear(nn.Linear):
         byte_indices = byte_indices[changed]
         shifts = shifts[changed]
         new_raw = new_raw[changed]
-
-        # Merge different trits sharing a byte before writing, avoiding duplicate
-        # advanced-index writes that could otherwise overwrite a neighbor update.
         unique_bytes, byte_inverse = torch.unique(
             byte_indices, sorted=True, return_inverse=True
         )
-        masks = torch.bitwise_left_shift(
-            torch.full_like(shifts, 0x3), shifts
-        )
+        masks = torch.bitwise_left_shift(torch.full_like(shifts, 0x3), shifts)
         values = torch.bitwise_left_shift(new_raw, shifts)
         clear_masks = torch.zeros(unique_bytes.numel(), dtype=torch.int16)
         set_values = torch.zeros(unique_bytes.numel(), dtype=torch.int16)
@@ -455,18 +473,92 @@ class SmaulSharedMoE(nn.Module):
         route_logits = self.router(flat)
         chosen_logits, chosen_experts = route_logits.topk(self.top_k, dim=-1)
         route_weights = torch.softmax(chosen_logits, dim=-1)
+
+        # Build the assignment table once, then group it by expert. The previous
+        # dispatch ran torch.where over every assignment once per expert (64 scans
+        # for moe-full). Sorting/counting reduces that to one grouping pass while
+        # keeping expert activations streamed one expert at a time.
+        token_ids = torch.arange(flat.shape[0], device=flat.device)
+        assignment_tokens = token_ids.repeat_interleave(self.top_k)
+        assignment_experts = chosen_experts.reshape(-1)
+        assignment_weights = route_weights.reshape(-1)
+        order = torch.argsort(assignment_experts, stable=True)
+        grouped_tokens = assignment_tokens.index_select(0, order)
+        grouped_weights = assignment_weights.index_select(0, order)
+        counts = torch.bincount(assignment_experts, minlength=self.n_experts).tolist()
+
         output = torch.zeros_like(flat)
-        # Sparse dispatch is faster than evaluating every expert in training and
-        # inference (measured on CPU, 4 experts/top-2: 41.4 -> 25.6 ms per 128-byte
-        # generation at d_model=128), so both modes share it.
-        for expert_id, expert in enumerate(self.experts):
-            token_indices, slots = torch.where(chosen_experts == expert_id)
-            if token_indices.numel() == 0:
-                continue
-            expert_output = expert(flat.index_select(0, token_indices))
-            weights = route_weights[token_indices, slots].unsqueeze(-1)
-            output = output.index_add(0, token_indices, expert_output * weights)
+        start = 0
+        for expert_id, count in enumerate(counts):
+            end = start + count
+            if count:
+                token_indices = grouped_tokens[start:end]
+                expert_output = self.experts[expert_id](
+                    flat.index_select(0, token_indices)
+                )
+                weights = grouped_weights[start:end].unsqueeze(-1)
+                output = output.index_add(
+                    0, token_indices, expert_output * weights
+                )
+            start = end
         return output.reshape(original_shape)
+
+
+class _NCMNativeRecurrentScan(torch.autograd.Function):
+    """CPU recurrent scan with C++ forward/backward kernels and PyTorch autograd."""
+
+    @staticmethod
+    def forward(ctx, values: Tensor, decay_rate: Tensor) -> Tensor:
+        if values.device.type != "cpu" or values.dtype != torch.float32:
+            raise ValueError("native recurrent scan requires CPU float32 activations")
+        rate = decay_rate.detach().float().clamp(min=1e-4, max=0.1)
+        alpha = torch.exp(-rate).contiguous()
+        values_cpu = values.detach().contiguous()
+        output = torch.empty_like(values_cpu)
+        values_np = values_cpu.numpy()
+        output_np = output.numpy()
+        alpha_np = alpha.numpy()
+
+        for batch_index in range(values_cpu.shape[0]):
+            state = np.zeros(values_cpu.shape[2], dtype=np.float32)
+            ok = _quant.recurrent_scan(
+                values_np[batch_index], alpha_np, state, output_np[batch_index]
+            )
+            if not ok:
+                raise RuntimeError("native recurrent scan backend became unavailable")
+
+        ctx.save_for_backward(output, alpha)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        states, alpha = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_values = torch.empty_like(states)
+        grad_output_np = grad_output.detach().numpy()
+        states_np = states.detach().numpy()
+        grad_values_np = grad_values.numpy()
+        alpha_np = alpha.detach().contiguous().numpy()
+        alpha_grad = np.zeros(alpha.numel(), dtype=np.float64)
+
+        for batch_index in range(states.shape[0]):
+            local_alpha_grad = np.zeros(alpha.numel(), dtype=np.float64)
+            ok = _quant.recurrent_backward_scan(
+                grad_output_np[batch_index],
+                states_np[batch_index],
+                alpha_np,
+                grad_values_np[batch_index],
+                local_alpha_grad,
+            )
+            if not ok:
+                raise RuntimeError("native recurrent backward backend became unavailable")
+            alpha_grad += local_alpha_grad
+
+        alpha_grad_tensor = torch.from_numpy(alpha_grad).to(
+            device=alpha.device, dtype=alpha.dtype
+        )
+        grad_rate = -alpha * alpha_grad_tensor
+        return grad_values, grad_rate
 
 
 class SmaulRecurrentBlock(nn.Module):
@@ -507,9 +599,15 @@ class SmaulRecurrentBlock(nn.Module):
         self.bonus = nn.Parameter(torch.ones(dimension))
 
     def _scan(self, values: Tensor, decay_rate: Tensor) -> Tensor:
-        """Evaluate the recurrent state with stable, bounded-size vectorized scans."""
+        """Use the fused native CPU scan when available; retain the vectorized fallback."""
         if values.shape[1] == 0:
             return values
+        if (
+            values.device.type == "cpu"
+            and values.dtype == torch.float32
+            and _quant.prepare_ternary_backend()
+        ):
+            return _NCMNativeRecurrentScan.apply(values, decay_rate)
         values_fp32 = values.float()
         rate = decay_rate.float()
         state = values_fp32.new_zeros(values.shape[0], values.shape[2])
