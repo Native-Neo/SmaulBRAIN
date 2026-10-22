@@ -608,8 +608,8 @@ class SmaulRecurrentBlock(nn.Module):
             and _quant.prepare_ternary_backend()
         ):
             return _NCMNativeRecurrentScan.apply(values, decay_rate)
-        values_fp32 = values.float()
-        rate = decay_rate.float()
+        values_fp32 = values if values.dtype == torch.float32 else values.float()
+        rate = decay_rate if decay_rate.dtype == torch.float32 else decay_rate.float()
         state = values_fp32.new_zeros(values.shape[0], values.shape[2])
         output_chunks = []
         for start in range(0, values.shape[1], self._SCAN_CHUNK):

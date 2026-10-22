@@ -119,10 +119,12 @@ class ByteBatchStream:
         self._fill(self.buffer_bytes)
         max_start = len(self.buffer) - self.seq_len
         starts = [random.randrange(max_start + 1) for _ in range(self.batch_size)]
-        batch = torch.tensor(
-            [list(self.buffer[start:start + self.seq_len]) for start in starts],
-            dtype=torch.long, device=device,
-        )
+        batch = torch.stack([
+            torch.frombuffer(
+                self.buffer[start:start + self.seq_len], dtype=torch.uint8
+            ).to(device=device, dtype=torch.long)
+            for start in starts
+        ])
         # Move through the stream over time instead of repeatedly sampling one fixed buffer.
         advance = min(self.batch_size * self.seq_len, max(1, len(self.buffer) // 4))
         del self.buffer[:advance]
