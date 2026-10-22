@@ -159,7 +159,7 @@ class _DirectTernaryLinear(torch.autograd.Function):
     def forward(ctx, x, bias, module):
         original_shape = x.shape
         x_flat = x.reshape(-1, x.shape[-1])
-        packed = module.ternary_packed
+        packed = module._packed_for_compute()
         scale = float(module.ternary_scale.item())
         shape = (module.in_features, module.out_features)
         ctx.module = module
@@ -219,7 +219,40 @@ class NCMLinear(nn.Linear):
             self._ternary_shape = tuple(shape)
             self._pending_ternary_indices = []
             self._pending_ternary_directions = []
+            self._tiled_packed = None
+            self._tiled_packed_key = None
             del self._parameters["weight"]
+
+    def _packed_for_compute(self):
+        """Packed codes in the layout the native matmul kernels read fastest.
+
+        The canonical row-major buffer stays the source of truth: it is what
+        checkpoints store and what the sparse update path patches. The
+        tile-contiguous copy is a derived compute cache (the fast native
+        kernels are ~2x quicker on it), rebuilt only when the canonical
+        buffer changes and dropped when the platform cannot build one.
+        """
+        version = self.ternary_packed._version
+        key = (version, self.ternary_packed.device)
+        if self._tiled_packed_key == key:
+            return self._tiled_packed
+        packed = None
+        retile = getattr(_quant, "retile_ternary", None)
+        if retile is not None and self.ternary_packed.device.type == "cpu":
+            buf = retile(self.ternary_packed, self._ternary_shape)
+            if buf is not None:
+                packed = _quant.TiledPacked(buf)
+        if packed is None:
+            # No fast layout available: the canonical buffer is the input.
+            packed = self.ternary_packed
+        self._tiled_packed = packed
+        self._tiled_packed_key = key
+        return packed
+
+    def _invalidate_packed_cache(self) -> None:
+        """Drop the derived tile-contiguous copy after the canonical buffer changed."""
+        self._tiled_packed = None
+        self._tiled_packed_key = None
 
     def _record_ternary_update(self, gradient_codes: Tensor) -> None:
         """Queue sparse gradient-sign updates until backward completes."""
@@ -275,6 +308,10 @@ class NCMLinear(nn.Linear):
             if changed is not None:
                 self._pending_ternary_indices.clear()
                 self._pending_ternary_directions.clear()
+                # The native applier patches the canonical buffer in place
+                # through a NumPy view, so the derived compute copy has to be
+                # dropped explicitly.
+                self._invalidate_packed_cache()
                 if changed:
                     self.ternary_updates.add_(changed)
                 return
@@ -326,6 +363,7 @@ class NCMLinear(nn.Linear):
             set_values,
         ).to(torch.uint8)
         packed[unique_bytes.to(packed.device)] = updated_bytes.to(packed.device)
+        self._invalidate_packed_cache()
         self.ternary_updates.add_(
             changed.sum().to(device=self.ternary_updates.device,
                              dtype=self.ternary_updates.dtype)
@@ -757,12 +795,12 @@ class ResidualVQTokenizer(nn.Module):
         straight_through = residual + (quantized - residual).detach()
         return ids, straight_through, vq_loss + self.config.commitment_weight * commitment
 
-    def forward(self, byte_ids: Tensor) -> tuple[Tensor, Tensor, list[Tensor]]:
-        if byte_ids.ndim != 2:
-            raise ValueError("byte_ids must have shape [batch, time]")
-        if not 1 <= byte_ids.shape[1] <= self.config.max_seq_len:
-            raise ValueError("sequence length must be within [1, max_seq_len]")
-        features = self.feature_norm(self.encoder(self.byte_embedding(byte_ids)))
+    def _encode_levels(self, byte_ids: Tensor, features: Tensor):
+        """Multiscale residual quantization.
+
+        Returns (codes, cumulative reconstruction, vq loss). The decoder is
+        not involved: encoding only needs the code ids.
+        """
         cumulative = features.new_zeros(features.shape)
         codes: list[Tensor] = []
         vq_loss = features.new_zeros(())
@@ -776,6 +814,15 @@ class ResidualVQTokenizer(nn.Module):
             codes.append(ids)
             cumulative = cumulative + resize_sequence(quantized, byte_ids.shape[1])
             vq_loss = vq_loss + level_loss
+        return codes, cumulative, vq_loss
+
+    def forward(self, byte_ids: Tensor) -> tuple[Tensor, Tensor, list[Tensor]]:
+        if byte_ids.ndim != 2:
+            raise ValueError("byte_ids must have shape [batch, time]")
+        if not 1 <= byte_ids.shape[1] <= self.config.max_seq_len:
+            raise ValueError("sequence length must be within [1, max_seq_len]")
+        features = self.feature_norm(self.encoder(self.byte_embedding(byte_ids)))
+        codes, cumulative, vq_loss = self._encode_levels(byte_ids, features)
         logits = self.decoder(self.decoder_norm(cumulative))
         reconstruction = F.cross_entropy(
             logits.reshape(-1, self.config.vocab_size), byte_ids.reshape(-1)
@@ -793,9 +840,16 @@ class ResidualVQTokenizer(nn.Module):
 
     @torch.no_grad()
     def encode(self, byte_ids: Tensor) -> list[Tensor]:
+        if byte_ids.ndim != 2:
+            raise ValueError("byte_ids must have shape [batch, time]")
+        if not 1 <= byte_ids.shape[1] <= self.config.max_seq_len:
+            raise ValueError("sequence length must be within [1, max_seq_len]")
         was_training = self.training
         self.eval()
-        _, _, codes = self.forward(byte_ids)
+        # Only the code ids are needed here; decoding the reconstruction head
+        # would burn most of the encoder's runtime for nothing.
+        features = self.feature_norm(self.encoder(self.byte_embedding(byte_ids)))
+        codes, _cumulative, _vq_loss = self._encode_levels(byte_ids, features)
         self.train(was_training)
         return codes
 

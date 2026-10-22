@@ -371,6 +371,71 @@ def test_ncm_linear_ternary_forward_and_backward_use_packed_weights():
     assert layer._cached_fp8_weight is None
 
 
+def test_ternary_compute_layout_matches_canonical_packed_codes():
+    """The fast compute layout must not change the packed-weight math."""
+    from smaulbrain import quant as _quant
+
+    torch.manual_seed(17)
+    layer = NCMLinear(
+        32, 24, forward_quant="ternary", backward_mode="ternary"
+    )
+    inputs = torch.randn(4, 32)
+    scale = float(layer.ternary_scale.item())
+    canonical = _quant.packed_matmat(
+        inputs, layer.ternary_packed, layer._ternary_shape, scale
+    )
+    compute = layer._packed_for_compute()
+    fast = _quant.packed_matmat(inputs, compute, layer._ternary_shape, scale)
+    assert torch.allclose(canonical, fast, atol=1e-6, rtol=1e-6)
+    # The canonical buffer stays the checkpoint format (row-major 2-bit codes).
+    assert layer.ternary_packed.numel() == (32 * 24 + 3) // 4
+
+
+def test_ternary_compute_layout_is_rebuilt_after_sparse_updates():
+    from smaulbrain import quant as _quant
+
+    torch.manual_seed(19)
+    layer = NCMLinear(
+        32, 24, forward_quant="ternary", backward_mode="ternary"
+    )
+    layer.ternary_update_rate = 1.0
+    inputs = torch.randn(4, 32)
+    scale = float(layer.ternary_scale.item())
+    layer._record_ternary_update(torch.randn(24, 32))
+    apply_direct_ternary_updates(layer)
+    assert int(layer.ternary_updates) > 0
+
+    canonical = _quant.packed_matmat(
+        inputs, layer.ternary_packed, layer._ternary_shape, scale
+    )
+    fast = _quant.packed_matmat(
+        inputs, layer._packed_for_compute(), layer._ternary_shape, scale
+    )
+    assert torch.allclose(canonical, fast, atol=1e-6, rtol=1e-6)
+
+
+def test_tokenizer_encode_skips_the_reconstruction_head():
+    """encode() must not run the decoder: it only needs the code ids."""
+    config = tiny_config()
+    tokenizer = ResidualVQTokenizer(config)
+    data = torch.randint(0, 256, (2, 9))
+    expected = tokenizer.encode(data)
+
+    calls = []
+    original = tokenizer.decoder.forward
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    tokenizer.decoder.forward = spy
+    codes = tokenizer.encode(data)
+    assert calls == []
+    assert len(codes) == len(expected)
+    for got, want in zip(codes, expected):
+        assert torch.equal(got, want)
+
+
 def test_legacy_fp32_master_ternary_checkpoint_migrates_to_packed_codes():
     layer = NCMLinear(5, 4, forward_quant="ternary", backward_mode="ternary")
     legacy_state = {
