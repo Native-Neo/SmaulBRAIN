@@ -558,3 +558,69 @@ def test_tokenizer_ternary_qat_has_gradients_for_trainable_parameters():
         for name, parameter in tokenizer.named_parameters()
         if isinstance(dict(tokenizer.named_modules()).get(name.rsplit(".", 1)[0]), NCMLinear)
     )
+
+
+
+def test_ternary_update_gradient_is_computed_in_global_mean_chunks(monkeypatch):
+    monkeypatch.setattr(ncm, "_TERNARY_GRADIENT_CHUNK_COLUMNS", 2)
+    sampled_chunks = []
+
+    def fake_chunk_sampler(
+        gradient, rate, seed, global_mean_abs, full_cols, column_offset
+    ):
+        sampled_chunks.append(
+            (gradient.detach().clone(), rate, seed, global_mean_abs, full_cols, column_offset)
+        )
+        return (
+            torch.tensor([column_offset], dtype=torch.int32),
+            torch.tensor([-1], dtype=torch.int8),
+        )
+
+    monkeypatch.setattr(
+        ncm._quant, "sample_ternary_gradient_update_chunk",
+        fake_chunk_sampler, raising=False,
+    )
+    layer = NCMLinear(
+        3, 5, forward_quant="ternary", backward_mode="ternary"
+    )
+    layer.ternary_update_rate = 0.2
+    torch.manual_seed(101)
+    dy = torch.randn(4, 5)
+    x_flat = torch.randn(4, 3)
+
+    layer._record_ternary_update_from_inputs(dy, x_flat)
+
+    full_gradient = (dy.t() @ x_flat).t()
+    expected_mean = float(
+        full_gradient.abs().sum(dtype=torch.float64).item()
+    ) / full_gradient.numel()
+    assert [chunk[5] for chunk in sampled_chunks] == [0, 2, 4]
+    assert [chunk[4] for chunk in sampled_chunks] == [5, 5, 5]
+    assert torch.allclose(
+        torch.cat([chunk[0] for chunk in sampled_chunks], dim=1),
+        full_gradient,
+    )
+    assert all(abs(chunk[3] - expected_mean) < 1e-7 for chunk in sampled_chunks)
+    assert [segment.tolist() for segment in layer._pending_ternary_indices] == [
+        [0], [2], [4]
+    ]
+    assert all(segment.tolist() == [-1] for segment in layer._pending_ternary_directions)
+    assert "weight" not in dict(layer.named_parameters())
+
+
+def test_failed_native_ternary_update_clears_queued_segments(monkeypatch):
+    layer = NCMLinear(
+        3, 5, forward_quant="ternary", backward_mode="ternary"
+    )
+    layer._pending_ternary_indices.append(torch.tensor([0], dtype=torch.int32))
+    layer._pending_ternary_directions.append(torch.tensor([1], dtype=torch.int8))
+
+    def fail_applier(*args, **kwargs):
+        raise RuntimeError("simulated native update failure")
+
+    monkeypatch.setattr(ncm._quant, "apply_ternary_update_segments", fail_applier)
+    with pytest.raises(RuntimeError, match="simulated native update failure"):
+        layer._apply_pending_ternary_updates()
+
+    assert layer._pending_ternary_indices == []
+    assert layer._pending_ternary_directions == []
