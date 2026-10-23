@@ -7,6 +7,7 @@ Data is streamed in bounded chunks; the entire corpus is never loaded into RAM.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import inspect
 from collections import deque
 import json
@@ -469,9 +470,19 @@ def main(argv=None) -> int:
         end = start + args.steps if args.steps is not None else max(start, args.max_steps)
         tokenizer.train()
         start_time = time.perf_counter()
+        # Instantaneous batch losses can be noisy, especially with random byte
+        # windows and VQ codebook assignments. Keep a bounded window so logs
+        # show both the current batch and the recent trend without growing RAM.
+        loss_window = deque(maxlen=100)
+        reconstruction_window = deque(maxlen=100)
+        quantization_window = deque(maxlen=100)
         for step in range(start, end):
             batch = stream.next(device)
             _, loss, _ = tokenizer(batch)
+            components = tokenizer.last_loss_components
+            loss_window.append(float(loss.detach()))
+            reconstruction_window.append(float(components["reconstruction"]))
+            quantization_window.append(float(components["quantization"]))
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             apply_direct_ternary_updates(tokenizer)
@@ -491,11 +502,13 @@ def main(argv=None) -> int:
                 avg_recon = sum(tokenizer_recon_window) / len(tokenizer_recon_window)
                 avg_quant = sum(tokenizer_quant_window) / len(tokenizer_quant_window)
                 print(
-                    f"tokenizer step={step + 1} loss={loss.item():.4f} "
+                    f"tokenizer step={step + 1} "
+                    f"loss={loss.item():.4f} loss_avg100={sum(loss_window) / len(loss_window):.4f} "
                     f"recon={components['reconstruction'].item():.4f} "
+                    f"recon_avg100={sum(reconstruction_window) / len(reconstruction_window):.4f} "
                     f"quant={components['quantization'].item():.4f} "
-                    f"avg_loss={avg_loss:.4f} avg_recon={avg_recon:.4f} "
-                    f"avg_quant={avg_quant:.4f} avg_n={len(tokenizer_loss_window)} "
+                    f"quant_avg100={sum(quantization_window) / len(quantization_window):.4f} "
+                    f"window={len(loss_window)} "
                     f"elapsed={time.perf_counter() - start_time:.1f}s",
                     flush=True,
                 )
