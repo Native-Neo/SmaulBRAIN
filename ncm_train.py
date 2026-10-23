@@ -457,9 +457,6 @@ def main(argv=None) -> int:
     generator_steps_this_run = 0
     last_tokenizer_loss = None
     last_generator_loss = None
-    tokenizer_loss_window = deque(maxlen=args.loss_window)
-    tokenizer_recon_window = deque(maxlen=args.loss_window)
-    tokenizer_quant_window = deque(maxlen=args.loss_window)
     generator_loss_window = deque(maxlen=args.loss_window)
 
     if args.stage == "tokenizer" or (args.stage == "both" and not generator_train_path.exists()):
@@ -473,9 +470,9 @@ def main(argv=None) -> int:
         # Instantaneous batch losses can be noisy, especially with random byte
         # windows and VQ codebook assignments. Keep a bounded window so logs
         # show both the current batch and the recent trend without growing RAM.
-        loss_window = deque(maxlen=100)
-        reconstruction_window = deque(maxlen=100)
-        quantization_window = deque(maxlen=100)
+        loss_window = deque(maxlen=args.loss_window)
+        reconstruction_window = deque(maxlen=args.loss_window)
+        quantization_window = deque(maxlen=args.loss_window)
         for step in range(start, end):
             batch = stream.next(device)
             _, loss, _ = tokenizer(batch)
@@ -491,23 +488,17 @@ def main(argv=None) -> int:
             tokenizer_steps_this_run += 1
             last_tokenizer_loss = float(loss.detach())
             components = tokenizer.last_loss_components
-            tokenizer_loss_window.append(last_tokenizer_loss)
-            tokenizer_recon_window.append(float(components["reconstruction"]))
-            tokenizer_quant_window.append(float(components["quantization"]))
             if (step + 1) % args.save_every == 0 or step + 1 == end:
                 save_checkpoint(tokenizer_train_path, tokenizer, optimizer, config, step + 1)
                 torch.save({"config": config.__dict__, "model": tokenizer.state_dict()}, tokenizer_path)
             if (step + 1) % args.log_every == 0 or step + 1 == end:
-                avg_loss = sum(tokenizer_loss_window) / len(tokenizer_loss_window)
-                avg_recon = sum(tokenizer_recon_window) / len(tokenizer_recon_window)
-                avg_quant = sum(tokenizer_quant_window) / len(tokenizer_quant_window)
                 print(
                     f"tokenizer step={step + 1} "
-                    f"loss={loss.item():.4f} loss_avg100={sum(loss_window) / len(loss_window):.4f} "
+                    f"loss={loss.item():.4f} loss_avg{args.loss_window}={sum(loss_window) / len(loss_window):.4f} "
                     f"recon={components['reconstruction'].item():.4f} "
-                    f"recon_avg100={sum(reconstruction_window) / len(reconstruction_window):.4f} "
+                    f"recon_avg{args.loss_window}={sum(reconstruction_window) / len(reconstruction_window):.4f} "
                     f"quant={components['quantization'].item():.4f} "
-                    f"quant_avg100={sum(quantization_window) / len(quantization_window):.4f} "
+                    f"quant_avg{args.loss_window}={sum(quantization_window) / len(quantization_window):.4f} "
                     f"window={len(loss_window)} "
                     f"elapsed={time.perf_counter() - start_time:.1f}s",
                     flush=True,
