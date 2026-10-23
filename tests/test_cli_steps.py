@@ -6,6 +6,28 @@ import torch
 import train
 
 
+def test_default_training_batch_size_is_one(monkeypatch, tmp_path):
+    captured = {}
+
+    def intercept_ncm_training(argv):
+        captured["argv"] = list(argv)
+        return 0
+
+    monkeypatch.setattr(train, "_ncm_train", intercept_ncm_training)
+    assert train.main([
+        "--preset", "moe-tiny",
+        "--seq-len", "16",
+        "--growth-every-steps", "0",
+        "--growth-loss-nats", "none",
+        "--checkpoint", str(tmp_path / "batch-one"),
+        "--max-steps", "1",
+    ]) == 0
+
+    argv = captured["argv"]
+    batch_index = argv.index("--batch-size")
+    assert argv[batch_index + 1] == "1"
+
+
 def test_resume_steps_means_additional_updates(tmp_path, capsys):
     ckpt = str(tmp_path / "run")
     common = ["--preset", "moe-tiny", "--seq-len", "16", "--growth-every-steps", "0",

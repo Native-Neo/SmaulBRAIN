@@ -6,6 +6,7 @@ multiscale code hierarchies. The CLI entry points use this architecture by defau
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Sequence
 
 import numpy as np
@@ -19,6 +20,7 @@ from smaulbrain import quant as _quant
 
 
 _TERNARY_GRADIENT_CHUNK_COLUMNS = 128
+_TERNARY_FULL_GRADIENT_MAX_ELEMENTS = 262_144
 
 
 @dataclass(frozen=True)
@@ -199,7 +201,50 @@ class NCMLinear(nn.Linear):
 
     def __init__(self, in_features, out_features, bias=True,
                  forward_quant="fp32", backward_mode="fp32"):
-        super().__init__(in_features, out_features, bias=bias)
+        if forward_quant == "ternary":
+            # Build packed ternary weights directly. Calling nn.Linear.__init__
+            # first would allocate an FP32 matrix, then a second transposed FP32
+            # copy before packing it, even though neither is retained.
+            nn.Module.__init__(self)
+            self.in_features = int(in_features)
+            self.out_features = int(out_features)
+            if bias:
+                self.bias = nn.Parameter(torch.empty(self.out_features))
+                bound = 1.0 / math.sqrt(self.in_features) if self.in_features else 0.0
+                nn.init.uniform_(self.bias, -bound, bound)
+            else:
+                self.register_parameter("bias", None)
+
+            weight_count = self.in_features * self.out_features
+            padded_count = (weight_count + 3) // 4 * 4
+            # Approximately match nn.Linear's Kaiming-uniform weights after
+            # the current 0.7 * mean(abs(weight)) ternary threshold: balanced
+            # signs, about one-third zero codes, and the expected quantized
+            # magnitude (0.675 / sqrt(fan_in)). Codes map -1, 0, +1 to 0, 1, 2.
+            codes = torch.randint(0, 3, (padded_count,), dtype=torch.uint8)
+            if weight_count < padded_count:
+                codes[weight_count:] = 1
+            groups = codes.view(-1, 4)
+            packed = (
+                groups[:, 0]
+                | (groups[:, 1] << 2)
+                | (groups[:, 2] << 4)
+                | (groups[:, 3] << 6)
+            )
+            scale = 0.675 / math.sqrt(self.in_features) if self.in_features else 1.0
+            self.register_buffer("ternary_packed", packed.contiguous())
+            self.register_buffer(
+                "ternary_scale", torch.tensor(float(scale), dtype=torch.float32)
+            )
+            self.register_buffer("ternary_updates", torch.zeros((), dtype=torch.long))
+            self._ternary_shape = (self.in_features, self.out_features)
+            self._pending_ternary_indices = []
+            self._pending_ternary_directions = []
+            self._tiled_packed = None
+            self._tiled_packed_key = None
+        else:
+            super().__init__(in_features, out_features, bias=bias)
+
         self.forward_quant = forward_quant
         self.backward_mode = backward_mode
         self._cached_version = -1
@@ -208,24 +253,6 @@ class NCMLinear(nn.Linear):
         self._cached_packed_shape = None
         self._cached_fp8_weight = None
         self.ternary_update_rate = 3e-4
-
-        if self.forward_quant == "ternary":
-            # The initialized FP32 tensor exists only during this conversion.
-            # Persistent trainable weight storage is the packed 2-bit code tensor.
-            packed, scale, shape, _ = _quant.pack_ternary(
-                self.weight.detach().t().contiguous()
-            )
-            self.register_buffer("ternary_packed", packed.to(dtype=torch.uint8))
-            self.register_buffer(
-                "ternary_scale", torch.tensor(float(scale), dtype=torch.float32)
-            )
-            self.register_buffer("ternary_updates", torch.zeros((), dtype=torch.long))
-            self._ternary_shape = tuple(shape)
-            self._pending_ternary_indices = []
-            self._pending_ternary_directions = []
-            self._tiled_packed = None
-            self._tiled_packed_key = None
-            del self._parameters["weight"]
 
     def _packed_for_compute(self):
         """Packed codes in the layout the native matmul kernels read fastest.
@@ -314,6 +341,15 @@ class NCMLinear(nn.Linear):
         total = full_rows * full_cols
         if total > 2**31 - 1:
             raise ValueError("ternary update indices exceed int32 capacity")
+
+        # Tiny MoE matrices do not need the two-pass low-memory algorithm.
+        # Keep their transient gradient below 1 MiB and sample it in one pass;
+        # larger matrices retain exact global-mean chunking to bound peak memory.
+        if total <= _TERNARY_FULL_GRADIENT_MAX_ELEMENTS:
+            gradient = (dy.t() @ x_flat).t()
+            if bool(torch.isfinite(gradient).all()):
+                self._record_ternary_update(gradient)
+            return
 
         chunk_width = min(_TERNARY_GRADIENT_CHUNK_COLUMNS, full_cols)
         abs_sum = 0.0

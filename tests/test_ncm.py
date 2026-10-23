@@ -561,7 +561,42 @@ def test_tokenizer_ternary_qat_has_gradients_for_trainable_parameters():
 
 
 
+def test_ternary_linear_initializes_packed_codes_without_fp32_weight(monkeypatch):
+    def forbidden_linear_init(*args, **kwargs):
+        pytest.fail("ternary initialization must not allocate an nn.Linear FP32 weight")
+
+    monkeypatch.setattr(torch.nn.Linear, "__init__", forbidden_linear_init)
+    layer = NCMLinear(7, 11, forward_quant="ternary", backward_mode="ternary")
+
+    assert "weight" not in dict(layer.named_parameters())
+    assert layer.ternary_packed.dtype == torch.uint8
+    assert layer.ternary_packed.numel() == (7 * 11 + 3) // 4
+    assert layer._ternary_shape == (7, 11)
+    assert torch.isfinite(layer.ternary_scale)
+    unpacked = ncm._quant.unpack_codes(layer.ternary_packed, layer._ternary_shape)
+    assert set(torch.unique(unpacked).tolist()) <= {-1, 0, 1}
+
+
+def test_small_ternary_gradient_uses_one_pass_full_gradient(monkeypatch):
+    monkeypatch.setattr(ncm, "_TERNARY_FULL_GRADIENT_MAX_ELEMENTS", 64)
+    layer = NCMLinear(3, 5, forward_quant="ternary", backward_mode="ternary")
+    captured = []
+    monkeypatch.setattr(
+        layer, "_record_ternary_update",
+        lambda gradient: captured.append(gradient.detach().clone()),
+    )
+    torch.manual_seed(31)
+    x = torch.randn(4, 3, requires_grad=True)
+    layer(x).sum().backward()
+
+    assert len(captured) == 1
+    assert captured[0].shape == (3, 5)
+    expected = (torch.ones(4, 5).t() @ x.detach()).t()
+    assert torch.allclose(captured[0], expected)
+
+
 def test_ternary_update_gradient_is_computed_in_global_mean_chunks(monkeypatch):
+    monkeypatch.setattr(ncm, "_TERNARY_FULL_GRADIENT_MAX_ELEMENTS", 0)
     monkeypatch.setattr(ncm, "_TERNARY_GRADIENT_CHUNK_COLUMNS", 2)
     sampled_chunks = []
 
