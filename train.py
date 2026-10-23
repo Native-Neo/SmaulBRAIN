@@ -47,6 +47,11 @@ def main(argv=None):
         help="NCM training stage; both is the normal end-to-end mode",
     )
     parser.add_argument("--save-every", type=int, default=100)
+    parser.add_argument(
+        "--grad-checkpoint", action="store_true",
+        help="low-memory generator training: recompute blocks in backward and "
+             "release each level's activations before building the next",
+    )
     args = parser.parse_args(raw_argv)
 
     if args.steps is not None and args.steps < 1:
@@ -110,6 +115,9 @@ def main(argv=None):
     ):
         if value is not None:
             ncm_args.extend([option, str(value)])
+
+    if args.grad_checkpoint:
+        ncm_args.append("--grad-checkpoint")
 
     if args.corpus:
         ncm_args.extend(["--data", args.corpus])

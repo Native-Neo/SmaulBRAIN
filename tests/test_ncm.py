@@ -176,6 +176,95 @@ def test_generator_uses_smaul_recurrent_blocks_instead_of_transformers():
     assert NCMTransformer is NCMGenerator
 
 
+def test_generator_gradient_checkpointing_matches_plain_backward():
+    config = tiny_config()
+    tokenizer = ResidualVQTokenizer(config)
+    codes = tokenizer.encode(torch.randint(0, 256, (2, 9)))
+    for parameter in tokenizer.parameters():
+        parameter.requires_grad_(False)
+
+    def run(checkpointing):
+        torch.manual_seed(29)
+        model = NCMGenerator(
+            config, tokenizer, gradient_checkpointing=checkpointing
+        )
+        model.train()
+        torch.manual_seed(31)
+        loss = ncm_loss(model, codes)
+        loss.backward()
+        grads = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+        return loss.detach(), grads
+
+    plain_loss, plain_grads = run(False)
+    checkpointed_loss, checkpointed_grads = run(True)
+
+    assert torch.allclose(plain_loss, checkpointed_loss)
+    assert plain_grads.keys() == checkpointed_grads.keys()
+    for name, plain in plain_grads.items():
+        assert torch.allclose(plain, checkpointed_grads[name], atol=1e-6, rtol=1e-5), name
+
+
+def test_iter_level_logits_matches_the_joint_forward():
+    config = tiny_config()
+    tokenizer = ResidualVQTokenizer(config)
+    codes = tokenizer.encode(torch.randint(0, 256, (2, 9)))
+    prefix = torch.randint(0, 256, (2, 5))
+    for parameter in tokenizer.parameters():
+        parameter.requires_grad_(False)
+
+    torch.manual_seed(37)
+    model = NCMGenerator(config, tokenizer)
+    model.eval()
+    joint = model(codes, prefix_tokens=prefix, corrupt=False)
+    per_level = [
+        logits for logits, _ in
+        model.iter_level_logits(codes, prefix_tokens=prefix, corrupt=False)
+    ]
+    assert len(per_level) == len(joint)
+    for chunked, whole in zip(per_level, joint):
+        assert torch.allclose(chunked, whole, atol=1e-6, rtol=1e-6)
+
+
+def test_chunked_loss_backward_matches_the_joint_loss():
+    config = tiny_config()
+    tokenizer = ResidualVQTokenizer(config)
+    codes = tokenizer.encode(torch.randint(0, 256, (2, 9)))
+    prefix = torch.randint(0, 256, (2, 5))
+    for parameter in tokenizer.parameters():
+        parameter.requires_grad_(False)
+
+    def run(chunked):
+        torch.manual_seed(41)
+        model = NCMGenerator(config, tokenizer)
+        model.train()
+        torch.manual_seed(43)
+        model.zero_grad(set_to_none=True)
+        if chunked:
+            loss = ncm.backward_ncm_loss_chunked(
+                model, codes, prefix_tokens=prefix
+            )
+        else:
+            loss = ncm_loss(model, codes, prefix_tokens=prefix)
+            loss.backward()
+        grads = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+        return loss.detach(), grads
+
+    joint_loss, joint_grads = run(False)
+    chunked_loss, chunked_grads = run(True)
+    assert torch.allclose(joint_loss, chunked_loss)
+    assert joint_grads.keys() == chunked_grads.keys()
+    for name, joint in joint_grads.items():
+        assert torch.allclose(joint, chunked_grads[name], atol=1e-6, rtol=1e-5), name
+
+
 def test_chunked_recurrent_scan_matches_the_recurrence_equation(monkeypatch):
     monkeypatch.setattr(ncm._quant, "prepare_ternary_backend", lambda: False)
     block = SmaulRecurrentBlock(dimension=3)

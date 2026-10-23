@@ -18,7 +18,8 @@ from torch import Tensor
 
 from ncm import (
     NCMConfig, NCMGenerator, NCMLinear, ResidualVQTokenizer,
-    apply_direct_ternary_updates, migrate_ternary_state_dict, ncm_loss,
+    apply_direct_ternary_updates, backward_ncm_loss_chunked,
+    migrate_ternary_state_dict, ncm_loss,
 )
 from smaulbrain import config as _preset_config
 
@@ -385,6 +386,11 @@ def main(argv=None) -> int:
     parser.add_argument("--backward-mode", choices=("fp32", "fp8", "ternary"), default="fp32")
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument(
+        "--grad-checkpoint", action="store_true",
+        help="low-memory generator training: recompute blocks in backward and "
+             "release each level's activations before building the next",
+    )
+    parser.add_argument(
         "--heads", type=int, default=4,
         help="legacy compatibility option; ignored by the recurrent NCM generator",
     )
@@ -496,7 +502,9 @@ def main(argv=None) -> int:
         tokenizer.eval()
         for parameter in tokenizer.parameters():
             parameter.requires_grad_(False)
-        generator = NCMGenerator(config, tokenizer).to(device)
+        generator = NCMGenerator(
+            config, tokenizer, gradient_checkpointing=args.grad_checkpoint
+        ).to(device)
         configure_direct_ternary_updates(generator, args.lr)
         generator_count = architecture_parameter_count(generator)
         trainable_count = architecture_parameter_count(generator, trainable_only=True)
@@ -519,9 +527,16 @@ def main(argv=None) -> int:
             target_tokens = batch[:, split:]
             with torch.no_grad():
                 codes = tokenizer.encode(target_tokens)
-            loss = ncm_loss(generator, codes, prefix_tokens=prefix_tokens)
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            if args.grad_checkpoint:
+                # Memory-first path: recompute blocks in backward and release
+                # each level's activations before building the next one.
+                loss = backward_ncm_loss_chunked(
+                    generator, codes, prefix_tokens=prefix_tokens
+                )
+            else:
+                loss = ncm_loss(generator, codes, prefix_tokens=prefix_tokens)
+                loss.backward()
             apply_direct_ternary_updates(generator)
             torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
             optimizer.step()

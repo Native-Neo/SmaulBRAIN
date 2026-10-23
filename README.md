@@ -110,6 +110,21 @@ Loading an older FP32-master ternary checkpoint converts its linear weights to
 packed codes and resets that stage's optimizer state, which is incompatible with
 the direct-discrete weight update path.
 
+Long-sequence training normally retains activations for every generator block
+and every hierarchy level, so peak memory grows with depth x sequence length x
+levels. Pass `--grad-checkpoint` for the low-memory path: each block is
+recomputed during backward and each level's activations are released before the
+next level is built. Peak memory then tracks depth plus a single level instead
+of their product. The recomputed path is mathematically identical to the plain
+one (same loss and, up to float round-off, the same gradients), so it is safe to
+resume a plain run with checkpointing enabled.
+
+```bash
+python train.py --preset dense-full --seq-len 8192 --batch-size 1 \
+  --forward-quant ternary --backward-mode ternary --grad-checkpoint \
+  --steps 100 --checkpoint checkpoints/ncm-long
+```
+
 Train from a raw-byte corpus, text files, JSONL, or Parquet:
 
 ```bash

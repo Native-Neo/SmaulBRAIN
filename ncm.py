@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
 from smaulbrain import quant as _quant
 
@@ -880,11 +881,15 @@ class NCMGenerator(nn.Module):
     each level to be predicted in parallel.
     """
 
-    def __init__(self, config: NCMConfig, tokenizer: ResidualVQTokenizer):
+    def __init__(self, config: NCMConfig, tokenizer: ResidualVQTokenizer,
+                 gradient_checkpointing: bool = False):
         super().__init__()
         if tokenizer.config != config:
             raise ValueError("tokenizer and generator must use the same NCMConfig")
         self.config = config
+        # Low-memory mode: recompute each recurrent block during backward
+        # instead of retaining its internals.
+        self.gradient_checkpointing = bool(gradient_checkpointing)
         self._tokenizer = (tokenizer,)
         for parameter in tokenizer.parameters():
             parameter.requires_grad_(False)
@@ -932,9 +937,9 @@ class NCMGenerator(nn.Module):
     def tokenizer(self) -> ResidualVQTokenizer:
         return self._tokenizer[0]
 
-    def _build_level_inputs(
+    def _level_parts(
         self, codes: Sequence[Tensor], corrupt: bool
-    ) -> tuple[Tensor, list[int]]:
+    ) -> tuple[list[Tensor], list[int]]:
         if len(codes) != self.config.levels:
             raise ValueError("one code tensor is required per level")
         batch = codes[0].shape[0]
@@ -969,7 +974,88 @@ class NCMGenerator(nn.Module):
                 conditioning_ids = torch.where(replace, random_ids, ids)
             quantized = self.tokenizer.codebooks[level](conditioning_ids)
             cumulative = cumulative + resize_sequence(quantized, length)
+        return parts, lengths
+
+    def _build_level_inputs(
+        self, codes: Sequence[Tensor], corrupt: bool
+    ) -> tuple[Tensor, list[int]]:
+        parts, lengths = self._level_parts(codes, corrupt)
         return torch.cat(parts, dim=1), lengths
+
+    def _prefix_features(
+        self, prefix_tokens: Tensor, batch: int, device: torch.device
+    ) -> Tensor:
+        """Frozen-tokenizer features for the prompt; carries no autograd graph."""
+        if prefix_tokens.ndim != 2 or prefix_tokens.shape[0] != batch:
+            raise ValueError("prefix_tokens must have shape [batch, prefix_length]")
+        if not 1 <= prefix_tokens.shape[1] <= self.config.max_seq_len:
+            raise ValueError("prefix length must be within [1, max_seq_len]")
+        with torch.no_grad():
+            return self.tokenizer.feature_norm(
+                self.tokenizer.encoder(self.tokenizer.byte_embedding(prefix_tokens))
+            )
+
+    def _project_prefix(self, features: Tensor) -> tuple[Tensor, int]:
+        """Build a prompt prefix; a fresh call gives each caller its own graph."""
+        positions = torch.arange(features.shape[1], device=features.device)
+        prefix = self.prefix_projection(features)
+        prefix = prefix + self.position_embeddings(positions).unsqueeze(0)
+        return prefix, prefix.shape[1]
+
+    def _run_blocks(self, hidden: Tensor, segment_lengths: list[int]) -> Tensor:
+        use_checkpoint = (
+            self.gradient_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+        )
+        for layer_index, block in enumerate(self.blocks):
+            mixer = (
+                self.channel_mixer
+                if self.config.model_kind == "moe"
+                else self.dense_mixers[layer_index]
+            )
+            if use_checkpoint:
+                # Only the block boundaries stay alive; the block's internals
+                # are recomputed during backward.
+                hidden = _torch_checkpoint(
+                    block, hidden, segment_lengths, mixer, use_reentrant=False
+                )
+            else:
+                hidden = block(hidden, segment_lengths, mixer)
+        return hidden
+
+    def iter_level_logits(
+        self, codes: Sequence[Tensor], *, prefix_tokens: Tensor | None = None,
+        corrupt: bool = True,
+    ):
+        """Yield ``(logits, target_ids)`` one level at a time.
+
+        Levels are independent inside the recurrent blocks: attention is
+        segment-local and every scan resets at its segment start, so walking the
+        levels one by one gives the same numbers as the joint pass while only
+        the current level's activations stay alive. Callers that backpropagate
+        inside the loop hold memory for the largest level instead of all of
+        them at once.
+        """
+        parts, _lengths = self._level_parts(codes, corrupt)
+        features = None
+        if prefix_tokens is not None:
+            features = self._prefix_features(
+                prefix_tokens, parts[0].shape[0], parts[0].device
+            )
+        for level, (part, target_ids) in enumerate(zip(parts, codes)):
+            # Each level gets its own recurrent state. When conditioning on a
+            # prompt, repeat the known prefix so no level can leak into another.
+            if features is None:
+                segment = part
+                prefix_length = 0
+            else:
+                prefix, prefix_length = self._project_prefix(features)
+                segment = torch.cat((prefix, part), dim=1)
+            hidden = self.final_norm(self._run_blocks(segment, [segment.shape[1]]))
+            if features is not None:
+                hidden = hidden[:, prefix_length:]
+            yield self.output_heads[level](hidden), target_ids
 
     def forward(
         self, codes: Sequence[Tensor], *, prefix_tokens: Tensor | None = None,
@@ -980,17 +1066,10 @@ class NCMGenerator(nn.Module):
         prefix = None
         prefix_length = 0
         if prefix_tokens is not None:
-            if prefix_tokens.ndim != 2 or prefix_tokens.shape[0] != inputs.shape[0]:
-                raise ValueError("prefix_tokens must have shape [batch, prefix_length]")
-            if not 1 <= prefix_tokens.shape[1] <= self.config.max_seq_len:
-                raise ValueError("prefix length must be within [1, max_seq_len]")
-            prefix_features = self.tokenizer.feature_norm(
-                self.tokenizer.encoder(self.tokenizer.byte_embedding(prefix_tokens))
+            features = self._prefix_features(
+                prefix_tokens, inputs.shape[0], inputs.device
             )
-            prefix_positions = torch.arange(prefix_tokens.shape[1], device=inputs.device)
-            prefix = self.prefix_projection(prefix_features)
-            prefix = prefix + self.position_embeddings(prefix_positions).unsqueeze(0)
-            prefix_length = prefix.shape[1]
+            prefix, prefix_length = self._project_prefix(features)
 
         # Each level gets its own recurrent state. When conditioning on a prompt,
         # repeat the known prefix for each level so no level can leak into another.
@@ -999,15 +1078,9 @@ class NCMGenerator(nn.Module):
             for part in level_inputs
         ]
         segment_lengths = [part.shape[1] for part in segments]
-        hidden = torch.cat(segments, dim=1)
-        for layer_index, block in enumerate(self.blocks):
-            mixer = (
-                self.channel_mixer
-                if self.config.model_kind == "moe"
-                else self.dense_mixers[layer_index]
-            )
-            hidden = block(hidden, segment_lengths, mixer)
-        hidden = self.final_norm(hidden)
+        hidden = self.final_norm(
+            self._run_blocks(torch.cat(segments, dim=1), segment_lengths)
+        )
 
         encoded_segments = torch.split(hidden, segment_lengths, dim=1)
         logits: list[Tensor] = []
@@ -1055,27 +1128,10 @@ class NCMGenerator(nn.Module):
         if prefix_tokens is None:
             hidden = current
         else:
-            if prefix_tokens.ndim != 2 or prefix_tokens.shape[0] != batch:
-                raise ValueError("prefix_tokens must have shape [batch, prefix_length]")
-            if not 1 <= prefix_tokens.shape[1] <= self.config.max_seq_len:
-                raise ValueError("prefix length must be within [1, max_seq_len]")
-            prefix_features = self.tokenizer.feature_norm(
-                self.tokenizer.encoder(self.tokenizer.byte_embedding(prefix_tokens))
-            )
-            prefix_positions = torch.arange(prefix_tokens.shape[1], device=device)
-            prefix = self.prefix_projection(prefix_features)
-            prefix = prefix + self.position_embeddings(prefix_positions).unsqueeze(0)
-            prefix_length = prefix.shape[1]
+            features = self._prefix_features(prefix_tokens, batch, device)
+            prefix, prefix_length = self._project_prefix(features)
             hidden = torch.cat((prefix, current), dim=1)
-        segment_lengths = [hidden.shape[1]]
-        for layer_index, block in enumerate(self.blocks):
-            mixer = (
-                self.channel_mixer
-                if self.config.model_kind == "moe"
-                else self.dense_mixers[layer_index]
-            )
-            hidden = block(hidden, segment_lengths, mixer)
-        hidden = self.final_norm(hidden)
+        hidden = self.final_norm(self._run_blocks(hidden, [hidden.shape[1]]))
         if prefix_length:
             hidden = hidden[:, prefix_length:]
         return self.output_heads[level](hidden)
@@ -1163,3 +1219,36 @@ def ncm_loss(
     )
     weights = weights / weights.sum()
     return sum(weight * loss for weight, loss in zip(weights, losses))
+
+
+def backward_ncm_loss_chunked(
+    model: NCMGenerator, codes: Sequence[Tensor],
+    *, prefix_tokens: Tensor | None = None,
+) -> Tensor:
+    """Backpropagate one level at a time instead of holding every level.
+
+    Same objective as ``ncm_loss(...).backward()`` (identical level weights),
+    but each level's activations are released before the next level is built, so
+    peak memory tracks the largest level instead of the sum of all levels.
+    Gradients accumulate in the usual ``.grad`` buffers and direct ternary
+    updates are merged when the caller applies them, so call ``zero_grad``
+    first and step the optimizer afterwards.
+    """
+    alpha = model.config.level_loss_alpha
+    weights = torch.tensor(
+        [max(1, target.shape[1]) ** (1.0 - alpha) for target in codes],
+        device=codes[0].device, dtype=torch.float32,
+    )
+    weights = (weights / weights.sum()).tolist()
+    total: Tensor | None = None
+    for weight, (logits, target) in zip(
+        weights,
+        model.iter_level_logits(codes, prefix_tokens=prefix_tokens, corrupt=True),
+    ):
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]), target.reshape(-1)
+        )
+        (weight * loss).backward()
+        term = loss.detach() * weight
+        total = term if total is None else total + term
+    return total
