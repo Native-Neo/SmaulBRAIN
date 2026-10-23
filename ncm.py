@@ -19,6 +19,7 @@ from smaulbrain import quant as _quant
 
 
 _TERNARY_GRADIENT_CHUNK_COLUMNS = 128
+_TERNARY_FULL_GRADIENT_MAX_ELEMENTS = 262_144
 
 
 @dataclass(frozen=True)
@@ -314,6 +315,15 @@ class NCMLinear(nn.Linear):
         total = full_rows * full_cols
         if total > 2**31 - 1:
             raise ValueError("ternary update indices exceed int32 capacity")
+
+        # Tiny MoE matrices do not need the two-pass low-memory algorithm.
+        # Keep their transient gradient below 1 MiB and sample it in one pass;
+        # larger matrices retain exact global-mean chunking to bound peak memory.
+        if total <= _TERNARY_FULL_GRADIENT_MAX_ELEMENTS:
+            gradient = (dy.t() @ x_flat).t()
+            if bool(torch.isfinite(gradient).all()):
+                self._record_ternary_update(gradient)
+            return
 
         chunk_width = min(_TERNARY_GRADIENT_CHUNK_COLUMNS, full_cols)
         abs_sum = 0.0
