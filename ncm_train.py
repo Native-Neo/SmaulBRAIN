@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
+from collections import deque
 import json
 import random
 import sys
@@ -381,6 +382,10 @@ def main(argv=None) -> int:
                         help="write checkpoints every N optimizer steps")
     parser.add_argument("--log-every", type=int, default=1,
                         help="print training metrics every N optimizer steps")
+    parser.add_argument(
+        "--loss-window", type=int, default=100,
+        help="number of recent training batches used for rolling loss averages",
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument(
@@ -418,7 +423,7 @@ def main(argv=None) -> int:
         parser.error("--steps must be >= 1")
     if args.steps is None and args.max_steps < 1:
         parser.error("--max-steps must be >= 1")
-    if min(args.save_every, args.log_every, args.batch_size, args.seq_len,
+    if min(args.save_every, args.log_every, args.loss_window, args.batch_size, args.seq_len,
            args.levels, args.codebook_size, args.heads) < 1:
         parser.error("save-every, log-every, batch-size, sequence length, levels and codebook size must be positive")
     if args.seq_len < 2:
@@ -451,6 +456,10 @@ def main(argv=None) -> int:
     generator_steps_this_run = 0
     last_tokenizer_loss = None
     last_generator_loss = None
+    tokenizer_loss_window = deque(maxlen=args.loss_window)
+    tokenizer_recon_window = deque(maxlen=args.loss_window)
+    tokenizer_quant_window = deque(maxlen=args.loss_window)
+    generator_loss_window = deque(maxlen=args.loss_window)
 
     if args.stage == "tokenizer" or (args.stage == "both" and not generator_train_path.exists()):
         tokenizer = ResidualVQTokenizer(config).to(device)
@@ -470,15 +479,23 @@ def main(argv=None) -> int:
             optimizer.step()
             tokenizer_steps_this_run += 1
             last_tokenizer_loss = float(loss.detach())
+            components = tokenizer.last_loss_components
+            tokenizer_loss_window.append(last_tokenizer_loss)
+            tokenizer_recon_window.append(float(components["reconstruction"]))
+            tokenizer_quant_window.append(float(components["quantization"]))
             if (step + 1) % args.save_every == 0 or step + 1 == end:
                 save_checkpoint(tokenizer_train_path, tokenizer, optimizer, config, step + 1)
                 torch.save({"config": config.__dict__, "model": tokenizer.state_dict()}, tokenizer_path)
             if (step + 1) % args.log_every == 0 or step + 1 == end:
-                components = tokenizer.last_loss_components
+                avg_loss = sum(tokenizer_loss_window) / len(tokenizer_loss_window)
+                avg_recon = sum(tokenizer_recon_window) / len(tokenizer_recon_window)
+                avg_quant = sum(tokenizer_quant_window) / len(tokenizer_quant_window)
                 print(
                     f"tokenizer step={step + 1} loss={loss.item():.4f} "
                     f"recon={components['reconstruction'].item():.4f} "
                     f"quant={components['quantization'].item():.4f} "
+                    f"avg_loss={avg_loss:.4f} avg_recon={avg_recon:.4f} "
+                    f"avg_quant={avg_quant:.4f} avg_n={len(tokenizer_loss_window)} "
                     f"elapsed={time.perf_counter() - start_time:.1f}s",
                     flush=True,
                 )
@@ -559,12 +576,18 @@ def main(argv=None) -> int:
             optimizer.step()
             generator_steps_this_run += 1
             last_generator_loss = float(loss.detach())
+            generator_loss_window.append(last_generator_loss)
             if (step + 1) % args.save_every == 0 or step + 1 == end:
                 save_checkpoint(generator_train_path, generator, optimizer, config, step + 1)
                 torch.save({"config": config.__dict__, "model": generator.state_dict()}, generator_path)
             if (step + 1) % args.log_every == 0 or step + 1 == end:
-                print(f"generator step={step + 1} loss={loss.item():.4f} "
-                      f"elapsed={time.perf_counter() - start_time:.1f}s", flush=True)
+                avg_loss = sum(generator_loss_window) / len(generator_loss_window)
+                print(
+                    f"generator step={step + 1} loss={loss.item():.4f} "
+                    f"avg_loss={avg_loss:.4f} avg_n={len(generator_loss_window)} "
+                    f"elapsed={time.perf_counter() - start_time:.1f}s",
+                    flush=True,
+                )
     print(json.dumps({
         "done": True,
         "preset": config.preset,
