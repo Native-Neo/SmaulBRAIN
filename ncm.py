@@ -18,6 +18,9 @@ from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 from smaulbrain import quant as _quant
 
 
+_TERNARY_GRADIENT_CHUNK_COLUMNS = 128
+
+
 @dataclass(frozen=True)
 class NCMConfig:
     vocab_size: int = 256
@@ -184,11 +187,10 @@ class _DirectTernaryLinear(torch.autograd.Function):
             dy, ctx.packed, ctx.packed_shape, ctx.scale
         )
         dbias = dy.sum(dim=0) if ctx.has_bias else None
-        # Ternary codes are the trainable weights. Keep the dense gradient only
-        # for this update; never attach it to a full-sized FP32 .grad tensor.
+        # Compute ternary code gradients in bounded output-column chunks.
+        # The sampler uses a global importance mean across all chunks.
         if ctx.module.training and ctx.module.ternary_update_rate > 0:
-            grad_codes = (dy.t() @ x_flat).t()
-            ctx.module._record_ternary_update(grad_codes)
+            ctx.module._record_ternary_update_from_inputs(dy, x_flat)
         return dx.reshape(ctx.input_shape).to(dtype=x_flat.dtype), dbias, None
 
 
@@ -296,6 +298,123 @@ class NCMLinear(nn.Linear):
         self._pending_ternary_directions.append(directions)
 
     @torch.no_grad()
+    def _record_ternary_update_from_inputs(self, dy: Tensor, x_flat: Tensor) -> None:
+        """Compute and sample ternary weight gradients without a full matrix.
+
+        Two passes are deliberate: the first calculates the global mean
+        absolute gradient, and the second recomputes each bounded chunk and
+        samples it with probabilities normalized against that same mean.
+        """
+        rate = float(self.ternary_update_rate)
+        if rate <= 0.0:
+            return
+
+        full_cols = int(self.out_features)
+        full_rows = int(self.in_features)
+        total = full_rows * full_cols
+        if total > 2**31 - 1:
+            raise ValueError("ternary update indices exceed int32 capacity")
+
+        chunk_width = min(_TERNARY_GRADIENT_CHUNK_COLUMNS, full_cols)
+        abs_sum = 0.0
+        for start in range(0, full_cols, chunk_width):
+            end = min(start + chunk_width, full_cols)
+            grad_chunk = (dy[:, start:end].t() @ x_flat).t()
+            if not bool(torch.isfinite(grad_chunk).all()):
+                return
+            abs_sum += float(
+                grad_chunk.detach().abs().sum(dtype=torch.float64).item()
+            )
+            del grad_chunk
+
+        global_mean_abs = abs_sum / float(total)
+        if not global_mean_abs > 0.0:
+            return
+
+        base_seed = int(
+            torch.randint(0, 2**63 - 1, (), dtype=torch.int64).item()
+        )
+        chunk_sampler = getattr(
+            _quant, "sample_ternary_gradient_update_chunk", None
+        )
+        native_sampler = getattr(_quant, "sample_ternary_gradient_updates", None)
+        pending_indices = []
+        pending_directions = []
+
+        for start in range(0, full_cols, chunk_width):
+            end = min(start + chunk_width, full_cols)
+            grad_chunk = (dy[:, start:end].t() @ x_flat).t()
+            chunk_seed = (base_seed + start) % (2**63 - 1)
+
+            if chunk_sampler is not None:
+                indices, directions = chunk_sampler(
+                    grad_chunk, rate, chunk_seed, global_mean_abs,
+                    full_cols, start,
+                )
+            else:
+                # Compatibility with older core packages. Their native sampler
+                # normalizes by the chunk mean, so scale the rate to preserve
+                # the full matrix's per-coordinate probability.
+                chunk_mean_abs = float(
+                    grad_chunk.detach().abs().sum(dtype=torch.float64).item()
+                ) / float(grad_chunk.numel())
+                if not chunk_mean_abs > 0.0:
+                    del grad_chunk
+                    continue
+                adjusted_rate = rate * chunk_mean_abs / global_mean_abs
+                sampled = None
+                if native_sampler is not None and grad_chunk.device.type == "cpu":
+                    sampled = native_sampler(
+                        grad_chunk, adjusted_rate, chunk_seed
+                    )
+                if sampled is not None:
+                    local_indices, directions = sampled
+                    local_indices = local_indices.to(torch.long)
+                    indices = (
+                        torch.div(
+                            local_indices, end - start, rounding_mode="floor"
+                        ) * full_cols
+                        + start + local_indices.remainder(end - start)
+                    ).to(torch.int32)
+                    directions = directions.to(torch.int8)
+                else:
+                    gradient = grad_chunk.detach().to(
+                        device="cpu", dtype=torch.float32
+                    ).contiguous()
+                    importance = gradient.abs()
+                    probabilities = (
+                        importance * (rate / global_mean_abs)
+                    ).clamp_(max=1.0)
+                    selected = torch.rand(importance.shape) < probabilities
+                    selected &= importance > 0
+                    local_indices = selected.reshape(-1).nonzero(
+                        as_tuple=False
+                    ).flatten()
+                    indices = (
+                        torch.div(
+                            local_indices, end - start, rounding_mode="floor"
+                        ) * full_cols
+                        + start + local_indices.remainder(end - start)
+                    ).to(torch.int32)
+                    directions = (
+                        -gradient.reshape(-1).index_select(0, local_indices)
+                        .sign().to(torch.int8)
+                    )
+                del grad_chunk
+
+            if indices.numel():
+                pending_indices.append(indices.to(device="cpu", dtype=torch.int32))
+                pending_directions.append(
+                    directions.to(device="cpu", dtype=torch.int8)
+                )
+            del grad_chunk
+
+        # Extend only after all chunks succeeded; an exception cannot leave a
+        # partially sampled gradient update queued for a later optimizer step.
+        self._pending_ternary_indices.extend(pending_indices)
+        self._pending_ternary_directions.extend(pending_directions)
+
+    @torch.no_grad()
     def _apply_pending_ternary_updates(self) -> None:
         """Apply queued sparse coordinate updates directly to packed 2-bit codes."""
         if not self._pending_ternary_indices:
@@ -303,10 +422,17 @@ class NCMLinear(nn.Linear):
 
         applier = getattr(_quant, "apply_ternary_update_segments", None)
         if applier is not None and self.ternary_packed.device.type == "cpu":
-            changed = applier(
-                self.ternary_packed, self._ternary_shape,
-                self._pending_ternary_indices, self._pending_ternary_directions,
-            )
+            try:
+                changed = applier(
+                    self.ternary_packed, self._ternary_shape,
+                    self._pending_ternary_indices, self._pending_ternary_directions,
+                )
+            except Exception:
+                # Avoid reapplying possibly partial native updates on retry.
+                self._pending_ternary_indices.clear()
+                self._pending_ternary_directions.clear()
+                self._invalidate_packed_cache()
+                raise
             if changed is not None:
                 self._pending_ternary_indices.clear()
                 self._pending_ternary_directions.clear()
@@ -318,8 +444,13 @@ class NCMLinear(nn.Linear):
                     self.ternary_updates.add_(changed)
                 return
 
-        indices = torch.cat(self._pending_ternary_indices).to(torch.long)
-        directions = torch.cat(self._pending_ternary_directions).to(torch.int16)
+        try:
+            indices = torch.cat(self._pending_ternary_indices).to(torch.long)
+            directions = torch.cat(self._pending_ternary_directions).to(torch.int16)
+        except Exception:
+            self._pending_ternary_indices.clear()
+            self._pending_ternary_directions.clear()
+            raise
         self._pending_ternary_indices.clear()
         self._pending_ternary_directions.clear()
         unique_indices, inverse = torch.unique(indices, sorted=True, return_inverse=True)
