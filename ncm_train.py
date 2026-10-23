@@ -387,7 +387,7 @@ def main(argv=None) -> int:
         "--loss-window", type=int, default=100,
         help="number of recent training batches used for rolling loss averages",
     )
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument(
         "--preset", default="custom",
