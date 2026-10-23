@@ -35,7 +35,7 @@ def main(argv=None):
         "--steps", type=int, default=None,
         help="number of additional updates per NCM stage (overrides --max-steps)",
     )
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--levels", type=int, default=4)
     parser.add_argument("--codebook-size", type=int, default=64)
     parser.add_argument("--d-model", type=int, default=None)
