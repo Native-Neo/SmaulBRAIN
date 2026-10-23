@@ -400,8 +400,6 @@ class NCMLinear(nn.Linear):
                         -gradient.reshape(-1).index_select(0, local_indices)
                         .sign().to(torch.int8)
                     )
-                del grad_chunk
-
             if indices.numel():
                 pending_indices.append(indices.to(device="cpu", dtype=torch.int32))
                 pending_directions.append(
