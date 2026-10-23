@@ -41,6 +41,11 @@ def test_default_cli_trains_and_infers_with_packed_ternary(tmp_path, capsys):
     assert "tokenizer step=2 " in training_output
     assert "generator step=1 " in training_output
     assert "generator step=2 " in training_output
+    assert "avg_loss=" in training_output
+    assert "avg_recon=" in training_output
+    assert "avg_quant=" in training_output
+    assert "avg_n=1" in training_output
+    assert "avg_n=2" in training_output
 
     assert infer_main([
         "--checkpoint", str(checkpoint),
