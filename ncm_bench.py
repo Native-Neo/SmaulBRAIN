@@ -47,6 +47,7 @@ def main(argv=None) -> int:
         generator, generator_state["model"]
     )
     generator.load_state_dict(generator_model_state)
+    del tokenizer_state, generator_state, tokenizer_model_state, generator_model_state
     tokenizer_parameters = sum(parameter.numel() for parameter in tokenizer.parameters())
     generator_parameters = sum(parameter.numel() for parameter in generator.parameters())
     generator.eval()

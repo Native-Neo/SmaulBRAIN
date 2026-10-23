@@ -119,6 +119,7 @@ class _NCMQuantizedLinear(torch.autograd.Function):
         mode = ctx.backward_mode
         kind = ctx.forward_quant
 
+        dy_q = None
         if kind == "ternary":
             dx = _quant.packed_matmat_transpose(
                 dy, ctx.packed, ctx.packed_shape, ctx.scale
@@ -133,7 +134,7 @@ class _NCMQuantizedLinear(torch.autograd.Function):
             dx = dy @ weight
 
         if kind != "fp32" and mode == "fp8":
-            dy_for_weight, _ = _quant.fp8_e4m3_quantize(dy)
+            dy_for_weight = dy_q if dy_q is not None else _quant.fp8_e4m3_quantize(dy)[0]
             x_for_weight, _ = _quant.fp8_e4m3_quantize(x)
         else:
             dy_for_weight, x_for_weight = dy, x
@@ -536,9 +537,7 @@ class SmaulSharedMoE(nn.Module):
                     flat.index_select(0, token_indices)
                 )
                 weights = grouped_weights[start:end].unsqueeze(-1)
-                output = output.index_add(
-                    0, token_indices, expert_output * weights
-                )
+                output.index_add_(0, token_indices, expert_output * weights)
             start = end
         return output.reshape(original_shape)
 

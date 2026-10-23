@@ -7,6 +7,7 @@ Data is streamed in bounded chunks; the entire corpus is never loaded into RAM.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import random
 import sys
@@ -166,7 +167,12 @@ class SmaulTrainingOptimizer:
     def state_dict(self) -> dict:
         return {
             "type": "SmaulOPT",
-            "state": self.optimizer.state_dict(),
+            # Live tensors (no clone): the caller serializes immediately, and a clone would
+            # duplicate every moment tensor in RAM at each checkpoint.
+            "state": {
+                name: {key: value for key, value in state.items() if key != "factored"}
+                for name, state in self.optimizer.state.items()
+            },
             "factored": {
                 name: bool(state["factored"])
                 for name, state in self.optimizer.state.items()
@@ -190,9 +196,16 @@ class SmaulTrainingOptimizer:
                         name,
                         float(payload["hyperparameters"][name]),
                     )
+            # Newer smaulbrain-core can adopt the loaded moments instead of cloning them.
+            adopt = (
+                {"copy": False}
+                if "copy" in inspect.signature(self.optimizer.load_state_dict).parameters
+                else {}
+            )
             self.optimizer.load_state_dict(
                 payload.get("state", {}),
                 payload.get("factored", {}),
+                **adopt,
             )
             self.optimizer.n_updates = int(payload.get("n_updates", 0))
             self.optimizer.register(self.params)
@@ -301,7 +314,7 @@ def load_stage_checkpoint(path: Path, model, optimizer, device) -> int:
     if not path.exists():
         return 0
     state = torch.load(path, map_location=device, weights_only=False)
-    model_state, migrated_ternary = migrate_ternary_state_dict(model, state["model"])
+    model_state, migrated_ternary = migrate_ternary_state_dict(model, state.pop("model"))
     try:
         model.load_state_dict(model_state)
     except (RuntimeError, ValueError) as exc:
@@ -317,6 +330,7 @@ def load_stage_checkpoint(path: Path, model, optimizer, device) -> int:
                 "directory to start a new run."
             )
         raise RuntimeError(f"Checkpoint {path} is incompatible: {reason}") from exc
+    del model_state  # loaded weights are copied into the module; don't hold a second set
     if migrated_ternary:
         print(
             "warning: migrated FP32-master ternary weights to packed discrete "
@@ -485,6 +499,7 @@ def main(argv=None) -> int:
             tokenizer, tokenizer_state["model"]
         )
         tokenizer.load_state_dict(tokenizer_model_state)
+        del tokenizer_state, tokenizer_model_state
         if migrated_ternary:
             print(
                 "Migrated tokenizer FP32-master ternary weights to packed discrete codes.",
@@ -499,6 +514,7 @@ def main(argv=None) -> int:
         if args.stage == "both":
             tokenizer_state = torch.load(tokenizer_path, map_location=device, weights_only=False)
             tokenizer.load_state_dict(tokenizer_state["model"])
+            del tokenizer_state
         tokenizer.eval()
         for parameter in tokenizer.parameters():
             parameter.requires_grad_(False)
@@ -514,6 +530,7 @@ def main(argv=None) -> int:
             f"total_architecture_parameters: {tokenizer_count + generator_count:,}",
             flush=True,
         )
+        optimizer = None  # release the tokenizer-stage optimizer state before building the generator's
         optimizer = SmaulTrainingOptimizer(generator, args.lr, args.weight_decay)
         start = load_stage_checkpoint(generator_train_path, generator, optimizer, device)
         end = start + args.steps if args.steps is not None else max(start, args.max_steps)

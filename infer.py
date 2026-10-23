@@ -137,6 +137,8 @@ def main(argv=None):
         )
         generator.load_state_dict(generator_model_state)
         generator.eval()
+        # The modules own their weights now; keep no second copy alive during generation.
+        del tokenizer_state, generator_state, tokenizer_model_state, generator_model_state
     except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
         parser.error(f"unable to load NCM checkpoint: {exc}")
 
