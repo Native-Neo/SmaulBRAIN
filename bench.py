@@ -11,7 +11,7 @@ import sys
 import time
 import statistics
 
-import torch
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -58,12 +58,12 @@ def main(argv=None):
         print("note: full presets are memory-heavy; running forward-only micro-bench",
               file=sys.stderr)
     init_t0 = time.perf_counter()
-    rng = torch.Generator(device="cpu").manual_seed(args.seed)
+    rng = np.random.default_rng(args.seed)
     params = _model.build_params(spec, rng, device=args.device)
     m = _model.Model(spec, params, forward_quant=args.forward_quant,
                      backward_mode=args.backward_mode, device=args.device)
     model_init_s = time.perf_counter() - init_t0
-    toks = torch.randint(0, 256, (args.seq_len,), generator=torch.Generator(device="cpu").manual_seed(1)).tolist()
+    toks = np.random.default_rng(1).integers(0, 256, (args.seq_len,)).tolist()
     res = {"hw": {"cpu": _cpu.detect(), "dispatch": _cpu.dispatch_name()},
            "preset": preset, "params": m.report()["total_params"],
            "seq_len": args.seq_len, "forward_quant": args.forward_quant,
@@ -84,7 +84,11 @@ def main(argv=None):
     res["warm_forward_samples_s"] = warm_times
     res["packed_cache_builds"] = m.packed.builds
     res["packed_cache_hits"] = m.packed.reuse_hits
-    res["packed_cache_bytes"] = int(sum(v["packed"].nbytes if hasattr(v["packed"], "nbytes") else v["packed"].numel() * v["packed"].element_size() for v in m.packed.d.values()))
+    res["packed_cache_bytes"] = int(sum(
+        entry["packed"].nbytes if hasattr(entry["packed"], "nbytes")
+        else np.asarray(entry["packed"]).nbytes
+        for entry in m.packed.d.values()
+    ))
 
     # Measure inference before the optimizer mutates parameters, so the
     # quantized cache always matches the weights being benchmarked.
