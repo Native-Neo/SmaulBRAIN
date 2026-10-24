@@ -4,8 +4,8 @@ The `train.py` and `infer.py` entry points use this Next-Concept Modeling
 (NCM) adaptation by default. It is inspired by the paper and official
 [HazyResearch/ncm repository](https://github.com/HazyResearch/ncm), but remains
 a compact implementation rather than a reproduction of the paper's full recipe.
-NCM checkpoints use `tokenizer.pt` and `generator.pt` rather than the legacy
-SmaulBRAIN `manifest.json` format.
+NCM checkpoints use `tokenizer.safetensors` and `generator.safetensors` rather
+than the legacy SmaulBRAIN `manifest.json` format.
 
 ## What the architecture does
 
@@ -17,10 +17,9 @@ SmaulBRAIN `manifest.json` format.
 3. **Train a SmaulBRAIN-style recurrent generator.** Each level's input is the
    resized cumulative reconstruction of *earlier* levels, never its own target
    IDs. The generator uses recurrent linear attention with learned decay and
-   bonus, RMSNorm, residual connections, and a shared sparse router/expert pool. A fused native C++ CPU scan computes
-   recurrent states and their backward gradients without a time-by-time attention
-   matrix when the installed core package provides the native backend; the
-   chunked PyTorch scan remains the portable fallback. Each level has an
+   bonus, RMSNorm, residual connections, and a shared sparse router/expert pool.
+   A chunked closed-form NumPy scan computes recurrent states and their backward
+   gradients without a time-by-time attention matrix. Each level has an
    independent recurrent state; prompt features are repeated for each level to
    prevent information leaking between levels. Conditioning corruption changes
    input conditioning IDs, not labels.
@@ -41,9 +40,9 @@ attention: it scans each known level both forward and backward, so every
 position can use same-level context while all codes in that level are predicted
 in parallel. The standard autoregressive model uses a causal forward state.
 For MoE presets, one router and expert pool are shared across every recurrent
-block. Dispatch now sorts and groups the routing assignments once per mixer
-call instead of scanning the entire assignment tensor with a separate
-`torch.where` for every expert. Expert MLPs are still evaluated sequentially,
+block. Dispatch sorts and groups the routing assignments once per mixer call
+instead of scanning the entire assignment tensor with a separate boolean-mask
+selection for every expert. Expert MLPs are still evaluated sequentially,
 one expert at a time, to avoid allocating padded all-expert activations. Dense
 presets use a per-layer SwiGLU channel mixer. Preset dimensions
 are inherited from the original four preset definitions, but NCM tokenizer and
@@ -59,8 +58,9 @@ transient gradient matrix, then queues sparse gradient-sign updates. When the
 installed core package includes the native update helpers, sampling reads the
 strided gradient directly without Python probability/mask tensors, and a C++
 kernel applies all queued updates to packed codes without concatenating each
-segment. Older package versions retain the portable PyTorch fallback. Biases,
-embeddings, codebooks, and normalization parameters remain floating point.
+segment. When the native helpers are unavailable, the portable NumPy path
+applies the same updates. Biases, embeddings, codebooks, and normalization
+parameters remain floating point.
 
 This direct-discrete ternary update rule is experimental and is not conventional
 straight-through-estimator QAT. Its convergence and generated-text quality must
@@ -112,7 +112,7 @@ conditioning on the first half of each sampled byte window and predicting the
 second half. Stage checkpoints are saved under the output directory, and
 training resumes automatically from the latest stage checkpoint. Run the two
 stages separately with --stage tokenizer and --stage generator if needed; the
-generator stage requires a matching tokenizer.pt.
+generator stage requires a matching `tokenizer.safetensors`.
 
 Defaults are deliberately small for low-memory experimentation. Increase
 --d-model, --layers, --levels, --codebook-size, or --experts only after a small
@@ -145,5 +145,8 @@ it produces worse text or requires much more training.
 ## Tests
 
 ```bash
-python -m pytest -q tests/test_ncm.py
+python -m pytest -q tests
 ```
+
+The default suite is NumPy-only. Archived PyTorch oracles, including
+`tests/_reference/test_ncm_parity.py`, require PyTorch and are run explicitly.
