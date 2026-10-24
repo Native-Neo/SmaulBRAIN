@@ -10,15 +10,17 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-import torch
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from smaulbrain import cli as _cli
 from smaulbrain import config as _cfg
+from smaulbrain import npgrad as ng
 from ncm import (
     NCMConfig, NCMGenerator, ResidualVQTokenizer, migrate_ternary_state_dict,
 )
+from ncm_checkpoint import load_checkpoint as load_ncm_checkpoint
 
 
 def _was_provided(argv, option):
@@ -90,9 +92,14 @@ def main(argv=None):
         parser.error("the default NCM runtime currently supports --paging R only")
 
     checkpoint_dir = Path(args.checkpoint)
-    tokenizer_path = checkpoint_dir / "tokenizer.pt"
-    generator_path = checkpoint_dir / "generator.pt"
+    tokenizer_path = checkpoint_dir / "tokenizer.safetensors"
+    generator_path = checkpoint_dir / "generator.safetensors"
     if not tokenizer_path.is_file() or not generator_path.is_file():
+        if (checkpoint_dir / "tokenizer.pt").is_file() or (checkpoint_dir / "generator.pt").is_file():
+            parser.error(
+                f"{checkpoint_dir} contains legacy PyTorch NCM checkpoints; convert them "
+                "with tests/_reference/convert_torch_checkpoint.py"
+            )
         if (checkpoint_dir / "manifest.json").is_file():
             parser.error(
                 f"{checkpoint_dir} contains a legacy SmaulBRAIN checkpoint, not NCM checkpoints"
@@ -103,12 +110,8 @@ def main(argv=None):
         )
 
     try:
-        tokenizer_state = torch.load(
-            tokenizer_path, map_location=args.device, weights_only=True
-        )
-        generator_state = torch.load(
-            generator_path, map_location=args.device, weights_only=True
-        )
+        tokenizer_state = load_ncm_checkpoint(tokenizer_path)
+        generator_state = load_ncm_checkpoint(generator_path)
         saved_config = NCMConfig(**tokenizer_state["config"])
         generator_config = NCMConfig(**generator_state["config"])
         if saved_config != generator_config:
@@ -125,13 +128,13 @@ def main(argv=None):
             preset = requested_preset
         _cfg.validate_quant_combo(config.forward_quant, config.backward_mode)
 
-        tokenizer = ResidualVQTokenizer(config).to(args.device)
+        tokenizer = ResidualVQTokenizer(config)
         tokenizer_model_state, _ = migrate_ternary_state_dict(
             tokenizer, tokenizer_state["model"]
         )
         tokenizer.load_state_dict(tokenizer_model_state)
         tokenizer.eval()
-        generator = NCMGenerator(config, tokenizer).to(args.device)
+        generator = NCMGenerator(config, tokenizer)
         generator_model_state, _ = migrate_ternary_state_dict(
             generator, generator_state["model"]
         )
@@ -160,22 +163,20 @@ def main(argv=None):
         )
 
     if args.seed is not None:
-        torch.manual_seed(args.seed)
-    prefix = torch.tensor(
-        [list(prompt_bytes)], dtype=torch.long, device=torch.device(args.device)
-    )
+        ng.manual_seed(args.seed)
+    prefix = ng.Tensor(np.asarray([list(prompt_bytes)], dtype=np.int64))
     start = __import__("time").perf_counter()
-    with torch.inference_mode():
+    with ng.no_grad():
         output = generator.generate(
             args.max_new_tokens,
-            device=args.device,
+            device="cpu",
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
             prefix_tokens=prefix,
         )
     elapsed = __import__("time").perf_counter() - start
-    generated = bytes(output[0].tolist())
+    generated = bytes(output.data[0].tolist())
     print(json.dumps({
         "preset": preset,
         "model_kind": config.model_kind,
