@@ -8,21 +8,26 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-import inspect
-from collections import deque
 import json
 import random
 import sys
 import time
 from pathlib import Path
 
-import torch
-from torch import Tensor
+import numpy as np
+
+from smaulbrain import npgrad as ng
+from smaulbrain.npgrad import Tensor
 
 from ncm import (
     NCMConfig, NCMGenerator, NCMLinear, ResidualVQTokenizer,
     apply_direct_ternary_updates, backward_ncm_loss_chunked,
     migrate_ternary_state_dict, ncm_loss,
+)
+from ncm_checkpoint import (
+    load_checkpoint as load_ncm_checkpoint,
+    save_model_checkpoint,
+    save_training_checkpoint,
 )
 from smaulbrain import config as _preset_config
 
@@ -119,16 +124,18 @@ class ByteBatchStream:
         if len(self.buffer) < self.seq_len + 1:
             raise ValueError("Corpus must contain at least seq_len + 1 bytes")
 
-    def next(self, device: torch.device) -> Tensor:
+    def next(self, device=None) -> np.ndarray:
         self._fill(self.buffer_bytes)
         max_start = len(self.buffer) - self.seq_len
-        starts = [random.randrange(max_start + 1) for _ in range(self.batch_size)]
-        batch = torch.stack([
-            torch.frombuffer(
-                self.buffer[start:start + self.seq_len], dtype=torch.uint8
-            ).to(device=device, dtype=torch.long)
-            for start in starts
-        ])
+        starts = np.fromiter(
+            (random.randrange(max_start + 1) for _ in range(self.batch_size)),
+            dtype=np.int64,
+            count=self.batch_size,
+        )
+        raw = np.frombuffer(self.buffer, dtype=np.uint8)
+        offsets = starts[:, None] + np.arange(self.seq_len, dtype=np.int64)
+        batch = raw[offsets].astype(np.int64)
+        del raw  # release the buffer export before shrinking the bytearray
         # Move through the stream over time instead of repeatedly sampling one fixed buffer.
         advance = min(self.batch_size * self.seq_len, max(1, len(self.buffer) // 4))
         del self.buffer[:advance]
@@ -136,7 +143,7 @@ class ByteBatchStream:
 
 
 class SmaulTrainingOptimizer:
-    """Adapt SmaulOPT's named-tensor API to PyTorch module training."""
+    """Adapt SmaulOPT's named-tensor API to NumPy module training."""
 
     def __init__(self, model, lr: float, weight_decay: float = 0.0):
         from smaulbrain.smaulopt import SmaulOPT
@@ -156,7 +163,7 @@ class SmaulTrainingOptimizer:
             if set_to_none:
                 parameter.grad = None
             elif parameter.grad is not None:
-                parameter.grad.zero_()
+                parameter.grad[...] = 0
 
     def step(self) -> None:
         gradients = {
@@ -198,16 +205,10 @@ class SmaulTrainingOptimizer:
                         name,
                         float(payload["hyperparameters"][name]),
                     )
-            # Newer smaulbrain-core can adopt the loaded moments instead of cloning them.
-            adopt = (
-                {"copy": False}
-                if "copy" in inspect.signature(self.optimizer.load_state_dict).parameters
-                else {}
-            )
             self.optimizer.load_state_dict(
                 payload.get("state", {}),
                 payload.get("factored", {}),
-                **adopt,
+                copy=False,
             )
             self.optimizer.n_updates = int(payload.get("n_updates", 0))
             self.optimizer.register(self.params)
@@ -304,19 +305,14 @@ def build_ncm_config(
 
 def save_checkpoint(path: Path, model, optimizer, config, step: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "config": config.__dict__,
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "step": step,
-    }, path)
+    save_training_checkpoint(path, config, model, optimizer, step)
 
 
-def load_stage_checkpoint(path: Path, model, optimizer, device) -> int:
+def load_stage_checkpoint(path: Path, model, optimizer, device=None) -> int:
     if not path.exists():
         return 0
-    state = torch.load(path, map_location=device, weights_only=False)
-    model_state, migrated_ternary = migrate_ternary_state_dict(model, state.pop("model"))
+    state = load_ncm_checkpoint(path)
+    model_state, migrated_ternary = migrate_ternary_state_dict(model, state["model"])
     try:
         model.load_state_dict(model_state)
     except (RuntimeError, ValueError) as exc:
@@ -333,14 +329,16 @@ def load_stage_checkpoint(path: Path, model, optimizer, device) -> int:
             )
         raise RuntimeError(f"Checkpoint {path} is incompatible: {reason}") from exc
     del model_state  # loaded weights are copied into the module; don't hold a second set
-    if migrated_ternary:
-        print(
-            "warning: migrated FP32-master ternary weights to packed discrete "
-            "codes; resetting optimizer state because the old full-precision "
-            "weight moments do not apply to direct ternary updates",
-            file=sys.stderr,
-            flush=True,
-        )
+    if migrated_ternary or state["optimizer"] is None:
+        if migrated_ternary:
+            print(
+                "warning: migrated FP32-master ternary weights to packed discrete "
+                "codes; resetting optimizer state because the old full-precision "
+                "weight moments do not apply to direct ternary updates",
+                file=sys.stderr,
+                flush=True,
+            )
+        optimizer.optimizer.register(optimizer.params)
     else:
         optimizer.load_state_dict(state["optimizer"])
     return int(state.get("step", 0))
@@ -415,7 +413,8 @@ def main(argv=None) -> int:
         help="legacy compatibility option; ignored by the recurrent NCM generator",
     )
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default="cpu",
+                        help="CPU-only compatibility option; tensors always run on CPU")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args(argv)
     if args.steps is None and args.max_steps is None:
@@ -445,13 +444,13 @@ def main(argv=None) -> int:
         parser.error(str(exc))
 
     random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    device = torch.device(args.device)
+    ng.manual_seed(args.seed)
+    device = "cpu"
     stream = ByteBatchStream(args.data, args.seq_len, args.batch_size, 4 << 20)
-    tokenizer_path = args.output / "tokenizer.pt"
-    generator_path = args.output / "generator.pt"
-    tokenizer_train_path = args.output / "tokenizer-training.pt"
-    generator_train_path = args.output / "generator-training.pt"
+    tokenizer_path = args.output / "tokenizer.safetensors"
+    generator_path = args.output / "generator.safetensors"
+    tokenizer_train_path = args.output / "tokenizer-training.safetensors"
+    generator_train_path = args.output / "generator-training.safetensors"
 
     tokenizer_steps_this_run = 0
     generator_steps_this_run = 0
@@ -463,7 +462,7 @@ def main(argv=None) -> int:
     generator_loss_window = deque(maxlen=args.loss_window)
 
     if args.stage == "tokenizer" or (args.stage == "both" and not generator_train_path.exists()):
-        tokenizer = ResidualVQTokenizer(config).to(device)
+        tokenizer = ResidualVQTokenizer(config)
         configure_direct_ternary_updates(tokenizer, args.lr)
         optimizer = SmaulTrainingOptimizer(tokenizer, args.lr, args.weight_decay)
         start = load_stage_checkpoint(tokenizer_train_path, tokenizer, optimizer, device)
@@ -477,7 +476,7 @@ def main(argv=None) -> int:
         reconstruction_window = deque(maxlen=100)
         quantization_window = deque(maxlen=100)
         for step in range(start, end):
-            batch = stream.next(device)
+            batch = ng.Tensor(stream.next(device))
             _, loss, _ = tokenizer(batch)
             components = tokenizer.last_loss_components
             loss_window.append(float(loss.detach()))
@@ -486,7 +485,7 @@ def main(argv=None) -> int:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             apply_direct_ternary_updates(tokenizer)
-            torch.nn.utils.clip_grad_norm_(tokenizer.parameters(), 1.0)
+            ng.clip_grad_norm_(tokenizer.parameters(), 1.0)
             optimizer.step()
             tokenizer_steps_this_run += 1
             last_tokenizer_loss = float(loss.detach())
@@ -496,7 +495,7 @@ def main(argv=None) -> int:
             tokenizer_quant_window.append(float(components["quantization"]))
             if (step + 1) % args.save_every == 0 or step + 1 == end:
                 save_checkpoint(tokenizer_train_path, tokenizer, optimizer, config, step + 1)
-                torch.save({"config": config.__dict__, "model": tokenizer.state_dict()}, tokenizer_path)
+                save_model_checkpoint(tokenizer_path, config, tokenizer)
             if (step + 1) % args.log_every == 0 or step + 1 == end:
                 avg_loss = sum(tokenizer_loss_window) / len(tokenizer_loss_window)
                 avg_recon = sum(tokenizer_recon_window) / len(tokenizer_recon_window)
@@ -513,18 +512,18 @@ def main(argv=None) -> int:
                     flush=True,
                 )
         if not tokenizer_path.exists():
-            torch.save({"config": config.__dict__, "model": tokenizer.state_dict()}, tokenizer_path)
+            save_model_checkpoint(tokenizer_path, config, tokenizer)
     else:
         if not tokenizer_path.exists():
             parser.error(f"missing tokenizer checkpoint: {tokenizer_path}")
-        tokenizer_state = torch.load(tokenizer_path, map_location=device, weights_only=False)
+        tokenizer_state = load_ncm_checkpoint(tokenizer_path)
         try:
             saved_config = NCMConfig(**tokenizer_state["config"])
         except (TypeError, ValueError) as exc:
             parser.error(f"invalid tokenizer checkpoint configuration: {exc}")
         if saved_config != config:
             parser.error("CLI model settings do not match the saved tokenizer configuration")
-        tokenizer = ResidualVQTokenizer(config).to(device)
+        tokenizer = ResidualVQTokenizer(config)
         tokenizer_model_state, migrated_ternary = migrate_ternary_state_dict(
             tokenizer, tokenizer_state["model"]
         )
@@ -542,7 +541,7 @@ def main(argv=None) -> int:
 
     if args.stage in ("generator", "both"):
         if args.stage == "both":
-            tokenizer_state = torch.load(tokenizer_path, map_location=device, weights_only=False)
+            tokenizer_state = load_ncm_checkpoint(tokenizer_path)
             tokenizer.load_state_dict(tokenizer_state["model"])
             del tokenizer_state
         tokenizer.eval()
@@ -550,7 +549,7 @@ def main(argv=None) -> int:
             parameter.requires_grad_(False)
         generator = NCMGenerator(
             config, tokenizer, gradient_checkpointing=args.grad_checkpoint
-        ).to(device)
+        )
         configure_direct_ternary_updates(generator, args.lr)
         generator_count = architecture_parameter_count(generator)
         trainable_count = architecture_parameter_count(generator, trainable_only=True)
@@ -570,9 +569,9 @@ def main(argv=None) -> int:
             batch = stream.next(device)
             # Train continuation: condition on the first half, predict the second half.
             split = max(1, batch.shape[1] // 2)
-            prefix_tokens = batch[:, :split]
-            target_tokens = batch[:, split:]
-            with torch.no_grad():
+            prefix_tokens = ng.Tensor(batch[:, :split])
+            target_tokens = ng.Tensor(batch[:, split:])
+            with ng.no_grad():
                 codes = tokenizer.encode(target_tokens)
             optimizer.zero_grad(set_to_none=True)
             if args.grad_checkpoint:
@@ -585,14 +584,14 @@ def main(argv=None) -> int:
                 loss = ncm_loss(generator, codes, prefix_tokens=prefix_tokens)
                 loss.backward()
             apply_direct_ternary_updates(generator)
-            torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
+            ng.clip_grad_norm_(generator.parameters(), 1.0)
             optimizer.step()
             generator_steps_this_run += 1
             last_generator_loss = float(loss.detach())
             generator_loss_window.append(last_generator_loss)
             if (step + 1) % args.save_every == 0 or step + 1 == end:
                 save_checkpoint(generator_train_path, generator, optimizer, config, step + 1)
-                torch.save({"config": config.__dict__, "model": generator.state_dict()}, generator_path)
+                save_model_checkpoint(generator_path, config, generator)
             if (step + 1) % args.log_every == 0 or step + 1 == end:
                 avg_loss = sum(generator_loss_window) / len(generator_loss_window)
                 print(
