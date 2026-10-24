@@ -6,12 +6,14 @@ import argparse
 import time
 from pathlib import Path
 
-import torch
+import numpy as np
 
 from ncm import (
     NCMConfig, NCMGenerator, ResidualVQTokenizer, level_length,
     migrate_ternary_state_dict,
 )
+from ncm_checkpoint import load_checkpoint as load_ncm_checkpoint
+from smaulbrain import npgrad as ng
 
 
 def main(argv=None) -> int:
@@ -23,26 +25,32 @@ def main(argv=None) -> int:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=0)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default="cpu",
+                        help="CPU-only compatibility option; tensors always run on CPU")
     args = parser.parse_args(argv)
     if args.new_bytes < 1 or args.runs < 1 or args.warmup < 0:
         parser.error("new-bytes and runs must be positive; warmup must be >= 0")
 
-    device = torch.device(args.device)
-    tokenizer_state = torch.load(
-        args.checkpoint_dir / "tokenizer.pt", map_location=device, weights_only=True
-    )
-    generator_state = torch.load(
-        args.checkpoint_dir / "generator.pt", map_location=device, weights_only=True
-    )
+    tokenizer_path = args.checkpoint_dir / "tokenizer.safetensors"
+    generator_path = args.checkpoint_dir / "generator.safetensors"
+    if not tokenizer_path.is_file() or not generator_path.is_file():
+        if ((args.checkpoint_dir / "tokenizer.pt").is_file()
+                or (args.checkpoint_dir / "generator.pt").is_file()):
+            parser.error(
+                "legacy PyTorch NCM checkpoints require "
+                "tests/_reference/convert_torch_checkpoint.py"
+            )
+        parser.error(f"missing NCM checkpoints under {args.checkpoint_dir}")
+    tokenizer_state = load_ncm_checkpoint(tokenizer_path)
+    generator_state = load_ncm_checkpoint(generator_path)
     config = NCMConfig(**tokenizer_state["config"])
-    tokenizer = ResidualVQTokenizer(config).to(device)
+    tokenizer = ResidualVQTokenizer(config)
     tokenizer_model_state, _ = migrate_ternary_state_dict(
         tokenizer, tokenizer_state["model"]
     )
     tokenizer.load_state_dict(tokenizer_model_state)
     tokenizer.eval()
-    generator = NCMGenerator(config, tokenizer).to(device)
+    generator = NCMGenerator(config, tokenizer)
     generator_model_state, _ = migrate_ternary_state_dict(
         generator, generator_state["model"]
     )
@@ -56,31 +64,26 @@ def main(argv=None) -> int:
         parser.error("prompt must not be empty")
     if len(prompt_ids) > config.max_seq_len:
         parser.error("prompt is longer than configured max_seq_len")
-    prefix = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    prefix = ng.Tensor(np.asarray([prompt_ids], dtype=np.int64))
 
     def run():
-        with torch.inference_mode():
+        with ng.no_grad():
             return generator.generate(
-                args.new_bytes, device=device, temperature=args.temperature,
+                args.new_bytes, device="cpu", temperature=args.temperature,
                 top_k=args.top_k, prefix_tokens=prefix,
             )
 
     for _ in range(args.warmup):
         run()
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-        torch.cuda.reset_peak_memory_stats(device)
     timings = []
     output = None
     for _ in range(args.runs):
         start = time.perf_counter()
         output = run()
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
         timings.append(time.perf_counter() - start)
     elapsed = sum(timings) / len(timings)
-    generated = bytes(output[0].tolist())
-    print(f"device: {device}")
+    generated = bytes(output.data[0].tolist())
+    print("device: cpu")
     print(f"tokenizer_parameters: {tokenizer_parameters:,}")
     print(f"generator_parameters: {generator_parameters:,}")
     print(f"total_architecture_parameters: {tokenizer_parameters + generator_parameters:,}")
@@ -97,8 +100,6 @@ def main(argv=None) -> int:
     print(f"mean_latency_seconds: {elapsed:.6f}")
     print(f"generated_bytes_per_second: {len(generated) / elapsed:.2f}")
     print(f"latency_seconds_per_run: {[round(x, 6) for x in timings]}")
-    if device.type == "cuda":
-        print(f"peak_allocated_mib: {torch.cuda.max_memory_allocated(device) / (1024 ** 2):.2f}")
     print("--- sample (UTF-8 decode uses replacement for invalid byte sequences) ---")
     print(generated.decode("utf-8", errors="replace"))
     return 0
