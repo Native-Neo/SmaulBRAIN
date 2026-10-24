@@ -76,8 +76,8 @@ def main(argv=None):
         parser.error("MTP is not implemented in the default NCM architecture; use --mtp-loss-weight 0")
 
     checkpoint = Path(args.checkpoint)
-    tokenizer_training = checkpoint / "tokenizer-training.pt"
-    generator_training = checkpoint / "generator-training.pt"
+    tokenizer_training = checkpoint / "tokenizer-training.safetensors"
+    generator_training = checkpoint / "generator-training.safetensors"
     ncm_resume_exists = tokenizer_training.is_file() or generator_training.is_file()
     legacy_manifest = checkpoint / "manifest.json"
     if args.resume and not ncm_resume_exists:
