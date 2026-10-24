@@ -2,6 +2,11 @@
 
 Train ResidualVQTokenizer first, freeze it, then train NCMGenerator against its
 multiscale code hierarchies. The CLI entry points use this architecture by default.
+
+This is the NumPy port of the original PyTorch module: parameters are
+``smaulbrain.npgrad.Tensor`` objects and every layer has an explicit,
+vectorized backward pass.  Public class names, method signatures and the
+checkpoint key layout are unchanged except that tensors are NumPy arrays.
 """
 from __future__ import annotations
 
@@ -10,12 +15,9 @@ from typing import Sequence
 
 import numpy as np
 
-import torch
-from torch import Tensor, nn
-from torch.nn import functional as F
-from torch.utils.checkpoint import checkpoint as _torch_checkpoint
-
+from smaulbrain import npgrad as ng
 from smaulbrain import quant as _quant
+from smaulbrain.npgrad import Parameter, Tensor
 
 
 _TERNARY_GRADIENT_CHUNK_COLUMNS = 128
@@ -88,227 +90,171 @@ class NCMConfig:
             raise ValueError("level_loss_alpha must be >= 0")
 
 
-class _NCMQuantizedLinear(torch.autograd.Function):
-    """Linear operation with packed ternary forward and no dense weight reconstruction."""
+def _arr(value):
+    return value.data if isinstance(value, Tensor) else np.asarray(value)
 
-    @staticmethod
-    def forward(ctx, x, weight, bias, forward_quant, backward_mode,
-                packed, scale, packed_shape, fp8_weight):
-        input_shape = x.shape
-        x_flat = x.reshape(-1, x.shape[-1])
-        ctx.forward_quant = forward_quant
-        ctx.backward_mode = backward_mode
-        ctx.packed = packed
-        ctx.scale = scale
-        ctx.packed_shape = packed_shape
-        ctx.has_bias = bias is not None
-        ctx.input_shape = input_shape
-        ctx.save_for_backward(x_flat, weight, fp8_weight)
 
-        if forward_quant == "fp8":
-            output = x_flat @ fp8_weight.t()
-        elif forward_quant == "ternary":
-            output = _quant.packed_matmat(x_flat, packed, packed_shape, scale)
+def _as_tensor(value, dtype=np.float32):
+    return ng.as_tensor(value, dtype=dtype)
+
+
+def _linear_init(rng, out_features, in_features):
+    bound = 1.0 / np.sqrt(in_features)
+    return (rng.uniform(-bound, bound, (out_features, in_features))
+            .astype(np.float32))
+
+
+def _fp8_linear(x, weight_q, module):
+    x = _as_tensor(x)
+    original_shape = x.shape
+    x_flat = x.reshape(-1, x.shape[-1])
+    out = x_flat.data @ weight_q.T
+    if module.bias is not None:
+        out = out + module.bias.data
+
+    def bw(g):
+        dy = g.reshape(-1, g.shape[-1])
+        if module.backward_mode == "fp8":
+            dy_q, _ = _quant.fp8_e4m3_quantize(dy)
+            dx = dy_q @ weight_q
+            x_q, _ = _quant.fp8_e4m3_quantize(x_flat.data)
+            dweight = dy_q.T @ x_q
         else:
-            output = x_flat @ weight.t()
-        if bias is not None:
-            output = output + bias
-        return output.reshape(*input_shape[:-1], weight.shape[0])
+            dx = dy @ weight_q
+            dweight = dy.T @ x_flat.data
+        dbias = dy.sum(axis=0) if module.bias is not None else None
+        return (dx.reshape(original_shape), dweight, dbias)
+
+    inputs = (x, module.weight) if module.bias is None else (x, module.weight, module.bias)
+    return ng.make_op(out.reshape(*original_shape[:-1], module.out_features), inputs, bw)
+
+
+def _direct_ternary_linear(x, bias, module):
+    x = _as_tensor(x)
+    original_shape = x.shape
+    x_flat = x.reshape(-1, x.shape[-1])
+    packed = module._packed_for_compute()
+    scale = float(np.asarray(module.ternary_scale))
+    shape = module._ternary_shape
+    out = _quant.packed_matmat(x_flat.data, packed, shape, scale)
+    if bias is not None:
+        out = out + bias.data
+
+    def bw(g):
+        dy = g.reshape(-1, g.shape[-1])
+        dx = _quant.packed_matmat_transpose(dy, packed, shape, scale)
+        dbias = dy.sum(axis=0) if bias is not None else None
+        if module.training and module.ternary_update_rate > 0:
+            module._record_ternary_update_from_inputs(dy, x_flat.data)
+        return (dx.reshape(original_shape),) if bias is None else (dx.reshape(original_shape), dbias)
+
+    inputs = (x,) if bias is None else (x, bias)
+    return ng.make_op(out.reshape(*original_shape[:-1], module.out_features), inputs, bw)
+
+
+class _NCMQuantizedLinear:
+    """Compatibility shim matching the former autograd.Function entry point."""
 
     @staticmethod
-    def backward(ctx, grad_output):
-        x, weight, fp8_weight = ctx.saved_tensors
-        dy = grad_output.reshape(-1, grad_output.shape[-1])
-        mode = ctx.backward_mode
-        kind = ctx.forward_quant
-
-        dy_q = None
-        if kind == "ternary":
-            dx = _quant.packed_matmat_transpose(
-                dy, ctx.packed, ctx.packed_shape, ctx.scale
-            )
-        elif kind == "fp8":
-            if mode == "fp8":
-                dy_q, _ = _quant.fp8_e4m3_quantize(dy)
-                dx = dy_q @ fp8_weight
-            else:
-                dx = dy @ fp8_weight
-        else:
-            dx = dy @ weight
-
-        if kind != "fp32" and mode == "fp8":
-            dy_for_weight = dy_q if dy_q is not None else _quant.fp8_e4m3_quantize(dy)[0]
-            x_for_weight, _ = _quant.fp8_e4m3_quantize(x)
-        else:
-            dy_for_weight, x_for_weight = dy, x
-        dweight = dy_for_weight.t() @ x_for_weight
-        dbias = dy.sum(dim=0) if ctx.has_bias else None
-        return (
-            dx.reshape(ctx.input_shape).to(dtype=x.dtype),
-            dweight.to(dtype=weight.dtype),
-            dbias,
-            None, None, None, None, None, None,
-        )
+    def apply(x, weight, bias, forward_quant, backward_mode, packed, scale, packed_shape, fp8_weight, module=None):
+        return _fp8_linear(x, fp8_weight, module)
 
 
-class _DirectTernaryLinear(torch.autograd.Function):
-    """Linear autograd using packed ternary weights and direct discrete updates.
-
-    No dense master-weight Parameter or dense weight-gradient buffer is retained.
-    The backward pass computes a transient weight-gradient matrix and queues
-    sparse sign updates, which are applied directly to the packed bitfield after
-    backward without reconstructing or repacking a dense weight matrix.
-    """
+class _DirectTernaryLinear:
+    """Compatibility shim matching the former autograd.Function entry point."""
 
     @staticmethod
-    def forward(ctx, x, bias, module):
-        original_shape = x.shape
-        x_flat = x.reshape(-1, x.shape[-1])
-        packed = module._packed_for_compute()
-        scale = float(module.ternary_scale.item())
-        shape = (module.in_features, module.out_features)
-        ctx.module = module
-        ctx.packed = packed
-        ctx.scale = scale
-        ctx.packed_shape = shape
-        ctx.input_shape = original_shape
-        ctx.has_bias = bias is not None
-        ctx.save_for_backward(x_flat)
-        output = _quant.packed_matmat(x_flat, packed, shape, scale)
-        if bias is not None:
-            output = output + bias
-        return output.reshape(*original_shape[:-1], module.out_features)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (x_flat,) = ctx.saved_tensors
-        dy = grad_output.reshape(-1, grad_output.shape[-1])
-        dx = _quant.packed_matmat_transpose(
-            dy, ctx.packed, ctx.packed_shape, ctx.scale
-        )
-        dbias = dy.sum(dim=0) if ctx.has_bias else None
-        # Compute ternary code gradients in bounded output-column chunks.
-        # The sampler uses a global importance mean across all chunks.
-        if ctx.module.training and ctx.module.ternary_update_rate > 0:
-            ctx.module._record_ternary_update_from_inputs(dy, x_flat)
-        return dx.reshape(ctx.input_shape).to(dtype=x_flat.dtype), dbias, None
+    def apply(x, bias, module):
+        return _direct_ternary_linear(x, bias, module)
 
 
-class NCMLinear(nn.Linear):
+class NCMLinear(ng.Module):
     """Linear layer with optional FP32, FP8, or directly trained packed-ternary weights."""
 
     def __init__(self, in_features, out_features, bias=True,
                  forward_quant="fp32", backward_mode="fp32"):
-        super().__init__(in_features, out_features, bias=bias)
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
         self.forward_quant = forward_quant
         self.backward_mode = backward_mode
-        self._cached_version = -1
-        self._cached_packed = None
-        self._cached_packed_scale = 1.0
-        self._cached_packed_shape = None
+        self._tiled_packed = None
         self._cached_fp8_weight = None
         self.ternary_update_rate = 3e-4
+        rng = ng.get_rng()
+        self.weight = Parameter(_linear_init(rng, out_features, in_features))
+        if bias:
+            self.bias = Parameter(_linear_init(rng, out_features, 1).reshape(-1))
+        else:
+            self.bias = None
 
         if self.forward_quant == "ternary":
-            # The initialized FP32 tensor exists only during this conversion.
-            # Persistent trainable weight storage is the packed 2-bit code tensor.
-            packed, scale, shape, _ = _quant.pack_ternary(
-                self.weight.detach().t().contiguous()
-            )
-            self.register_buffer("ternary_packed", packed.to(dtype=torch.uint8))
-            self.register_buffer(
-                "ternary_scale", torch.tensor(float(scale), dtype=torch.float32)
-            )
-            self.register_buffer("ternary_updates", torch.zeros((), dtype=torch.long))
+            packed, scale, shape, _ = _quant.pack_ternary(self.weight.data.T.copy())
+            self.register_buffer("ternary_packed", np.asarray(packed, dtype=np.uint8))
+            self.register_buffer("ternary_scale", np.asarray(float(scale), dtype=np.float32))
+            self.register_buffer("ternary_updates", np.zeros((), dtype=np.int64))
             self._ternary_shape = tuple(shape)
             self._pending_ternary_indices = []
             self._pending_ternary_directions = []
-            self._tiled_packed = None
-            self._tiled_packed_key = None
-            del self._parameters["weight"]
+            del self.weight
+            self._cached_fp8_weight = None
 
     def _packed_for_compute(self):
-        """Packed codes in the layout the native matmul kernels read fastest.
-
-        The canonical row-major buffer stays the source of truth: it is what
-        checkpoints store and what the sparse update path patches. The
-        tile-contiguous copy is a derived compute cache (the fast native
-        kernels are ~2x quicker on it), rebuilt only when the canonical
-        buffer changes and dropped when the platform cannot build one.
-        """
-        version = self.ternary_packed._version
-        key = (version, self.ternary_packed.device)
-        if self._tiled_packed_key == key:
+        """Packed codes in the layout the native matmul kernels read fastest."""
+        if self._tiled_packed is not None:
             return self._tiled_packed
         packed = None
         retile = getattr(_quant, "retile_ternary", None)
-        if retile is not None and self.ternary_packed.device.type == "cpu":
+        if retile is not None:
             buf = retile(self.ternary_packed, self._ternary_shape)
             if buf is not None:
                 packed = _quant.TiledPacked(buf)
         if packed is None:
-            # No fast layout available: the canonical buffer is the input.
             packed = self.ternary_packed
         self._tiled_packed = packed
-        self._tiled_packed_key = key
         return packed
 
     def _invalidate_packed_cache(self) -> None:
-        """Drop the derived tile-contiguous copy after the canonical buffer changed."""
         self._tiled_packed = None
-        self._tiled_packed_key = None
 
     def _record_ternary_update(self, gradient_codes: Tensor) -> None:
         """Queue sparse gradient-sign updates until backward completes."""
         rate = float(self.ternary_update_rate)
         if rate <= 0:
             return
-
-        # The package C++ path reads the strided GEMM gradient directly and emits
-        # compact sparse updates. The fallback preserves compatibility with older
-        # installed smaulbrain-core packages.
-        sampler = getattr(_quant, "sample_ternary_gradient_updates", None)
-        if sampler is not None and gradient_codes.device.type == "cpu":
-            seed = int(torch.randint(0, 2**63 - 1, (), dtype=torch.int64).item())
-            sampled = sampler(gradient_codes, rate, seed)
-            if sampled is not None:
-                indices, directions = sampled
-                if indices.numel():
-                    self._pending_ternary_indices.append(indices)
-                    self._pending_ternary_directions.append(directions)
-                return
-
-        gradient = gradient_codes.detach().to(
-            device="cpu", dtype=torch.float32
-        ).contiguous()
-        if gradient.shape != self._ternary_shape or not torch.isfinite(gradient).all():
+        gradient = np.ascontiguousarray(_arr(gradient_codes), dtype=np.float32)
+        if gradient.shape != self._ternary_shape or not np.isfinite(gradient).all():
             return
-        importance = gradient.abs()
+        seed = int(ng.get_rng().integers(0, 2**63 - 1))
+        sampler = getattr(_quant, "sample_ternary_gradient_updates", None)
+        sampled = sampler(gradient, rate, seed) if sampler is not None else None
+        if sampled is not None:
+            indices, directions = sampled
+            if np.asarray(indices).size:
+                self._pending_ternary_indices.append(np.asarray(indices, dtype=np.int32))
+                self._pending_ternary_directions.append(np.asarray(directions, dtype=np.int8))
+            return
+        importance = np.abs(gradient)
         mean_importance = float(importance.mean())
         if not mean_importance > 0:
             return
-        probabilities = (importance * (rate / mean_importance)).clamp_(max=1.0)
-        selected = torch.rand(importance.shape) < probabilities
-        selected &= importance > 0
-        indices = selected.reshape(-1).nonzero(as_tuple=False).flatten()
-        if indices.numel() == 0:
+        probabilities = np.minimum(importance * (rate / mean_importance), 1.0)
+        rng = np.random.default_rng(seed)
+        selected = (rng.random(gradient.shape) < probabilities) & (importance > 0)
+        indices = np.flatnonzero(selected.reshape(-1)).astype(np.int32)
+        if indices.size == 0:
             return
-        directions = -gradient.reshape(-1)[indices].sign().to(torch.int8)
-        self._pending_ternary_indices.append(indices.to(torch.int32))
+        directions = (-np.sign(gradient.reshape(-1)[indices])).astype(np.int8)
+        self._pending_ternary_indices.append(indices)
         self._pending_ternary_directions.append(directions)
 
-    @torch.no_grad()
     def _record_ternary_update_from_inputs(self, dy: Tensor, x_flat: Tensor) -> None:
-        """Compute and sample ternary weight gradients without a full matrix.
-
-        Two passes are deliberate: the first calculates the global mean
-        absolute gradient, and the second recomputes each bounded chunk and
-        samples it with probabilities normalized against that same mean.
-        """
+        """Compute and sample ternary weight gradients without a full matrix."""
         rate = float(self.ternary_update_rate)
         if rate <= 0.0:
             return
-
+        dy = np.asarray(_arr(dy), dtype=np.float32)
+        x_flat = np.asarray(_arr(x_flat), dtype=np.float32)
         full_cols = int(self.out_features)
         full_rows = int(self.in_features)
         total = full_rows * full_cols
@@ -319,114 +265,72 @@ class NCMLinear(nn.Linear):
         abs_sum = 0.0
         for start in range(0, full_cols, chunk_width):
             end = min(start + chunk_width, full_cols)
-            grad_chunk = (dy[:, start:end].t() @ x_flat).t()
-            if not bool(torch.isfinite(grad_chunk).all()):
+            grad_chunk = (dy[:, start:end].T @ x_flat).T
+            if not np.isfinite(grad_chunk).all():
                 return
-            abs_sum += float(
-                grad_chunk.detach().abs().sum(dtype=torch.float64).item()
-            )
-            del grad_chunk
-
+            abs_sum += float(np.abs(grad_chunk.astype(np.float64)).sum())
         global_mean_abs = abs_sum / float(total)
         if not global_mean_abs > 0.0:
             return
 
-        base_seed = int(
-            torch.randint(0, 2**63 - 1, (), dtype=torch.int64).item()
-        )
-        chunk_sampler = getattr(
-            _quant, "sample_ternary_gradient_update_chunk", None
-        )
-        native_sampler = getattr(_quant, "sample_ternary_gradient_updates", None)
+        base_seed = int(ng.get_rng().integers(0, 2**63 - 1))
+        chunk_sampler = getattr(_quant, "sample_ternary_gradient_update_chunk", None)
         pending_indices = []
         pending_directions = []
 
         for start in range(0, full_cols, chunk_width):
             end = min(start + chunk_width, full_cols)
-            grad_chunk = (dy[:, start:end].t() @ x_flat).t()
+            grad_chunk = (dy[:, start:end].T @ x_flat).T
             chunk_seed = (base_seed + start) % (2**63 - 1)
-
             if chunk_sampler is not None:
                 indices, directions = chunk_sampler(
                     grad_chunk, rate, chunk_seed, global_mean_abs,
                     full_cols, start,
                 )
+                indices = np.asarray(indices, dtype=np.int32)
+                directions = np.asarray(directions, dtype=np.int8)
             else:
-                # Compatibility with older core packages. Their native sampler
-                # normalizes by the chunk mean, so scale the rate to preserve
-                # the full matrix's per-coordinate probability.
-                chunk_mean_abs = float(
-                    grad_chunk.detach().abs().sum(dtype=torch.float64).item()
-                ) / float(grad_chunk.numel())
+                chunk_mean_abs = float(np.abs(grad_chunk.astype(np.float64)).sum()) / float(grad_chunk.size)
                 if not chunk_mean_abs > 0.0:
-                    del grad_chunk
                     continue
                 adjusted_rate = rate * chunk_mean_abs / global_mean_abs
-                sampled = None
-                if native_sampler is not None and grad_chunk.device.type == "cpu":
-                    sampled = native_sampler(
-                        grad_chunk, adjusted_rate, chunk_seed
-                    )
+                sampler = getattr(_quant, "sample_ternary_gradient_updates", None)
+                sampled = sampler(grad_chunk, adjusted_rate, chunk_seed) if sampler is not None else None
                 if sampled is not None:
                     local_indices, directions = sampled
-                    local_indices = local_indices.to(torch.long)
-                    indices = (
-                        torch.div(
-                            local_indices, end - start, rounding_mode="floor"
-                        ) * full_cols
-                        + start + local_indices.remainder(end - start)
-                    ).to(torch.int32)
-                    directions = directions.to(torch.int8)
+                    local_indices = np.asarray(local_indices, dtype=np.int64)
+                    indices = ((local_indices // (end - start)) * full_cols
+                               + start + local_indices % (end - start)).astype(np.int32)
+                    directions = np.asarray(directions, dtype=np.int8)
                 else:
-                    gradient = grad_chunk.detach().to(
-                        device="cpu", dtype=torch.float32
-                    ).contiguous()
-                    importance = gradient.abs()
-                    probabilities = (
-                        importance * (rate / global_mean_abs)
-                    ).clamp_(max=1.0)
-                    selected = torch.rand(importance.shape) < probabilities
-                    selected &= importance > 0
-                    local_indices = selected.reshape(-1).nonzero(
-                        as_tuple=False
-                    ).flatten()
-                    indices = (
-                        torch.div(
-                            local_indices, end - start, rounding_mode="floor"
-                        ) * full_cols
-                        + start + local_indices.remainder(end - start)
-                    ).to(torch.int32)
-                    directions = (
-                        -gradient.reshape(-1).index_select(0, local_indices)
-                        .sign().to(torch.int8)
-                    )
-            if indices.numel():
-                pending_indices.append(indices.to(device="cpu", dtype=torch.int32))
-                pending_directions.append(
-                    directions.to(device="cpu", dtype=torch.int8)
-                )
-            del grad_chunk
+                    importance = np.abs(grad_chunk)
+                    probabilities = np.minimum(importance * (rate / global_mean_abs), 1.0)
+                    rng = np.random.default_rng(int(chunk_seed))
+                    selected = (rng.random(grad_chunk.shape) < probabilities) & (importance > 0)
+                    local_indices = np.flatnonzero(selected.reshape(-1))
+                    indices = ((local_indices // (end - start)) * full_cols
+                               + start + local_indices % (end - start)).astype(np.int32)
+                    directions = (-np.sign(grad_chunk.reshape(-1)[local_indices])).astype(np.int8)
+            if indices.size:
+                pending_indices.append(indices)
+                pending_directions.append(directions)
 
-        # Extend only after all chunks succeeded; an exception cannot leave a
-        # partially sampled gradient update queued for a later optimizer step.
         self._pending_ternary_indices.extend(pending_indices)
         self._pending_ternary_directions.extend(pending_directions)
 
-    @torch.no_grad()
     def _apply_pending_ternary_updates(self) -> None:
         """Apply queued sparse coordinate updates directly to packed 2-bit codes."""
         if not self._pending_ternary_indices:
             return
 
         applier = getattr(_quant, "apply_ternary_update_segments", None)
-        if applier is not None and self.ternary_packed.device.type == "cpu":
+        if applier is not None:
             try:
                 changed = applier(
                     self.ternary_packed, self._ternary_shape,
                     self._pending_ternary_indices, self._pending_ternary_directions,
                 )
             except Exception:
-                # Avoid reapplying possibly partial native updates on retry.
                 self._pending_ternary_indices.clear()
                 self._pending_ternary_directions.clear()
                 self._invalidate_packed_cache()
@@ -434,98 +338,68 @@ class NCMLinear(nn.Linear):
             if changed is not None:
                 self._pending_ternary_indices.clear()
                 self._pending_ternary_directions.clear()
-                # The native applier patches the canonical buffer in place
-                # through a NumPy view, so the derived compute copy has to be
-                # dropped explicitly.
                 self._invalidate_packed_cache()
                 if changed:
-                    self.ternary_updates.add_(changed)
+                    self.ternary_updates[...] += int(changed)
                 return
 
         try:
-            indices = torch.cat(self._pending_ternary_indices).to(torch.long)
-            directions = torch.cat(self._pending_ternary_directions).to(torch.int16)
+            indices = np.concatenate([np.asarray(x, dtype=np.int64)
+                                      for x in self._pending_ternary_indices])
+            directions = np.concatenate([np.asarray(x, dtype=np.int16)
+                                         for x in self._pending_ternary_directions])
         except Exception:
             self._pending_ternary_indices.clear()
             self._pending_ternary_directions.clear()
             raise
         self._pending_ternary_indices.clear()
         self._pending_ternary_directions.clear()
-        unique_indices, inverse = torch.unique(indices, sorted=True, return_inverse=True)
-        votes = torch.zeros(unique_indices.numel(), dtype=torch.int16)
-        votes.scatter_add_(0, inverse, directions)
-        directions = votes.sign()
+        unique_indices, inverse = np.unique(indices, return_inverse=True)
+        votes = np.zeros(unique_indices.size, dtype=np.int16)
+        np.add.at(votes, inverse, directions)
+        directions = np.sign(votes)
         active = directions != 0
-        if not bool(active.any()):
+        if not active.any():
             return
         unique_indices = unique_indices[active]
         directions = directions[active]
 
         packed = self.ternary_packed.reshape(-1)
-        byte_indices = torch.div(unique_indices, 4, rounding_mode="floor")
-        shifts = (unique_indices.remainder(4) * 2).to(torch.int16)
-        old_bytes = packed[byte_indices.to(packed.device)].to(
-            device="cpu", dtype=torch.int16
-        )
-        old_raw = torch.bitwise_and(
-            torch.bitwise_right_shift(old_bytes, shifts), 0x3
-        )
-        new_raw = (old_raw + directions).clamp_(0, 2)
+        byte_indices = unique_indices // 4
+        shifts = (unique_indices % 4 * 2).astype(np.int16)
+        old_bytes = packed[byte_indices].astype(np.int16)
+        old_raw = (old_bytes >> shifts) & 0x3
+        new_raw = np.clip(old_raw + directions, 0, 2)
         changed = new_raw != old_raw
-        if not bool(changed.any()):
+        if not changed.any():
             return
         byte_indices = byte_indices[changed]
         shifts = shifts[changed]
         new_raw = new_raw[changed]
-        unique_bytes, byte_inverse = torch.unique(
-            byte_indices, sorted=True, return_inverse=True
-        )
-        masks = torch.bitwise_left_shift(torch.full_like(shifts, 0x3), shifts)
-        values = torch.bitwise_left_shift(new_raw, shifts)
-        clear_masks = torch.zeros(unique_bytes.numel(), dtype=torch.int16)
-        set_values = torch.zeros(unique_bytes.numel(), dtype=torch.int16)
-        clear_masks.scatter_add_(0, byte_inverse, masks)
-        set_values.scatter_add_(0, byte_inverse, values)
-        old = packed[unique_bytes.to(packed.device)].to(
-            device="cpu", dtype=torch.int16
-        )
-        updated_bytes = torch.bitwise_or(
-            torch.bitwise_and(old, torch.bitwise_not(clear_masks)),
-            set_values,
-        ).to(torch.uint8)
-        packed[unique_bytes.to(packed.device)] = updated_bytes.to(packed.device)
+        unique_bytes, byte_inverse = np.unique(byte_indices, return_inverse=True)
+        masks = (0x3 << shifts).astype(np.int16)
+        values = (new_raw << shifts).astype(np.int16)
+        clear_masks = np.zeros(unique_bytes.size, dtype=np.int16)
+        set_values = np.zeros(unique_bytes.size, dtype=np.int16)
+        np.add.at(clear_masks, byte_inverse, masks)
+        np.add.at(set_values, byte_inverse, values)
+        old = packed[unique_bytes].astype(np.int16)
+        updated = ((old & ~clear_masks) | set_values).astype(np.uint8)
+        packed[unique_bytes] = updated
         self._invalidate_packed_cache()
-        self.ternary_updates.add_(
-            changed.sum().to(device=self.ternary_updates.device,
-                             dtype=self.ternary_updates.dtype)
-        )
-
-
-    def _quantized_weight(self):
-        version = self.weight._version
-        if version == self._cached_version:
-            return
-        self._cached_version = version
-        self._cached_fp8_weight = None
-        self._cached_packed = None
-        self._cached_packed_shape = None
-        if self.forward_quant == "fp8":
-            self._cached_fp8_weight, _ = _quant.fp8_e4m3_quantize(self.weight.detach())
+        self.ternary_updates[...] += int(changed.sum())
 
     def forward(self, x: Tensor) -> Tensor:
         if self.forward_quant == "fp32":
-            return F.linear(x, self.weight, self.bias)
+            return ng.linear(x, self.weight, self.bias)
         if self.forward_quant == "ternary":
-            return _DirectTernaryLinear.apply(x, self.bias, self)
-        self._quantized_weight()
-        fp8_weight = self._cached_fp8_weight
-        return _NCMQuantizedLinear.apply(
-            x, self.weight, self.bias, self.forward_quant, self.backward_mode,
-            None, 1.0, None, fp8_weight,
-        )
+            return _direct_ternary_linear(x, self.bias, self)
+        fp8_weight, _ = _quant.fp8_e4m3_quantize(self.weight.data)
+        self._cached_fp8_weight = fp8_weight
+        return _fp8_linear(x, fp8_weight, self)
 
 
-def migrate_ternary_state_dict(model: nn.Module, state_dict: dict) -> tuple[dict, bool]:
+def migrate_ternary_state_dict(model: ng.Module, state_dict: dict) -> tuple[dict, bool]:
     """Convert legacy FP32-master ternary checkpoints to packed direct-ternary state."""
     converted = dict(state_dict)
     migrated = False
@@ -537,24 +411,20 @@ def migrate_ternary_state_dict(model: nn.Module, state_dict: dict) -> tuple[dict
         packed_key = prefix + "ternary_packed"
         if old_weight_key not in converted or packed_key in converted:
             continue
-        weight = converted.pop(old_weight_key)
-        packed, scale, shape, _ = _quant.pack_ternary(
-            weight.detach().t().contiguous()
-        )
+        weight = np.asarray(_arr(converted.pop(old_weight_key)), dtype=np.float32)
+        packed, scale, shape, _ = _quant.pack_ternary(weight.T.copy())
         if tuple(shape) != module._ternary_shape:
             raise ValueError(f"legacy ternary checkpoint shape mismatch at {old_weight_key}")
-        converted[packed_key] = packed.to(dtype=torch.uint8)
-        converted[prefix + "ternary_scale"] = torch.tensor(
-            float(scale), dtype=torch.float32
-        )
+        converted[packed_key] = np.asarray(packed, dtype=np.uint8)
+        converted[prefix + "ternary_scale"] = np.asarray(float(scale), dtype=np.float32)
         converted.setdefault(
-            prefix + "ternary_updates", module.ternary_updates.detach().clone()
+            prefix + "ternary_updates", np.array(module.ternary_updates, copy=True)
         )
         migrated = True
     return converted, migrated
 
 
-def apply_direct_ternary_updates(model: nn.Module) -> None:
+def apply_direct_ternary_updates(model: ng.Module) -> None:
     """Flush pending sparse ternary updates once per completed backward pass."""
     for module in model.modules():
         if isinstance(module, NCMLinear) and module.forward_quant == "ternary":
@@ -570,33 +440,32 @@ def level_length(length: int, level: int, levels: int) -> int:
 def resize_sequence(x: Tensor, length: int, mode: str = "linear") -> Tensor:
     if x.shape[1] == length:
         return x
+    transposed = ng.transpose(x, (0, 2, 1))
     if mode == "area":
-        return F.interpolate(x.transpose(1, 2), size=length, mode="area").transpose(1, 2)
-    return F.interpolate(
-        x.transpose(1, 2), size=length, mode="linear", align_corners=False
-    ).transpose(1, 2)
+        resized = ng.interpolate1d(transposed, length, "area")
+    else:
+        resized = ng.interpolate1d(transposed, length, "linear")
+    return ng.transpose(resized, (0, 2, 1))
 
 
-class RMSNorm(nn.Module):
+class RMSNorm(ng.Module):
     """SmaulBRAIN-style RMS normalization with epsilon 1e-6."""
 
     def __init__(self, dimension: int, eps: float = 1e-6):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(dimension))
+        self.weight = Parameter(np.ones(dimension, dtype=np.float32))
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
-        scale = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + self.eps)
-        return x * scale.to(dtype=x.dtype) * self.weight.to(dtype=x.dtype)
+        scale = ng.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + self.eps)
+        return x * scale * self.weight
 
 
-class SmaulExpert(nn.Module):
+class SmaulExpert(ng.Module):
     """One SmaulBRAIN-style GELU expert with bias-free projections."""
 
-    def __init__(
-        self, dimension: int, hidden_dimension: int,
-        forward_quant: str = "fp32", backward_mode: str = "fp32",
-    ):
+    def __init__(self, dimension: int, hidden_dimension: int,
+                 forward_quant: str = "fp32", backward_mode: str = "fp32"):
         super().__init__()
         self.W_in = NCMLinear(
             dimension, hidden_dimension, bias=False,
@@ -608,17 +477,15 @@ class SmaulExpert(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.W_out(F.gelu(self.W_in(x)))
+        return self.W_out(ng.gelu(self.W_in(x)))
 
 
-class SmaulSharedMoE(nn.Module):
+class SmaulSharedMoE(ng.Module):
     """One sparse router and expert pool shared by every recurrent block."""
 
-    def __init__(
-        self, dimension: int, n_experts: int, top_k: int,
-        expert_hidden: int = 0, forward_quant: str = "fp32",
-        backward_mode: str = "fp32",
-    ):
+    def __init__(self, dimension: int, n_experts: int, top_k: int,
+                 expert_hidden: int = 0, forward_quant: str = "fp32",
+                 backward_mode: str = "fp32"):
         super().__init__()
         if n_experts < 1 or not 1 <= top_k <= n_experts:
             raise ValueError("top_k must be between 1 and n_experts")
@@ -630,124 +497,53 @@ class SmaulSharedMoE(nn.Module):
             dimension, n_experts, bias=False,
             forward_quant=forward_quant, backward_mode=backward_mode,
         )
-        self.experts = nn.ModuleList(
-            SmaulExpert(
-                dimension, expert_hidden, forward_quant, backward_mode
-            ) for _ in range(n_experts)
+        self.experts = ng.ModuleList(
+            SmaulExpert(dimension, expert_hidden, forward_quant, backward_mode)
+            for _ in range(n_experts)
         )
 
     def forward(self, x: Tensor) -> Tensor:
         original_shape = x.shape
         flat = x.reshape(-1, original_shape[-1])
         route_logits = self.router(flat)
-        chosen_logits, chosen_experts = route_logits.topk(self.top_k, dim=-1)
-        route_weights = torch.softmax(chosen_logits, dim=-1)
+        chosen_experts = np.argsort(-route_logits.data, axis=-1, kind="stable")[:, :self.top_k]
+        chosen_logits = ng.gather_last(route_logits, chosen_experts)
+        route_weights = ng.softmax(chosen_logits, axis=-1)
 
-        # Build the assignment table once, then group it by expert. The previous
-        # dispatch ran torch.where over every assignment once per expert (64 scans
-        # for moe-full). Sorting/counting reduces that to one grouping pass while
-        # keeping expert activations streamed one expert at a time.
-        token_ids = torch.arange(flat.shape[0], device=flat.device)
-        assignment_tokens = token_ids.repeat_interleave(self.top_k)
+        token_ids = np.arange(flat.shape[0])
+        assignment_tokens = np.repeat(token_ids, self.top_k)
         assignment_experts = chosen_experts.reshape(-1)
         assignment_weights = route_weights.reshape(-1)
-        order = torch.argsort(assignment_experts, stable=True)
-        grouped_tokens = assignment_tokens.index_select(0, order)
-        grouped_weights = assignment_weights.index_select(0, order)
-        counts = torch.bincount(assignment_experts, minlength=self.n_experts).tolist()
+        order = np.argsort(assignment_experts, kind="stable")
+        grouped_tokens = assignment_tokens[order]
+        grouped_weights = assignment_weights[order]
+        counts = np.bincount(assignment_experts, minlength=self.n_experts)
 
-        output = torch.zeros_like(flat)
+        output = Tensor(np.zeros_like(flat.data))
         start = 0
         for expert_id, count in enumerate(counts):
-            end = start + count
+            end = start + int(count)
             if count:
                 token_indices = grouped_tokens[start:end]
-                expert_output = self.experts[expert_id](
-                    flat.index_select(0, token_indices)
-                )
+                expert_output = self.experts[expert_id](flat[token_indices])
                 weights = grouped_weights[start:end].unsqueeze(-1)
-                output.index_add_(0, token_indices, expert_output * weights)
+                output = ng.index_add_rows(output, token_indices, expert_output * weights)
             start = end
         return output.reshape(original_shape)
 
 
-class _NCMNativeRecurrentScan(torch.autograd.Function):
-    """CPU recurrent scan with C++ forward/backward kernels and PyTorch autograd."""
-
-    @staticmethod
-    def forward(ctx, values: Tensor, decay_rate: Tensor) -> Tensor:
-        if values.device.type != "cpu" or values.dtype != torch.float32:
-            raise ValueError("native recurrent scan requires CPU float32 activations")
-        rate = decay_rate.detach().float().clamp(min=1e-4, max=0.1)
-        alpha = torch.exp(-rate).contiguous()
-        values_cpu = values.detach().contiguous()
-        output = torch.empty_like(values_cpu)
-        values_np = values_cpu.numpy()
-        output_np = output.numpy()
-        alpha_np = alpha.numpy()
-
-        for batch_index in range(values_cpu.shape[0]):
-            state = np.zeros(values_cpu.shape[2], dtype=np.float32)
-            ok = _quant.recurrent_scan(
-                values_np[batch_index], alpha_np, state, output_np[batch_index]
-            )
-            if not ok:
-                raise RuntimeError("native recurrent scan backend became unavailable")
-
-        ctx.save_for_backward(output, alpha)
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor):
-        states, alpha = ctx.saved_tensors
-        grad_output = grad_output.contiguous()
-        grad_values = torch.empty_like(states)
-        grad_output_np = grad_output.detach().numpy()
-        states_np = states.detach().numpy()
-        grad_values_np = grad_values.numpy()
-        alpha_np = alpha.detach().contiguous().numpy()
-        alpha_grad = np.zeros(alpha.numel(), dtype=np.float64)
-
-        for batch_index in range(states.shape[0]):
-            local_alpha_grad = np.zeros(alpha.numel(), dtype=np.float64)
-            ok = _quant.recurrent_backward_scan(
-                grad_output_np[batch_index],
-                states_np[batch_index],
-                alpha_np,
-                grad_values_np[batch_index],
-                local_alpha_grad,
-            )
-            if not ok:
-                raise RuntimeError("native recurrent backward backend became unavailable")
-            alpha_grad += local_alpha_grad
-
-        alpha_grad_tensor = torch.from_numpy(alpha_grad).to(
-            device=alpha.device, dtype=alpha.dtype
-        )
-        grad_rate = -alpha * alpha_grad_tensor
-        return grad_values, grad_rate
-
-
-class SmaulRecurrentBlock(nn.Module):
+class SmaulRecurrentBlock(ng.Module):
     """Bidirectional, parallel-scan adaptation of SmaulBRAIN's recurrent block.
 
     Attention uses the elementwise recurrent state s[t] = decay * s[t-1] +
     k[t] * v[t], with a reverse scan added so every position in an NCM level
     can use context from both sides while the whole level is predicted at once.
-    A chunked closed-form scan avoids a Python loop over every position and
-    never constructs a time-by-time attention matrix. Channel mixing is handled
-    by the single shared sparse expert pool; both sublayers use pre-RMSNorm.
     """
 
-    # NCM's normal code levels are short (often <=128 positions). Larger
-    # chunks reduce Python/Tensor-op launch overhead; long contexts still use
-    # bounded chunks to keep the closed-form recurrence numerically stable.
     _SCAN_CHUNK = 128
 
-    def __init__(
-        self, dimension: int, forward_quant: str = "fp32",
-        backward_mode: str = "fp32",
-    ):
+    def __init__(self, dimension: int, forward_quant: str = "fp32",
+                 backward_mode: str = "fp32"):
         super().__init__()
         self.norm_attention = RMSNorm(dimension)
         self.norm_channel = RMSNorm(dimension)
@@ -760,63 +556,37 @@ class SmaulRecurrentBlock(nn.Module):
         self.W_k = NCMLinear(dimension, dimension, **linear_args)
         self.W_v = NCMLinear(dimension, dimension, **linear_args)
         self.W_o = NCMLinear(dimension, dimension, **linear_args)
-        # softplus(-4) starts near a 0.018 decay rate, retaining useful state.
-        # The bounded rate keeps the vectorized scan numerically stable.
-        self.decay_logit = nn.Parameter(torch.full((dimension,), -4.0))
-        self.bonus = nn.Parameter(torch.ones(dimension))
+        self.decay_logit = Parameter(np.full((dimension,), -4.0, dtype=np.float32))
+        self.bonus = Parameter(np.ones(dimension, dtype=np.float32))
 
     def _scan(self, values: Tensor, decay_rate: Tensor) -> Tensor:
-        """Use the fused native CPU scan when available; retain the vectorized fallback."""
+        """Chunked closed-form recurrent scan."""
         if values.shape[1] == 0:
             return values
-        if (
-            values.device.type == "cpu"
-            and values.dtype == torch.float32
-            and _quant.prepare_ternary_backend()
-        ):
-            return _NCMNativeRecurrentScan.apply(values, decay_rate)
-        values_fp32 = values if values.dtype == torch.float32 else values.float()
-        rate = decay_rate if decay_rate.dtype == torch.float32 else decay_rate.float()
-        state = values_fp32.new_zeros(values.shape[0], values.shape[2])
-        output_chunks = []
-        for start in range(0, values.shape[1], self._SCAN_CHUNK):
-            chunk = values_fp32[:, start:start + self._SCAN_CHUNK]
-            steps = torch.arange(
-                1, chunk.shape[1] + 1, dtype=torch.float32, device=values.device
-            ).unsqueeze(1)
-            powers = torch.exp(-steps * rate.unsqueeze(0))
-            weighted_prefix = (chunk / powers.unsqueeze(0)).cumsum(dim=1)
-            scanned = weighted_prefix * powers.unsqueeze(0)
-            scanned = scanned + powers.unsqueeze(0) * state.unsqueeze(1)
-            state = scanned[:, -1, :]
-            output_chunks.append(scanned)
-        return torch.cat(output_chunks, dim=1).to(dtype=values.dtype)
+        alpha = ng.exp(-decay_rate.float())
+        return ng.scan(values, alpha)
 
-    def forward(
-        self, x: Tensor, segment_lengths: Sequence[int],
-        channel_mixer: nn.Module,
-    ) -> Tensor:
+    def forward(self, x: Tensor, segment_lengths: Sequence[int],
+                channel_mixer: ng.Module) -> Tensor:
         if sum(segment_lengths) != x.shape[1] or any(length < 1 for length in segment_lengths):
             raise ValueError("segment_lengths must be positive and sum to the sequence length")
 
         normalized = self.norm_attention(x)
-        read_gate = torch.sigmoid(self.W_r(normalized))
+        read_gate = ng.sigmoid(self.W_r(normalized))
         keys = self.W_k(normalized)
         values = self.W_v(normalized)
         key_value = keys * values
-        decay_rate = F.softplus(self.decay_logit).clamp(min=1e-4, max=0.1)
+        decay_rate = ng.clamp(ng.softplus(self.decay_logit), 1e-4, 0.1)
 
-        # Reset recurrent state at each independent NCM level/prompt segment.
         contexts = []
         offset = 0
         for length in segment_lengths:
             segment = key_value[:, offset:offset + length]
-            # One scan over [forward; reversed] halves tensor-op launches.
             batch = segment.shape[0]
-            both = self._scan(torch.cat((segment, segment.flip(dims=(1,))), dim=0), decay_rate)
-            contexts.append(0.5 * (both[:batch] + both[batch:].flip(dims=(1,))))
+            both = self._scan(ng.concat((segment, ng.flip(segment, 1)), axis=0), decay_rate)
+            contexts.append(0.5 * (both[:batch] + ng.flip(both[batch:], 1)))
             offset += length
-        context = torch.cat(contexts, dim=1)
+        context = ng.concat(contexts, axis=1)
         attended = self.W_o(read_gate * (context + self.bonus * key_value))
         x = x + attended
 
@@ -824,105 +594,77 @@ class SmaulRecurrentBlock(nn.Module):
         return x + channel_mixer(channel_input)
 
 
-class SmaulDenseFFN(nn.Module):
+class SmaulDenseFFN(ng.Module):
     """SwiGLU channel mixer used by the dense presets."""
 
-    def __init__(
-        self, dimension: int, hidden_dimension: int,
-        forward_quant: str = "fp32", backward_mode: str = "fp32",
-    ):
+    def __init__(self, dimension: int, hidden_dimension: int,
+                 forward_quant: str = "fp32", backward_mode: str = "fp32"):
         super().__init__()
-        self.W_a = NCMLinear(
-            dimension, hidden_dimension, forward_quant=forward_quant,
-            backward_mode=backward_mode,
-        )
-        self.W_b = NCMLinear(
-            dimension, hidden_dimension, forward_quant=forward_quant,
-            backward_mode=backward_mode,
-        )
-        self.W_c = NCMLinear(
-            hidden_dimension, dimension, forward_quant=forward_quant,
-            backward_mode=backward_mode,
-        )
+        self.W_a = NCMLinear(dimension, hidden_dimension, forward_quant=forward_quant,
+                             backward_mode=backward_mode)
+        self.W_b = NCMLinear(dimension, hidden_dimension, forward_quant=forward_quant,
+                             backward_mode=backward_mode)
+        self.W_c = NCMLinear(hidden_dimension, dimension, forward_quant=forward_quant,
+                             backward_mode=backward_mode)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.W_c(F.silu(self.W_a(x)) * self.W_b(x))
+        return self.W_c(ng.silu(self.W_a(x)) * self.W_b(x))
 
 
-class ResidualVQTokenizer(nn.Module):
-    """Byte-level multiscale residual VQ tokenizer with a reconstruction loss.
-
-    Each level has a separate codebook and a longer sequence than the previous
-    level. Code vectors are upsampled and accumulated before the next residual
-    is quantized. This is a compact baseline, not the paper's full VQ-VAE.
-    """
+class ResidualVQTokenizer(ng.Module):
+    """Byte-level multiscale residual VQ tokenizer with a reconstruction loss."""
 
     def __init__(self, config: NCMConfig):
         super().__init__()
         self.config = config
-        self.byte_embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.encoder = nn.Sequential(
-            NCMLinear(
-                config.d_model, config.d_model,
-                forward_quant=config.forward_quant,
-                backward_mode=config.backward_mode,
-            ),
-            nn.GELU(),
-            NCMLinear(
-                config.d_model, config.d_model,
-                forward_quant=config.forward_quant,
-                backward_mode=config.backward_mode,
-            ),
+        self.byte_embedding = ng.Embedding(config.vocab_size, config.d_model)
+        self.encoder = ng.Sequential(
+            NCMLinear(config.d_model, config.d_model,
+                      forward_quant=config.forward_quant,
+                      backward_mode=config.backward_mode),
+            ng.GELU(),
+            NCMLinear(config.d_model, config.d_model,
+                      forward_quant=config.forward_quant,
+                      backward_mode=config.backward_mode),
         )
-        # Keep latent RMS bounded as the encoder learns; residual codebooks and
-        # the reconstruction head should not see unbounded latent magnitudes.
         self.feature_norm = RMSNorm(config.d_model)
-        self.codebooks = nn.ModuleList(
-            nn.Embedding(config.codebook_size, config.d_model)
+        self.codebooks = ng.ModuleList(
+            ng.Embedding(config.codebook_size, config.d_model)
             for _ in range(config.levels)
         )
-        self.register_buffer(
-            "_codebook_initialized", torch.zeros(config.levels, dtype=torch.bool)
-        )
+        self.register_buffer("_codebook_initialized",
+                             np.zeros(config.levels, dtype=np.bool_))
         self.decoder_norm = RMSNorm(config.d_model)
-        self.decoder = nn.Sequential(
-            NCMLinear(
-                config.d_model, config.d_model,
-                forward_quant=config.forward_quant,
-                backward_mode=config.backward_mode,
-            ),
-            nn.GELU(),
-            NCMLinear(
-                config.d_model, config.vocab_size,
-                forward_quant=config.forward_quant,
-                backward_mode=config.backward_mode,
-            ),
+        self.decoder = ng.Sequential(
+            NCMLinear(config.d_model, config.d_model,
+                      forward_quant=config.forward_quant,
+                      backward_mode=config.backward_mode),
+            ng.GELU(),
+            NCMLinear(config.d_model, config.vocab_size,
+                      forward_quant=config.forward_quant,
+                      backward_mode=config.backward_mode),
         )
         self.last_loss_components: dict[str, Tensor] = {}
 
     def _quantize(self, residual: Tensor, level: int) -> tuple[Tensor, Tensor, Tensor]:
         codebook = self.codebooks[level].weight
         if self.training and not bool(self._codebook_initialized[level]):
-            # Seed code vectors from actual residuals to reduce early codebook collapse.
-            with torch.no_grad():
-                samples = residual.detach().reshape(-1, residual.shape[-1])
-                choices = torch.randint(
-                    samples.shape[0], (self.config.codebook_size,), device=samples.device
-                )
-                codebook.copy_(samples[choices].to(codebook.dtype))
-                self._codebook_initialized[level] = True
+            samples = residual.detach().reshape(-1, residual.shape[-1]).data
+            choices = ng.get_rng().integers(0, samples.shape[0], self.config.codebook_size)
+            codebook.data[...] = samples[choices]
+            self._codebook_initialized[level] = True
         flat = residual.reshape(-1, residual.shape[-1]).float()
-        weights = codebook.float()
-        distances = (
-            flat.square().sum(1, keepdim=True) - 2 * flat @ weights.t()
-            + weights.square().sum(1).unsqueeze(0)
-        )
-        ids = distances.argmin(dim=-1).view(residual.shape[:2])
-        quantized = self.codebooks[level](ids)
-        vq_loss = F.mse_loss(quantized, residual.detach())
-        commitment = F.mse_loss(residual, quantized.detach())
+        weights = codebook
+        distances = (np.sum(flat.data ** 2, axis=1, keepdims=True)
+                     - 2.0 * flat.data @ weights.data.T
+                     + np.sum(weights.data ** 2, axis=1)[None, :])
+        ids = np.argmin(distances, axis=-1).reshape(residual.shape[:2])
+        ids_t = Tensor(ids.astype(np.int64))
+        quantized = self.codebooks[level](ids_t)
+        vq_loss = ng.mse_loss(quantized, residual.detach())
+        commitment = ng.mse_loss(residual, quantized.detach())
         straight_through = residual + (quantized - residual).detach()
-        return ids, straight_through, vq_loss + self.config.commitment_weight * commitment
+        return ids_t, straight_through, vq_loss + self.config.commitment_weight * commitment
 
     def _encode_levels(self, byte_ids: Tensor, features: Tensor):
         """Multiscale residual quantization.
@@ -930,14 +672,14 @@ class ResidualVQTokenizer(nn.Module):
         Returns (codes, cumulative reconstruction, vq loss). The decoder is
         not involved: encoding only needs the code ids.
         """
-        cumulative = features.new_zeros(features.shape)
+        cumulative = Tensor(np.zeros(features.shape, dtype=np.float32))
         codes: list[Tensor] = []
-        vq_loss = features.new_zeros(())
+        vq_loss = Tensor(np.zeros((), dtype=np.float32))
         for level in range(self.config.levels):
             size = level_length(byte_ids.shape[1], level, self.config.levels)
-            target = F.adaptive_avg_pool1d(
-                features.transpose(1, 2), size
-            ).transpose(1, 2)
+            target = ng.transpose(ng.adaptive_avg_pool1d(
+                ng.transpose(features, (0, 2, 1)), size
+            ), (0, 2, 1))
             prior = resize_sequence(cumulative, size)
             ids, quantized, level_loss = self._quantize(target - prior, level)
             codes.append(ids)
@@ -953,13 +695,11 @@ class ResidualVQTokenizer(nn.Module):
         features = self.feature_norm(self.encoder(self.byte_embedding(byte_ids)))
         codes, cumulative, vq_loss = self._encode_levels(byte_ids, features)
         logits = self.decoder(self.decoder_norm(cumulative))
-        reconstruction = F.cross_entropy(
+        reconstruction = ng.cross_entropy(
             logits.reshape(-1, self.config.vocab_size), byte_ids.reshape(-1)
         )
         mean_vq_loss = vq_loss / self.config.levels
         total_loss = reconstruction + mean_vq_loss
-        # Detached diagnostics let the trainer report each term without holding
-        # extra autograd graphs or synchronizing a GPU on every training step.
         self.last_loss_components = {
             "reconstruction": reconstruction.detach(),
             "quantization": mean_vq_loss.detach(),
@@ -967,7 +707,6 @@ class ResidualVQTokenizer(nn.Module):
         }
         return logits, total_loss, codes
 
-    @torch.no_grad()
     def encode(self, byte_ids: Tensor) -> list[Tensor]:
         if byte_ids.ndim != 2:
             raise ValueError("byte_ids must have shape [batch, time]")
@@ -975,39 +714,45 @@ class ResidualVQTokenizer(nn.Module):
             raise ValueError("sequence length must be within [1, max_seq_len]")
         was_training = self.training
         self.eval()
-        # Only the code ids are needed here; decoding the reconstruction head
-        # would burn most of the encoder's runtime for nothing.
-        features = self.feature_norm(self.encoder(self.byte_embedding(byte_ids)))
-        codes, _cumulative, _vq_loss = self._encode_levels(byte_ids, features)
+        with ng.no_grad():
+            features = self.feature_norm(self.encoder(self.byte_embedding(byte_ids)))
+            codes, _cumulative, _vq_loss = self._encode_levels(byte_ids, features)
         self.train(was_training)
         return codes
 
-    @torch.no_grad()
     def decode(self, codes: Sequence[Tensor], output_length: int) -> Tensor:
         if len(codes) != self.config.levels:
             raise ValueError("one code tensor is required per level")
         if not 1 <= output_length <= self.config.max_seq_len:
             raise ValueError("output_length must be within [1, max_seq_len]")
-        batch = codes[0].shape[0]
-        cumulative = self.byte_embedding.weight.new_zeros(
-            batch, output_length, self.config.d_model
-        )
-        for level, ids in enumerate(codes):
-            expected = level_length(output_length, level, self.config.levels)
-            if ids.shape != (batch, expected):
-                raise ValueError(f"level {level} codes must have shape [batch, {expected}]")
-            cumulative = cumulative + resize_sequence(self.codebooks[level](ids), output_length)
-        return self.decoder(self.decoder_norm(cumulative)).argmax(dim=-1)
+        with ng.no_grad():
+            batch = codes[0].shape[0]
+            cumulative = Tensor(np.zeros((batch, output_length, self.config.d_model),
+                                         dtype=np.float32))
+            for level, ids in enumerate(codes):
+                expected = level_length(output_length, level, self.config.levels)
+                if ids.shape != (batch, expected):
+                    raise ValueError(f"level {level} codes must have shape [batch, {expected}]")
+                cumulative = cumulative + resize_sequence(
+                    self.codebooks[level](ids), output_length)
+            logits = self.decoder(self.decoder_norm(cumulative))
+        return Tensor(np.argmax(logits.data, axis=-1).astype(np.int64))
 
 
-class NCMGenerator(nn.Module):
-    """Predict every code level in one training pass; generate one level per step.
+def _checkpointed_block(block, hidden, segment_lengths, mixer):
+    with ng.no_grad():
+        output = block(hidden, segment_lengths, mixer)
+    def bw(g):
+        local = Tensor(hidden.data.copy(), requires_grad=hidden.requires_grad)
+        with ng.enable_grad():
+            recomputed = block(local, segment_lengths, mixer)
+            recomputed.backward(g)
+        return (local.grad,)
+    return ng.make_op(output.data.copy(), (hidden,), bw)
 
-    Inputs are cumulative reconstructions of *earlier* levels, not the target
-    level's ground-truth IDs. Target codes are labels only. Independent
-    recurrent scans keep levels isolated while allowing all positions within
-    each level to be predicted in parallel.
-    """
+
+class NCMGenerator(ng.Module):
+    """Predict every code level in one training pass; generate one level per step."""
 
     def __init__(self, config: NCMConfig, tokenizer: ResidualVQTokenizer,
                  gradient_checkpointing: bool = False):
@@ -1015,8 +760,6 @@ class NCMGenerator(nn.Module):
         if tokenizer.config != config:
             raise ValueError("tokenizer and generator must use the same NCMConfig")
         self.config = config
-        # Low-memory mode: recompute each recurrent block during backward
-        # instead of retaining its internals.
         self.gradient_checkpointing = bool(gradient_checkpointing)
         self._tokenizer = (tokenizer,)
         for parameter in tokenizer.parameters():
@@ -1026,14 +769,10 @@ class NCMGenerator(nn.Module):
             "forward_quant": config.forward_quant,
             "backward_mode": config.backward_mode,
         }
-        self.input_projection = NCMLinear(
-            config.d_model, config.d_model, **linear_args
-        )
-        self.prefix_projection = NCMLinear(
-            config.d_model, config.d_model, **linear_args
-        )
-        self.level_embeddings = nn.Embedding(config.levels, config.d_model)
-        self.position_embeddings = nn.Embedding(config.max_seq_len, config.d_model)
+        self.input_projection = NCMLinear(config.d_model, config.d_model, **linear_args)
+        self.prefix_projection = NCMLinear(config.d_model, config.d_model, **linear_args)
+        self.level_embeddings = ng.Embedding(config.levels, config.d_model)
+        self.position_embeddings = ng.Embedding(config.max_seq_len, config.d_model)
         if config.model_kind == "moe":
             self.channel_mixer = SmaulSharedMoE(
                 config.d_model, config.n_experts, config.top_k,
@@ -1042,21 +781,17 @@ class NCMGenerator(nn.Module):
             self.dense_mixers = None
         else:
             self.channel_mixer = None
-            self.dense_mixers = nn.ModuleList(
-                SmaulDenseFFN(
-                    config.d_model, config.ffn_hidden,
-                    config.forward_quant, config.backward_mode,
-                )
+            self.dense_mixers = ng.ModuleList(
+                SmaulDenseFFN(config.d_model, config.ffn_hidden,
+                              config.forward_quant, config.backward_mode)
                 for _ in range(config.n_layers)
             )
-        self.blocks = nn.ModuleList(
-            SmaulRecurrentBlock(
-                config.d_model, config.forward_quant, config.backward_mode
-            )
+        self.blocks = ng.ModuleList(
+            SmaulRecurrentBlock(config.d_model, config.forward_quant, config.backward_mode)
             for _ in range(config.n_layers)
         )
         self.final_norm = RMSNorm(config.d_model)
-        self.output_heads = nn.ModuleList(
+        self.output_heads = ng.ModuleList(
             NCMLinear(config.d_model, config.codebook_size, **linear_args)
             for _ in range(config.levels)
         )
@@ -1065,19 +800,14 @@ class NCMGenerator(nn.Module):
     def tokenizer(self) -> ResidualVQTokenizer:
         return self._tokenizer[0]
 
-    def _level_parts(
-        self, codes: Sequence[Tensor], corrupt: bool
-    ) -> tuple[list[Tensor], list[int]]:
+    def _level_parts(self, codes: Sequence[Tensor], corrupt: bool) -> tuple[list[Tensor], list[int]]:
         if len(codes) != self.config.levels:
             raise ValueError("one code tensor is required per level")
         batch = codes[0].shape[0]
         length = codes[-1].shape[1]
         if length > self.config.max_seq_len:
             raise ValueError("sequence exceeds config.max_seq_len")
-        device = codes[0].device
-        cumulative = self.tokenizer.byte_embedding.weight.new_zeros(
-            batch, length, self.config.d_model, device=device
-        )
+        cumulative = Tensor(np.zeros((batch, length, self.config.d_model), dtype=np.float32))
         parts: list[Tensor] = []
         lengths: list[int] = []
         for level, ids in enumerate(codes):
@@ -1085,47 +815,39 @@ class NCMGenerator(nn.Module):
             if ids.shape != (batch, expected):
                 raise ValueError(f"level {level} codes must have shape [batch, {expected}]")
             lengths.append(expected)
-            # The current level's input contains only earlier levels.
             current = resize_sequence(cumulative, expected, mode="area")
-            positions = torch.arange(expected, device=device)
+            positions = np.arange(expected)
             part = self.input_projection(current)
             part = part + self.position_embeddings(positions).unsqueeze(0)
-            part = part + self.level_embeddings.weight[level].view(1, 1, -1)
+            part = part + self.level_embeddings.weight[level].reshape(1, 1, -1)
             parts.append(part)
-            # Corrupt conditioning IDs only; the original IDs remain the labels.
             conditioning_ids = ids
             if corrupt and self.training and self.config.conditioning_corruption > 0:
-                replace = torch.rand(ids.shape, device=ids.device) < self.config.conditioning_corruption
-                random_ids = torch.randint(
-                    self.config.codebook_size, ids.shape, device=ids.device
-                )
-                conditioning_ids = torch.where(replace, random_ids, ids)
+                rng = ng.get_rng()
+                replace = rng.random(ids.shape) < self.config.conditioning_corruption
+                random_ids = rng.integers(0, self.config.codebook_size, ids.shape)
+                conditioning_ids = Tensor(np.where(replace, random_ids, ids.data).astype(np.int64))
             quantized = self.tokenizer.codebooks[level](conditioning_ids)
             cumulative = cumulative + resize_sequence(quantized, length)
         return parts, lengths
 
-    def _build_level_inputs(
-        self, codes: Sequence[Tensor], corrupt: bool
-    ) -> tuple[Tensor, list[int]]:
+    def _build_level_inputs(self, codes: Sequence[Tensor], corrupt: bool) -> tuple[Tensor, list[int]]:
         parts, lengths = self._level_parts(codes, corrupt)
-        return torch.cat(parts, dim=1), lengths
+        return ng.concat(parts, axis=1), lengths
 
-    def _prefix_features(
-        self, prefix_tokens: Tensor, batch: int, device: torch.device
-    ) -> Tensor:
+    def _prefix_features(self, prefix_tokens: Tensor, batch: int) -> Tensor:
         """Frozen-tokenizer features for the prompt; carries no autograd graph."""
         if prefix_tokens.ndim != 2 or prefix_tokens.shape[0] != batch:
             raise ValueError("prefix_tokens must have shape [batch, prefix_length]")
         if not 1 <= prefix_tokens.shape[1] <= self.config.max_seq_len:
             raise ValueError("prefix length must be within [1, max_seq_len]")
-        with torch.no_grad():
+        with ng.no_grad():
             return self.tokenizer.feature_norm(
                 self.tokenizer.encoder(self.tokenizer.byte_embedding(prefix_tokens))
             )
 
     def _project_prefix(self, features: Tensor) -> tuple[Tensor, int]:
-        """Build a prompt prefix; a fresh call gives each caller its own graph."""
-        positions = torch.arange(features.shape[1], device=features.device)
+        positions = np.arange(features.shape[1])
         prefix = self.prefix_projection(features)
         prefix = prefix + self.position_embeddings(positions).unsqueeze(0)
         return prefix, prefix.shape[1]
@@ -1134,83 +856,56 @@ class NCMGenerator(nn.Module):
         use_checkpoint = (
             self.gradient_checkpointing
             and self.training
-            and torch.is_grad_enabled()
+            and ng.is_grad_enabled()
         )
         for layer_index, block in enumerate(self.blocks):
-            mixer = (
-                self.channel_mixer
-                if self.config.model_kind == "moe"
-                else self.dense_mixers[layer_index]
-            )
+            mixer = (self.channel_mixer if self.config.model_kind == "moe"
+                     else self.dense_mixers[layer_index])
             if use_checkpoint:
-                # Only the block boundaries stay alive; the block's internals
-                # are recomputed during backward.
-                hidden = _torch_checkpoint(
-                    block, hidden, segment_lengths, mixer, use_reentrant=False
-                )
+                hidden = _checkpointed_block(block, hidden, segment_lengths, mixer)
             else:
                 hidden = block(hidden, segment_lengths, mixer)
         return hidden
 
-    def iter_level_logits(
-        self, codes: Sequence[Tensor], *, prefix_tokens: Tensor | None = None,
-        corrupt: bool = True,
-    ):
-        """Yield ``(logits, target_ids)`` one level at a time.
-
-        Levels are independent inside the recurrent blocks: attention is
-        segment-local and every scan resets at its segment start, so walking the
-        levels one by one gives the same numbers as the joint pass while only
-        the current level's activations stay alive. Callers that backpropagate
-        inside the loop hold memory for the largest level instead of all of
-        them at once.
-        """
+    def iter_level_logits(self, codes: Sequence[Tensor], *, prefix_tokens: Tensor | None = None,
+                          corrupt: bool = True):
+        """Yield ``(logits, target_ids)`` one level at a time."""
         parts, _lengths = self._level_parts(codes, corrupt)
         features = None
         if prefix_tokens is not None:
-            features = self._prefix_features(
-                prefix_tokens, parts[0].shape[0], parts[0].device
-            )
+            features = self._prefix_features(prefix_tokens, parts[0].shape[0])
         for level, (part, target_ids) in enumerate(zip(parts, codes)):
-            # Each level gets its own recurrent state. When conditioning on a
-            # prompt, repeat the known prefix so no level can leak into another.
             if features is None:
                 segment = part
                 prefix_length = 0
             else:
                 prefix, prefix_length = self._project_prefix(features)
-                segment = torch.cat((prefix, part), dim=1)
+                segment = ng.concat((prefix, part), axis=1)
             hidden = self.final_norm(self._run_blocks(segment, [segment.shape[1]]))
             if features is not None:
                 hidden = hidden[:, prefix_length:]
             yield self.output_heads[level](hidden), target_ids
 
-    def forward(
-        self, codes: Sequence[Tensor], *, prefix_tokens: Tensor | None = None,
-        corrupt: bool = True,
-    ) -> list[Tensor]:
+    def forward(self, codes: Sequence[Tensor], *, prefix_tokens: Tensor | None = None,
+                corrupt: bool = True) -> list[Tensor]:
         inputs, lengths = self._build_level_inputs(codes, corrupt)
-        level_inputs = list(torch.split(inputs, lengths, dim=1))
+        level_inputs = ng.split(inputs, lengths, axis=1)
         prefix = None
         prefix_length = 0
         if prefix_tokens is not None:
-            features = self._prefix_features(
-                prefix_tokens, inputs.shape[0], inputs.device
-            )
+            features = self._prefix_features(prefix_tokens, inputs.shape[0])
             prefix, prefix_length = self._project_prefix(features)
 
-        # Each level gets its own recurrent state. When conditioning on a prompt,
-        # repeat the known prefix for each level so no level can leak into another.
         segments = [
-            torch.cat((prefix, part), dim=1) if prefix is not None else part
+            ng.concat((prefix, part), axis=1) if prefix is not None else part
             for part in level_inputs
         ]
         segment_lengths = [part.shape[1] for part in segments]
         hidden = self.final_norm(
-            self._run_blocks(torch.cat(segments, dim=1), segment_lengths)
+            self._run_blocks(ng.concat(segments, axis=1), segment_lengths)
         )
 
-        encoded_segments = torch.split(hidden, segment_lengths, dim=1)
+        encoded_segments = ng.split(hidden, segment_lengths, axis=1)
         logits: list[Tensor] = []
         for level, encoded in enumerate(encoded_segments):
             if prefix is not None:
@@ -1218,10 +913,8 @@ class NCMGenerator(nn.Module):
             logits.append(self.output_heads[level](encoded))
         return logits
 
-    def predict_level(
-        self, codes: Sequence[Tensor], level: int,
-        *, prefix_tokens: Tensor | None = None,
-    ) -> Tensor:
+    def predict_level(self, codes: Sequence[Tensor], level: int,
+                      *, prefix_tokens: Tensor | None = None) -> Tensor:
         """Predict only one level, avoiding work on unrelated levels at inference."""
         if not 0 <= level < self.config.levels:
             raise ValueError("level is outside the configured hierarchy")
@@ -1231,10 +924,7 @@ class NCMGenerator(nn.Module):
         length = codes[-1].shape[1]
         if length > self.config.max_seq_len:
             raise ValueError("sequence exceeds config.max_seq_len")
-        device = codes[0].device
-        cumulative = self.tokenizer.byte_embedding.weight.new_zeros(
-            batch, length, self.config.d_model, device=device
-        )
+        cumulative = Tensor(np.zeros((batch, length, self.config.d_model), dtype=np.float32))
         for prior_level in range(level):
             prior_length = level_length(length, prior_level, self.config.levels)
             ids = codes[prior_level]
@@ -1245,31 +935,26 @@ class NCMGenerator(nn.Module):
             cumulative = cumulative + resize_sequence(
                 self.tokenizer.codebooks[prior_level](ids), length
             )
-        current = resize_sequence(
-            cumulative, codes[level].shape[1], mode="area"
-        )
+        current = resize_sequence(cumulative, codes[level].shape[1], mode="area")
         current = self.input_projection(current)
-        positions = torch.arange(current.shape[1], device=device)
+        positions = np.arange(current.shape[1])
         current = current + self.position_embeddings(positions).unsqueeze(0)
-        current = current + self.level_embeddings.weight[level].view(1, 1, -1)
+        current = current + self.level_embeddings.weight[level].reshape(1, 1, -1)
         prefix_length = 0
         if prefix_tokens is None:
             hidden = current
         else:
-            features = self._prefix_features(prefix_tokens, batch, device)
+            features = self._prefix_features(prefix_tokens, batch)
             prefix, prefix_length = self._project_prefix(features)
-            hidden = torch.cat((prefix, current), dim=1)
+            hidden = ng.concat((prefix, current), axis=1)
         hidden = self.final_norm(self._run_blocks(hidden, [hidden.shape[1]]))
         if prefix_length:
             hidden = hidden[:, prefix_length:]
         return self.output_heads[level](hidden)
 
-    @torch.no_grad()
-    def generate_codes(
-        self, lengths: Sequence[int], device: torch.device | str = "cpu",
-        temperature: float = 0.0, top_k: int = 0,
-        prefix_tokens: Tensor | None = None, top_p: float = 1.0,
-    ) -> list[Tensor]:
+    def generate_codes(self, lengths: Sequence[int], device: str = "cpu",
+                       temperature: float = 0.0, top_k: int = 0,
+                       prefix_tokens: Tensor | None = None, top_p: float = 1.0) -> list[Tensor]:
         """Generate the hierarchy in K sequential calls, parallel within each level."""
         if len(lengths) != self.config.levels:
             raise ValueError("one length is required per level")
@@ -1282,39 +967,39 @@ class NCMGenerator(nn.Module):
         if not 0 < top_p <= 1:
             raise ValueError("top_p must be in (0, 1]")
         batch_size = prefix_tokens.shape[0] if prefix_tokens is not None else 1
-        if prefix_tokens is not None:
-            device = prefix_tokens.device
-        codes = [
-            torch.zeros(batch_size, n, dtype=torch.long, device=device) for n in lengths
-        ]
-        for level in range(self.config.levels):
-            logits = self.predict_level(codes, level, prefix_tokens=prefix_tokens)
-            if temperature == 0:
-                codes[level] = logits.argmax(dim=-1)
-            else:
-                if top_k:
-                    k = min(top_k, logits.shape[-1])
-                    threshold = logits.topk(k, dim=-1).values[..., -1, None]
-                    logits = logits.masked_fill(logits < threshold, float("-inf"))
-                probs = torch.softmax(logits / temperature, dim=-1)
-                if top_p < 1.0:
-                    sorted_probs, sorted_indices = probs.sort(dim=-1, descending=True)
-                    remove = sorted_probs.cumsum(dim=-1) - sorted_probs >= top_p
-                    sorted_probs = sorted_probs.masked_fill(remove, 0.0)
-                    filtered = torch.zeros_like(probs)
-                    filtered.scatter_(-1, sorted_indices, sorted_probs)
-                    probs = filtered / filtered.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-                codes[level] = torch.multinomial(
-                    probs.reshape(-1, probs.shape[-1]), 1
-                ).reshape(probs.shape[:-1])
+        codes = [Tensor(np.zeros((batch_size, n), dtype=np.int64)) for n in lengths]
+        with ng.no_grad():
+            for level in range(self.config.levels):
+                logits = self.predict_level(codes, level, prefix_tokens=prefix_tokens)
+                lg = logits.data
+                if temperature == 0:
+                    ids = np.argmax(lg, axis=-1)
+                else:
+                    if top_k:
+                        k = min(top_k, lg.shape[-1])
+                        threshold = np.partition(lg, -k, axis=-1)[..., -k, None]
+                        lg = np.where(lg < threshold, -np.inf, lg)
+                    probs = ng.softmax(Tensor(lg / temperature), axis=-1).data
+                    if top_p < 1.0:
+                        order = np.argsort(-probs, axis=-1, kind="stable")
+                        sorted_probs = np.take_along_axis(probs, order, axis=-1)
+                        remove = np.cumsum(sorted_probs, axis=-1) - sorted_probs >= top_p
+                        sorted_probs = np.where(remove, 0.0, sorted_probs)
+                        probs = np.zeros_like(probs)
+                        np.put_along_axis(probs, order, sorted_probs, axis=-1)
+                        probs = probs / np.maximum(probs.sum(axis=-1, keepdims=True), 1e-12)
+                    flat = probs.reshape(-1, probs.shape[-1])
+                    u = ng.get_rng().random(flat.shape[0])
+                    cdf = np.cumsum(flat, axis=-1)
+                    ids = (cdf < u[:, None]).sum(axis=-1)
+                    ids = np.minimum(ids, probs.shape[-1] - 1)
+                    ids = ids.reshape(probs.shape[:-1])
+                codes[level] = Tensor(ids.astype(np.int64))
         return codes
 
-    @torch.no_grad()
-    def generate(
-        self, output_length: int, device: torch.device | str = "cpu",
-        temperature: float = 0.0, top_k: int = 0,
-        prefix_tokens: Tensor | None = None, top_p: float = 1.0,
-    ) -> Tensor:
+    def generate(self, output_length: int, device: str = "cpu",
+                 temperature: float = 0.0, top_k: int = 0,
+                 prefix_tokens: Tensor | None = None, top_p: float = 1.0) -> Tensor:
         lengths = [
             level_length(output_length, level, self.config.levels)
             for level in range(self.config.levels)
@@ -1326,56 +1011,41 @@ class NCMGenerator(nn.Module):
 
 
 # Compatibility alias for existing scripts and user code that imported the old name.
-# The implementation below is recurrent and contains no TransformerEncoder layers.
 NCMTransformer = NCMGenerator
 
 
-def ncm_loss(
-    model: NCMGenerator, codes: Sequence[Tensor],
-    *, prefix_tokens: Tensor | None = None,
-) -> Tensor:
+def _level_weights(model: NCMGenerator, codes: Sequence[Tensor]) -> list[float]:
+    alpha = model.config.level_loss_alpha
+    weights = np.asarray(
+        [max(1, target.shape[1]) ** (1.0 - alpha) for target in codes],
+        dtype=np.float32,
+    )
+    weights = weights / weights.sum()
+    return [float(w) for w in weights]
+
+
+def ncm_loss(model: NCMGenerator, codes: Sequence[Tensor],
+             *, prefix_tokens: Tensor | None = None) -> Tensor:
     """Length-normalized multilevel CE; alpha=1 weights each level equally."""
     logits = model(codes, prefix_tokens=prefix_tokens, corrupt=True)
     losses = [
-        F.cross_entropy(pred.reshape(-1, pred.shape[-1]), target.reshape(-1))
+        ng.cross_entropy(pred.reshape(-1, pred.shape[-1]), target.reshape(-1))
         for pred, target in zip(logits, codes)
     ]
-    alpha = model.config.level_loss_alpha
-    weights = torch.tensor(
-        [max(1, target.shape[1]) ** (1.0 - alpha) for target in codes],
-        device=logits[0].device, dtype=logits[0].dtype,
-    )
-    weights = weights / weights.sum()
+    weights = _level_weights(model, codes)
     return sum(weight * loss for weight, loss in zip(weights, losses))
 
 
-def backward_ncm_loss_chunked(
-    model: NCMGenerator, codes: Sequence[Tensor],
-    *, prefix_tokens: Tensor | None = None,
-) -> Tensor:
-    """Backpropagate one level at a time instead of holding every level.
-
-    Same objective as ``ncm_loss(...).backward()`` (identical level weights),
-    but each level's activations are released before the next level is built, so
-    peak memory tracks the largest level instead of the sum of all levels.
-    Gradients accumulate in the usual ``.grad`` buffers and direct ternary
-    updates are merged when the caller applies them, so call ``zero_grad``
-    first and step the optimizer afterwards.
-    """
-    alpha = model.config.level_loss_alpha
-    weights = torch.tensor(
-        [max(1, target.shape[1]) ** (1.0 - alpha) for target in codes],
-        device=codes[0].device, dtype=torch.float32,
-    )
-    weights = (weights / weights.sum()).tolist()
+def backward_ncm_loss_chunked(model: NCMGenerator, codes: Sequence[Tensor],
+                              *, prefix_tokens: Tensor | None = None) -> Tensor:
+    """Backpropagate one level at a time instead of holding every level."""
+    weights = _level_weights(model, codes)
     total: Tensor | None = None
     for weight, (logits, target) in zip(
         weights,
         model.iter_level_logits(codes, prefix_tokens=prefix_tokens, corrupt=True),
     ):
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]), target.reshape(-1)
-        )
+        loss = ng.cross_entropy(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
         (weight * loss).backward()
         term = loss.detach() * weight
         total = term if total is None else total + term
