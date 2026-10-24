@@ -1,22 +1,29 @@
-# SmaulBRAIN — PyTorch port
+# SmaulBRAIN — NumPy port
 
-A PyTorch/autograd port of the SmaulBRAIN byte-level recurrent language model. The package retains the dense and MoE presets, tied embedding/output weights, recurrent state, stable top-k routing, expert growth/pruning, factored SmaulOPT, quantized forward paths, checkpoint recovery, inference, evaluation, and benchmarking tools.
+A pure-NumPy port of the SmaulBRAIN byte-level recurrent language model. The
+runtime uses a small tape-based autograd engine (`smaulbrain.npgrad`) from the
+sibling `smaulbrain-core` package and runs on CPU in float32. The port retains
+the dense and MoE presets, tied embedding/output weights, recurrent state,
+stable top-k routing, expert growth/pruning, factored SmaulOPT, quantized
+forward paths, checkpoint recovery, inference, evaluation, and benchmarking
+tools.
 
 ## Install
 
-```bash
-pip install smaulbrain-core
-```
-
-For development from a checkout:
+From a checkout with `smaulbrain-core` as a sibling directory:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+python -m pip install -e ../smaulbrain-core
 python -m pip install -r requirements.txt
 ```
 
-PyTorch is the tensor/training runtime. NumPy remains a dependency for reading legacy `.npz` data/checkpoints and for the compatibility adapter used by the optional existing C++ kernels. Quantization and optimizer C++ kernels compile on demand if a working C++ compiler is available; the Torch implementation remains the fallback.
+The editable install makes `smaulbrain` importable. If you prefer not to
+install it, run commands with `PYTHONPATH=.:../smaulbrain-core`.
+
+NumPy is the tensor/training runtime and safetensors is the checkpoint format.
+Quantization and optimizer C++ kernels compile on demand if a working C++
+compiler is available; the NumPy implementation remains the fallback. PyTorch
+is only needed to run the archived parity oracles under `tests/_reference/`.
 
 ## Quick start
 
@@ -38,7 +45,9 @@ Run a fixed number of additional optimizer updates after resuming:
 python train.py --preset moe-tiny --steps 10 --checkpoint checkpoints/demo --resume
 ```
 
-`--max-steps` is the target global step; `--steps` is the number of updates for this invocation. The final summary reports raw loss separately from the historical smoothed loss and reports the last routing overflow fraction.
+`--max-steps` is the target global step; `--steps` is the number of updates for
+this invocation. The final summary reports raw loss separately from the
+historical smoothed loss and reports the last routing overflow fraction.
 
 Train on a raw corpus (files are read as bytes):
 
@@ -50,9 +59,13 @@ Generate text and evaluate:
 
 ```bash
 python infer.py --preset moe-tiny --checkpoint checkpoints/demo --prompt "Hello" --max-new-tokens 64
-python evaluate.py --preset moe-tiny --checkpoint checkpoints/demo --eval-batches 16
-python prune.py --preset moe-tiny --checkpoint checkpoints/demo --rm-worst 1 --dry-run
+python evaluate.py --preset moe-tiny --checkpoint checkpoints/legacy-core --eval-batches 16
+python prune.py --preset moe-tiny --checkpoint checkpoints/legacy-core --rm-worst 1 --dry-run
 ```
+
+`evaluate.py` and `prune.py` operate on the original core checkpoint format
+(`manifest.json` plus safetensors payloads), not on the default NCM checkpoint
+directory.
 
 Run checks:
 
@@ -60,29 +73,47 @@ Run checks:
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python -m pytest -q tests
 ```
 
-On small CPUs, limiting BLAS/OpenMP threads avoids thread-launch overhead for the model's many small operations.
+The default suite is NumPy-only and skips `tests/_reference/`. The archived
+PyTorch parity oracle can be run separately when PyTorch is installed:
+
+```bash
+PYTHONPATH=.:../smaulbrain-core python -m pytest -q tests/_reference/test_ncm_parity.py
+```
+
+On small CPUs, limiting BLAS/OpenMP threads avoids thread-launch overhead for
+the model's many small operations.
 
 ## Presets and runtime options
 
-`--preset` accepts `dense-tiny`, `dense-full`, `moe-tiny`, and `moe-full`; `--dense` / `--moe` aliases work with `--preset tiny|full`. Choose `--forward-quant fp32|fp8|ternary`, `--backward-mode fp32|fp8|ternary`, and `--paging R|V|D2R|D2V|R2V`. VRAM modes require a supported CUDA device. FP8 is software E4M3 emulation, not a promise of hardware FP8 arithmetic.
+`--preset` accepts `dense-tiny`, `dense-full`, `moe-tiny`, and `moe-full`;
+`--dense` / `--moe` aliases work with `--preset tiny|full`. Choose
+`--forward-quant fp32|fp8|ternary` and `--backward-mode fp32|fp8|ternary`. The
+port is CPU-only: `--device cpu` is the supported setting, and the default NCM
+training and inference paths accept `--paging R` only. FP8 is software E4M3
+emulation, not a promise of hardware FP8 arithmetic.
 
-Growth controls include `--growth-every-steps`, `--growth-loss-nats`, `--growth-loss-beta`, `--growth-min-eval-samples`, `--growth-noise-scale`, and `--growth-seed`. Use `0` to disable periodic growth and `none` to disable the loss trigger.
+The original core runtime exposes `--paging R|V|D2R|D2V|R2V` and expert
+growth controls (`--growth-every-steps`, `--growth-loss-nats`,
+`--growth-loss-beta`, `--growth-min-eval-samples`, `--growth-noise-scale`,
+`--growth-seed`). VRAM paging modes are not available in this CPU-only port.
+The default NCM architecture uses a fixed in-memory expert pool, so NCM training
+does not grow or prune experts.
 
 ## Project map
 
-- `smaulbrain/model.py`, `ops.py`, `moe.py`: PyTorch model, differentiable ops, routing.
-- `smaulbrain/smaulopt.py`: custom factored optimizer and checkpointable state.
-- `smaulbrain/quant.py`: FP8-emulation and packed ternary paths.
-- `smaulbrain/paging.py`, `growth.py`, `prune_cmd.py`: expert storage/cache, growth, pruning.
-- `smaulbrain/checkpoint.py`, `train_loop.py`: checkpointing, recovery, training loop.
-- `smaulbrain/inference.py`, `data.py`, `vocab.py`: sampling, byte streams, encoding.
-- `train.py`, `infer.py`, `evaluate.py`, `prune.py`, `bench.py`, `bench_router.py`: CLI tools.
-- `tests/`: numerical references, hot-path checks, routing/quantization, optimizer, lifecycle and recovery tests.
+- `ncm.py`: NumPy NCM tokenizer, generator, ternary/FP8 linear paths, losses.
+- `ncm_train.py`, `ncm_checkpoint.py`: NCM training loop and safetensors checkpoints.
+- `train.py`, `infer.py`: default NCM training and inference entry points.
+- `evaluate.py`, `prune.py`: evaluation and pruning for core-format checkpoints.
+- `bench.py`, `bench_router.py`, `ncm_bench.py`: throughput/benchmark tools.
+- `smaulbrain-core/smaulbrain/`: NumPy model, autograd, ops, routing, SmaulOPT,
+  quantization, paging, growth, checkpointing, and inference runtime.
+- `tests/`: NumPy runtime tests; `tests/_reference/`: archived PyTorch oracles.
 - `docs/NCM.md`, `docs/systems.md`: NCM architecture, runtime settings, and known limitations.
 
 ## Default CLI architecture: NCM
 
-`train.py` and `infer.py` now use the coarse-to-fine Next-Concept Modeling
+`train.py` and `infer.py` use the coarse-to-fine Next-Concept Modeling
 architecture by default. It combines a multiscale residual-VQ byte tokenizer
 with a bidirectional recurrent generator, RMSNorm, residual connections, and
 either a dense SwiGLU mixer or a shared sparse MoE pool. Positions within each
@@ -137,13 +168,26 @@ python infer.py --checkpoint checkpoints/ncm-run \
   --prompt "Once upon a time, " --max-new-tokens 128
 ```
 
-Training saves tokenizer and generator checkpoints separately and automatically
-resumes saved training stages. For Parquet input, install `pyarrow`. The older
-`ncm_train.py` and `ncm_bench.py` commands remain available for direct
-experiments. The prototype is smaller and simpler than the paper's full recipe;
-validate held-out text quality and end-to-end speed rather than treating the
-paper's reported speedups as guaranteed.
+Training writes model and training checkpoints as safetensors files:
+`tokenizer.safetensors`, `generator.safetensors`,
+`tokenizer-training.safetensors`, and `generator-training.safetensors`.
+Small JSON metadata (config, step, optimizer hyperparameters) lives in the
+safetensors header. Training resumes saved stages automatically. For Parquet
+input, install `pyarrow`. The older `ncm_train.py` and `ncm_bench.py` commands
+remain available for direct experiments. The prototype is smaller and simpler
+than the paper's full recipe; validate held-out text quality and end-to-end
+speed rather than treating the paper's reported speedups as guaranteed.
 
 ## Compatibility and limits
 
-New checkpoints use PyTorch `.pt` tensors with integrity checks and atomic publication. Legacy `smaulbrain-v2:1` NumPy checkpoints and per-expert `.npz` files are imported, but legacy NumPy RNG continuation is not bit-for-bit replayed. Full presets need substantial RAM; count checks do not allocate full models. See `docs/NCM.md` and `docs/systems.md` before selecting paging/quantization settings. CPU regression tests do not certify CUDA behavior or convergence/performance for full-size models.
+New NCM checkpoints are safetensors containers with integrity metadata and
+atomic publication. The original core runtime writes a `manifest.json` plus
+`params.safetensors` / `optim.safetensors`; legacy `smaulbrain-v2:1` NumPy
+checkpoints and per-expert `.npz` files are still imported. Legacy PyTorch NCM
+`.pt` files must be converted first with
+`tests/_reference/convert_torch_checkpoint.py`. PyTorch RNG streams are not
+reproduced: loaded weights are exact, but freshly seeded runs differ from the
+original implementation. Full presets need substantial RAM; count checks do not
+allocate full models. See `docs/NCM.md` and `docs/systems.md` before selecting
+quantization settings. CPU regression tests do not certify convergence or
+performance for full-size models.
